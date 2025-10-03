@@ -2,13 +2,6 @@
 """
 Stewart Platform Control GUI with Clean IK Implementation
 Based on Robert Eisele's proven method
-
-Optimized for Teensy 4.1:
-- USB operates at 480 Mbit/sec (baud rate parameter ignored)
-- No auto-reset on serial connection
-- Fast update rate (20ms) for responsive control
-
-Requirements: pip install pyserial numpy
 """
 
 import tkinter as tk
