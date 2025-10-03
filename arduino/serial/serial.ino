@@ -1,14 +1,14 @@
 /*
-  Stewart Platform - Simple Servo Controller
+  Stewart Platform - Servo Controller with Speed Control
 
+  SIGN CONVENTION:
+  - Receives angles from Python where: NEGATIVE = UP, POSITIVE = DOWN
+  - Servos can physically move: UP to -90°, DOWN to +45°
+  
   Receives 6 servo angles over serial and moves servos.
   Expected serial format: "theta0,theta1,theta2,theta3,theta4,theta5\n"
-  Example: "0.0,0.0,0.0,0.0,0.0,0.0\n"
-
-  Before using:
-  - Serial mode: UART, fixed baud rate
-  - Baud rate: 9600 (maestroSerial)
-  - Serial monitor: 115200 (USB Serial)
+  Optional speed control: "SPD:value\n" where value is 0-255 (0=unlimited)
+  Example: "0.0,0.0,0.0,0.0,0.0,0.0\n" or "SPD:50\n"
 */
 
 #include "PololuMaestro.h"
@@ -18,27 +18,39 @@
 MicroMaestro maestro(maestroSerial);
 
 // CONSTANTS
-float abs_0 = 4000;   // 0 degrees position in microseconds
-float abs_90 = 8000;  // 90 degrees position in microseconds
+float abs_0 = 4000;
+float abs_90 = 8000;
 
-// Servo ranges (CCW direction)
+// Servo angle limits (degrees)
+// NEGATIVE = servo moves UP (can go to -90°)
+// POSITIVE = servo moves DOWN (can go to +45°)
+const float SERVO_ANGLE_UP_LIMIT = -90.0;    // Maximum up movement
+const float SERVO_ANGLE_DOWN_LIMIT = 45.0;   // Maximum down movement
+
+// Servo ranges (CCW direction) - used for calibration mapping
 float range[6][2] = {
-  {-45, 45}, {45, -45},   // a1, a2
-  {-45, 45}, {45, -45},   // b1, b2
-  {-45, 45}, {45, -45}    // c1, c2
+  {-45, 45}, {45, -45},
+  {-45, 45}, {45, -45},
+  {-45, 45}, {45, -45}
 };
 
 // Servo offsets (calibration)
 float offset[6] = {-0.5, 7, -2, 4, -2.5, 5.5};
 
-float theta[6] = {0, 0, 0, 0, 0, 0};  // Current servo angles
+float theta[6] = {0, 0, 0, 0, 0, 0};
+int servoSpeed = 20;        // 0 = unlimited (fastest)
+int servoAcceleration = 20; // 0 = unlimited (fastest)
 
 void setup() {
   Serial.begin(115200);
   maestroSerial.begin(9600);
 
   Serial.println("Stewart Platform Servo Controller");
-  Serial.println("Send format: theta0,theta1,theta2,theta3,theta4,theta5");
+  Serial.println("Commands:");
+  Serial.println("  Angles: theta0,theta1,theta2,theta3,theta4,theta5");
+  Serial.println("         (Negative=UP to -90°, Positive=DOWN to +45°)");
+  Serial.println("  Speed:  SPD:value (0-255, 0=unlimited)");
+  Serial.println("  Accel:  ACC:value (0-255, 0=unlimited)");
   Serial.println("Ready.");
 }
 
@@ -46,6 +58,22 @@ void loop() {
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
+
+    // Check for speed command
+    if (input.startsWith("SPD:")) {
+      servoSpeed = input.substring(4).toInt();
+      Serial.print("Speed set to: ");
+      Serial.println(servoSpeed);
+      return;
+    }
+
+    // Check for acceleration command
+    if (input.startsWith("ACC:")) {
+      servoAcceleration = input.substring(4).toInt();
+      Serial.print("Acceleration set to: ");
+      Serial.println(servoAcceleration);
+      return;
+    }
 
     // Parse comma-separated angles
     float angles[6];
@@ -67,10 +95,15 @@ void loop() {
       // Validate angles
       bool valid = true;
       for (int i = 0; i < 6; i++) {
-        if (abs(angles[i]) > 40) {
+        // Check physical servo limits
+        if (angles[i] < SERVO_ANGLE_UP_LIMIT || angles[i] > SERVO_ANGLE_DOWN_LIMIT) {
           Serial.print("ERROR: Angle ");
           Serial.print(i);
-          Serial.print(" exceeds limit: ");
+          Serial.print(" out of range [");
+          Serial.print(SERVO_ANGLE_UP_LIMIT);
+          Serial.print(" UP, ");
+          Serial.print(SERVO_ANGLE_DOWN_LIMIT);
+          Serial.print(" DOWN]: ");
           Serial.println(angles[i]);
           valid = false;
           break;
@@ -91,14 +124,10 @@ void loop() {
         }
 
         // Move servos
-        moveServos(0, 0);  // Max speed and acceleration
+        moveServos(servoSpeed, servoAcceleration);
 
-        Serial.print("OK: ");
-        for (int i = 0; i < 6; i++) {
-          Serial.print(theta[i]);
-          if (i < 5) Serial.print(",");
-        }
-        Serial.println();
+        // Minimal feedback to reduce serial overhead
+        Serial.println("OK");
       }
     } else {
       Serial.println("ERROR: Expected 6 angles");
