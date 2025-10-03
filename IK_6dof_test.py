@@ -12,7 +12,7 @@ Requirements: pip install pyserial numpy
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 import serial
 import serial.tools.list_ports
 import numpy as np
@@ -22,17 +22,19 @@ import time
 class StewartPlatformIK:
     """Inverse kinematics using Robert Eisele's method."""
 
-    def __init__(self):
+    def __init__(self, horn_length=31.75, rod_length=145.0, base=73.025,
+                 base_anchors=36.8893, platform=67.775, platform_anchors=12.7,
+                 top_surface_offset=26.0):
         # Physical dimensions (mm)
-        self.horn_length = 31.75
-        self.rod_length = 145.0
-        self.base = 73.025
-        self.base_anchors = 36.8893
-        self.platform = 67.775
-        self.platform_anchors = 12.7
+        self.horn_length = horn_length
+        self.rod_length = rod_length
+        self.base = base
+        self.base_anchors = base_anchors
+        self.platform = platform
+        self.platform_anchors = platform_anchors
 
         # Distance from anchor center to top surface
-        self.top_surface_offset = 26.0  # mm above anchor center
+        self.top_surface_offset = top_surface_offset
 
         base_angels = np.array([-np.pi / 2, np.pi / 6, np.pi * 5 / 6])
         platform_angels = np.array([-np.pi * 5 / 6, -np.pi / 6, np.pi / 2])
@@ -191,13 +193,129 @@ class StewartPlatformIK:
         ])
 
 
+class PlatformParametersDialog:
+    """Dialog for editing platform physical parameters."""
+
+    def __init__(self, parent, current_params):
+        self.result = None
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Platform Parameters")
+        self.dialog.geometry("400x350")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        # Parameter definitions (name, current_value, description)
+        self.params = [
+            ("horn_length", current_params.get("horn_length", 31.75), "Servo Horn Length (mm)"),
+            ("rod_length", current_params.get("rod_length", 145.0), "Push Rod Length (mm)"),
+            ("base", current_params.get("base", 73.025), "Base Radius (mm)"),
+            ("base_anchors", current_params.get("base_anchors", 36.8893), "Base Anchor Offset (mm)"),
+            ("platform", current_params.get("platform", 67.775), "Platform Radius (mm)"),
+            ("platform_anchors", current_params.get("platform_anchors", 12.7), "Platform Anchor Offset (mm)"),
+            ("top_surface_offset", current_params.get("top_surface_offset", 26.0), "Top Surface Offset (mm)")
+        ]
+
+        self.entries = {}
+        self.create_widgets()
+
+        # Center dialog on parent
+        self.dialog.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() // 2) - (self.dialog.winfo_width() // 2)
+        y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.dialog.winfo_height() // 2)
+        self.dialog.geometry(f"+{x}+{y}")
+
+    def create_widgets(self):
+        # Main frame
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill='both', expand=True)
+
+        ttk.Label(main_frame, text="Platform Physical Parameters",
+                  font=('TkDefaultFont', 10, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 15))
+
+        # Create entry fields for each parameter
+        for idx, (param_name, current_value, description) in enumerate(self.params, start=1):
+            ttk.Label(main_frame, text=description).grid(row=idx, column=0, sticky='w', pady=5)
+
+            entry = ttk.Entry(main_frame, width=15)
+            entry.insert(0, str(current_value))
+            entry.grid(row=idx, column=1, sticky='ew', pady=5, padx=(10, 0))
+
+            self.entries[param_name] = entry
+
+        main_frame.columnconfigure(1, weight=1)
+
+        # Buttons frame
+        btn_frame = ttk.Frame(self.dialog, padding=(20, 0, 20, 20))
+        btn_frame.pack(fill='x')
+
+        ttk.Button(btn_frame, text="Apply", command=self.on_apply).pack(side='right', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.on_cancel).pack(side='right')
+        ttk.Button(btn_frame, text="Reset to Defaults", command=self.on_reset).pack(side='left')
+
+        # Bind Enter key to apply
+        self.dialog.bind('<Return>', lambda e: self.on_apply())
+        self.dialog.bind('<Escape>', lambda e: self.on_cancel())
+
+    def on_reset(self):
+        """Reset all values to defaults."""
+        defaults = {
+            "horn_length": 31.75,
+            "rod_length": 145.0,
+            "base": 73.025,
+            "base_anchors": 36.8893,
+            "platform": 67.775,
+            "platform_anchors": 12.7,
+            "top_surface_offset": 26.0
+        }
+
+        for param_name, entry in self.entries.items():
+            entry.delete(0, tk.END)
+            entry.insert(0, str(defaults[param_name]))
+
+    def on_apply(self):
+        """Validate and apply the parameters."""
+        try:
+            self.result = {}
+            for param_name, entry in self.entries.items():
+                value = float(entry.get())
+                if value <= 0:
+                    raise ValueError(f"{param_name} must be positive")
+                self.result[param_name] = value
+
+            self.dialog.destroy()
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Error: {str(e)}\n\nPlease enter valid positive numbers.",
+                                 parent=self.dialog)
+
+    def on_cancel(self):
+        """Cancel without applying changes."""
+        self.result = None
+        self.dialog.destroy()
+
+    def show(self):
+        """Show dialog and wait for result."""
+        self.dialog.wait_window()
+        return self.result
+
+
 class StewartControlGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Stewart Platform Control")
         self.root.geometry("600x700")
 
-        self.ik = StewartPlatformIK()
+        # Initialize with default parameters
+        self.platform_params = {
+            "horn_length": 31.75,
+            "rod_length": 145.0,
+            "base": 73.025,
+            "base_anchors": 36.8893,
+            "platform": 67.775,
+            "platform_anchors": 12.7,
+            "top_surface_offset": 26.0
+        }
+
+        self.ik = StewartPlatformIK(**self.platform_params)
         self.serial_conn = None
         self.is_connected = False
 
@@ -258,7 +376,10 @@ class StewartControlGUI:
             variable=self.use_top_surface_offset,
             command=self.on_offset_toggle
         )
-        offset_checkbox.pack(anchor='w')
+        offset_checkbox.pack(anchor='w', pady=2)
+
+        ttk.Button(config_frame, text="Edit Platform Parameters",
+                   command=self.open_parameters_dialog).pack(anchor='w', pady=2)
 
         # Sliders frame
         sliders_frame = ttk.LabelFrame(self.root, text="Manual Control (6 DOF)", padding=10)
@@ -312,6 +433,64 @@ class StewartControlGUI:
         ttk.Button(btn_frame, text="Home Position", command=self.home_position).pack(side='left', padx=5)
         ttk.Button(btn_frame, text="Clear Log", command=lambda: self.log_text.delete(1.0, tk.END)).pack(side='left',
                                                                                                         padx=5)
+
+    def open_parameters_dialog(self):
+        """Open dialog to edit platform parameters."""
+        dialog = PlatformParametersDialog(self.root, self.platform_params)
+        new_params = dialog.show()
+
+        if new_params:
+            self.apply_new_parameters(new_params)
+
+    def apply_new_parameters(self, new_params):
+        """Apply new platform parameters and reinitialize IK."""
+        try:
+            # Store new parameters
+            self.platform_params = new_params
+
+            # Reinitialize IK with new parameters
+            self.ik = StewartPlatformIK(**new_params)
+
+            # Update UI elements that depend on home height
+            self.update_z_slider_for_new_params()
+
+            # Update offset checkbox label
+            for widget in self.root.winfo_children():
+                if isinstance(widget, ttk.LabelFrame) and widget.cget('text') == "Configuration":
+                    for child in widget.winfo_children():
+                        if isinstance(child, ttk.Checkbutton):
+                            child.config(text=f"Use Top Surface Offset (+{self.ik.top_surface_offset}mm)")
+
+            self.log("Platform parameters updated successfully")
+            self.log(
+                f"New home heights - Anchor: {self.ik.home_height:.2f}mm, Top: {self.ik.home_height_top_surface:.2f}mm")
+
+            # Recalculate with new parameters
+            self.calculate_and_send()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to apply parameters:\n{str(e)}")
+            self.log(f"ERROR applying parameters: {e}")
+
+    def update_z_slider_for_new_params(self):
+        """Update Z slider range and position after parameter changes."""
+        home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
+
+        # Update Z slider configuration
+        self.sliders['z'].config(from_=home_z - 30, to=home_z + 30)
+
+        # Update Z label
+        if self.use_top_surface_offset.get():
+            label_text = f"Z Height (mm) - Top Surface [Home: {home_z:.1f}]"
+        else:
+            label_text = f"Z Height (mm) - Anchor Center [Home: {home_z:.1f}]"
+
+        self.dof_labels['z'].config(text=label_text)
+
+        # Move to new home height
+        self.dof_values['z'] = home_z
+        self.sliders['z'].set(home_z)
+        self.value_labels['z'].config(text=f"{home_z:.2f}")
 
     def on_offset_toggle(self):
         """Handle toggle of top surface offset."""
