@@ -1,10 +1,6 @@
 /*
   Stewart Platform - Servo Controller with Speed Control
 
-  SIGN CONVENTION:
-  - Receives angles from Python where: NEGATIVE = UP, POSITIVE = DOWN
-  - Servos can physically move: UP to -90°, DOWN to +45°
-  
   Receives 6 servo angles over serial and moves servos.
   Expected serial format: "theta0,theta1,theta2,theta3,theta4,theta5\n"
   Optional speed control: "SPD:value\n" where value is 0-255 (0=unlimited)
@@ -21,13 +17,7 @@ MicroMaestro maestro(maestroSerial);
 float abs_0 = 4000;
 float abs_90 = 8000;
 
-// Servo angle limits (degrees)
-// NEGATIVE = servo moves UP (can go to -90°)
-// POSITIVE = servo moves DOWN (can go to +45°)
-const float SERVO_ANGLE_UP_LIMIT = -90.0;    // Maximum up movement
-const float SERVO_ANGLE_DOWN_LIMIT = 45.0;   // Maximum down movement
-
-// Servo ranges (CCW direction) - used for calibration mapping
+// Servo ranges (CCW direction)
 float range[6][2] = {
   {-45, 45}, {45, -45},
   {-45, 45}, {45, -45},
@@ -48,7 +38,6 @@ void setup() {
   Serial.println("Stewart Platform Servo Controller");
   Serial.println("Commands:");
   Serial.println("  Angles: theta0,theta1,theta2,theta3,theta4,theta5");
-  Serial.println("         (Negative=UP to -90°, Positive=DOWN to +45°)");
   Serial.println("  Speed:  SPD:value (0-255, 0=unlimited)");
   Serial.println("  Accel:  ACC:value (0-255, 0=unlimited)");
   Serial.println("Ready.");
@@ -95,15 +84,10 @@ void loop() {
       // Validate angles
       bool valid = true;
       for (int i = 0; i < 6; i++) {
-        // Check physical servo limits
-        if (angles[i] < SERVO_ANGLE_UP_LIMIT || angles[i] > SERVO_ANGLE_DOWN_LIMIT) {
+        if (abs(angles[i]) > 40) {
           Serial.print("ERROR: Angle ");
           Serial.print(i);
-          Serial.print(" out of range [");
-          Serial.print(SERVO_ANGLE_UP_LIMIT);
-          Serial.print(" UP, ");
-          Serial.print(SERVO_ANGLE_DOWN_LIMIT);
-          Serial.print(" DOWN]: ");
+          Serial.print(" exceeds limit: ");
           Serial.println(angles[i]);
           valid = false;
           break;
