@@ -31,6 +31,9 @@ class StewartPlatformIK:
         self.platform = 67.775
         self.platform_anchors = 12.7
 
+        # Distance from anchor center to top surface
+        self.top_surface_offset = 26.0  # mm above anchor center
+
         base_angels = np.array([-np.pi / 2, np.pi / 6, np.pi * 5 / 6])
         platform_angels = np.array([-np.pi * 5 / 6, -np.pi / 6, np.pi / 2])
 
@@ -45,7 +48,7 @@ class StewartPlatformIK:
         # Calculate beta angles
         self.beta_angles = self._calculate_beta_angles()
 
-        # Calculate home height from actual geometry
+        # Calculate home height from actual geometry (anchor center)
         base_pos = self.base_anchors[0]
         platform_pos = self.platform_anchors[0]
 
@@ -58,7 +61,11 @@ class StewartPlatformIK:
 
         self.home_height = np.sqrt(self.rod_length ** 2 - horiz_dist_sq)
 
-        print(f"Calculated home height: {self.home_height:.2f}mm")
+        # Home height of the TOP SURFACE (what user interacts with)
+        self.home_height_top_surface = self.home_height + self.top_surface_offset
+
+        print(f"Calculated anchor center home height: {self.home_height:.2f}mm")
+        print(f"Calculated top surface home height: {self.home_height_top_surface:.2f}mm")
         print(f"Horizontal distance (servo 0): {np.sqrt(horiz_dist_sq):.2f}mm")
 
     def claculate_home_coordinates(self, l, d, phi):
@@ -97,12 +104,31 @@ class StewartPlatformIK:
         return beta_angles
 
     def calculate_servo_angles(self, translation: np.ndarray, rotation: np.ndarray):
-        """Calculate servo angles for desired pose."""
+        """Calculate servo angles for desired pose.
+
+        Args:
+            translation: Desired position of the TOP SURFACE [x, y, z] in mm
+            rotation: Desired orientation [rx, ry, rz] in degrees
+
+        Returns:
+            Array of 6 servo angles in degrees, or None if unreachable
+        """
+        # Convert rotation to quaternion
         quat = self._euler_to_quaternion(np.radians(rotation))
+
+        # The anchor center is offset below the top surface in platform's local frame
+        offset_platform_frame = np.array([0, 0, -self.top_surface_offset])
+
+        # Transform this offset to world coordinates using the current rotation
+        offset_world_frame = self._rotate_vector(offset_platform_frame, quat)
+
+        # Calculate where the anchor center needs to be
+        anchor_center_translation = translation + offset_world_frame
+
         angles = np.zeros(6)
 
         for k in range(6):
-            p_world = translation + self._rotate_vector(self.platform_anchors[k], quat)
+            p_world = anchor_center_translation + self._rotate_vector(self.platform_anchors[k], quat)
             leg = p_world - self.base_anchors[k]
             leg_length_sq = np.dot(leg, leg)
 
@@ -168,9 +194,9 @@ class StewartControlGUI:
         self.serial_conn = None
         self.is_connected = False
 
-        # DOF values
+        # DOF values - Z now represents TOP SURFACE position
         self.dof_values = {
-            'x': 0.0, 'y': 0.0, 'z': self.ik.home_height,
+            'x': 0.0, 'y': 0.0, 'z': self.ik.home_height_top_surface,
             'rx': 0.0, 'ry': 0.0, 'rz': 0.0
         }
 
@@ -178,8 +204,11 @@ class StewartControlGUI:
         self.dof_config = {
             'x': (-30.0, 30.0, 0.1, 0.0, "X Position (mm) - Right+"),
             'y': (-30.0, 30.0, 0.1, 0.0, "Y Position (mm) - Away+"),
-            'z': (self.ik.home_height - 30, self.ik.home_height + 30, 0.1,
-                  self.ik.home_height, f"Z Height (mm) - Up+ [{self.ik.home_height:.1f}]"),
+            'z': (self.ik.home_height_top_surface - 30,
+                  self.ik.home_height_top_surface + 30,
+                  0.1,
+                  self.ik.home_height_top_surface,
+                  f"Z Height (mm) - Up+ [Top Surface: {self.ik.home_height_top_surface:.1f}]"),
             'rx': (-15.0, 15.0, 0.1, 0.0, "Rotation X (°) - Roll"),
             'ry': (-15.0, 15.0, 0.1, 0.0, "Rotation Y (°) - Pitch"),
             'rz': (-15.0, 15.0, 0.1, 0.0, "Rotation Z (°) - Yaw")
