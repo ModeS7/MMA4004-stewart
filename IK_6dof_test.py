@@ -37,9 +37,6 @@ class StewartPlatformIK:
                                                                        platform_angels)
         self.platform_anchors = np.roll(platform_anchors_out_of_fase, shift=-1, axis=0)
 
-        print("Base anchors:\n", self.base_anchors)
-        print("Platform anchors:\n", self.platform_anchors)
-
         # Calculate beta angles
         self.beta_angles = self._calculate_beta_angles()
 
