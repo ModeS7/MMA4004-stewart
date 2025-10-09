@@ -95,6 +95,11 @@ class StewartPlatformIK:
 
         return beta_angles
 
+    def update_offset(self, new_offset):
+        """Update top surface offset and recalculate home height."""
+        self.top_surface_offset = new_offset
+        self.home_height_top_surface = self.home_height + self.top_surface_offset
+
     def calculate_servo_angles(self, translation: np.ndarray, rotation: np.ndarray,
                                use_top_surface_offset: bool = True):
         """Calculate servo angles for desired pose.
@@ -202,7 +207,6 @@ class PlatformParametersDialog:
             ("base_anchors", current_params.get("base_anchors", 36.8893), "Base Anchor Offset (mm)"),
             ("platform", current_params.get("platform", 67.775), "Platform Radius (mm)"),
             ("platform_anchors", current_params.get("platform_anchors", 12.7), "Platform Anchor Offset (mm)"),
-            ("top_surface_offset", current_params.get("top_surface_offset", 26.0), "Top Surface Offset (mm)")
         ]
 
         self.entries = {}
@@ -255,7 +259,6 @@ class PlatformParametersDialog:
             "base_anchors": 36.8893,
             "platform": 67.775,
             "platform_anchors": 12.7,
-            "top_surface_offset": 26.0
         }
 
         for param_name, entry in self.entries.items():
@@ -292,7 +295,7 @@ class StewartControlGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Stewart Platform Control")
-        self.root.geometry("600x700")
+        self.root.geometry("600x750")
 
         # Initialize with default parameters
         self.platform_params = {
@@ -360,13 +363,36 @@ class StewartControlGUI:
         config_frame = ttk.LabelFrame(self.root, text="Configuration", padding=10)
         config_frame.pack(fill='x', padx=10, pady=5)
 
+        # Offset enable checkbox
         offset_checkbox = ttk.Checkbutton(
             config_frame,
-            text=f"Use Top Surface Offset (+{self.ik.top_surface_offset}mm)",
+            text=f"Use Top Surface Offset",
             variable=self.use_top_surface_offset,
             command=self.on_offset_toggle
         )
         offset_checkbox.pack(anchor='w', pady=2)
+
+        # Offset slider
+        offset_slider_frame = ttk.Frame(config_frame)
+        offset_slider_frame.pack(fill='x', pady=5)
+
+        self.offset_label = ttk.Label(offset_slider_frame, text="Top Surface Offset (mm):")
+        self.offset_label.grid(row=0, column=0, sticky='w', padx=(0, 10))
+
+        self.offset_slider = ttk.Scale(
+            offset_slider_frame,
+            from_=0.0,
+            to=50.0,
+            orient='horizontal',
+            command=self.on_offset_slider_change
+        )
+        self.offset_slider.set(self.ik.top_surface_offset)
+        self.offset_slider.grid(row=0, column=1, sticky='ew', padx=5)
+
+        self.offset_value_label = ttk.Label(offset_slider_frame, text=f"{self.ik.top_surface_offset:.1f}", width=8)
+        self.offset_value_label.grid(row=0, column=2, padx=5)
+
+        offset_slider_frame.columnconfigure(1, weight=1)
 
         ttk.Button(config_frame, text="Edit Platform Parameters",
                    command=self.open_parameters_dialog).pack(anchor='w', pady=2)
@@ -424,6 +450,31 @@ class StewartControlGUI:
         ttk.Button(btn_frame, text="Clear Log", command=lambda: self.log_text.delete(1.0, tk.END)).pack(side='left',
                                                                                                         padx=5)
 
+    def on_offset_slider_change(self, value):
+        """Handle offset slider changes."""
+        new_offset = float(value)
+        self.offset_value_label.config(text=f"{new_offset:.1f}")
+
+        # Update IK offset
+        self.ik.update_offset(new_offset)
+        self.platform_params["top_surface_offset"] = new_offset
+
+        # Update Z slider if in top surface mode
+        if self.use_top_surface_offset.get():
+            home_z = self.ik.home_height_top_surface
+            self.dof_labels['z'].config(text=f"Z Height (mm) - Top Surface [Home: {home_z:.1f}]")
+            self.sliders['z'].config(from_=home_z - 30, to=home_z + 30)
+
+            # Maintain current Z position relative to new home
+            current_relative_z = self.dof_values['z'] - (self.ik.home_height + new_offset - self.ik.top_surface_offset)
+            new_z = home_z + current_relative_z
+            self.dof_values['z'] = new_z
+            self.sliders['z'].set(new_z)
+            self.value_labels['z'].config(text=f"{new_z:.2f}")
+
+        self.log(f"Top surface offset updated to {new_offset:.1f}mm")
+        self.calculate_and_send()
+
     def open_parameters_dialog(self):
         """Open dialog to edit platform parameters."""
         dialog = PlatformParametersDialog(self.root, self.platform_params)
@@ -435,6 +486,9 @@ class StewartControlGUI:
     def apply_new_parameters(self, new_params):
         """Apply new platform parameters and reinitialize IK."""
         try:
+            # Preserve current offset
+            new_params["top_surface_offset"] = self.platform_params["top_surface_offset"]
+
             # Store new parameters
             self.platform_params = new_params
 
@@ -443,13 +497,6 @@ class StewartControlGUI:
 
             # Update UI elements that depend on home height
             self.update_z_slider_for_new_params()
-
-            # Update offset checkbox label
-            for widget in self.root.winfo_children():
-                if isinstance(widget, ttk.LabelFrame) and widget.cget('text') == "Configuration":
-                    for child in widget.winfo_children():
-                        if isinstance(child, ttk.Checkbutton):
-                            child.config(text=f"Use Top Surface Offset (+{self.ik.top_surface_offset}mm)")
 
             self.log("Platform parameters updated successfully")
             self.log(
