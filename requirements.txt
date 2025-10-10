@@ -1,2 +1,6 @@
 pyserial
 numpy
+mujoco
+mujoco-mjx
+matplotlib
+pandas
