@@ -96,7 +96,7 @@ class SystemIDConfig:
     # Manual mode parameters
     K: float = 1.0
     tau: float = 0.1
-    delay: float = 0.5
+    delay: float = 0.35 + 0.196 #0.159
 
     # Auto-fit mode initial guesses
     initial_K: float = 1.0

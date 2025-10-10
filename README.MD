@@ -2,7 +2,7 @@
 done - Run step response tests on all 6 servos to extract time constant τ
 done - Measure actual platform geometry (link lengths, joint offsets)
 done - Record test trajectories: commanded angles + IMU data
-done - Implement first-order servo dynamics
+done - Implement first-order servo dynamics K = 1, τ = 0.1s, delay = 0.35s
 
 2.
 - Install MuJoCo + mujoco-python bindings
