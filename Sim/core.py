@@ -507,3 +507,241 @@ def rk4_step(state, derivative_fn, dt, *args):
     )
 
     return new_state
+
+
+class TrajectoryPattern:
+    """
+    Base class for trajectory patterns.
+
+    All patterns return positions in millimeters and velocities in mm/s.
+    Time-based parametric equations for smooth, continuous motion.
+    """
+
+    def get_position(self, t):
+        """
+        Get (x, y) position at time t.
+
+        Args:
+            t: time in seconds
+
+        Returns:
+            (x, y): position in millimeters
+        """
+        raise NotImplementedError
+
+    def get_velocity(self, t):
+        """
+        Get (vx, vy) velocity at time t.
+
+        Args:
+            t: time in seconds
+
+        Returns:
+            (vx, vy): velocity in mm/s
+        """
+        raise NotImplementedError
+
+    def reset(self):
+        """Reset pattern state (if stateful)."""
+        pass
+
+
+class CirclePattern(TrajectoryPattern):
+    """Circular trajectory pattern."""
+
+    def __init__(self, radius=50.0, period=10.0, clockwise=True):
+        """
+        Args:
+            radius: circle radius in mm
+            period: time to complete one revolution in seconds
+            clockwise: direction of rotation
+        """
+        self.radius = radius
+        self.period = period
+        self.omega = 2 * np.pi / period
+        self.direction = -1 if clockwise else 1
+
+    def get_position(self, t):
+        angle = self.direction * self.omega * t
+        x = self.radius * np.cos(angle)
+        y = self.radius * np.sin(angle)
+        return x, y
+
+    def get_velocity(self, t):
+        angle = self.direction * self.omega * t
+        vx = -self.direction * self.radius * self.omega * np.sin(angle)
+        vy = self.direction * self.radius * self.omega * np.cos(angle)
+        return vx, vy
+
+
+class FigureEightPattern(TrajectoryPattern):
+    """Figure-8 (lemniscate) trajectory pattern."""
+
+    def __init__(self, width=60.0, height=40.0, period=12.0):
+        """
+        Args:
+            width: total width of figure-8 in mm
+            height: total height of figure-8 in mm
+            period: time to complete one full cycle in seconds
+        """
+        self.a = width / 2.0  # semi-width
+        self.b = height / 2.0  # semi-height
+        self.omega = 2 * np.pi / period
+
+    def get_position(self, t):
+        # Parametric equations for figure-8 (lemniscate)
+        angle = self.omega * t
+
+        # Lemniscate of Gerono: x = a*cos(t), y = b*sin(t)*cos(t)
+        x = self.a * np.cos(angle)
+        y = self.b * np.sin(angle) * np.cos(angle)
+
+        return x, y
+
+    def get_velocity(self, t):
+        angle = self.omega * t
+
+        # Derivatives of parametric equations
+        vx = -self.a * self.omega * np.sin(angle)
+        # d/dt[sin(t)*cos(t)] = cos²(t) - sin²(t) = cos(2t)
+        vy = self.b * self.omega * np.cos(2 * angle)
+
+        return vx, vy
+
+
+class StarPattern(TrajectoryPattern):
+    """Five-pointed star trajectory pattern (connects every 2nd point)."""
+
+    def __init__(self, radius=60.0, period=15.0):
+        """
+        Args:
+            radius: radius to star points in mm
+            period: time to trace complete star in seconds
+        """
+        self.radius = radius
+        self.period = period
+
+        # 5 points around a circle
+        self.num_vertices = 5
+
+        # Visit order: 0 → 2 → 4 → 1 → 3 → 0 (every 2nd point creates star)
+        self.visit_order = [0, 2, 4, 1, 3, 0]
+
+        # Compute positions of the 5 vertices
+        self.vertex_positions = self._compute_vertex_positions()
+
+        # Positions in drawing order
+        self.path_positions = [self.vertex_positions[i] for i in self.visit_order]
+
+    def _compute_vertex_positions(self):
+        """Compute (x, y) positions of 5 vertices around circle."""
+        positions = []
+        for i in range(self.num_vertices):
+            # Start at top (90°), go clockwise
+            angle = np.pi / 2 - i * (2 * np.pi / self.num_vertices)
+            x = self.radius * np.cos(angle)
+            y = self.radius * np.sin(angle)
+            positions.append((x, y))
+        return positions
+
+    def get_position(self, t):
+        # Normalize time to [0, 1] for one complete cycle
+        t_norm = (t % self.period) / self.period
+
+        # Star has 5 line segments (6 points including return to start)
+        num_segments = len(self.path_positions) - 1
+
+        # Which segment are we on? (0 to 4)
+        segment_idx = int(t_norm * num_segments)
+        segment_idx = min(segment_idx, num_segments - 1)
+
+        # Progress within current segment [0, 1]
+        segment_progress = (t_norm * num_segments) % 1.0
+
+        # Linear interpolation between current and next point
+        current_pos = self.path_positions[segment_idx]
+        next_pos = self.path_positions[segment_idx + 1]
+
+        x = current_pos[0] + segment_progress * (next_pos[0] - current_pos[0])
+        y = current_pos[1] + segment_progress * (next_pos[1] - current_pos[1])
+
+        return x, y
+
+    def get_velocity(self, t):
+        # Normalize time to [0, 1]
+        t_norm = (t % self.period) / self.period
+
+        num_segments = len(self.path_positions) - 1
+
+        # Which segment?
+        segment_idx = int(t_norm * num_segments)
+        segment_idx = min(segment_idx, num_segments - 1)
+
+        # Velocity is constant along each line segment
+        current_pos = self.path_positions[segment_idx]
+        next_pos = self.path_positions[segment_idx + 1]
+
+        # Distance for this segment
+        dx = next_pos[0] - current_pos[0]
+        dy = next_pos[1] - current_pos[1]
+
+        # Time per segment
+        segment_time = self.period / num_segments
+
+        # Velocity (mm/s)
+        vx = dx / segment_time
+        vy = dy / segment_time
+
+        return vx, vy
+
+class StaticPattern(TrajectoryPattern):
+    """Static position (no movement)."""
+
+    def __init__(self, x=0.0, y=0.0):
+        """
+        Args:
+            x: x position in mm
+            y: y position in mm
+        """
+        self.x = x
+        self.y = y
+
+    def get_position(self, t):
+        return self.x, self.y
+
+    def get_velocity(self, t):
+        return 0.0, 0.0
+
+
+class PatternFactory:
+    """Factory for creating trajectory patterns."""
+
+    @staticmethod
+    def create(pattern_type, **kwargs):
+        """
+        Create a trajectory pattern.
+
+        Args:
+            pattern_type: 'static', 'circle', 'figure8', 'star'
+            **kwargs: pattern-specific parameters
+
+        Returns:
+            TrajectoryPattern instance
+        """
+        patterns = {
+            'static': StaticPattern,
+            'circle': CirclePattern,
+            'figure8': FigureEightPattern,
+            'star': StarPattern
+        }
+
+        if pattern_type not in patterns:
+            raise ValueError(f"Unknown pattern type: {pattern_type}. "
+                             f"Available: {list(patterns.keys())}")
+
+        return patterns[pattern_type](**kwargs)
+
+    @staticmethod
+    def list_patterns():
+        """Get list of available pattern types."""
+        return ['static', 'circle', 'figure8', 'star']

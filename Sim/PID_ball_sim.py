@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle, Circle
 
-from core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D
+from core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory
 from control_core import PIDController
 
 
@@ -65,8 +65,13 @@ class StewartSimulatorGUI:
         )
 
         # PID Controller
-        self.pid_controller = PIDController(kp=0.01, ki=0.0, kd=0.005, output_limit=15.0)
+        self.pid_controller = PIDController(kp=0.003, ki=0.001, kd=0.003, output_limit=15.0)
         self.pid_enabled = tk.BooleanVar(value=False)
+
+        # Trajectory pattern
+        self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
+        self.pattern_type = tk.StringVar(value='static')
+        self.pattern_start_time = 0.0
 
         # PID gain scalars (multipliers)
         self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]
@@ -275,6 +280,31 @@ class StewartSimulatorGUI:
         # Initialize PID controller with default gains
         self.update_pid_gains()
 
+        # Trajectory pattern selector
+        pattern_frame = ttk.LabelFrame(pid_frame, text="Trajectory Pattern", padding=10)
+        pattern_frame.pack(fill='x', pady=(10, 0))
+
+        # Pattern selector
+        selector_frame = ttk.Frame(pattern_frame)
+        selector_frame.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(selector_frame, text="Pattern:", font=('Segoe UI', 9)).pack(side='left', padx=(0, 10))
+
+        pattern_combo = ttk.Combobox(selector_frame, textvariable=self.pattern_type,
+                                     width=15, state='readonly',
+                                     values=['static', 'circle', 'figure8', 'star'])
+        pattern_combo.pack(side='left', padx=5)
+        pattern_combo.bind('<<ComboboxSelected>>', self.on_pattern_change)
+
+        ttk.Button(selector_frame, text="Reset", command=self.reset_pattern, width=8).pack(side='left', padx=5)
+
+        # Pattern info display
+        self.pattern_info_label = ttk.Label(pattern_frame,
+                                            text="Tracking: Center (0, 0)",
+                                            font=('Consolas', 8),
+                                            foreground=self.colors['success'])
+        self.pattern_info_label.pack(anchor='w', pady=(5, 0))
+
         # Ball control
         ball_frame = ttk.LabelFrame(left_panel, text="Ball Control", padding=10)
         ball_frame.pack(fill='x', pady=(0, 10))
@@ -422,8 +452,10 @@ class StewartSimulatorGUI:
                                     alpha=0.5)
         self.ax.add_patch(platform_square)
 
-        self.ax.plot(0, 0, '+', color=self.colors['highlight'],
-                     markersize=12, markeredgewidth=2, label='Target')
+        self.trajectory_line, = self.ax.plot([], [], '--', color=self.colors['highlight'],
+                                             alpha=0.3, linewidth=1, label='Trajectory')
+        self.target_marker, = self.ax.plot([0], [0], 'x', color=self.colors['success'],
+                                           markersize=10, markeredgewidth=2, label='Target')
 
         self.ball_circle = Circle((0, 0), 3.0, color='#ff4444', alpha=0.8,
                                   zorder=10, label='Ball')
@@ -438,11 +470,45 @@ class StewartSimulatorGUI:
         self.canvas.draw()
 
     def update_plot(self):
-        """Update the plot with current ball position."""
+        """Update the plot with current ball position and trajectory."""
+        # Update ball position
         ball_x = self.ball_pos[0, 0].item() * 1000
         ball_y = self.ball_pos[0, 1].item() * 1000
         self.ball_circle.center = (ball_x, ball_y)
 
+        # Update trajectory path (show trajectory even if PID disabled, for preview)
+        if self.pattern_type.get() != 'static':
+            # Draw trajectory for one complete cycle
+            pattern_time = self.simulation_time - self.pattern_start_time
+
+            # Get period based on pattern type
+            pattern_periods = {
+                'circle': 10.0,
+                'figure8': 12.0,
+                'star': 15.0
+            }
+            period = pattern_periods.get(self.pattern_type.get(), 10.0)
+
+            # Sample points along trajectory
+            t_samples = np.linspace(0, period, 100)
+            path_x = []
+            path_y = []
+            for t in t_samples:
+                x, y = self.current_pattern.get_position(t)
+                path_x.append(x)
+                path_y.append(y)
+
+            self.trajectory_line.set_data(path_x, path_y)
+
+            # Update current target position
+            target_x, target_y = self.current_pattern.get_position(pattern_time)
+            self.target_marker.set_data([target_x], [target_y])
+        else:
+            # Static pattern - just show center
+            self.trajectory_line.set_data([], [])
+            self.target_marker.set_data([0], [0])
+
+        # Update tilt arrow
         if self.tilt_arrow is not None:
             self.tilt_arrow.remove()
             self.tilt_arrow = None
@@ -471,6 +537,7 @@ class StewartSimulatorGUI:
 
         if enabled:
             self.pid_controller.reset()
+            self.reset_pattern()
             self.pid_status_label.config(foreground=self.colors['success'])
 
             # Log current gains
@@ -543,6 +610,40 @@ class StewartSimulatorGUI:
 
         if self.pid_enabled.get():
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
+
+    def on_pattern_change(self, event=None):
+        """Handle pattern selection change."""
+        pattern_type = self.pattern_type.get()
+
+        # Create new pattern with default parameters
+        if pattern_type == 'static':
+            self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
+            info = "Tracking: Center (0, 0)"
+        elif pattern_type == 'circle':
+            self.current_pattern = PatternFactory.create('circle', radius=50.0, period=10.0, clockwise=True)
+            info = "Tracking: Circle (r=50mm, T=10s)"
+        elif pattern_type == 'figure8':
+            self.current_pattern = PatternFactory.create('figure8', width=60.0, height=40.0, period=12.0)
+            info = "Tracking: Figure-8 (60×40mm, T=12s)"
+        elif pattern_type == 'star':
+            self.current_pattern = PatternFactory.create('star', radius=60.0, period=15.0)
+            info = "Tracking: 5-Point Star (r=60mm, T=15s)"
+        else:
+            return
+
+        self.pattern_info_label.config(text=info)
+        self.reset_pattern()
+        self.update_plot()
+        self.log(f"Pattern changed to: {pattern_type}")
+
+    def reset_pattern(self):
+        """Reset pattern to start from current time."""
+        self.pattern_start_time = self.simulation_time
+        self.current_pattern.reset()
+        self.log(f"Pattern reset at t={self.simulation_time:.2f}s")
+
+        if self.pid_enabled.get():
+            self.pid_controller.reset()
 
     def apply_random_tilt(self, max_degrees=1.0):
         """Apply small random tilt to platform (simulates imperfect placement)."""
@@ -692,7 +793,11 @@ class StewartSimulatorGUI:
                 try:
                     ball_x_mm = self.ball_pos[0, 0].item() * 1000
                     ball_y_mm = self.ball_pos[0, 1].item() * 1000
-                    target_pos_mm = (0.0, 0.0)  # Keep ball centered
+
+                    # Get target position from trajectory pattern
+                    pattern_time = self.simulation_time - self.pattern_start_time
+                    target_x, target_y = self.current_pattern.get_position(pattern_time)
+                    target_pos_mm = (target_x, target_y)
 
                     rx, ry = self.pid_controller.update((ball_x_mm, ball_y_mm), target_pos_mm, dt)
 
@@ -709,6 +814,12 @@ class StewartSimulatorGUI:
                     error_y = target_pos_mm[1] - ball_y_mm
                     self.pid_output_label.config(text=f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
                     self.pid_error_label.config(text=f"Error: ({error_x:.1f}, {error_y:.1f}) mm")
+
+                    # Debug logging (every 2 seconds)
+                    if int(self.simulation_time * 0.5) % 2 == 0 and int((self.simulation_time - dt) * 0.5) % 2 == 1:
+                        self.log(f"Target: ({target_x:.1f},{target_y:.1f})mm "
+                                 f"Ball: ({ball_x_mm:.1f},{ball_y_mm:.1f})mm "
+                                 f"Error: ({error_x:.1f},{error_y:.1f})mm")
 
                     # Calculate IK with PID-controlled tilt
                     translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
