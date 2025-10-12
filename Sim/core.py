@@ -262,6 +262,7 @@ class SimpleBallPhysics2D:
     - Angular velocity (omega) tracked and coupled to linear velocity
     - Rolling constraint: v = omega × r
     - For solid sphere rolling down slope: a = (5/7) * g * sin(theta)
+    - For hollow sphere rolling down slope: a = (3/5) * g * sin(theta)
     - Rolling resistance for realistic energy dissipation
     """
 
@@ -269,21 +270,38 @@ class SimpleBallPhysics2D:
                  ball_radius=0.01,
                  ball_mass=0.0027,
                  gravity=9.81,
-                 rolling_friction=0.01):
+                 rolling_friction=0.01,
+                 sphere_type='hollow'):  # ← Add this parameter
 
         self.radius = ball_radius
         self.mass = ball_mass
         self.g = gravity
         self.mu_roll = rolling_friction
+        self.sphere_type = sphere_type
 
-        # Moment of inertia for solid sphere: I = (2/5) * m * r^2
-        self.I = (2.0 / 5.0) * ball_mass * ball_radius ** 2
+        # Calculate moment of inertia based on sphere type
+        self.update_sphere_type(sphere_type)
+
+    def update_sphere_type(self, sphere_type):
+        """Update moment of inertia and mass factor based on sphere type."""
+        self.sphere_type = sphere_type
+
+        if sphere_type == 'solid':
+            # Solid sphere: I = (2/5) * m * r²
+            self.I = (2.0 / 5.0) * self.mass * self.radius ** 2
+        elif sphere_type == 'hollow':
+            # Hollow sphere (thin shell): I = (2/3) * m * r²
+            self.I = (2.0 / 3.0) * self.mass * self.radius ** 2
+        else:
+            raise ValueError(f"Unknown sphere_type: {sphere_type}. Use 'solid' or 'hollow'")
 
         # For rolling motion, effective mass factor
-        # a = F / m_eff, where m_eff = m * (1 + I/(m*r^2)) = m * (1 + 2/5) = 7m/5
-        self.mass_factor = 1.0 + self.I / (self.mass * self.radius ** 2)  # = 7/5 for sphere
+        # a = F / m_eff, where m_eff = m * (1 + I/(m*r²))
+        # Solid: 1 + 2/5 = 7/5 = 1.4
+        # Hollow: 1 + 2/3 = 5/3 ≈ 1.667
+        self.mass_factor = 1.0 + self.I / (self.mass * self.radius ** 2)
 
-    def step(self, ball_pos, ball_vel, ball_omega, platform_pose, dt):
+    def step(self, ball_pos, ball_vel, ball_omega, platform_pose, dt, platform_angular_accel=None):
         """
         Step physics using RK4 integration with ROLLING.
 
@@ -368,14 +386,14 @@ class SimpleBallPhysics2D:
 
         return d_pos, d_vel, d_omega
 
-    def _compute_accelerations(self, xy_pos, xy_vel, xy_omega, platform_pose):
+    def _compute_accelerations(self, xy_pos, xy_vel, xy_omega, platform_pose, platform_angular_accel=None):
         """
         Compute accelerations for a ROLLING ball on tilted surface.
 
-        For a ball rolling without slipping down a slope:
-        - Linear acceleration: a = g*sin(theta) / (1 + I/(m*r^2))
-        - For solid sphere: a = (5/7) * g * sin(theta)
-        - Angular acceleration: alpha = a / r
+        Accounts for:
+        - Gravitational component down the slope
+        - Vertical acceleration of platform at ball position (changes effective gravity)
+        - Rolling dynamics (moment of inertia)
         """
         batch_size = xy_pos.shape[0]
         device = xy_pos.device
@@ -384,12 +402,39 @@ class SimpleBallPhysics2D:
         rx = torch.deg2rad(platform_pose[:, 3])  # roll
         ry = torch.deg2rad(platform_pose[:, 4])  # pitch
 
-        # Gravity components down the slope
-        gx = -self.g * torch.sin(ry)
-        gy = -self.g * torch.sin(rx)
+        # Ball position relative to platform center (in meters)
+        ball_x = xy_pos[:, 0]
+        ball_y = xy_pos[:, 1]
+
+        # Compute vertical acceleration of platform at ball's position
+        # This comes from platform_angular_accel if we track it
+        # For now, we'll use a simplified model based on current angles
+        # (assumes quasi-static: angular velocity ≈ 0)
+
+        # Compute effective gravity accounting for platform vertical acceleration
+        g_eff = self.g
+
+        if platform_angular_accel is not None:
+            # Vertical acceleration at ball position due to platform rotation
+            # a_z = x·(d²ry/dt²) - y·(d²rx/dt²)
+            # Convert angular accel from deg/s² to rad/s²
+            alpha_rx_rad = platform_angular_accel['rx'] * (np.pi / 180.0)
+            alpha_ry_rad = platform_angular_accel['ry'] * (np.pi / 180.0)
+
+            # Vertical acceleration at ball position (simplified, assuming small angles)
+            a_z_platform = ball_x * alpha_ry_rad - ball_y * alpha_rx_rad
+
+            # Modify effective gravity
+            g_eff = self.g - a_z_platform
+
+            # Clamp to reasonable range (platform can't create negative gravity)
+            g_eff = torch.clamp(g_eff, 0.1 * self.g, 2.0 * self.g)
+
+        # Rest of function uses g_eff instead of self.g
+        gx = -g_eff * torch.sin(ry)
+        gy = -g_eff * torch.sin(rx)
 
         # For rolling motion, acceleration is reduced by rotational inertia
-        # a = F / m_eff, where m_eff = m * (1 + I/(m*r^2))
         ax = gx / self.mass_factor
         ay = gy / self.mass_factor
 
@@ -397,15 +442,14 @@ class SimpleBallPhysics2D:
 
         # Rolling resistance (opposes motion)
         vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
-        rolling_resistance = -self.mu_roll * self.g * xy_vel / (vel_magnitude + 1e-8)
+        rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + 1e-8)
 
         accel_linear = accel_linear + rolling_resistance
 
         # Angular acceleration from rolling constraint
-        # For rolling: v = omega × r, so alpha = a / r
         accel_angular = accel_linear / self.radius
 
-        # Additional damping on angular velocity (energy dissipation)
+        # Additional damping on angular velocity
         omega_damping = -self.mu_roll * xy_omega
         accel_angular = accel_angular + omega_damping
 
