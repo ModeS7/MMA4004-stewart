@@ -55,8 +55,9 @@ class StewartSimulatorGUI:
 
         self.ball_physics = SimpleBallPhysics2D(
             ball_radius=0.01,
+            ball_mass=0.0027,
             gravity=9.81,
-            friction_coef=0.1
+            rolling_friction=0.001
         )
 
         ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
@@ -194,10 +195,10 @@ class StewartSimulatorGUI:
         physics_info_frame.pack(fill='x', pady=(0, 10))
 
         info_items = [
-            ("Type:", "2D (XY only)"),
+            ("Type:", "2D Rolling (not sliding)"),
             ("Integration:", "RK4 (4th order)"),
-            ("Bouncing:", "Disabled"),
-            ("Friction:", f"{self.ball_physics.friction}")
+            ("Mass factor:", "7/5 (sphere)"),
+            ("Rolling friction:", f"{self.ball_physics.mu_roll}")
         ]
 
         for label, value in info_items:
@@ -520,7 +521,7 @@ class StewartSimulatorGUI:
                     ]], dtype=torch.float32)
 
                     self.ball_pos, self.ball_vel, self.ball_omega, contact_info = \
-                        self.ball_physics.step(self.ball_pos, self.ball_vel, platform_pose, dt)
+                        self.ball_physics.step(self.ball_pos, self.ball_vel, self.ball_omega, platform_pose, dt)
 
                     if contact_info.get('fell_off', False):
                         self.log("Ball fell off platform")
