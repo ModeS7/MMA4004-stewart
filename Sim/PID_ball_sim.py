@@ -23,6 +23,9 @@ class StewartSimulatorGUI:
         self.root.title("Stewart Platform - PID Ball Balancing Control")
         self.root.geometry("1400x900")
 
+        # Register cleanup handler for window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         # Dark mode colors
         self.colors = {
             'bg': '#1e1e1e',
@@ -54,10 +57,11 @@ class StewartSimulatorGUI:
         self.servos = [FirstOrderServo(K=1.0, tau=0.1, delay=0.35) for _ in range(6)]
 
         self.ball_physics = SimpleBallPhysics2D(
-            ball_radius=0.01,
+            ball_radius=0.04,
             ball_mass=0.0027,
             gravity=9.81,
-            rolling_friction=0.001
+            rolling_friction=0.001,
+            sphere_type='hollow'
         )
 
         # PID Controller
@@ -66,9 +70,9 @@ class StewartSimulatorGUI:
 
         # PID gain scalars (multipliers)
         self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]
-        self.kp_scalar_idx = tk.IntVar(value=5)  # Default to 0.01
+        self.kp_scalar_idx = tk.IntVar(value=4)  # Default to 0.001
         self.ki_scalar_idx = tk.IntVar(value=4)  # Default to 0.001
-        self.kd_scalar_idx = tk.IntVar(value=5)  # Default to 0.01
+        self.kd_scalar_idx = tk.IntVar(value=4)  # Default to 0.001
 
         ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
         self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
@@ -79,6 +83,7 @@ class StewartSimulatorGUI:
         self.simulation_time = 0.0
         self.last_update_time = None
         self.update_rate_ms = 20
+        self.simulation_loop_id = None
 
         self.use_top_surface_offset = tk.BooleanVar(value=True)
         self.dof_values = {
@@ -106,6 +111,11 @@ class StewartSimulatorGUI:
         self.pid_value_labels = {}
 
         self.create_widgets()
+
+        # Platform motion tracking for dynamics
+        self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
+        self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
+        self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
 
     def setup_dark_theme(self):
         """Configure ttk widgets for dark mode."""
@@ -215,35 +225,54 @@ class StewartSimulatorGUI:
         self.pid_status_label.pack(side='left', padx=(10, 0))
 
         # PID gains
-        pid_gains = [('kp', 'P (Proportional)', 1.0),
-                     ('ki', 'I (Integral)', 0.0),
-                     ('kd', 'D (Derivative)', 0.5)]
+        pid_gains = [('kp', 'P (Proportional)', 3.0),
+                     ('ki', 'I (Integral)', 1.0),
+                     ('kd', 'D (Derivative)', 3.0)]
+
+        # Store default values for later
+        pid_defaults = {}
 
         for gain_name, label, default in pid_gains:
+            pid_defaults[gain_name] = default
+
             frame = ttk.Frame(pid_frame)
             frame.pack(fill='x', pady=5)
 
             ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', pady=2)
 
-            slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal',
-                               command=lambda val, g=gain_name: self.on_pid_slider_change(g, val))
+            slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
             slider.grid(row=0, column=1, sticky='ew', padx=10)
-            slider.set(default)
             self.pid_sliders[gain_name] = slider
 
+            # Create value label
             value_label = ttk.Label(frame, text=f"{default:.2f}", width=6, font=('Consolas', 9))
             value_label.grid(row=0, column=2)
             self.pid_value_labels[gain_name] = value_label
 
             # Scalar selector
-            scalar_var = getattr(self, f'{gain_name}_scalar_idx')
-            scalar_combo = ttk.Combobox(frame, textvariable=scalar_var, width=12, state='readonly',
+            scalar_combo = ttk.Combobox(frame, width=12, state='readonly',
                                         values=[f'×{s:.7g}' for s in self.scalar_values])
             scalar_combo.grid(row=0, column=3, padx=(5, 0))
-            scalar_combo.bind('<<ComboboxSelected>>', lambda e, g=gain_name: self.update_pid_gains())
+
+            # Set initial index based on IntVar
+            scalar_var = getattr(self, f'{gain_name}_scalar_idx')
+            scalar_combo.current(scalar_var.get())
+
+            # Update IntVar when selection changes
+            scalar_combo.bind('<<ComboboxSelected>>',
+                              lambda e, combo=scalar_combo, var=scalar_var, g=gain_name:
+                              self._on_scalar_selected(combo, var, g))
 
             frame.columnconfigure(1, weight=1)
 
+        # set all slider values and attach callbacks
+        for gain_name, default in pid_defaults.items():
+            self.pid_sliders[gain_name].set(default)
+            self.pid_sliders[gain_name].config(
+                command=lambda val, g=gain_name: self.on_pid_slider_change(g, val)
+            )
+
+        # Initialize PID controller with default gains
         self.update_pid_gains()
 
         # Ball control
@@ -481,15 +510,30 @@ class StewartSimulatorGUI:
         self.pid_value_labels[gain_name].config(text=f"{val:.2f}")
         self.update_pid_gains()
 
+    def _on_scalar_selected(self, combo, int_var, gain_name):
+        """Handle scalar combobox selection."""
+        selected_index = combo.current()
+        int_var.set(selected_index)
+        self.update_pid_gains()
+
     def update_pid_gains(self):
         """Update PID controller with current gain values and scalars."""
         kp_raw = float(self.pid_sliders['kp'].get())
         ki_raw = float(self.pid_sliders['ki'].get())
         kd_raw = float(self.pid_sliders['kd'].get())
 
-        kp_scalar = self.scalar_values[self.kp_scalar_idx.get()]
-        ki_scalar = self.scalar_values[self.ki_scalar_idx.get()]
-        kd_scalar = self.scalar_values[self.kd_scalar_idx.get()]
+        kp_idx = self.kp_scalar_idx.get()
+        ki_idx = self.ki_scalar_idx.get()
+        kd_idx = self.kd_scalar_idx.get()
+
+        # Validate indices
+        kp_idx = max(0, min(kp_idx, len(self.scalar_values) - 1))
+        ki_idx = max(0, min(ki_idx, len(self.scalar_values) - 1))
+        kd_idx = max(0, min(kd_idx, len(self.scalar_values) - 1))
+
+        kp_scalar = self.scalar_values[kp_idx]
+        ki_scalar = self.scalar_values[ki_idx]
+        kd_scalar = self.scalar_values[kd_idx]
 
         kp = kp_raw * kp_scalar
         ki = ki_raw * ki_scalar
@@ -499,6 +543,25 @@ class StewartSimulatorGUI:
 
         if self.pid_enabled.get():
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
+
+    def apply_random_tilt(self, max_degrees=1.0):
+        """Apply small random tilt to platform (simulates imperfect placement)."""
+        if not self.pid_enabled.get():
+            # Don't apply random tilt if manual control is active
+            return
+
+        random_rx = np.random.uniform(-max_degrees, max_degrees)
+        random_ry = np.random.uniform(-max_degrees, max_degrees)
+
+        self.dof_values['rx'] = random_rx
+        self.dof_values['ry'] = random_ry
+
+        self.value_labels['rx'].config(text=f"{random_rx:.2f}")
+        self.value_labels['ry'].config(text=f"{random_ry:.2f}")
+
+        self.calculate_ik()
+
+        self.log(f"Platform disturbance: rx={random_rx:.2f}°, ry={random_ry:.2f}°")
 
     def reset_ball(self):
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
@@ -510,6 +573,7 @@ class StewartSimulatorGUI:
 
         if self.pid_enabled.get():
             self.pid_controller.reset()
+            self.apply_random_tilt()  # Add disturbance when PID is active
 
         self.update_plot()
         self.log("Ball reset to center")
@@ -573,6 +637,12 @@ class StewartSimulatorGUI:
 
     def stop_simulation(self):
         self.simulation_running = False
+
+        # Cancel the simulation loop
+        if self.simulation_loop_id is not None:
+            self.root.after_cancel(self.simulation_loop_id)
+            self.simulation_loop_id = None
+
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.log("Simulation stopped")
@@ -609,6 +679,7 @@ class StewartSimulatorGUI:
 
     def simulation_loop(self):
         if not self.simulation_running:
+            self.simulation_loop_id = None  # Clear the ID
             return
 
         current_time = time.time()
@@ -685,10 +756,14 @@ class StewartSimulatorGUI:
                     ]], dtype=torch.float32)
 
                     self.ball_pos, self.ball_vel, self.ball_omega, contact_info = \
-                        self.ball_physics.step(self.ball_pos, self.ball_vel, self.ball_omega, platform_pose, dt)
-
+                        self.ball_physics.step(
+                            self.ball_pos, self.ball_vel, self.ball_omega, platform_pose, dt,
+                            platform_angular_accel=self.platform_angular_accel
+                        )
                     if contact_info.get('fell_off', False):
                         self.log("Ball fell off platform")
+                        if self.pid_enabled.get():
+                            self.apply_random_tilt()  # Add disturbance on auto-reset
 
                     ball_x_mm = self.ball_pos[0, 0].item() * 1000
                     ball_y_mm = self.ball_pos[0, 1].item() * 1000
@@ -702,12 +777,60 @@ class StewartSimulatorGUI:
                     self.log(f"Physics error: {str(e)}")
                     self.reset_ball()
 
+                if self.last_update_time is not None:
+                    rx_now = rotation[0]
+                    ry_now = rotation[1]
+
+                    # Angular velocity (deg/s)
+                    omega_rx = (rx_now - self.prev_platform_angles['rx']) / dt
+                    omega_ry = (ry_now - self.prev_platform_angles['ry']) / dt
+
+                    # Angular acceleration (deg/s²)
+                    alpha_rx = (omega_rx - self.platform_angular_vel['rx']) / dt
+                    alpha_ry = (omega_ry - self.platform_angular_vel['ry']) / dt
+
+                    self.platform_angular_vel['rx'] = omega_rx
+                    self.platform_angular_vel['ry'] = omega_ry
+                    self.platform_angular_accel['rx'] = alpha_rx
+                    self.platform_angular_accel['ry'] = alpha_ry
+
+                    self.prev_platform_angles['rx'] = rx_now
+                    self.prev_platform_angles['ry'] = ry_now
+
             self.update_plot()
 
         self.last_update_time = current_time
         self.sim_time_label.config(text=f"Time: {self.simulation_time:.2f}s")
 
-        self.root.after(self.update_rate_ms, self.simulation_loop)
+        # Schedule next iteration and save the callback ID
+        self.simulation_loop_id = self.root.after(self.update_rate_ms, self.simulation_loop)
+
+    def on_closing(self):
+        """Clean shutdown when window is closed."""
+        # Stop simulation
+        self.simulation_running = False
+
+        # Cancel the simulation loop callback
+        if self.simulation_loop_id is not None:
+            try:
+                self.root.after_cancel(self.simulation_loop_id)
+                self.simulation_loop_id = None
+            except:
+                pass  # Window might already be destroyed
+
+        # Cancel any pending update timer
+        if self.update_timer is not None:
+            try:
+                self.root.after_cancel(self.update_timer)
+            except:
+                pass
+
+        # Destroy the window
+        try:
+            self.root.quit()  # Exit mainloop first
+            self.root.destroy()
+        except:
+            pass
 
 
 def main():
