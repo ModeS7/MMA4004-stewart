@@ -5,7 +5,7 @@ Stewart Platform Core Components
 Shared classes for Stewart platform simulation and control:
 - FirstOrderServo: Servo dynamics model
 - StewartPlatformIK: Inverse and forward kinematics
-- SimpleBallPhysics2D: Simplified 2D ball physics with RK4
+- SimpleBallPhysics2D: 2D ball physics with ROLLING
 """
 
 import numpy as np
@@ -255,69 +255,64 @@ class StewartPlatformIK:
 
 class SimpleBallPhysics2D:
     """
-    SIMPLIFIED 2D Ball Physics with RK4 Integration
+    2D Ball Physics with PROPER ROLLING (not sliding)
 
-    Key simplifications:
-    1. Ball is always on platform surface (no Z dynamics)
-    2. Only XY motion matters
-    3. Gravity component projected onto tilted surface
-    4. RK4 integration for numerical stability
-    5. Simple linear friction
+    Physics model:
+    - Ball rolls (not slides) on tilted surface
+    - Angular velocity (omega) tracked and coupled to linear velocity
+    - Rolling constraint: v = omega × r
+    - For solid sphere rolling down slope: a = (5/7) * g * sin(theta)
+    - Rolling resistance for realistic energy dissipation
     """
 
     def __init__(self,
                  ball_radius=0.01,
+                 ball_mass=0.0027,
                  gravity=9.81,
-                 friction_coef=0.1):
+                 rolling_friction=0.01):
 
         self.radius = ball_radius
+        self.mass = ball_mass
         self.g = gravity
-        self.friction = friction_coef
+        self.mu_roll = rolling_friction
 
-    def step(self, ball_pos, ball_vel, platform_pose, dt):
+        # Moment of inertia for solid sphere: I = (2/5) * m * r^2
+        self.I = (2.0 / 5.0) * ball_mass * ball_radius ** 2
+
+        # For rolling motion, effective mass factor
+        # a = F / m_eff, where m_eff = m * (1 + I/(m*r^2)) = m * (1 + 2/5) = 7m/5
+        self.mass_factor = 1.0 + self.I / (self.mass * self.radius ** 2)  # = 7/5 for sphere
+
+    def step(self, ball_pos, ball_vel, ball_omega, platform_pose, dt):
         """
-        Step physics using RK4 integration.
+        Step physics using RK4 integration with ROLLING.
 
         Args:
             ball_pos: (batch, 3) - only X and Y matter, Z is computed
             ball_vel: (batch, 3) - only X and Y matter
+            ball_omega: (batch, 3) - angular velocity [wx, wy, wz] (rad/s)
             platform_pose: (batch, 6) [x, y, z, rx, ry, rz]
             dt: timestep
 
         Returns:
-            new_pos, new_vel, contact_info
+            new_pos, new_vel, new_omega, contact_info
         """
         batch_size = ball_pos.shape[0]
         device = ball_pos.device
 
-        # Extract 2D state (X, Y positions and velocities)
-        xy_pos = ball_pos[:, :2]  # (batch, 2)
-        xy_vel = ball_vel[:, :2]  # (batch, 2)
+        # Extract 2D state
+        xy_pos = ball_pos[:, :2]
+        xy_vel = ball_vel[:, :2]
+        xy_omega = ball_omega[:, :2]  # Only X and Y components matter for 2D rolling
 
-        # RK4 integration in 2D
-        k1_vel, k1_pos = self._compute_derivatives(xy_pos, xy_vel, platform_pose)
-
-        k2_vel, k2_pos = self._compute_derivatives(
-            xy_pos + 0.5 * dt * k1_pos,
-            xy_vel + 0.5 * dt * k1_vel,
+        # Use generic RK4 integration
+        state = (xy_pos, xy_vel, xy_omega)
+        new_xy_pos, new_xy_vel, new_xy_omega = rk4_step(
+            state,
+            self._compute_derivatives,
+            dt,
             platform_pose
         )
-
-        k3_vel, k3_pos = self._compute_derivatives(
-            xy_pos + 0.5 * dt * k2_pos,
-            xy_vel + 0.5 * dt * k2_vel,
-            platform_pose
-        )
-
-        k4_vel, k4_pos = self._compute_derivatives(
-            xy_pos + dt * k3_pos,
-            xy_vel + dt * k3_vel,
-            platform_pose
-        )
-
-        # Combine RK4 stages
-        new_xy_pos = xy_pos + (dt / 6.0) * (k1_pos + 2 * k2_pos + 2 * k3_pos + k4_pos)
-        new_xy_vel = xy_vel + (dt / 6.0) * (k1_vel + 2 * k2_vel + 2 * k3_vel + k4_vel)
 
         # Check boundary (square platform ±100mm)
         max_xy = 0.1  # 100mm = 0.1 meters
@@ -326,101 +321,145 @@ class SimpleBallPhysics2D:
         contact_info = {'fell_off': False}
 
         if fell_off.any():
-            # Reset to center
             for i in range(batch_size):
                 if fell_off[i]:
                     new_xy_pos[i] = 0.0
                     new_xy_vel[i] = 0.0
+                    new_xy_omega[i] = 0.0
             contact_info['fell_off'] = True
 
-        # Compute Z position (always on surface)
+        # Compute Z position
         platform_z = self._compute_platform_height(new_xy_pos, platform_pose)
 
-        # Reconstruct 3D position
+        # Reconstruct 3D vectors
         new_ball_pos = torch.zeros((batch_size, 3), device=device)
         new_ball_pos[:, :2] = new_xy_pos
         new_ball_pos[:, 2] = platform_z + self.radius
 
-        # Reconstruct 3D velocity (Z velocity is zero)
         new_ball_vel = torch.zeros((batch_size, 3), device=device)
         new_ball_vel[:, :2] = new_xy_vel
 
-        # No angular velocity in this simplified model
         new_ball_omega = torch.zeros((batch_size, 3), device=device)
+        new_ball_omega[:, :2] = new_xy_omega
 
         contact_info['in_contact'] = torch.ones(batch_size, dtype=torch.bool)
+        contact_info['rolling_speed'] = torch.norm(new_xy_omega, dim=1) * self.radius
 
         return new_ball_pos, new_ball_vel, new_ball_omega, contact_info
 
-    def _compute_derivatives(self, xy_pos, xy_vel, platform_pose):
+    def _compute_derivatives(self, state, platform_pose):
         """
-        Compute derivatives for RK4.
+        Compute derivatives for RK4 with ROLLING physics.
+
+        Args:
+            state: tuple of (xy_pos, xy_vel, xy_omega)
+            platform_pose: platform pose tensor
 
         Returns:
-            d(velocity)/dt, d(position)/dt
+            tuple of (d_pos, d_vel, d_omega)
         """
-        # Position derivative is just velocity
+        xy_pos, xy_vel, xy_omega = state
+
+        # Position derivative is velocity
         d_pos = xy_vel
 
-        # Velocity derivative is acceleration from gravity and friction
-        d_vel = self._compute_acceleration(xy_pos, xy_vel, platform_pose)
+        # Compute accelerations (linear and angular)
+        d_vel, d_omega = self._compute_accelerations(xy_pos, xy_vel, xy_omega, platform_pose)
 
-        return d_vel, d_pos
+        return d_pos, d_vel, d_omega
 
-    def _compute_acceleration(self, xy_pos, xy_vel, platform_pose):
+    def _compute_accelerations(self, xy_pos, xy_vel, xy_omega, platform_pose):
         """
-        Compute 2D acceleration on tilted platform.
+        Compute accelerations for a ROLLING ball on tilted surface.
 
-        For a tilted plane:
-        - Pitch (ry) tilts platform in X direction
-        - Roll (rx) tilts platform in Y direction
-
-        Gravity component down the slope:
-        - ax = -g * sin(pitch)
-        - ay = -g * sin(roll)
+        For a ball rolling without slipping down a slope:
+        - Linear acceleration: a = g*sin(theta) / (1 + I/(m*r^2))
+        - For solid sphere: a = (5/7) * g * sin(theta)
+        - Angular acceleration: alpha = a / r
         """
         batch_size = xy_pos.shape[0]
         device = xy_pos.device
 
-        # Extract rotation angles (degrees -> radians)
+        # Extract rotation angles
         rx = torch.deg2rad(platform_pose[:, 3])  # roll
         ry = torch.deg2rad(platform_pose[:, 4])  # pitch
 
-        # Gravity component projected onto slope
-        # Positive pitch -> ball rolls backward (negative x)
-        # Positive roll -> ball rolls left (negative y)
-        ax = -self.g * torch.sin(ry)
-        ay = -self.g * torch.sin(rx)
+        # Gravity components down the slope
+        gx = -self.g * torch.sin(ry)
+        gy = -self.g * torch.sin(rx)
 
-        accel_gravity = torch.stack([ax, ay], dim=1)
+        # For rolling motion, acceleration is reduced by rotational inertia
+        # a = F / m_eff, where m_eff = m * (1 + I/(m*r^2))
+        ax = gx / self.mass_factor
+        ay = gy / self.mass_factor
 
-        # Friction opposes motion (simple linear friction)
+        accel_linear = torch.stack([ax, ay], dim=1)
+
+        # Rolling resistance (opposes motion)
         vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
-        friction_force = -self.friction * xy_vel / (vel_magnitude + 1e-8)
+        rolling_resistance = -self.mu_roll * self.g * xy_vel / (vel_magnitude + 1e-8)
 
-        # Total acceleration
-        total_accel = accel_gravity + friction_force
+        accel_linear = accel_linear + rolling_resistance
 
-        return total_accel
+        # Angular acceleration from rolling constraint
+        # For rolling: v = omega × r, so alpha = a / r
+        accel_angular = accel_linear / self.radius
+
+        # Additional damping on angular velocity (energy dissipation)
+        omega_damping = -self.mu_roll * xy_omega
+        accel_angular = accel_angular + omega_damping
+
+        return accel_linear, accel_angular
 
     def _compute_platform_height(self, xy_pos, platform_pose):
-        """
-        Compute platform Z height at given XY position.
-        """
-        # Platform center
+        """Compute platform Z height at given XY position."""
         px = platform_pose[:, 0] / 1000  # mm to m
         py = platform_pose[:, 1] / 1000
         pz = platform_pose[:, 2] / 1000
 
-        # Rotation angles
         rx = torch.deg2rad(platform_pose[:, 3])
         ry = torch.deg2rad(platform_pose[:, 4])
 
-        # Distance from platform center
         dx = xy_pos[:, 0] - px
         dy = xy_pos[:, 1] - py
 
-        # Height change due to tilt (small angle approximation)
         height = pz + dx * torch.tan(ry) - dy * torch.tan(rx)
 
         return height
+
+
+def rk4_step(state, derivative_fn, dt, *args):
+    """
+    Generic RK4 (Runge-Kutta 4th order) integration step.
+
+    Args:
+        state: tuple of tensors representing the system state
+        derivative_fn: function that computes derivatives, signature: (state, *args) -> derivatives
+        dt: timestep
+        *args: additional arguments passed to derivative_fn
+
+    Returns:
+        tuple of new state tensors
+    """
+    # k1 = f(t, y)
+    k1 = derivative_fn(state, *args)
+
+    # k2 = f(t + dt/2, y + k1*dt/2)
+    state_k2 = tuple(s + 0.5 * dt * k for s, k in zip(state, k1))
+    k2 = derivative_fn(state_k2, *args)
+
+    # k3 = f(t + dt/2, y + k2*dt/2)
+    state_k3 = tuple(s + 0.5 * dt * k for s, k in zip(state, k2))
+    k3 = derivative_fn(state_k3, *args)
+
+    # k4 = f(t + dt, y + k3*dt)
+    state_k4 = tuple(s + dt * k for s, k in zip(state, k3))
+    k4 = derivative_fn(state_k4, *args)
+
+    # y_new = y + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+    new_state = tuple(
+        s + (dt / 6.0) * (k1_i + 2 * k2_i + 2 * k3_i + 4 * k4_i)
+        for s, k1_i, k2_i, k3_i, k4_i in zip(state, k1, k2, k3, k4)
+    )
+
+    return new_state
