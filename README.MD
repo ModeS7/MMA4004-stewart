@@ -5,9 +5,9 @@ done - Record test trajectories: commanded angles + IMU data
 done - Implement first-order servo dynamics K = 1, τ = 0.1s, delay = 0.35s
 
 2.
-- Install MuJoCo + mujoco-python bindings
-- Create basic MJCF model
-- Verify model loads and runs in mujoco.viewer
+done - Make a working sim with FK
+- implement ball dynamics
+- implement contact dynamics
 
 3.
 - Run recorded trajectories in simulation (open-loop)
