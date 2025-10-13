@@ -73,7 +73,7 @@ class StewartSimulatorGUI:
         }
         self.lqr_controller = LQRController(
             Q_pos=1.0,
-            Q_vel=1.0,
+            Q_vel=0.1,
             R=0.01,
             output_limit=15.0,
             ball_physics_params=ball_physics_params
