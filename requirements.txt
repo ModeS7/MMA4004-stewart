@@ -4,3 +4,6 @@ mujoco
 mujoco-mjx
 matplotlib
 pandas
+scipy
+torch
+torchvision
