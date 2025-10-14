@@ -2,6 +2,7 @@
 """
 Stewart Platform Automated Experiments with IMU Logging
 Combines servo control with high-frequency IMU data collection
+FIXED: Proper command timestamp tracking
 """
 
 import tkinter as tk
@@ -174,7 +175,6 @@ class IMUReader(threading.Thread):
                     if not line:
                         continue
 
-                    # Debug: Show first few lines
                     if self.debug_counter < 10:
                         self.log_callback(f"RX: {line}")
                         self.debug_counter += 1
@@ -197,21 +197,13 @@ class IMUReader(threading.Thread):
                                 if self.debug_counter < 20:
                                     self.log_callback(f"Parse error: {e}")
                                     self.debug_counter += 1
-                        else:
-                            if self.debug_counter < 20:
-                                self.log_callback(f"Bad IMU format: {line}")
-                                self.debug_counter += 1
 
                     elif line.startswith("IMU_"):
                         self.log_callback(line)
                     elif line == "READY":
                         self.log_callback("Teensy ready")
                     elif line == "OK" or line == "OK_SPD":
-                        pass  # Suppress verbose ACKs
-                    else:
-                        if self.debug_counter < 20:
-                            self.log_callback(f"Other: {line}")
-                            self.debug_counter += 1
+                        pass
             except Exception as e:
                 if self.debug_counter < 20:
                     self.log_callback(f"IMU thread error: {e}")
@@ -229,7 +221,6 @@ class ExperimentRunner:
 
     @staticmethod
     def step_response(axis, amplitude, duration=2.0):
-        """Generate step input experiment."""
         return {
             'name': f'Step_{axis}_{amplitude:+.1f}deg',
             'type': 'step',
@@ -240,7 +231,6 @@ class ExperimentRunner:
 
     @staticmethod
     def sine_wave(axis, amplitude, frequency, duration=5.0):
-        """Generate sinusoidal input experiment."""
         return {
             'name': f'Sine_{axis}_A{amplitude:.1f}deg_F{frequency:.2f}Hz',
             'type': 'sine',
@@ -252,29 +242,13 @@ class ExperimentRunner:
 
     @staticmethod
     def get_default_experiments():
-        """Define default experiment sequence with extensive rotation tests."""
+        """Simple experiment sequence with large angle steps."""
         experiments = []
 
-        # Step responses for rotations - multiple amplitudes up to 13 degrees
-        for amplitude in [5.0, 8.0, 10.0, 13.0]:
-            for axis in ['rx', 'ry']:
-                experiments.append(ExperimentRunner.step_response(axis, amplitude, 3.0))
-                experiments.append(ExperimentRunner.step_response(axis, -amplitude, 3.0))
-
-        # RZ rotations (smaller range)
-        for amplitude in [5.0, 8.0, 10.0]:
-            experiments.append(ExperimentRunner.step_response('rz', amplitude, 3.0))
-            experiments.append(ExperimentRunner.step_response('rz', -amplitude, 3.0))
-
-        # Sine waves for RX and RY at different frequencies
+        # Step responses for RX and RY - ±15 degrees
         for axis in ['rx', 'ry']:
-            for freq in [0.25, 0.5, 1.0, 1.5]:
-                experiments.append(ExperimentRunner.sine_wave(axis, 10.0, freq, 8.0))
-
-        # Lower amplitude, higher frequency sine waves
-        for axis in ['rx', 'ry']:
-            for freq in [2.0, 3.0]:
-                experiments.append(ExperimentRunner.sine_wave(axis, 6.0, freq, 6.0))
+            experiments.append(ExperimentRunner.step_response(axis, 15.0, 3.0))
+            experiments.append(ExperimentRunner.step_response(axis, -15.0, 3.0))
 
         return experiments
 
@@ -299,18 +273,15 @@ class StewartControlGUI:
         self.serial_conn = None
         self.is_connected = False
 
-        # IMU data handling
         self.imu_queue = Queue(maxsize=10000)
         self.imu_reader = None
         self.imu_samples_received = 0
 
-        # CSV logging
         self.csv_file = None
         self.csv_writer = None
         self.is_recording = False
         self.csv_rows_written = 0
 
-        # Experiment management
         self.is_running_experiments = False
         self.current_experiment = None
         self.experiment_thread = None
@@ -323,6 +294,9 @@ class StewartControlGUI:
         }
 
         self.current_angles = np.zeros(6)
+
+        # FIXED: Track command timestamp
+        self.last_command_time = 0.0
 
         self.create_widgets()
 
@@ -409,7 +383,6 @@ class StewartControlGUI:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, font=('Courier', 8))
         self.log_text.pack(fill='both', expand=True)
 
-        # Start display updates
         self.update_displays()
 
     def browse_folder(self):
@@ -445,7 +418,6 @@ class StewartControlGUI:
             self.serial_conn = serial.Serial(port, 2000000, timeout=0.1)
             time.sleep(2)
 
-            # Read and display startup messages
             startup_lines = []
             while self.serial_conn.in_waiting:
                 line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
@@ -455,12 +427,10 @@ class StewartControlGUI:
             for line in startup_lines:
                 self.log(f"Teensy: {line}")
 
-            # Set speed to 0 (maximum)
             self.log("Setting servo speed to maximum...")
             self.serial_conn.write(b"SPD:0\n")
             time.sleep(0.1)
 
-            # Start IMU reader thread
             self.imu_reader = IMUReader(self.serial_conn, self.imu_queue, self.log)
             self.imu_reader.start()
 
@@ -470,8 +440,6 @@ class StewartControlGUI:
             self.run_exp_btn.config(state='normal')
 
             self.log("Connection established successfully")
-
-            # Move to home
             self.home_position()
 
         except Exception as e:
@@ -498,13 +466,9 @@ class StewartControlGUI:
         self.log("Disconnected")
 
     def update_displays(self):
-        """Update IMU display and statistics."""
-        samples_this_update = 0
-
         try:
             while not self.imu_queue.empty():
                 data = self.imu_queue.get_nowait()
-                samples_this_update += 1
                 self.imu_samples_received += 1
 
                 accel = data['accel']
@@ -515,13 +479,11 @@ class StewartControlGUI:
 
                 self.imu_label.config(text=f"Accel: [{accel_str}] | Gyro: [{gyro_str}]")
 
-                # Write to CSV if recording
                 if self.is_recording and self.csv_writer:
                     self.write_csv_row(data)
         except Empty:
             pass
 
-        # Update statistics
         self.stats_label.config(
             text=f"IMU samples: {self.imu_samples_received} | CSV rows: {self.csv_rows_written} | Queue: {self.imu_queue.qsize()}"
         )
@@ -529,16 +491,15 @@ class StewartControlGUI:
         self.root.after(50, self.update_displays)
 
     def start_recording(self, filename):
-        """Start CSV recording."""
         try:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
 
             self.csv_file = open(filename, 'w', newline='', buffering=1)
             self.csv_writer = csv.writer(self.csv_file)
 
-            # Write header
+            # FIXED: Added command_time_pc column
             self.csv_writer.writerow([
-                'timestamp_us', 'timestamp_pc',
+                'timestamp_us', 'timestamp_pc', 'command_time_pc',
                 'x', 'y', 'z', 'rx', 'ry', 'rz',
                 'theta0', 'theta1', 'theta2', 'theta3', 'theta4', 'theta5',
                 'accel_x', 'accel_y', 'accel_z',
@@ -554,7 +515,6 @@ class StewartControlGUI:
             messagebox.showerror("Recording Error", str(e))
 
     def stop_recording(self):
-        """Stop CSV recording."""
         if self.csv_file:
             self.csv_file.close()
             self.csv_file = None
@@ -563,11 +523,12 @@ class StewartControlGUI:
         self.is_recording = False
 
     def write_csv_row(self, imu_data):
-        """Write a row to the CSV file."""
         try:
+            # FIXED: Include command timestamp
             row = [
                 imu_data['timestamp_us'],
                 imu_data['timestamp_pc'],
+                self.last_command_time,  # Command timestamp
                 self.dof_values['x'],
                 self.dof_values['y'],
                 self.dof_values['z'],
@@ -584,7 +545,6 @@ class StewartControlGUI:
             self.log(f"ERROR writing CSV: {e}")
 
     def send_position(self, x, y, z, rx, ry, rz):
-        """Send position command and update state."""
         self.dof_values['x'] = x
         self.dof_values['y'] = y
         self.dof_values['z'] = z
@@ -606,6 +566,8 @@ class StewartControlGUI:
 
             if self.is_connected and self.serial_conn:
                 command = ",".join([f"{angle:.3f}" for angle in angles]) + "\n"
+                # FIXED: Capture exact send time
+                self.last_command_time = time.time()
                 self.serial_conn.write(command.encode())
                 return True
         else:
@@ -613,19 +575,16 @@ class StewartControlGUI:
             return False
 
     def home_position(self):
-        """Move to home position."""
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
         self.send_position(0, 0, home_z, 0, 0, 0)
         self.log("Moving to home position")
 
     def emergency_stop(self):
-        """Emergency stop - go to home."""
         self.stop_experiments()
         self.home_position()
         self.log("EMERGENCY STOP - Returning to home")
 
     def start_experiments(self):
-        """Start automated experiment sequence."""
         if self.is_running_experiments:
             return
 
@@ -638,7 +597,6 @@ class StewartControlGUI:
         self.experiment_thread.start()
 
     def stop_experiments(self):
-        """Stop experiment sequence."""
         self.is_running_experiments = False
         if self.experiment_thread:
             self.experiment_thread.join(timeout=1)
@@ -649,7 +607,6 @@ class StewartControlGUI:
         self.exp_status_label.config(text="Experiments stopped")
 
     def run_experiments(self):
-        """Execute all experiments."""
         experiments = ExperimentRunner.get_default_experiments()
         output_folder = self.output_folder_var.get()
 
@@ -668,38 +625,30 @@ class StewartControlGUI:
             )
             self.log(f"=== Experiment {idx + 1}/{len(experiments)}: {exp['name']} ===")
 
-            # Create filename
             filename = os.path.join(output_folder, f"{timestamp}_{exp['name']}.csv")
 
-            # Return to home before each experiment
             home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
             self.send_position(0, 0, home_z, 0, 0, 0)
             time.sleep(1.5)
 
-            # Clear queue before starting
             while not self.imu_queue.empty():
                 try:
                     self.imu_queue.get_nowait()
                 except Empty:
                     break
 
-            # Start recording
             self.start_recording(filename)
             time.sleep(0.2)
 
-            # Execute experiment
             if exp['type'] == 'step':
                 self.run_step_experiment(exp)
             elif exp['type'] == 'sine':
                 self.run_sine_experiment(exp)
 
-            # Wait for queue to drain
             time.sleep(0.5)
 
-            # Stop recording
             self.stop_recording()
 
-            # Return to home
             self.send_position(0, 0, home_z, 0, 0, 0)
             time.sleep(1.0)
 
@@ -711,14 +660,12 @@ class StewartControlGUI:
         self.log("=== ALL EXPERIMENTS COMPLETED ===")
 
     def run_step_experiment(self, exp):
-        """Execute step response experiment."""
         axis = exp['axis']
         amplitude = exp['amplitude']
         duration = exp['duration']
 
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
 
-        # Apply step
         pos = {'x': 0, 'y': 0, 'z': home_z, 'rx': 0, 'ry': 0, 'rz': 0}
         pos[axis] = amplitude
 
@@ -726,7 +673,6 @@ class StewartControlGUI:
         time.sleep(duration)
 
     def run_sine_experiment(self, exp):
-        """Execute sinusoidal experiment."""
         axis = exp['axis']
         amplitude = exp['amplitude']
         frequency = exp['frequency']
@@ -735,7 +681,7 @@ class StewartControlGUI:
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
 
         start_time = time.time()
-        dt = 0.02  # 50 Hz update rate
+        dt = 0.02
 
         while time.time() - start_time < duration and self.is_running_experiments:
             t = time.time() - start_time
