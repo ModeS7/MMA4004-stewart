@@ -177,6 +177,13 @@ class StewartSimulatorGUI:
                   selectbackground=[('readonly', self.colors['widget_bg'])],
                   foreground=[('readonly', self.colors['fg'])])
 
+        # Configure combobox dropdown list (Listbox widget)
+        self.root.option_add('*TCombobox*Listbox.background', self.colors['widget_bg'])
+        self.root.option_add('*TCombobox*Listbox.foreground', self.colors['fg'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', self.colors['highlight'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', self.colors['button_fg'])
+        self.root.option_add('*TCombobox*Listbox.font', ('Segoe UI', 9))
+
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, style='TFrame')
         main_frame.pack(fill='both', expand=True, padx=5, pady=5)
