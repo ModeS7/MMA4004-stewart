@@ -12,6 +12,7 @@ import numpy as np
 
 from base_simulator import ControllerConfig, BaseStewartSimulator
 from control_core import LQRController
+from gui_builder import create_standard_layout
 
 
 class LQRControllerConfig(ControllerConfig):
@@ -41,64 +42,101 @@ class LQRControllerConfig(ControllerConfig):
             ball_physics_params=self.ball_physics_params
         )
 
-    def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
-        """Create LQR weight parameter widgets."""
-        weights = [
-            ('Q_pos', 'Q Position Weight', self.default_weights['Q_pos']),
-            ('Q_vel', 'Q Velocity Weight', self.default_weights['Q_vel']),
-            ('R', 'R Control Weight', self.default_weights['R'])
-        ]
-
-        sliders = {}
-        value_labels = {}
-        scalar_vars = {}
-
-        for param_name, label, default in weights:
-            self.default_scalar_idx = self.default_scalar_indices[param_name]
-            self.create_parameter_slider(
-                parent_frame, param_name, label, default,
-                sliders, value_labels, scalar_vars,
-                on_param_change_callback
-            )
-
-        return {
-            'sliders': sliders,
-            'value_labels': value_labels,
-            'scalar_vars': scalar_vars,
-            'update_fn': lambda: None
-        }
-
     def get_scalar_values(self) -> list:
         return self.scalar_values
 
-    def create_info_widgets(self, parent_frame, colors, controller_instance):
-        """Create 'Show Gain Matrix' button for LQR."""
-        info_btn_frame = ttk.Frame(parent_frame)
-        info_btn_frame.pack(fill='x', pady=(10, 0))
 
-        ttk.Button(info_btn_frame, text="Show Gain Matrix",
-                   command=lambda: self._show_gain_matrix(parent_frame, colors),
-                   width=20).pack(side='left', padx=5)
+class LQRStewartSimulator(BaseStewartSimulator):
+    """LQR-specific Stewart Platform Simulator with modular GUI."""
 
-    def _show_gain_matrix(self, parent_widget, colors):
+    def __init__(self, root):
+        ball_physics_params = {
+            'radius': 0.04,
+            'mass': 0.0027,
+            'gravity': 9.81,
+            'mass_factor': 1.667
+        }
+
+        config = LQRControllerConfig(ball_physics_params)
+        super().__init__(root, config)
+
+    def get_layout_config(self):
+        """Define GUI layout for LQR simulator."""
+
+        layout = create_standard_layout(
+            scrollable_columns=True,
+            include_plot=True
+        )
+
+        # Column 1: Controls and configuration
+        layout['columns'][0]['modules'] = [
+            {'type': 'simulation_control'},
+            {'type': 'controller',
+             'args': {'controller_config': self.controller_config,
+                      'controller_widgets': self.controller_widgets}},
+            {'type': 'trajectory_pattern',
+             'args': {'pattern_var': self.pattern_type}},
+            {'type': 'ball_control'},
+            {'type': 'ball_state'},
+            {'type': 'configuration',
+             'args': {'use_offset_var': self.use_top_surface_offset}},
+        ]
+
+        # Column 2: Servo angles, FK, output, log, and manual pose
+        layout['columns'][1]['modules'] = [
+            {'type': 'servo_angles',
+             'args': {'show_actual': True}},
+            {'type': 'platform_pose'},
+            {'type': 'controller_output',
+             'args': {'controller_name': 'LQR'}},
+            {'type': 'manual_pose',
+             'args': {'dof_config': self.dof_config}},
+            {'type': 'debug_log',
+             'args': {'height': 8}},
+        ]
+
+        return layout
+
+    def _create_callbacks(self):
+        """Override to add LQR-specific callbacks."""
+        callbacks = super()._create_callbacks()
+        callbacks['show_gain_matrix'] = self.show_gain_matrix
+        return callbacks
+
+    def _build_modular_gui(self):
+        """Override to add gain matrix button after GUI is built."""
+        super()._build_modular_gui()
+
+        # Add show gain matrix button to controller module
+        if 'controller' in self.gui_modules:
+            controller_frame = self.gui_modules['controller'].frame
+
+            info_frame = ttk.Frame(controller_frame)
+            info_frame.pack(fill='x', pady=(10, 0))
+
+            ttk.Button(info_frame, text="Show Gain Matrix",
+                       command=self.show_gain_matrix,
+                       width=20).pack(side='left', padx=5)
+
+    def show_gain_matrix(self):
         """Display LQR gain matrix in popup."""
-        if self.controller_ref is None:
+        if self.controller is None or not hasattr(self.controller, 'get_gain_matrix'):
             print("Error: Controller not initialized")
             return
 
-        K = self.controller_ref.get_gain_matrix()
+        K = self.controller.get_gain_matrix()
         if K is None:
             print("Error: LQR gain matrix not computed")
             return
 
-        popup = tk.Toplevel(parent_widget)
+        popup = tk.Toplevel(self.root)
         popup.title("LQR Gain Matrix")
-        popup.configure(bg=colors['bg'])
+        popup.configure(bg=self.colors['bg'])
         popup.geometry("500x300")
 
         text = tk.Text(popup,
-                       bg=colors['widget_bg'],
-                       fg=colors['fg'],
+                       bg=self.colors['widget_bg'],
+                       fg=self.colors['fg'],
                        font=('Consolas', 9),
                        wrap='none')
         text.pack(fill='both', expand=True, padx=10, pady=10)
@@ -115,21 +153,6 @@ class LQRControllerConfig(ControllerConfig):
         text.insert('end', f"- Velocity gain: {K[0, 2]:.4f} deg/(m/s)\n")
 
         text.config(state='disabled')
-
-
-class LQRStewartSimulator(BaseStewartSimulator):
-    """LQR-specific Stewart Platform Simulator."""
-
-    def __init__(self, root):
-        ball_physics_params = {
-            'radius': 0.04,
-            'mass': 0.0027,
-            'gravity': 9.81,
-            'mass_factor': 1.667
-        }
-
-        config = LQRControllerConfig(ball_physics_params)
-        super().__init__(root, config)
 
     def _initialize_controller(self):
         """Initialize LQR controller with parameters from widgets."""

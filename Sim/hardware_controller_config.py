@@ -21,7 +21,7 @@ import serial
 import serial.tools.list_ports
 from queue import Queue, Empty
 
-from PID_ball_sim import PIDControllerConfig
+from base_simulator import ControllerConfig
 from control_core import PIDController
 from utils import ControlLoopConfig, GUIConfig
 
@@ -260,38 +260,29 @@ class SerialController:
 # HARDWARE CONTROLLER CONFIGURATION
 # ============================================================================
 
-class HardwareControllerConfig(PIDControllerConfig):
-    """Hardware PID configuration with camera-specific extensions."""
-
+class HardwareControllerConfig(ControllerConfig):
     def __init__(self):
-        super().__init__()
-        self.default_scalar_idx = 3  # 0.01 for hardware
+        # Don't call super().__init__() - implement directly
+        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
+                              0.001, 0.01, 0.1, 1.0, 10.0]
+        self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
+        self.default_scalar_idx = 3  # 0.0001 for hardware
 
     def get_controller_name(self) -> str:
         return "PID (Hardware)"
 
     def create_controller(self, **kwargs):
-        kwargs.setdefault('derivative_filter_alpha', 0.1)
-        return super().create_controller(**kwargs)
+        # Don't call super() - create PIDController directly
+        return PIDController(
+            kp=kwargs.get('kp', 0.0003),
+            ki=kwargs.get('ki', 0.0001),
+            kd=kwargs.get('kd', 0.0003),
+            output_limit=kwargs.get('output_limit', 15.0),
+            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', 0.1)
+        )
 
-    def create_info_widgets(self, parent_frame, colors, controller_instance):
-        """Add hardware-specific info widgets."""
-        cal_frame = ttk.LabelFrame(parent_frame, text="Camera Calibration", padding=10)
-        cal_frame.pack(fill='x', pady=(10, 0))
-
-        ttk.Label(cal_frame, text="Width (mm):").grid(row=0, column=0, sticky='w', pady=2)
-        width_entry = ttk.Entry(cal_frame, width=10)
-        width_entry.insert(0, "350.0")
-        width_entry.grid(row=0, column=1, padx=5, pady=2)
-
-        ttk.Label(cal_frame, text="Height (mm):").grid(row=1, column=0, sticky='w', pady=2)
-        height_entry = ttk.Entry(cal_frame, width=10)
-        height_entry.insert(0, "266.0")
-        height_entry.grid(row=1, column=1, padx=5, pady=2)
-
-        ttk.Button(parent_frame, text="Show Performance Stats",
-                   command=lambda: print("Stats requested"),
-                   width=20).pack(pady=(10, 0))
+    def get_scalar_values(self) -> list:
+        return self.scalar_values
 
 
 def main():

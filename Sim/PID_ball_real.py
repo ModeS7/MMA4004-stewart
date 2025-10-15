@@ -5,14 +5,11 @@ Stewart Platform Real Hardware Controller
 Features:
 - 100Hz dedicated control thread
 - Pixy2 camera integration
-- Maestro servo control
-- IK caching for performance
-- Vector-based tilt limiting
-- Camera Y-axis inversion handling
+- Modular GUI with scrollable columns
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import numpy as np
 import time
 import threading
@@ -20,16 +17,15 @@ import serial.tools.list_ports
 
 from base_simulator import BaseStewartSimulator
 from hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from utils import (
-    ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG,
-    format_time, format_vector_2d
-)
+from utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
+from gui_builder import create_standard_layout
 
 
 class HardwareStewartSimulator(BaseStewartSimulator):
-    """Hardware-specific Stewart Platform Simulator."""
+    """Hardware-specific Stewart Platform Simulator with modular GUI."""
 
     def __init__(self, root):
+        self.port_var = tk.StringVar()
         config = HardwareControllerConfig()
         super().__init__(root, config)
 
@@ -67,87 +63,86 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.last_gui_update = time.time()
         self.gui_update_count = 0
 
-        self._add_hardware_widgets()
+        # Disable start button until connected
+        if 'simulation_control' in self.gui_modules:
+            self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
-        self.log("⚡ Hardware controller initialized (100Hz mode)")
+        self.log("Hardware controller initialized (100Hz mode)")
         self.log("IK cache: 5000 entries (1mm/1° resolution)")
 
-    def _add_hardware_widgets(self):
-        """Add hardware-specific GUI widgets."""
-        for widget in self.root.winfo_children():
-            if isinstance(widget, ttk.Frame):
-                main_frame = widget
-                break
+    def _create_controller_param_widgets(self):
+        """Override to use hardware-specific defaults."""
+        # Hardware uses smaller default scalar (0.0001 instead of 0.001)
+        self.param_definitions = [
+            ('kp', 'P (Proportional)', 3.0, 3),  # 0.0001 scalar
+            ('ki', 'I (Integral)', 1.0, 3),
+            ('kd', 'D (Derivative)', 3.0, 3)
+        ]
 
-        left_panel = None
-        for child in main_frame.winfo_children():
-            if isinstance(child, ttk.Frame):
-                left_panel = child
-                break
+        self.controller_widgets = {
+            'sliders': {},
+            'value_labels': {},
+            'scalar_vars': {},
+            'update_fn': lambda: None,
+            'param_definitions': self.param_definitions
+        }
 
-        if left_panel is None:
-            return
+    def get_layout_config(self):
+        """Define hardware-specific GUI layout with scrollable columns."""
 
-        perf_frame = ttk.LabelFrame(left_panel, text="⚡ 100Hz MODE", padding=10)
-        perf_frame.pack(fill='x', pady=(0, 10), before=left_panel.winfo_children()[0])
+        layout = create_standard_layout(
+            scrollable_columns=True,  # Enable scrolling for 1080p
+            include_plot=True
+        )
 
-        self.fps_label = ttk.Label(perf_frame, text="Control Loop: 0 Hz",
-                                   font=('Consolas', 10, 'bold'),
-                                   foreground=self.colors['success'])
-        self.fps_label.pack()
+        # Column 1 (400px, scrollable): Hardware controls and configuration
+        layout['columns'][0]['modules'] = [
+            {'type': 'performance_stats'},
+            {'type': 'serial_connection',
+             'args': {'port_var': self.port_var}},
+            {'type': 'simulation_control'},
+            {'type': 'controller',
+             'args': {'controller_config': self.controller_config,
+                      'controller_widgets': self.controller_widgets}},
+            {'type': 'trajectory_pattern',
+             'args': {'pattern_var': self.pattern_type}},
+            {'type': 'ball_state'},
+            {'type': 'configuration',
+             'args': {'use_offset_var': self.use_top_surface_offset}},
+        ]
 
-        self.cache_label = ttk.Label(perf_frame, text="IK Cache: 0.0%",
-                                     font=('Consolas', 9))
-        self.cache_label.pack()
+        # Column 2 (450px, scrollable): Status displays, manual control, and log
+        layout['columns'][1]['modules'] = [
+            {'type': 'servo_angles',
+             'args': {'show_actual': False}},  # No simulated servos in hardware
+            {'type': 'platform_pose'},
+            {'type': 'controller_output',
+             'args': {'controller_name': 'PID (Hardware)'}},
+            {'type': 'manual_pose',
+             'args': {'dof_config': self.dof_config}},
+            {'type': 'debug_log',
+             'args': {'height': 8}},
+        ]
 
-        self.timeout_label = ttk.Label(perf_frame, text="IK Timeouts: 0",
-                                       font=('Consolas', 9))
-        self.timeout_label.pack()
+        return layout
 
-        ttk.Button(perf_frame, text="Show Statistics",
-                   command=self.show_timing_stats).pack(pady=(5, 0))
+    def _create_callbacks(self):
+        """Create callback dictionary including hardware-specific callbacks."""
+        callbacks = super()._create_callbacks()
 
-        conn_frame = ttk.LabelFrame(left_panel, text="Serial Connection", padding=10)
-        conn_frame.pack(fill='x', pady=(0, 10), before=left_panel.winfo_children()[1])
+        # Add hardware-specific callbacks (refresh_ports now handled by module)
+        callbacks.update({
+            'connect': self.connect_serial,
+            'disconnect': self.disconnect_serial,
+            'show_stats': self.show_timing_stats,
+        })
 
-        port_frame = ttk.Frame(conn_frame)
-        port_frame.pack(fill='x', pady=(0, 5))
-
-        ttk.Label(port_frame, text="Port:").pack(side='left', padx=(0, 5))
-
-        self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(port_frame, textvariable=self.port_var,
-                                       width=15, state='readonly')
-        self.port_combo.pack(side='left', padx=5)
-        self.refresh_ports()
-
-        ttk.Button(port_frame, text="↻", command=self.refresh_ports,
-                   width=3).pack(side='left')
-
-        conn_btn_frame = ttk.Frame(conn_frame)
-        conn_btn_frame.pack(fill='x', pady=(5, 0))
-
-        self.connect_btn = ttk.Button(conn_btn_frame, text="Connect",
-                                      command=self.connect_serial, width=12)
-        self.connect_btn.pack(side='left', padx=5)
-
-        self.disconnect_btn = ttk.Button(conn_btn_frame, text="Disconnect",
-                                         command=self.disconnect_serial,
-                                         state='disabled', width=12)
-        self.disconnect_btn.pack(side='left', padx=5)
-
-        self.conn_status_label = ttk.Label(conn_frame, text="Not connected",
-                                           foreground=self.colors['border'])
-        self.conn_status_label.pack(pady=(5, 0))
-
-        self.start_btn.config(state='disabled')
+        return callbacks
 
     def refresh_ports(self):
-        """Refresh available serial ports."""
-        ports = [port.device for port in serial.tools.list_ports.comports()]
-        self.port_combo['values'] = ports
-        if ports:
-            self.port_combo.current(0)
+        """Refresh available serial ports (public method for manual use)."""
+        if 'serial_connection' in self.gui_modules:
+            self.gui_modules['serial_connection']._refresh_ports()
 
     def prewarm_ik_cache(self):
         """Pre-calculate common IK solutions."""
@@ -172,7 +167,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     count += 1
 
         elapsed = time.time() - start_time
-        self.log(f"✓ Pre-warmed {count} poses in {elapsed:.2f}s")
+        self.log(f"Pre-warmed {count} poses in {elapsed:.2f}s")
 
     def connect_serial(self):
         """Connect to hardware."""
@@ -186,24 +181,23 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         if success:
             self.connected = True
-            self.conn_status_label.config(text="Connected",
-                                          foreground=self.colors['success'])
-            self.connect_btn.config(state='disabled')
-            self.disconnect_btn.config(state='normal')
-            self.start_btn.config(state='normal')
-            self.log(f"✓ Connected to {port}")
+            self.log(f"Connected to {port}")
 
             time.sleep(0.5)
             self.serial_controller.set_servo_speed(0)
             time.sleep(0.1)
             self.serial_controller.set_servo_acceleration(0)
             time.sleep(0.2)
-            self.log("✓ Servos: Speed=0 (unlimited), Accel=0")
+            self.log("Servos: Speed=0 (unlimited), Accel=0")
 
             self.prewarm_ik_cache()
+
+            # Enable start button
+            if 'simulation_control' in self.gui_modules:
+                self.gui_modules['simulation_control'].start_btn.config(state='normal')
         else:
             messagebox.showerror("Error", message)
-            self.log(f"✗ {message}")
+            self.log(f"Error: {message}")
 
     def disconnect_serial(self):
         """Disconnect from hardware."""
@@ -214,12 +208,11 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.serial_controller.disconnect()
 
         self.connected = False
-        self.conn_status_label.config(text="Not connected",
-                                      foreground=self.colors['border'])
-        self.connect_btn.config(state='normal')
-        self.disconnect_btn.config(state='disabled')
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='disabled')
+
+        # Disable start button
+        if 'simulation_control' in self.gui_modules:
+            self.gui_modules['simulation_control'].start_btn.config(state='disabled')
+
         self.log("Disconnected")
 
     def _initialize_controller(self):
@@ -263,10 +256,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.simulation_time = 0.0
         self.ik_timeout_count = 0
 
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='normal')
-
-        self.log("▶ Control started (100Hz dedicated thread)")
+        self.log("Control started (100Hz dedicated thread)")
 
         self.control_thread = threading.Thread(target=self._control_thread_func,
                                                daemon=True)
@@ -384,65 +374,86 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if not self.simulation_running:
             return
 
-        if self.ball_detected:
-            status = "Detected"
-        else:
-            status = "Not detected"
+        # Update GUI modules
+        self.update_gui_modules()
 
-        self.ball_pos_label.config(
-            text=f"Position: {format_vector_2d(self.ball_pos_mm)}"
-        )
-        self.ball_vel_label.config(text=f"Status: {status}")
+        # Update plot
+        if self.gui_update_count % 2 == 0:
+            self._update_hardware_plot()
 
+        self.gui_update_count += 1
+
+        # Update performance stats once per second
+        current_time = time.time()
+        if current_time - self.last_gui_update >= 1.0:
+            self.last_gui_update = current_time
+
+        self.root.after(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
+
+    def update_gui_modules(self):
+        """Override to add hardware-specific state."""
+        # Ball detection status
+        status = "Detected" if self.ball_detected else "Not detected"
+
+        state = {
+            'simulation_time': self.simulation_time,
+            'controller_enabled': self.controller_enabled.get(),
+            'ball_pos': self.ball_pos_mm,
+            'ball_vel': status,  # Pass status as string for hardware
+            'dof_values': self.dof_values,
+            'connected': self.connected,
+            'fps': ControlLoopConfig.FREQUENCY_HZ,
+            'cache_hit_rate': self.ik_cache.get_hit_rate(),
+            'ik_timeouts': self.ik_timeout_count,
+        }
+
+        # Controller output
         if self.controller_enabled.get():
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
-
-            self.value_labels['rx'].config(text=f"{rx:.2f}")
-            self.value_labels['ry'].config(text=f"{ry:.2f}")
+            magnitude = np.sqrt(rx ** 2 + ry ** 2)
+            magnitude_percent = (magnitude / 15.0) * 100
 
             pattern_time = self.simulation_time - self.pattern_start_time
             target_x, target_y = self.current_pattern.get_position(pattern_time)
             error_x = target_x - self.ball_pos_mm[0]
             error_y = target_y - self.ball_pos_mm[1]
 
-            magnitude = np.sqrt(rx ** 2 + ry ** 2)
-            magnitude_percent = (magnitude / 15.0) * 100
+            state['controller_output'] = (rx, ry)
+            state['controller_magnitude'] = (magnitude, magnitude_percent)
+            state['controller_error'] = (error_x, error_y)
 
-            self.controller_output_label.config(text=f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
-            self.tilt_magnitude_label.config(
-                text=f"Magnitude: {magnitude:.2f}° ({magnitude_percent:.1f}%)"
-            )
-            self.controller_error_label.config(
-                text=f"Error: {format_vector_2d((error_x, error_y))}"
-            )
-
+        # Servo angles
         if self.last_sent_angles is not None:
-            for i in range(6):
-                self.cmd_angle_labels[i].config(
-                    text=f"S{i + 1}: {self.last_sent_angles[i]:6.2f}°"
-                )
+            state['cmd_angles'] = self.last_sent_angles
 
-        self.sim_time_label.config(text=f"Time: {format_time(self.simulation_time)}")
+        # Pattern info
+        pattern_configs = {
+            'static': "Tracking: Center (0, 0)",
+            'circle': "Tracking: Circle (r=50mm, T=10s)",
+            'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
+            'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
+        }
+        state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
 
-        self.gui_update_count += 1
-        if self.gui_update_count % 2 == 0:
-            self._update_hardware_plot()
+        self.gui_builder.update_modules(state)
 
-        current_time = time.time()
-        if current_time - self.last_gui_update >= 1.0:
-            self.fps_label.config(text=f"Control: {ControlLoopConfig.FREQUENCY_HZ:.1f} Hz")
+    def setup_plot(self):
+        """Setup plot for hardware (override base class)."""
+        super().setup_plot()
 
-            hit_rate = self.ik_cache.get_hit_rate()
-            self.cache_label.config(text=f"IK Cache: {hit_rate * 100:.1f}%")
+        # Add ball trail line (initially empty)
+        self.ball_trail, = self.ax.plot([], [], 'r-', alpha=0.3, linewidth=1,
+                                        label='Ball Trail')
 
-            self.timeout_label.config(text=f"IK Timeouts: {self.ik_timeout_count}")
+        # Update legend
+        legend = self.ax.legend(loc='upper right', fontsize=8,
+                                facecolor=self.colors['panel_bg'],
+                                edgecolor=self.colors['border'],
+                                labelcolor=self.colors['fg'])
+        legend.get_frame().set_alpha(0.9)
 
-            self.last_gui_update = current_time
-
-        self.root.after(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
-
-    def _update_hardware_plot(self):
+        self.canvas.draw()
         """Update plot with hardware data."""
         try:
             if self.ball_detected:
@@ -452,7 +463,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 self.ball_circle.set_alpha(0.2)
 
             if len(self.ball_history_x) > 1:
-                self.ball_trail.set_data(self.ball_history_x, self.ball_history_y)
+                self.ball_trail, = self.ax.plot(self.ball_history_x, self.ball_history_y,
+                                                'r-', alpha=0.3, linewidth=1)
 
             if self.pattern_type.get() != 'static':
                 pattern_time = self.simulation_time - self.pattern_start_time
@@ -520,8 +532,69 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         messagebox.showinfo("Performance Statistics", stats_msg)
 
+    def calculate_ik(self):
+        """Calculate inverse kinematics and send to hardware."""
+        translation = np.array([self.dof_values['x'],
+                                self.dof_values['y'],
+                                self.dof_values['z']])
+
+        from control_core import clip_tilt_vector
+        from utils import MAX_TILT_ANGLE_DEG
+
+        rx_limited, ry_limited, tilt_mag = clip_tilt_vector(
+            self.dof_values['rx'],
+            self.dof_values['ry'],
+            MAX_TILT_ANGLE_DEG
+        )
+
+        if tilt_mag > MAX_TILT_ANGLE_DEG and not self.controller_enabled.get():
+            self.dof_values['rx'] = rx_limited
+            self.dof_values['ry'] = ry_limited
+
+        rotation = np.array([rx_limited, ry_limited, self.dof_values['rz']])
+
+        angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                self.use_top_surface_offset.get())
+
+        if angles is not None:
+            self.last_cmd_angles = angles
+
+            # Send to hardware if connected and not running control loop
+            if self.connected and not self.simulation_running:
+                self.serial_controller.send_servo_angles(angles)
+
+    def on_controller_toggle(self):
+        """Override to handle manual control disabling for hardware."""
+        enabled = self.controller_enabled.get()
+
+        if enabled:
+            self.controller.reset()
+            self.reset_pattern()
+            self.log("PID control ENABLED")
+
+            # Disable manual tilt control
+            if 'manual_pose' in self.gui_modules:
+                manual_pose = self.gui_modules['manual_pose']
+                manual_pose.sliders['rx'].config(state='disabled')
+                manual_pose.sliders['ry'].config(state='disabled')
+                # Also disable x, y, z for hardware (only tilt control makes sense during operation)
+                manual_pose.sliders['x'].config(state='disabled')
+                manual_pose.sliders['y'].config(state='disabled')
+                manual_pose.sliders['z'].config(state='disabled')
+        else:
+            self.log("PID control DISABLED")
+
+            # Enable manual control
+            if 'manual_pose' in self.gui_modules:
+                manual_pose = self.gui_modules['manual_pose']
+                manual_pose.sliders['rx'].config(state='normal')
+                manual_pose.sliders['ry'].config(state='normal')
+                manual_pose.sliders['x'].config(state='normal')
+                manual_pose.sliders['y'].config(state='normal')
+                manual_pose.sliders['z'].config(state='normal')
+
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
-        """Hardware controller update (compatibility with base class)."""
+        """Hardware controller update (not used - control thread handles it)."""
         return self.controller.update(ball_pos_mm, target_pos_mm, dt)
 
     def stop_simulation(self):
@@ -538,9 +611,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 except:
                     break
 
-        self.start_btn.config(state='normal')
-        self.stop_btn.config(state='disabled')
-        self.log("⏸ Control stopped")
+        self.log("Control stopped")
 
     def on_closing(self):
         """Clean shutdown."""
@@ -557,6 +628,18 @@ def main():
     """Launch hardware controller."""
     root = tk.Tk()
     app = HardwareStewartSimulator(root)
+
+    app.log("=" * 50)
+    app.log("Hardware Controller - Ready")
+    app.log("=" * 50)
+    app.log("")
+    app.log("Quick Start:")
+    app.log("1. Select serial port and click 'Connect'")
+    app.log("2. Enable PID Control for automatic balancing")
+    app.log("3. Click 'Start' to begin 100Hz control loop")
+    app.log("4. Select trajectory patterns to track")
+    app.log("")
+
     root.mainloop()
 
 
