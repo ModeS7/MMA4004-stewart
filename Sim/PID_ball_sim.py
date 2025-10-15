@@ -1,959 +1,174 @@
 #!/usr/bin/env python3
 """
-Stewart Platform Simulator with PID Ball Balancing Control
-With Dark Mode
+PID Controller Configuration for Stewart Platform Simulator
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
-import numpy as np
-import torch
-import time
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Rectangle, Circle
-
-from core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory
+from tkinter import ttk
+from base_simulator import ControllerConfig, BaseStewartSimulator
 from control_core import PIDController
 
 
-class StewartSimulatorGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Stewart Platform - PID Ball Balancing Control")
-        self.root.geometry("1400x900")
+class PIDControllerConfig(ControllerConfig):
+    """Configuration for PID controller."""
 
-        # Register cleanup handler for window close
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+    def __init__(self):
+        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]
+        self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
+        self.default_scalar_idx = 4  # 0.001
 
-        # Dark mode colors
-        self.colors = {
-            'bg': '#1e1e1e',
-            'panel_bg': '#2d2d2d',
-            'widget_bg': '#3d3d3d',
-            'fg': '#e0e0e0',
-            'highlight': '#007acc',
-            'button_bg': '#0e639c',
-            'button_fg': '#ffffff',
-            'entry_bg': '#3d3d3d',
-            'border': '#555555',
-            'success': '#4ec9b0',
-            'warning': '#ce9178'
-        }
+    def get_controller_name(self) -> str:
+        return "PID"
 
-        self.root.configure(bg=self.colors['bg'])
-        self.setup_dark_theme()
-
-        self.platform_params = {
-            "horn_length": 31.75,
-            "rod_length": 145.0,
-            "base": 73.025,
-            "base_anchors": 36.8893,
-            "platform": 67.775,
-            "platform_anchors": 12.7,
-            "top_surface_offset": 26.0
-        }
-        self.ik = StewartPlatformIK(**self.platform_params)
-        self.servos = [FirstOrderServo(K=1.0, tau=0.1, delay=0.0) for _ in range(6)]
-
-        self.ball_physics = SimpleBallPhysics2D(
-            ball_radius=0.04,
-            ball_mass=0.0027,
-            gravity=9.81,
-            rolling_friction=0.001,
-            sphere_type='hollow'
+    def create_controller(self, **kwargs):
+        return PIDController(
+            kp=kwargs.get('kp', 0.003),
+            ki=kwargs.get('ki', 0.001),
+            kd=kwargs.get('kd', 0.003),
+            output_limit=kwargs.get('output_limit', 15.0)
         )
 
-        # PID Controller
-        self.pid_controller = PIDController(kp=0.003, ki=0.001, kd=0.003, output_limit=15.0)
-        self.pid_enabled = tk.BooleanVar(value=False)
+    def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
+        """Create PID gain parameter widgets."""
+        gains = [
+            ('kp', 'P (Proportional)', self.default_gains['kp']),
+            ('ki', 'I (Integral)', self.default_gains['ki']),
+            ('kd', 'D (Derivative)', self.default_gains['kd'])
+        ]
 
-        # Trajectory pattern
-        self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
-        self.pattern_type = tk.StringVar(value='static')
-        self.pattern_start_time = 0.0
+        sliders = {}
+        value_labels = {}
+        scalar_vars = {}
 
-        # PID gain scalars (multipliers)
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]
-        self.kp_scalar_idx = tk.IntVar(value=4)  # Default to 0.001
-        self.ki_scalar_idx = tk.IntVar(value=4)  # Default to 0.001
-        self.kd_scalar_idx = tk.IntVar(value=4)  # Default to 0.001
-
-        ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
-        self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
-        self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
-        self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
-
-        self.simulation_running = False
-        self.simulation_time = 0.0
-        self.last_update_time = None
-        self.update_rate_ms = 20
-        self.simulation_loop_id = None
-
-        self.use_top_surface_offset = tk.BooleanVar(value=True)
-        self.dof_values = {
-            'x': 0.0, 'y': 0.0, 'z': self.ik.home_height_top_surface,
-            'rx': 0.0, 'ry': 0.0, 'rz': 0.0
-        }
-
-        self.dof_config = {
-            'x': (-30.0, 30.0, 0.1, 0.0, "X Position (mm)"),
-            'y': (-30.0, 30.0, 0.1, 0.0, "Y Position (mm)"),
-            'z': (self.ik.home_height_top_surface - 30,
-                  self.ik.home_height_top_surface + 30,
-                  0.1, self.ik.home_height_top_surface, "Z Height (mm)"),
-            'rx': (-15.0, 15.0, 0.1, 0.0, "Roll (°)"),
-            'ry': (-15.0, 15.0, 0.1, 0.0, "Pitch (°)"),
-            'rz': (-15.0, 15.0, 0.1, 0.0, "Yaw (°)")
-        }
-
-        self.sliders = {}
-        self.value_labels = {}
-        self.update_timer = None
-
-        # PID sliders
-        self.pid_sliders = {}
-        self.pid_value_labels = {}
-
-        self.create_widgets()
-
-        # Platform motion tracking for dynamics
-        self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
-        self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
-        self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
-
-    def setup_dark_theme(self):
-        """Configure ttk widgets for dark mode."""
-        style = ttk.Style()
-        style.theme_use('default')
-
-        style.configure('TFrame', background=self.colors['bg'])
-        style.configure('Card.TFrame', background=self.colors['panel_bg'], relief='flat')
-
-        style.configure('TLabelframe',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['fg'],
-                        borderwidth=1,
-                        relief='solid')
-        style.configure('TLabelframe.Label',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['highlight'],
-                        font=('Segoe UI', 9, 'bold'))
-
-        style.configure('TLabel',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['fg'],
-                        font=('Segoe UI', 9))
-
-        style.configure('TButton',
-                        background=self.colors['button_bg'],
-                        foreground=self.colors['button_fg'],
-                        borderwidth=0,
-                        focuscolor='none',
-                        font=('Segoe UI', 9))
-        style.map('TButton',
-                  background=[('active', self.colors['highlight']),
-                              ('pressed', '#005a9e')])
-
-        style.configure('TScale',
-                        background=self.colors['panel_bg'],
-                        troughcolor=self.colors['widget_bg'],
-                        borderwidth=0)
-
-        style.configure('TCheckbutton',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['fg'],
-                        font=('Segoe UI', 9))
-
-        style.configure('TCombobox',
-                        fieldbackground=self.colors['widget_bg'],
-                        background=self.colors['button_bg'],
-                        foreground=self.colors['fg'],
-                        arrowcolor=self.colors['fg'],
-                        selectbackground=self.colors['highlight'],
-                        selectforeground=self.colors['button_fg'])
-        style.map('TCombobox',
-                  fieldbackground=[('readonly', self.colors['widget_bg'])],
-                  selectbackground=[('readonly', self.colors['widget_bg'])],
-                  foreground=[('readonly', self.colors['fg'])])
-
-        # Configure combobox dropdown list (Listbox widget)
-        self.root.option_add('*TCombobox*Listbox.background', self.colors['widget_bg'])
-        self.root.option_add('*TCombobox*Listbox.foreground', self.colors['fg'])
-        self.root.option_add('*TCombobox*Listbox.selectBackground', self.colors['highlight'])
-        self.root.option_add('*TCombobox*Listbox.selectForeground', self.colors['button_fg'])
-        self.root.option_add('*TCombobox*Listbox.font', ('Segoe UI', 9))
-
-    def create_widgets(self):
-        main_frame = ttk.Frame(self.root, style='TFrame')
-        main_frame.pack(fill='both', expand=True, padx=5, pady=5)
-
-        left_panel = ttk.Frame(main_frame, style='TFrame', width=400)
-        left_panel.pack(side='left', fill='both', expand=False, padx=(0, 5))
-        left_panel.pack_propagate(False)
-
-        middle_panel = ttk.Frame(main_frame, style='TFrame', width=450)
-        middle_panel.pack(side='left', fill='both', expand=False, padx=5)
-        middle_panel.pack_propagate(False)
-
-        right_panel = ttk.Frame(main_frame, style='TFrame')
-        right_panel.pack(side='right', fill='both', expand=True, padx=(5, 0))
-
-        # === LEFT PANEL ===
-
-        # Simulation control
-        sim_frame = ttk.LabelFrame(left_panel, text="Simulation Control", padding=10)
-        sim_frame.pack(fill='x', pady=(0, 10))
-
-        btn_frame = ttk.Frame(sim_frame)
-        btn_frame.pack(fill='x')
-
-        self.start_btn = ttk.Button(btn_frame, text="▶ Start", command=self.start_simulation, width=10)
-        self.start_btn.pack(side='left', padx=5)
-
-        self.stop_btn = ttk.Button(btn_frame, text="⏸ Stop", command=self.stop_simulation, state='disabled', width=10)
-        self.stop_btn.pack(side='left', padx=5)
-
-        self.reset_btn = ttk.Button(btn_frame, text="↻ Reset", command=self.reset_simulation, width=10)
-        self.reset_btn.pack(side='left', padx=5)
-
-        self.sim_time_label = ttk.Label(sim_frame, text="Time: 0.00s", font=('Consolas', 10, 'bold'))
-        self.sim_time_label.pack(pady=(10, 0))
-
-        # PID Control
-        pid_frame = ttk.LabelFrame(left_panel, text="PID Ball Balancing", padding=10)
-        pid_frame.pack(fill='x', pady=(0, 10))
-
-        enable_frame = ttk.Frame(pid_frame)
-        enable_frame.pack(fill='x', pady=(0, 10))
-
-        ttk.Checkbutton(enable_frame, text="Enable PID Control",
-                        variable=self.pid_enabled,
-                        command=self.on_pid_toggle).pack(side='left')
-
-        self.pid_status_label = ttk.Label(enable_frame, text="●",
-                                          foreground=self.colors['border'],
-                                          font=('Segoe UI', 14))
-        self.pid_status_label.pack(side='left', padx=(10, 0))
-
-        # PID gains
-        pid_gains = [('kp', 'P (Proportional)', 3.0),
-                     ('ki', 'I (Integral)', 1.0),
-                     ('kd', 'D (Derivative)', 3.0)]
-
-        # Store default values for later
-        pid_defaults = {}
-
-        for gain_name, label, default in pid_gains:
-            pid_defaults[gain_name] = default
-
-            frame = ttk.Frame(pid_frame)
+        for gain_name, label, default in gains:
+            frame = ttk.Frame(parent_frame)
             frame.pack(fill='x', pady=5)
 
-            ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', pady=2)
+            ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(
+                row=0, column=0, sticky='w', pady=2
+            )
 
             slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
             slider.grid(row=0, column=1, sticky='ew', padx=10)
-            self.pid_sliders[gain_name] = slider
+            slider.set(default)
+            sliders[gain_name] = slider
 
-            # Create value label
             value_label = ttk.Label(frame, text=f"{default:.2f}", width=6, font=('Consolas', 9))
             value_label.grid(row=0, column=2)
-            self.pid_value_labels[gain_name] = value_label
+            value_labels[gain_name] = value_label
 
-            # Scalar selector
-            scalar_combo = ttk.Combobox(frame, width=12, state='readonly',
-                                        values=[f'×{s:.7g}' for s in self.scalar_values])
+            scalar_var = tk.IntVar(value=self.default_scalar_idx)
+            scalar_vars[gain_name] = scalar_var
+
+            scalar_combo = ttk.Combobox(
+                frame, width=12, state='readonly',
+                values=[f'×{s:.7g}' for s in self.scalar_values]
+            )
             scalar_combo.grid(row=0, column=3, padx=(5, 0))
+            scalar_combo.current(self.default_scalar_idx)
 
-            # Set initial index based on IntVar
-            scalar_var = getattr(self, f'{gain_name}_scalar_idx')
-            scalar_combo.current(scalar_var.get())
-
-            # Update IntVar when selection changes
-            scalar_combo.bind('<<ComboboxSelected>>',
-                              lambda e, combo=scalar_combo, var=scalar_var, g=gain_name:
-                              self._on_scalar_selected(combo, var, g))
+            # Bind events
+            slider.config(command=lambda val, g=gain_name: self._on_slider_change(
+                g, val, sliders, value_labels, on_param_change_callback
+            ))
+            scalar_combo.bind('<<ComboboxSelected>>', lambda e, combo=scalar_combo, var=scalar_var, g=gain_name:
+            self._on_scalar_change(combo, var, g, on_param_change_callback))
 
             frame.columnconfigure(1, weight=1)
 
-        # set all slider values and attach callbacks
-        for gain_name, default in pid_defaults.items():
-            self.pid_sliders[gain_name].set(default)
-            self.pid_sliders[gain_name].config(
-                command=lambda val, g=gain_name: self.on_pid_slider_change(g, val)
-            )
-
-        # Initialize PID controller with default gains
-        self.update_pid_gains()
-
-        # Trajectory pattern selector
-        pattern_frame = ttk.LabelFrame(pid_frame, text="Trajectory Pattern", padding=10)
-        pattern_frame.pack(fill='x', pady=(10, 0))
-
-        # Pattern selector
-        selector_frame = ttk.Frame(pattern_frame)
-        selector_frame.pack(fill='x', pady=(0, 5))
-
-        ttk.Label(selector_frame, text="Pattern:", font=('Segoe UI', 9)).pack(side='left', padx=(0, 10))
-
-        pattern_combo = ttk.Combobox(selector_frame, textvariable=self.pattern_type,
-                                     width=15, state='readonly',
-                                     values=['static', 'circle', 'figure8', 'star'])
-        pattern_combo.pack(side='left', padx=5)
-        pattern_combo.bind('<<ComboboxSelected>>', self.on_pattern_change)
-
-        ttk.Button(selector_frame, text="Reset", command=self.reset_pattern, width=8).pack(side='left', padx=5)
-
-        # Pattern info display
-        self.pattern_info_label = ttk.Label(pattern_frame,
-                                            text="Tracking: Center (0, 0)",
-                                            font=('Consolas', 8),
-                                            foreground=self.colors['success'])
-        self.pattern_info_label.pack(anchor='w', pady=(5, 0))
-
-        # Ball control
-        ball_frame = ttk.LabelFrame(left_panel, text="Ball Control", padding=10)
-        ball_frame.pack(fill='x', pady=(0, 10))
-
-        ball_btn_frame = ttk.Frame(ball_frame)
-        ball_btn_frame.pack()
-
-        ttk.Button(ball_btn_frame, text="⟲ Reset Ball", command=self.reset_ball, width=15).pack(side='left', padx=5)
-        ttk.Button(ball_btn_frame, text="⇝ Push Ball", command=self.push_ball, width=15).pack(side='left', padx=5)
-
-        # Ball state
-        ball_info_frame = ttk.LabelFrame(left_panel, text="Ball State", padding=10)
-        ball_info_frame.pack(fill='x', pady=(0, 10))
-
-        self.ball_pos_label = ttk.Label(ball_info_frame, text="Position: (0.0, 0.0) mm", font=('Consolas', 9))
-        self.ball_pos_label.pack(anchor='w', pady=2)
-
-        self.ball_vel_label = ttk.Label(ball_info_frame, text="Velocity: (0.0, 0.0) mm/s", font=('Consolas', 9))
-        self.ball_vel_label.pack(anchor='w', pady=2)
-
-        # Config
-        config_frame = ttk.LabelFrame(left_panel, text="Configuration", padding=10)
-        config_frame.pack(fill='x', pady=(0, 10))
-
-        ttk.Checkbutton(config_frame, text="Use Top Surface Offset",
-                        variable=self.use_top_surface_offset,
-                        command=self.on_offset_toggle).pack(anchor='w')
-
-        # Manual sliders
-        sliders_frame = ttk.LabelFrame(left_panel, text="Manual Pose Control (6 DOF)", padding=10)
-        sliders_frame.pack(fill='both', expand=True)
-
-        for idx, (dof, (min_val, max_val, res, default, label)) in enumerate(self.dof_config.items()):
-            ttk.Label(sliders_frame, text=label, font=('Segoe UI', 9)).grid(row=idx, column=0, sticky='w', pady=8)
-
-            slider = ttk.Scale(sliders_frame, from_=min_val, to=max_val, orient='horizontal',
-                               command=lambda val, d=dof: self.on_slider_change(d, val))
-            slider.grid(row=idx, column=1, sticky='ew', padx=10, pady=8)
-            self.sliders[dof] = slider
-
-            value_label = ttk.Label(sliders_frame, text=f"{default:.2f}", width=8, font=('Consolas', 9))
-            value_label.grid(row=idx, column=2, pady=8)
-            self.value_labels[dof] = value_label
-            slider.set(default)
-
-        sliders_frame.columnconfigure(1, weight=1)
-
-        # === MIDDLE PANEL ===
-
-        # Commanded angles
-        cmd_angles_frame = ttk.LabelFrame(middle_panel, text="Commanded Servo Angles (IK)", padding=10)
-        cmd_angles_frame.pack(fill='x', pady=(0, 10))
-
-        self.cmd_angle_labels = []
-        for i in range(6):
-            label = ttk.Label(cmd_angles_frame, text=f"S{i + 1}: 0.00°", font=('Consolas', 9))
-            label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
-            self.cmd_angle_labels.append(label)
-
-        # Actual angles
-        actual_angles_frame = ttk.LabelFrame(middle_panel, text="Actual Servo Angles", padding=10)
-        actual_angles_frame.pack(fill='x', pady=(0, 10))
-
-        self.actual_angle_labels = []
-        for i in range(6):
-            label = ttk.Label(actual_angles_frame, text=f"S{i + 1}: 0.00°", font=('Consolas', 9))
-            label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
-            self.actual_angle_labels.append(label)
-
-        # FK
-        fk_frame = ttk.LabelFrame(middle_panel, text="Platform Pose (FK)", padding=10)
-        fk_frame.pack(fill='x', pady=(0, 10))
-
-        self.fk_pos_label = ttk.Label(fk_frame, text="X: 0.00  Y: 0.00  Z: 0.00 mm", font=('Consolas', 9))
-        self.fk_pos_label.pack(anchor='w', pady=2)
-
-        self.fk_rot_label = ttk.Label(fk_frame, text="Roll: 0.00  Pitch: 0.00  Yaw: 0.00°", font=('Consolas', 9))
-        self.fk_rot_label.pack(anchor='w', pady=2)
-
-        # PID output
-        pid_output_frame = ttk.LabelFrame(middle_panel, text="PID Output", padding=10)
-        pid_output_frame.pack(fill='x', pady=(0, 10))
-
-        self.pid_output_label = ttk.Label(pid_output_frame, text="Tilt: rx=0.00°  ry=0.00°", font=('Consolas', 9))
-        self.pid_output_label.pack(anchor='w', pady=2)
-
-        self.pid_error_label = ttk.Label(pid_output_frame, text="Error: (0.0, 0.0) mm", font=('Consolas', 9))
-        self.pid_error_label.pack(anchor='w', pady=2)
-
-        # Log
-        log_frame = ttk.LabelFrame(middle_panel, text="Debug Log", padding=10)
-        log_frame.pack(fill='both', expand=True)
-
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=10,
-            font=('Consolas', 8),
-            bg=self.colors['widget_bg'],
-            fg=self.colors['fg'],
-            insertbackground=self.colors['fg'],
-            selectbackground=self.colors['highlight'],
-            selectforeground=self.colors['button_fg'],
-            relief='flat',
-            borderwidth=0
-        )
-        self.log_text.pack(fill='both', expand=True)
-
-        # === RIGHT PANEL ===
-        plot_frame = ttk.LabelFrame(right_panel, text="Ball Position (Top View)", padding=10)
-        plot_frame.pack(fill='both', expand=True)
-
-        plt.style.use('dark_background')
-        self.fig, self.ax = plt.subplots(figsize=(6, 6), facecolor=self.colors['panel_bg'])
-        self.ax.set_facecolor(self.colors['widget_bg'])
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
-        self.canvas.get_tk_widget().pack(fill='both', expand=True)
-
-        self.setup_plot()
-        self.log("PID ball balancing control initialized")
-        self.log("Configure PID gains and enable to start automatic balancing")
-
-    def setup_plot(self):
-        """Setup the matplotlib plot with dark theme."""
-        self.ax.clear()
-        self.ax.set_xlim(-120, 120)
-        self.ax.set_ylim(-120, 120)
-        self.ax.set_xlabel('X (mm)', color=self.colors['fg'], fontsize=10)
-        self.ax.set_ylabel('Y (mm)', color=self.colors['fg'], fontsize=10)
-        self.ax.set_title('Ball Position (Top View)', color=self.colors['fg'], fontsize=11, fontweight='bold')
-        self.ax.grid(True, alpha=0.2, linestyle='--', color=self.colors['fg'])
-        self.ax.set_aspect('equal')
-
-        self.ax.tick_params(colors=self.colors['fg'])
-
-        for spine in self.ax.spines.values():
-            spine.set_color(self.colors['border'])
-
-        platform_square = Rectangle((-100, -100), 200, 200,
-                                    fill=False,
-                                    edgecolor=self.colors['fg'],
-                                    linewidth=2,
-                                    linestyle='--',
-                                    label='Platform Edge',
-                                    alpha=0.5)
-        self.ax.add_patch(platform_square)
-
-        self.trajectory_line, = self.ax.plot([], [], '--', color=self.colors['highlight'],
-                                             alpha=0.3, linewidth=1, label='Trajectory')
-        self.target_marker, = self.ax.plot([0], [0], 'x', color=self.colors['success'],
-                                           markersize=10, markeredgewidth=2, label='Target')
-
-        self.ball_circle = Circle((0, 0), 3.0, color='#ff4444', alpha=0.8,
-                                  zorder=10, label='Ball')
-        self.ax.add_patch(self.ball_circle)
-
-        self.tilt_arrow = None
-
-        legend = self.ax.legend(loc='upper right', fontsize=8, facecolor=self.colors['panel_bg'],
-                                edgecolor=self.colors['border'], labelcolor=self.colors['fg'])
-        legend.get_frame().set_alpha(0.9)
-
-        self.canvas.draw()
-
-    def update_plot(self):
-        """Update the plot with current ball position and trajectory."""
-        # Update ball position
-        ball_x = self.ball_pos[0, 0].item() * 1000
-        ball_y = self.ball_pos[0, 1].item() * 1000
-        self.ball_circle.center = (ball_x, ball_y)
-
-        # Update trajectory path (show trajectory even if PID disabled, for preview)
-        if self.pattern_type.get() != 'static':
-            # Draw trajectory for one complete cycle
-            pattern_time = self.simulation_time - self.pattern_start_time
-
-            # Get period based on pattern type
-            pattern_periods = {
-                'circle': 10.0,
-                'figure8': 12.0,
-                'star': 15.0
-            }
-            period = pattern_periods.get(self.pattern_type.get(), 10.0)
-
-            # Sample points along trajectory
-            t_samples = np.linspace(0, period, 100)
-            path_x = []
-            path_y = []
-            for t in t_samples:
-                x, y = self.current_pattern.get_position(t)
-                path_x.append(x)
-                path_y.append(y)
-
-            self.trajectory_line.set_data(path_x, path_y)
-
-            # Update current target position
-            target_x, target_y = self.current_pattern.get_position(pattern_time)
-            self.target_marker.set_data([target_x], [target_y])
-        else:
-            # Static pattern - just show center
-            self.trajectory_line.set_data([], [])
-            self.target_marker.set_data([0], [0])
-
-        # Update tilt arrow
-        if self.tilt_arrow is not None:
-            self.tilt_arrow.remove()
-            self.tilt_arrow = None
-
-        rx = self.dof_values['rx']
-        ry = self.dof_values['ry']
-
-        if abs(rx) > 0.5 or abs(ry) > 0.5:
-            dx = -np.sin(np.radians(ry))
-            dy = -np.sin(np.radians(rx))
-            magnitude = np.sqrt(dx ** 2 + dy ** 2)
-
-            if magnitude > 0:
-                dx = (dx / magnitude) * 30
-                dy = (dy / magnitude) * 30
-                color = self.colors['success'] if self.pid_enabled.get() else self.colors['highlight']
-                self.tilt_arrow = self.ax.arrow(0, 0, dx, dy, head_width=8, head_length=10,
-                                                fc=color, ec=color,
-                                                alpha=0.6, linewidth=2, zorder=5)
-
-        self.canvas.draw_idle()
-
-    def on_pid_toggle(self):
-        """Handle PID enable/disable toggle."""
-        enabled = self.pid_enabled.get()
-
-        if enabled:
-            self.pid_controller.reset()
-            self.reset_pattern()
-            self.pid_status_label.config(foreground=self.colors['success'])
-
-            # Log current gains
-            kp = self.pid_controller.kp
-            ki = self.pid_controller.ki
-            kd = self.pid_controller.kd
-            self.log("PID control ENABLED - automatic balancing active")
-            self.log(f"Current gains: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
-
-            # Disable manual tilt controls
-            self.sliders['rx'].config(state='disabled')
-            self.sliders['ry'].config(state='disabled')
-
-            # Initialize with zero tilt
-            self.dof_values['rx'] = 0.0
-            self.dof_values['ry'] = 0.0
-            self.value_labels['rx'].config(text="0.00")
-            self.value_labels['ry'].config(text="0.00")
-
-            # Trigger initial IK calculation
-            self.calculate_ik()
-        else:
-            self.pid_status_label.config(foreground=self.colors['border'])
-            self.log("PID control DISABLED - manual control active")
-
-            # Re-enable manual tilt controls
-            self.sliders['rx'].config(state='normal')
-            self.sliders['ry'].config(state='normal')
-
-            # Restore slider positions
-            self.sliders['rx'].set(self.dof_values['rx'])
-            self.sliders['ry'].set(self.dof_values['ry'])
-
-    def on_pid_slider_change(self, gain_name, value):
-        """Handle PID gain slider changes."""
+        # Return widget references and update function
+        return {
+            'sliders': sliders,
+            'value_labels': value_labels,
+            'scalar_vars': scalar_vars,
+            'update_fn': lambda: self._update_gains(sliders, scalar_vars, on_param_change_callback)
+        }
+
+    def _on_slider_change(self, gain_name, value, sliders, value_labels, callback):
+        """Handle slider value change."""
         val = float(value)
-        self.pid_value_labels[gain_name].config(text=f"{val:.2f}")
-        self.update_pid_gains()
+        value_labels[gain_name].config(text=f"{val:.2f}")
+        callback()
 
-    def _on_scalar_selected(self, combo, int_var, gain_name):
-        """Handle scalar combobox selection."""
-        selected_index = combo.current()
-        int_var.set(selected_index)
-        self.update_pid_gains()
+    def _on_scalar_change(self, combo, var, gain_name, callback):
+        """Handle scalar selection change."""
+        var.set(combo.current())
+        callback()
 
-    def update_pid_gains(self):
-        """Update PID controller with current gain values and scalars."""
-        kp_raw = float(self.pid_sliders['kp'].get())
-        ki_raw = float(self.pid_sliders['ki'].get())
-        kd_raw = float(self.pid_sliders['kd'].get())
+    def _update_gains(self, sliders, scalar_vars, callback):
+        """Update PID gains (called by callback mechanism)."""
+        # This is handled by the parent callback mechanism
+        pass
 
-        kp_idx = self.kp_scalar_idx.get()
-        ki_idx = self.ki_scalar_idx.get()
-        kd_idx = self.kd_scalar_idx.get()
+    def get_scalar_values(self) -> list:
+        return self.scalar_values
 
-        # Validate indices
-        kp_idx = max(0, min(kp_idx, len(self.scalar_values) - 1))
-        ki_idx = max(0, min(ki_idx, len(self.scalar_values) - 1))
-        kd_idx = max(0, min(kd_idx, len(self.scalar_values) - 1))
+    def create_info_widgets(self, parent_frame, colors, controller_instance):
+        """No additional info widgets for PID."""
+        pass
 
-        kp_scalar = self.scalar_values[kp_idx]
-        ki_scalar = self.scalar_values[ki_idx]
-        kd_scalar = self.scalar_values[kd_idx]
+
+class PIDStewartSimulator(BaseStewartSimulator):
+    """PID-specific Stewart Platform Simulator."""
+
+    def __init__(self, root):
+        config = PIDControllerConfig()
+        super().__init__(root, config)
+
+    def _initialize_controller(self):
+        """Initialize PID controller with parameters from widgets."""
+        sliders = self.controller_widgets['sliders']
+        scalar_vars = self.controller_widgets['scalar_vars']
+
+        kp_raw = float(sliders['kp'].get())
+        ki_raw = float(sliders['ki'].get())
+        kd_raw = float(sliders['kd'].get())
+
+        kp_scalar = self.controller_config.scalar_values[scalar_vars['kp'].get()]
+        ki_scalar = self.controller_config.scalar_values[scalar_vars['ki'].get()]
+        kd_scalar = self.controller_config.scalar_values[scalar_vars['kd'].get()]
 
         kp = kp_raw * kp_scalar
         ki = ki_raw * ki_scalar
         kd = kd_raw * kd_scalar
 
-        self.pid_controller.set_gains(kp, ki, kd)
+        self.controller = self.controller_config.create_controller(
+            kp=kp, ki=ki, kd=kd, output_limit=15.0
+        )
 
-        if self.pid_enabled.get():
+    def on_controller_param_change(self):
+        """Update controller when parameters change."""
+        if self.controller is None:
+            return
+
+        sliders = self.controller_widgets['sliders']
+        scalar_vars = self.controller_widgets['scalar_vars']
+
+        kp_raw = float(sliders['kp'].get())
+        ki_raw = float(sliders['ki'].get())
+        kd_raw = float(sliders['kd'].get())
+
+        kp_scalar = self.controller_config.scalar_values[scalar_vars['kp'].get()]
+        ki_scalar = self.controller_config.scalar_values[scalar_vars['ki'].get()]
+        kd_scalar = self.controller_config.scalar_values[scalar_vars['kd'].get()]
+
+        kp = kp_raw * kp_scalar
+        ki = ki_raw * ki_scalar
+        kd = kd_raw * kd_scalar
+
+        self.controller.set_gains(kp, ki, kd)
+
+        if self.controller_enabled.get():
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
-    def on_pattern_change(self, event=None):
-        """Handle pattern selection change."""
-        pattern_type = self.pattern_type.get()
-
-        # Create new pattern with default parameters
-        if pattern_type == 'static':
-            self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
-            info = "Tracking: Center (0, 0)"
-        elif pattern_type == 'circle':
-            self.current_pattern = PatternFactory.create('circle', radius=50.0, period=10.0, clockwise=True)
-            info = "Tracking: Circle (r=50mm, T=10s)"
-        elif pattern_type == 'figure8':
-            self.current_pattern = PatternFactory.create('figure8', width=60.0, height=40.0, period=12.0)
-            info = "Tracking: Figure-8 (60×40mm, T=12s)"
-        elif pattern_type == 'star':
-            self.current_pattern = PatternFactory.create('star', radius=60.0, period=15.0)
-            info = "Tracking: 5-Point Star (r=60mm, T=15s)"
-        else:
-            return
-
-        self.pattern_info_label.config(text=info)
-        self.reset_pattern()
-        self.update_plot()
-        self.log(f"Pattern changed to: {pattern_type}")
-
-    def reset_pattern(self):
-        """Reset pattern to start from current time."""
-        self.pattern_start_time = self.simulation_time
-        self.current_pattern.reset()
-        self.log(f"Pattern reset at t={self.simulation_time:.2f}s")
-
-        if self.pid_enabled.get():
-            self.pid_controller.reset()
-
-    def apply_random_tilt(self, max_degrees=1.0):
-        """Apply small random tilt to platform (simulates imperfect placement)."""
-        if not self.pid_enabled.get():
-            # Don't apply random tilt if manual control is active
-            return
-
-        random_rx = np.random.uniform(-max_degrees, max_degrees)
-        random_ry = np.random.uniform(-max_degrees, max_degrees)
-
-        self.dof_values['rx'] = random_rx
-        self.dof_values['ry'] = random_ry
-
-        self.value_labels['rx'].config(text=f"{random_rx:.2f}")
-        self.value_labels['ry'].config(text=f"{random_ry:.2f}")
-
-        self.calculate_ik()
-
-        self.log(f"Platform disturbance: rx={random_rx:.2f}°, ry={random_ry:.2f}°")
-
-    def reset_ball(self):
-        home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
-        ball_start_height = (home_z / 1000) + self.ball_physics.radius
-
-        self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
-        self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
-        self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
-
-        if self.pid_enabled.get():
-            self.pid_controller.reset()
-            self.apply_random_tilt()  # Add disturbance when PID is active
-
-        self.update_plot()
-        self.log("Ball reset to center")
-
-    def push_ball(self):
-        vx = np.random.uniform(-0.05, 0.05)
-        vy = np.random.uniform(-0.05, 0.05)
-        self.ball_vel = torch.tensor([[vx, vy, 0.0]], dtype=torch.float32)
-        self.log(f"Ball pushed: vx={vx:.3f}, vy={vy:.3f} m/s")
-
-    def log(self, message):
-        self.log_text.insert(tk.END, f"[{self.simulation_time:.2f}s] {message}\n")
-        self.log_text.see(tk.END)
-
-    def on_offset_toggle(self):
-        enabled = self.use_top_surface_offset.get()
-        home_z = self.ik.home_height_top_surface if enabled else self.ik.home_height
-
-        self.sliders['z'].config(from_=home_z - 30, to=home_z + 30)
-        self.dof_values['z'] = home_z
-        self.sliders['z'].set(home_z)
-        self.value_labels['z'].config(text=f"{home_z:.2f}")
-
-        ball_start_height = (home_z / 1000) + self.ball_physics.radius
-        self.ball_pos[0, 2] = ball_start_height
-        self.log(f"Offset: {'Top Surface' if enabled else 'Anchor Center'}")
-
-    def on_slider_change(self, dof, value):
-        val = float(value)
-        self.dof_values[dof] = val
-        self.value_labels[dof].config(text=f"{val:.2f}")
-
-        if self.update_timer is not None:
-            self.root.after_cancel(self.update_timer)
-        self.update_timer = self.root.after(50, self.calculate_ik)
-
-    def calculate_ik(self):
-        translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
-        rotation = np.array([self.dof_values['rx'], self.dof_values['ry'], self.dof_values['rz']])
-
-        angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset.get())
-
-        if angles is not None:
-            for i in range(6):
-                self.cmd_angle_labels[i].config(text=f"S{i + 1}: {angles[i]:6.2f}°")
-
-            if self.simulation_running:
-                for i, servo in enumerate(self.servos):
-                    servo.send_command(angles[i], self.simulation_time)
-        else:
-            for i in range(6):
-                self.cmd_angle_labels[i].config(text=f"S{i + 1}: ERROR")
-
-    def start_simulation(self):
-        self.simulation_running = True
-        self.last_update_time = time.time()
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='normal')
-        self.log("Simulation started")
-        self.simulation_loop()
-
-    def stop_simulation(self):
-        self.simulation_running = False
-
-        # Cancel the simulation loop
-        if self.simulation_loop_id is not None:
-            self.root.after_cancel(self.simulation_loop_id)
-            self.simulation_loop_id = None
-
-        self.start_btn.config(state='normal')
-        self.stop_btn.config(state='disabled')
-        self.log("Simulation stopped")
-
-    def reset_simulation(self):
-        was_running = self.simulation_running
-        if was_running:
-            self.stop_simulation()
-
-        for servo in self.servos:
-            servo.reset()
-
-        self.simulation_time = 0.0
-        self.last_update_time = None
-        self.sim_time_label.config(text="Time: 0.00s")
-
-        for dof, (_, _, _, default, _) in self.dof_config.items():
-            if dof == 'z':
-                home_z = (self.ik.home_height_top_surface if self.use_top_surface_offset.get()
-                          else self.ik.home_height)
-                self.sliders[dof].set(home_z)
-            else:
-                self.sliders[dof].set(default)
-
-        self.reset_ball()
-
-        if self.pid_enabled.get():
-            self.pid_controller.reset()
-
-        self.log("Simulation reset")
-
-        if was_running:
-            self.start_simulation()
-
-    def simulation_loop(self):
-        if not self.simulation_running:
-            self.simulation_loop_id = None  # Clear the ID
-            return
-
-        current_time = time.time()
-        if self.last_update_time is not None:
-            dt = current_time - self.last_update_time
-            self.simulation_time += dt
-
-            # PID control loop
-            if self.pid_enabled.get():
-                try:
-                    ball_x_mm = self.ball_pos[0, 0].item() * 1000
-                    ball_y_mm = self.ball_pos[0, 1].item() * 1000
-
-                    # Get target position from trajectory pattern
-                    pattern_time = self.simulation_time - self.pattern_start_time
-                    target_x, target_y = self.current_pattern.get_position(pattern_time)
-                    target_pos_mm = (target_x, target_y)
-
-                    rx, ry = self.pid_controller.update((ball_x_mm, ball_y_mm), target_pos_mm, dt)
-
-                    # Update dof values with PID output
-                    self.dof_values['rx'] = rx
-                    self.dof_values['ry'] = ry
-
-                    # Update displays
-                    self.value_labels['rx'].config(text=f"{rx:.2f}")
-                    self.value_labels['ry'].config(text=f"{ry:.2f}")
-
-                    # Update PID output display
-                    error_x = target_pos_mm[0] - ball_x_mm
-                    error_y = target_pos_mm[1] - ball_y_mm
-                    self.pid_output_label.config(text=f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
-                    self.pid_error_label.config(text=f"Error: ({error_x:.1f}, {error_y:.1f}) mm")
-
-                    # Debug logging (every 2 seconds)
-                    if int(self.simulation_time * 0.5) % 2 == 0 and int((self.simulation_time - dt) * 0.5) % 2 == 1:
-                        self.log(f"Target: ({target_x:.1f},{target_y:.1f})mm "
-                                 f"Ball: ({ball_x_mm:.1f},{ball_y_mm:.1f})mm "
-                                 f"Error: ({error_x:.1f},{error_y:.1f})mm")
-
-                    # Calculate IK with PID-controlled tilt
-                    translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
-                    rotation = np.array([rx, ry, self.dof_values['rz']])
-
-                    angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset.get())
-
-                    if angles is not None:
-                        for i in range(6):
-                            self.cmd_angle_labels[i].config(text=f"S{i + 1}: {angles[i]:6.2f}°")
-                            self.servos[i].send_command(angles[i], self.simulation_time)
-                    else:
-                        self.log("PID: IK solution out of range")
-
-                except Exception as e:
-                    self.log(f"PID control error: {str(e)}")
-                    self.pid_enabled.set(False)
-                    self.on_pid_toggle()
-
-            # Update servos
-            for servo in self.servos:
-                servo.update(dt, self.simulation_time)
-
-            actual_angles = np.array([servo.get_angle() for servo in self.servos])
-
-            for i in range(6):
-                self.actual_angle_labels[i].config(text=f"S{i + 1}: {actual_angles[i]:6.2f}°")
-
-            translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
-                actual_angles, use_top_surface_offset=self.use_top_surface_offset.get()
-            )
-
-            if success:
-                self.fk_pos_label.config(
-                    text=f"X: {translation[0]:6.2f}  Y: {translation[1]:6.2f}  Z: {translation[2]:6.2f} mm"
-                )
-                self.fk_rot_label.config(
-                    text=f"Roll: {rotation[0]:6.2f}  Pitch: {rotation[1]:6.2f}  Yaw: {rotation[2]:6.2f}°"
-                )
-
-                try:
-                    platform_pose = torch.tensor([[
-                        translation[0] / 1000, translation[1] / 1000, translation[2] / 1000,
-                        rotation[0], rotation[1], rotation[2]
-                    ]], dtype=torch.float32)
-
-                    self.ball_pos, self.ball_vel, self.ball_omega, contact_info = \
-                        self.ball_physics.step(
-                            self.ball_pos, self.ball_vel, self.ball_omega, platform_pose, dt,
-                            platform_angular_accel=self.platform_angular_accel
-                        )
-                    if contact_info.get('fell_off', False):
-                        self.log("Ball fell off platform")
-                        if self.pid_enabled.get():
-                            self.apply_random_tilt()  # Add disturbance on auto-reset
-
-                    ball_x_mm = self.ball_pos[0, 0].item() * 1000
-                    ball_y_mm = self.ball_pos[0, 1].item() * 1000
-                    vel_x_mm = self.ball_vel[0, 0].item() * 1000
-                    vel_y_mm = self.ball_vel[0, 1].item() * 1000
-
-                    self.ball_pos_label.config(text=f"Position: ({ball_x_mm:.1f}, {ball_y_mm:.1f}) mm")
-                    self.ball_vel_label.config(text=f"Velocity: ({vel_x_mm:.1f}, {vel_y_mm:.1f}) mm/s")
-
-                except Exception as e:
-                    self.log(f"Physics error: {str(e)}")
-                    self.reset_ball()
-
-                if self.last_update_time is not None:
-                    rx_now = rotation[0]
-                    ry_now = rotation[1]
-
-                    # Angular velocity (deg/s)
-                    omega_rx = (rx_now - self.prev_platform_angles['rx']) / dt
-                    omega_ry = (ry_now - self.prev_platform_angles['ry']) / dt
-
-                    # Angular acceleration (deg/s²)
-                    alpha_rx = (omega_rx - self.platform_angular_vel['rx']) / dt
-                    alpha_ry = (omega_ry - self.platform_angular_vel['ry']) / dt
-
-                    self.platform_angular_vel['rx'] = omega_rx
-                    self.platform_angular_vel['ry'] = omega_ry
-                    self.platform_angular_accel['rx'] = alpha_rx
-                    self.platform_angular_accel['ry'] = alpha_ry
-
-                    self.prev_platform_angles['rx'] = rx_now
-                    self.prev_platform_angles['ry'] = ry_now
-
-            self.update_plot()
-
-        self.last_update_time = current_time
-        self.sim_time_label.config(text=f"Time: {self.simulation_time:.2f}s")
-
-        # Schedule next iteration and save the callback ID
-        self.simulation_loop_id = self.root.after(self.update_rate_ms, self.simulation_loop)
-
-    def on_closing(self):
-        """Clean shutdown when window is closed."""
-        # Stop simulation
-        self.simulation_running = False
-
-        # Cancel the simulation loop callback
-        if self.simulation_loop_id is not None:
-            try:
-                self.root.after_cancel(self.simulation_loop_id)
-                self.simulation_loop_id = None
-            except:
-                pass  # Window might already be destroyed
-
-        # Cancel any pending update timer
-        if self.update_timer is not None:
-            try:
-                self.root.after_cancel(self.update_timer)
-            except:
-                pass
-
-        # Destroy the window
-        try:
-            self.root.quit()  # Exit mainloop first
-            self.root.destroy()
-        except:
-            pass
+    def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
+        """Update PID controller."""
+        return self.controller.update(ball_pos_mm, target_pos_mm, dt)
 
 
 def main():
     root = tk.Tk()
-    app = StewartSimulatorGUI(root)
+    app = PIDStewartSimulator(root)
     root.mainloop()
 
 
