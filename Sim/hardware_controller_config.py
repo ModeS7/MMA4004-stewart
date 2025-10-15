@@ -13,7 +13,7 @@ Key differences from simulation:
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 import numpy as np
 import time
 import threading
@@ -21,8 +21,9 @@ import serial
 import serial.tools.list_ports
 from queue import Queue, Empty
 
-from base_simulator import ControllerConfig, BaseStewartSimulator
+from PID_ball_sim import PIDControllerConfig
 from control_core import PIDController
+from utils import ControlLoopConfig, GUIConfig
 
 
 # ============================================================================
@@ -39,7 +40,6 @@ class IKCache:
         self.misses = 0
 
     def get_key(self, translation, rotation):
-        # Round to 1mm and 1° for high cache hit rate
         t_key = tuple(np.round(translation, 0))
         r_key = tuple(np.round(rotation, 0))
         return (t_key, r_key)
@@ -114,9 +114,9 @@ class SerialController:
         self.running = False
 
         if self.read_thread:
-            self.read_thread.join(timeout=1)
+            self.read_thread.join(timeout=1.0)
         if self.write_thread:
-            self.write_thread.join(timeout=1)
+            self.write_thread.join(timeout=1.0)
 
         if self.serial and self.serial.is_open:
             self.serial.close()
@@ -207,14 +207,13 @@ class SerialController:
             current_time = time.time()
             time_since_last = current_time - self.last_command_time
 
-            # Adaptive rate limiting based on queue size
             queue_size = self.command_queue.qsize()
             if queue_size > 10:
                 min_interval = 0.05
             elif queue_size > 5:
                 min_interval = 0.02
             else:
-                min_interval = 0.01
+                min_interval = ControlLoopConfig.INTERVAL_S
 
             if time_since_last < min_interval:
                 return True
@@ -261,115 +260,35 @@ class SerialController:
 # HARDWARE CONTROLLER CONFIGURATION
 # ============================================================================
 
-class HardwareControllerConfig(ControllerConfig):
-    """Configuration for hardware PID controller with camera."""
+class HardwareControllerConfig(PIDControllerConfig):
+    """Hardware PID configuration with camera-specific extensions."""
 
     def __init__(self):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
-                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
-        self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
-        self.default_scalar_idx = 3  # 0.01
+        super().__init__()
+        self.default_scalar_idx = 3  # 0.01 for hardware
 
     def get_controller_name(self) -> str:
         return "PID (Hardware)"
 
     def create_controller(self, **kwargs):
-        return PIDController(
-            kp=kwargs.get('kp', 0.03),
-            ki=kwargs.get('ki', 0.01),
-            kd=kwargs.get('kd', 0.03),
-            output_limit=kwargs.get('output_limit', 15.0),
-            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', 0.1)  # Light filtering for camera
-        )
-
-    def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
-        """Create PID gain parameter widgets."""
-        gains = [
-            ('kp', 'P (Proportional)', self.default_gains['kp']),
-            ('ki', 'I (Integral)', self.default_gains['ki']),
-            ('kd', 'D (Derivative)', self.default_gains['kd'])
-        ]
-
-        sliders = {}
-        value_labels = {}
-        scalar_vars = {}
-
-        for gain_name, label, default in gains:
-            frame = ttk.Frame(parent_frame)
-            frame.pack(fill='x', pady=5)
-
-            ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(
-                row=0, column=0, sticky='w', pady=2
-            )
-
-            slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
-            slider.grid(row=0, column=1, sticky='ew', padx=10)
-            slider.set(default)
-            sliders[gain_name] = slider
-
-            value_label = ttk.Label(frame, text=f"{default:.2f}", width=6,
-                                    font=('Consolas', 9))
-            value_label.grid(row=0, column=2)
-            value_labels[gain_name] = value_label
-
-            scalar_var = tk.IntVar(value=self.default_scalar_idx)
-            scalar_vars[gain_name] = scalar_var
-
-            scalar_combo = ttk.Combobox(
-                frame, width=12, state='readonly',
-                values=[f'×{s:.7g}' for s in self.scalar_values]
-            )
-            scalar_combo.grid(row=0, column=3, padx=(5, 0))
-            scalar_combo.current(self.default_scalar_idx)
-
-            # Bind events
-            slider.config(command=lambda val, g=gain_name: self._on_slider_change(
-                g, val, sliders, value_labels, on_param_change_callback
-            ))
-            scalar_combo.bind('<<ComboboxSelected>>',
-                              lambda e, combo=scalar_combo, var=scalar_var, g=gain_name:
-                              self._on_scalar_change(combo, var, g, on_param_change_callback))
-
-            frame.columnconfigure(1, weight=1)
-
-        return {
-            'sliders': sliders,
-            'value_labels': value_labels,
-            'scalar_vars': scalar_vars,
-            'update_fn': lambda: None
-        }
-
-    def _on_slider_change(self, gain_name, value, sliders, value_labels, callback):
-        """Handle slider value change."""
-        val = float(value)
-        value_labels[gain_name].config(text=f"{val:.2f}")
-        callback()
-
-    def _on_scalar_change(self, combo, var, gain_name, callback):
-        """Handle scalar selection change."""
-        var.set(combo.current())
-        callback()
-
-    def get_scalar_values(self) -> list:
-        return self.scalar_values
+        kwargs.setdefault('derivative_filter_alpha', 0.1)
+        return super().create_controller(**kwargs)
 
     def create_info_widgets(self, parent_frame, colors, controller_instance):
         """Add hardware-specific info widgets."""
-        # Camera calibration
         cal_frame = ttk.LabelFrame(parent_frame, text="Camera Calibration", padding=10)
         cal_frame.pack(fill='x', pady=(10, 0))
 
         ttk.Label(cal_frame, text="Width (mm):").grid(row=0, column=0, sticky='w', pady=2)
         width_entry = ttk.Entry(cal_frame, width=10)
-        width_entry.insert(0, "200.0")
+        width_entry.insert(0, "350.0")
         width_entry.grid(row=0, column=1, padx=5, pady=2)
 
         ttk.Label(cal_frame, text="Height (mm):").grid(row=1, column=0, sticky='w', pady=2)
         height_entry = ttk.Entry(cal_frame, width=10)
-        height_entry.insert(0, "133.0")
+        height_entry.insert(0, "266.0")
         height_entry.grid(row=1, column=1, padx=5, pady=2)
 
-        # Performance stats button
         ttk.Button(parent_frame, text="Show Performance Stats",
                    command=lambda: print("Stats requested"),
                    width=20).pack(pady=(10, 0))

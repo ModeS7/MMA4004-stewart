@@ -4,7 +4,6 @@ PID Controller Configuration for Stewart Platform Simulator
 """
 
 import tkinter as tk
-from tkinter import ttk
 from base_simulator import ControllerConfig, BaseStewartSimulator
 from control_core import PIDController
 
@@ -13,7 +12,8 @@ class PIDControllerConfig(ControllerConfig):
     """Configuration for PID controller."""
 
     def __init__(self):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]
+        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
+                              0.001, 0.01, 0.1, 1.0, 10.0]
         self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
         self.default_scalar_idx = 4  # 0.001
 
@@ -26,7 +26,7 @@ class PIDControllerConfig(ControllerConfig):
             ki=kwargs.get('ki', 0.001),
             kd=kwargs.get('kd', 0.003),
             output_limit=kwargs.get('output_limit', 15.0),
-            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', 0.0)  # No filtering for simulation
+            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', 0.0)
         )
 
     def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
@@ -41,65 +41,19 @@ class PIDControllerConfig(ControllerConfig):
         value_labels = {}
         scalar_vars = {}
 
-        for gain_name, label, default in gains:
-            frame = ttk.Frame(parent_frame)
-            frame.pack(fill='x', pady=5)
-
-            ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(
-                row=0, column=0, sticky='w', pady=2
+        for param_name, label, default in gains:
+            self.create_parameter_slider(
+                parent_frame, param_name, label, default,
+                sliders, value_labels, scalar_vars,
+                on_param_change_callback
             )
 
-            slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
-            slider.grid(row=0, column=1, sticky='ew', padx=10)
-            slider.set(default)
-            sliders[gain_name] = slider
-
-            value_label = ttk.Label(frame, text=f"{default:.2f}", width=6, font=('Consolas', 9))
-            value_label.grid(row=0, column=2)
-            value_labels[gain_name] = value_label
-
-            scalar_var = tk.IntVar(value=self.default_scalar_idx)
-            scalar_vars[gain_name] = scalar_var
-
-            scalar_combo = ttk.Combobox(
-                frame, width=12, state='readonly',
-                values=[f'×{s:.7g}' for s in self.scalar_values]
-            )
-            scalar_combo.grid(row=0, column=3, padx=(5, 0))
-            scalar_combo.current(self.default_scalar_idx)
-
-            # Bind events
-            slider.config(command=lambda val, g=gain_name: self._on_slider_change(
-                g, val, sliders, value_labels, on_param_change_callback
-            ))
-            scalar_combo.bind('<<ComboboxSelected>>', lambda e, combo=scalar_combo, var=scalar_var, g=gain_name:
-            self._on_scalar_change(combo, var, g, on_param_change_callback))
-
-            frame.columnconfigure(1, weight=1)
-
-        # Return widget references and update function
         return {
             'sliders': sliders,
             'value_labels': value_labels,
             'scalar_vars': scalar_vars,
-            'update_fn': lambda: self._update_gains(sliders, scalar_vars, on_param_change_callback)
+            'update_fn': lambda: None
         }
-
-    def _on_slider_change(self, gain_name, value, sliders, value_labels, callback):
-        """Handle slider value change."""
-        val = float(value)
-        value_labels[gain_name].config(text=f"{val:.2f}")
-        callback()
-
-    def _on_scalar_change(self, combo, var, gain_name, callback):
-        """Handle scalar selection change."""
-        var.set(combo.current())
-        callback()
-
-    def _update_gains(self, sliders, scalar_vars, callback):
-        """Update PID gains (called by callback mechanism)."""
-        # This is handled by the parent callback mechanism
-        pass
 
     def get_scalar_values(self) -> list:
         return self.scalar_values
@@ -121,21 +75,15 @@ class PIDStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        kp_raw = float(sliders['kp'].get())
-        ki_raw = float(sliders['ki'].get())
-        kd_raw = float(sliders['kd'].get())
-
-        kp_scalar = self.controller_config.scalar_values[scalar_vars['kp'].get()]
-        ki_scalar = self.controller_config.scalar_values[scalar_vars['ki'].get()]
-        kd_scalar = self.controller_config.scalar_values[scalar_vars['kd'].get()]
-
-        kp = kp_raw * kp_scalar
-        ki = ki_raw * ki_scalar
-        kd = kd_raw * kd_scalar
+        kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
+        ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
+        kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
 
         self.controller = self.controller_config.create_controller(
             kp=kp, ki=ki, kd=kd, output_limit=15.0
         )
+
+        self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
     def on_controller_param_change(self):
         """Update controller when parameters change."""
@@ -145,17 +93,9 @@ class PIDStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        kp_raw = float(sliders['kp'].get())
-        ki_raw = float(sliders['ki'].get())
-        kd_raw = float(sliders['kd'].get())
-
-        kp_scalar = self.controller_config.scalar_values[scalar_vars['kp'].get()]
-        ki_scalar = self.controller_config.scalar_values[scalar_vars['ki'].get()]
-        kd_scalar = self.controller_config.scalar_values[scalar_vars['kd'].get()]
-
-        kp = kp_raw * kp_scalar
-        ki = ki_raw * ki_scalar
-        kd = kd_raw * kd_scalar
+        kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
+        ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
+        kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
 
         self.controller.set_gains(kp, ki, kd)
 

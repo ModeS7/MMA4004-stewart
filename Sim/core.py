@@ -5,12 +5,14 @@ Stewart Platform Core Components
 Shared classes for Stewart platform simulation and control:
 - FirstOrderServo: Servo dynamics model
 - StewartPlatformIK: Inverse and forward kinematics
-- SimpleBallPhysics2D: 2D ball physics with ROLLING
+- SimpleBallPhysics2D: 2D ball physics with rolling motion
 """
 
 import numpy as np
 import torch
 from collections import deque
+
+from utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM
 
 
 class FirstOrderServo:
@@ -60,13 +62,13 @@ class StewartPlatformIK:
         self.platform_anchors = platform_anchors
         self.top_surface_offset = top_surface_offset
 
-        base_angels = np.array([-np.pi / 2, np.pi / 6, np.pi * 5 / 6])
-        platform_angels = np.array([-np.pi * 5 / 6, -np.pi / 6, np.pi / 2])
+        base_angles = np.array([-np.pi / 2, np.pi / 6, np.pi * 5 / 6])
+        platform_angles = np.array([-np.pi * 5 / 6, -np.pi / 6, np.pi / 2])
 
-        self.base_anchors = self.calculate_home_coordinates(self.base, self.base_anchors, base_angels)
-        platform_anchors_out_of_fase = self.calculate_home_coordinates(self.platform, self.platform_anchors,
-                                                                       platform_angels)
-        self.platform_anchors = np.roll(platform_anchors_out_of_fase, shift=-1, axis=0)
+        self.base_anchors = self.calculate_home_coordinates(self.base, self.base_anchors, base_angles)
+        platform_anchors_out_of_phase = self.calculate_home_coordinates(self.platform, self.platform_anchors,
+                                                                        platform_angles)
+        self.platform_anchors = np.roll(platform_anchors_out_of_phase, shift=-1, axis=0)
 
         self.beta_angles = self._calculate_beta_angles()
 
@@ -81,12 +83,12 @@ class StewartPlatformIK:
         self.home_height_top_surface = self.home_height + self.top_surface_offset
 
     def calculate_home_coordinates(self, l, d, phi):
-        angels = np.array([-np.pi / 2, np.pi / 2])
+        angles = np.array([-np.pi / 2, np.pi / 2])
         xy = np.zeros((6, 3))
         for i in range(len(phi)):
-            for j in range(len(angels)):
-                x = l * np.cos(phi[i]) + d * np.cos(phi[i] + angels[j])
-                y = l * np.sin(phi[i]) + d * np.sin(phi[i] + angels[j])
+            for j in range(len(angles)):
+                x = l * np.cos(phi[i]) + d * np.cos(phi[i] + angles[j])
+                y = l * np.sin(phi[i]) + d * np.sin(phi[i] + angles[j])
                 xy[i * 2 + j] = np.array([x, y, 0])
         return xy
 
@@ -145,7 +147,7 @@ class StewartPlatformIK:
             alpha_k = np.arcsin(ratio) - np.arctan2(f_k, e_k)
             angles[k] = np.degrees(alpha_k)
 
-            if abs(angles[k]) > 40:
+            if abs(angles[k]) > MAX_SERVO_ANGLE_DEG:
                 return None
 
         return -angles
@@ -219,11 +221,12 @@ class StewartPlatformIK:
             translation += pose_update[:3]
             rotation += pose_update[3:]
 
-            if np.linalg.norm(translation[:2]) > 100:
+            # Convergence bounds for FK iteration (wider than control limits)
+            if np.linalg.norm(translation[:2]) > PLATFORM_HALF_SIZE_MM:
                 return None, None, False, iteration
             if translation[2] < 0 or translation[2] > 300:
                 return None, None, False, iteration
-            if np.any(np.abs(rotation) > 45):
+            if np.any(np.abs(rotation) > 45):  # FK convergence limit, not control limit
                 return None, None, False, iteration
 
         return None, None, False, max_iterations
@@ -255,15 +258,16 @@ class StewartPlatformIK:
 
 class SimpleBallPhysics2D:
     """
-    2D Ball Physics with PROPER ROLLING (not sliding)
+    2D Ball Physics with rolling motion.
 
     Physics model:
     - Ball rolls (not slides) on tilted surface
-    - Angular velocity (omega) tracked and coupled to linear velocity
+    - Angular velocity tracked and coupled to linear velocity
     - Rolling constraint: v = omega × r
-    - For solid sphere rolling down slope: a = (5/7) * g * sin(theta)
-    - For hollow sphere rolling down slope: a = (3/5) * g * sin(theta)
-    - Rolling resistance for realistic energy dissipation
+    - Acceleration depends on moment of inertia:
+        * Solid sphere: a = (5/7) * g * sin(theta)
+        * Hollow sphere: a = (3/5) * g * sin(theta)
+    - Rolling resistance for energy dissipation
     """
 
     def __init__(self,
@@ -271,39 +275,32 @@ class SimpleBallPhysics2D:
                  ball_mass=0.0027,
                  gravity=9.81,
                  rolling_friction=0.01,
-                 sphere_type='hollow'):  # ← Add this parameter
-
+                 sphere_type='hollow'):
         self.radius = ball_radius
         self.mass = ball_mass
         self.g = gravity
         self.mu_roll = rolling_friction
         self.sphere_type = sphere_type
 
-        # Calculate moment of inertia based on sphere type
         self.update_sphere_type(sphere_type)
 
     def update_sphere_type(self, sphere_type):
-        """Update moment of inertia and mass factor based on sphere type."""
+        """Update moment of inertia based on sphere type."""
         self.sphere_type = sphere_type
 
         if sphere_type == 'solid':
-            # Solid sphere: I = (2/5) * m * r²
             self.I = (2.0 / 5.0) * self.mass * self.radius ** 2
         elif sphere_type == 'hollow':
-            # Hollow sphere (thin shell): I = (2/3) * m * r²
             self.I = (2.0 / 3.0) * self.mass * self.radius ** 2
         else:
             raise ValueError(f"Unknown sphere_type: {sphere_type}. Use 'solid' or 'hollow'")
 
-        # For rolling motion, effective mass factor
-        # a = F / m_eff, where m_eff = m * (1 + I/(m*r²))
-        # Solid: 1 + 2/5 = 7/5 = 1.4
-        # Hollow: 1 + 2/3 = 5/3 ≈ 1.667
+        # Effective mass factor for rolling: m_eff = m * (1 + I/(m*r²))
         self.mass_factor = 1.0 + self.I / (self.mass * self.radius ** 2)
 
     def step(self, ball_pos, ball_vel, ball_omega, platform_pose, dt, platform_angular_accel=None):
         """
-        Step physics using RK4 integration with ROLLING.
+        Step physics using RK4 integration with rolling motion.
 
         Args:
             ball_pos: (batch, 3) - only X and Y matter, Z is computed
@@ -311,6 +308,7 @@ class SimpleBallPhysics2D:
             ball_omega: (batch, 3) - angular velocity [wx, wy, wz] (rad/s)
             platform_pose: (batch, 6) [x, y, z, rx, ry, rz]
             dt: timestep
+            platform_angular_accel: optional dict with 'rx' and 'ry' angular accelerations
 
         Returns:
             new_pos, new_vel, new_omega, contact_info
@@ -318,22 +316,21 @@ class SimpleBallPhysics2D:
         batch_size = ball_pos.shape[0]
         device = ball_pos.device
 
-        # Extract 2D state
         xy_pos = ball_pos[:, :2]
         xy_vel = ball_vel[:, :2]
-        xy_omega = ball_omega[:, :2]  # Only X and Y components matter for 2D rolling
+        xy_omega = ball_omega[:, :2]
 
-        # Use generic RK4 integration
         state = (xy_pos, xy_vel, xy_omega)
         new_xy_pos, new_xy_vel, new_xy_omega = rk4_step(
             state,
             self._compute_derivatives,
             dt,
-            platform_pose
+            platform_pose,
+            platform_angular_accel
         )
 
-        # Check boundary (square platform ±100mm)
-        max_xy = 0.1  # 100mm = 0.1 meters
+        # Check platform boundary
+        max_xy = PLATFORM_HALF_SIZE_MM / 1000.0  # Convert mm to meters
         fell_off = (torch.abs(new_xy_pos[:, 0]) > max_xy) | (torch.abs(new_xy_pos[:, 1]) > max_xy)
 
         contact_info = {'fell_off': False}
@@ -346,10 +343,8 @@ class SimpleBallPhysics2D:
                     new_xy_omega[i] = 0.0
             contact_info['fell_off'] = True
 
-        # Compute Z position
         platform_z = self._compute_platform_height(new_xy_pos, platform_pose)
 
-        # Reconstruct 3D vectors
         new_ball_pos = torch.zeros((batch_size, 3), device=device)
         new_ball_pos[:, :2] = new_xy_pos
         new_ball_pos[:, 2] = platform_z + self.radius
@@ -365,82 +360,53 @@ class SimpleBallPhysics2D:
 
         return new_ball_pos, new_ball_vel, new_ball_omega, contact_info
 
-    def _compute_derivatives(self, state, platform_pose):
-        """
-        Compute derivatives for RK4 with ROLLING physics.
-
-        Args:
-            state: tuple of (xy_pos, xy_vel, xy_omega)
-            platform_pose: platform pose tensor
-
-        Returns:
-            tuple of (d_pos, d_vel, d_omega)
-        """
+    def _compute_derivatives(self, state, platform_pose, platform_angular_accel=None):
+        """Compute derivatives for RK4 with rolling physics."""
         xy_pos, xy_vel, xy_omega = state
 
-        # Position derivative is velocity
         d_pos = xy_vel
-
-        # Compute accelerations (linear and angular)
-        d_vel, d_omega = self._compute_accelerations(xy_pos, xy_vel, xy_omega, platform_pose)
+        d_vel, d_omega = self._compute_accelerations(xy_pos, xy_vel, xy_omega,
+                                                     platform_pose, platform_angular_accel)
 
         return d_pos, d_vel, d_omega
 
     def _compute_accelerations(self, xy_pos, xy_vel, xy_omega, platform_pose, platform_angular_accel=None):
         """
-        Compute accelerations for a ROLLING ball on tilted surface.
+        Compute accelerations for rolling ball on tilted surface.
 
         Accounts for:
         - Gravitational component down the slope
-        - Vertical acceleration of platform at ball position (changes effective gravity)
+        - Platform vertical acceleration (changes effective gravity)
         - Rolling dynamics (moment of inertia)
         """
         batch_size = xy_pos.shape[0]
-        device = xy_pos.device
 
-        # Extract rotation angles
-        rx = torch.deg2rad(platform_pose[:, 3])  # roll
-        ry = torch.deg2rad(platform_pose[:, 4])  # pitch
+        rx = torch.deg2rad(platform_pose[:, 3])
+        ry = torch.deg2rad(platform_pose[:, 4])
 
-        # Ball position relative to platform center (in meters)
         ball_x = xy_pos[:, 0]
         ball_y = xy_pos[:, 1]
 
-        # Compute vertical acceleration of platform at ball's position
-        # This comes from platform_angular_accel if we track it
-        # For now, we'll use a simplified model based on current angles
-        # (assumes quasi-static: angular velocity ≈ 0)
-
-        # Compute effective gravity accounting for platform vertical acceleration
         g_eff = self.g
 
         if platform_angular_accel is not None:
-            # Vertical acceleration at ball position due to platform rotation
-            # a_z = x·(d²ry/dt²) - y·(d²rx/dt²)
-            # Convert angular accel from deg/s² to rad/s²
             alpha_rx_rad = platform_angular_accel['rx'] * (np.pi / 180.0)
             alpha_ry_rad = platform_angular_accel['ry'] * (np.pi / 180.0)
 
-            # Vertical acceleration at ball position (simplified, assuming small angles)
             a_z_platform = ball_x * alpha_ry_rad - ball_y * alpha_rx_rad
-
-            # Modify effective gravity
             g_eff = self.g - a_z_platform
-
-            # Clamp to reasonable range (platform can't create negative gravity)
             g_eff = torch.clamp(g_eff, 0.1 * self.g, 2.0 * self.g)
 
-        # Rest of function uses g_eff instead of self.g
         gx = -g_eff * torch.sin(ry)
         gy = -g_eff * torch.sin(rx)
 
-        # For rolling motion, acceleration is reduced by rotational inertia
+        # Rolling reduces acceleration by mass factor
         ax = gx / self.mass_factor
         ay = gy / self.mass_factor
 
         accel_linear = torch.stack([ax, ay], dim=1)
 
-        # Rolling resistance (opposes motion)
+        # Rolling resistance
         vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
         rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + 1e-8)
 
@@ -449,7 +415,7 @@ class SimpleBallPhysics2D:
         # Angular acceleration from rolling constraint
         accel_angular = accel_linear / self.radius
 
-        # Additional damping on angular velocity
+        # Angular velocity damping
         omega_damping = -self.mu_roll * xy_omega
         accel_angular = accel_angular + omega_damping
 
@@ -457,7 +423,7 @@ class SimpleBallPhysics2D:
 
     def _compute_platform_height(self, xy_pos, platform_pose):
         """Compute platform Z height at given XY position."""
-        px = platform_pose[:, 0] / 1000  # mm to m
+        px = platform_pose[:, 0] / 1000
         py = platform_pose[:, 1] / 1000
         pz = platform_pose[:, 2] / 1000
 
@@ -477,30 +443,25 @@ def rk4_step(state, derivative_fn, dt, *args):
     Generic RK4 (Runge-Kutta 4th order) integration step.
 
     Args:
-        state: tuple of tensors representing the system state
-        derivative_fn: function that computes derivatives, signature: (state, *args) -> derivatives
+        state: tuple of tensors representing system state
+        derivative_fn: function computing derivatives
         dt: timestep
-        *args: additional arguments passed to derivative_fn
+        *args: additional arguments for derivative_fn
 
     Returns:
         tuple of new state tensors
     """
-    # k1 = f(t, y)
     k1 = derivative_fn(state, *args)
 
-    # k2 = f(t + dt/2, y + k1*dt/2)
     state_k2 = tuple(s + 0.5 * dt * k for s, k in zip(state, k1))
     k2 = derivative_fn(state_k2, *args)
 
-    # k3 = f(t + dt/2, y + k2*dt/2)
     state_k3 = tuple(s + 0.5 * dt * k for s, k in zip(state, k2))
     k3 = derivative_fn(state_k3, *args)
 
-    # k4 = f(t + dt, y + k3*dt)
     state_k4 = tuple(s + dt * k for s, k in zip(state, k3))
     k4 = derivative_fn(state_k4, *args)
 
-    # y_new = y + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
     new_state = tuple(
         s + (dt / 6.0) * (k1_i + 2 * k2_i + 2 * k3_i + 4 * k4_i)
         for s, k1_i, k2_i, k3_i, k4_i in zip(state, k1, k2, k3, k4)
@@ -514,7 +475,6 @@ class TrajectoryPattern:
     Base class for trajectory patterns.
 
     All patterns return positions in millimeters and velocities in mm/s.
-    Time-based parametric equations for smooth, continuous motion.
     """
 
     def get_position(self, t):
@@ -550,12 +510,6 @@ class CirclePattern(TrajectoryPattern):
     """Circular trajectory pattern."""
 
     def __init__(self, radius=50.0, period=10.0, clockwise=True):
-        """
-        Args:
-            radius: circle radius in mm
-            period: time to complete one revolution in seconds
-            clockwise: direction of rotation
-        """
         self.radius = radius
         self.period = period
         self.omega = 2 * np.pi / period
@@ -578,66 +532,38 @@ class FigureEightPattern(TrajectoryPattern):
     """Figure-8 (lemniscate) trajectory pattern."""
 
     def __init__(self, width=60.0, height=40.0, period=12.0):
-        """
-        Args:
-            width: total width of figure-8 in mm
-            height: total height of figure-8 in mm
-            period: time to complete one full cycle in seconds
-        """
-        self.a = width / 2.0  # semi-width
-        self.b = height / 2.0  # semi-height
+        self.a = width / 2.0
+        self.b = height / 2.0
         self.omega = 2 * np.pi / period
 
     def get_position(self, t):
-        # Parametric equations for figure-8 (lemniscate)
         angle = self.omega * t
-
-        # Lemniscate of Gerono: x = a*cos(t), y = b*sin(t)*cos(t)
         x = self.a * np.cos(angle)
         y = self.b * np.sin(angle) * np.cos(angle)
-
         return x, y
 
     def get_velocity(self, t):
         angle = self.omega * t
-
-        # Derivatives of parametric equations
         vx = -self.a * self.omega * np.sin(angle)
-        # d/dt[sin(t)*cos(t)] = cos²(t) - sin²(t) = cos(2t)
         vy = self.b * self.omega * np.cos(2 * angle)
-
         return vx, vy
 
 
 class StarPattern(TrajectoryPattern):
-    """Five-pointed star trajectory pattern (connects every 2nd point)."""
+    """Five-pointed star trajectory pattern."""
 
     def __init__(self, radius=60.0, period=15.0):
-        """
-        Args:
-            radius: radius to star points in mm
-            period: time to trace complete star in seconds
-        """
         self.radius = radius
         self.period = period
-
-        # 5 points around a circle
         self.num_vertices = 5
-
-        # Visit order: 0 → 2 → 4 → 1 → 3 → 0 (every 2nd point creates star)
         self.visit_order = [0, 2, 4, 1, 3, 0]
-
-        # Compute positions of the 5 vertices
         self.vertex_positions = self._compute_vertex_positions()
-
-        # Positions in drawing order
         self.path_positions = [self.vertex_positions[i] for i in self.visit_order]
 
     def _compute_vertex_positions(self):
         """Compute (x, y) positions of 5 vertices around circle."""
         positions = []
         for i in range(self.num_vertices):
-            # Start at top (90°), go clockwise
             angle = np.pi / 2 - i * (2 * np.pi / self.num_vertices)
             x = self.radius * np.cos(angle)
             y = self.radius * np.sin(angle)
@@ -645,20 +571,11 @@ class StarPattern(TrajectoryPattern):
         return positions
 
     def get_position(self, t):
-        # Normalize time to [0, 1] for one complete cycle
         t_norm = (t % self.period) / self.period
-
-        # Star has 5 line segments (6 points including return to start)
         num_segments = len(self.path_positions) - 1
-
-        # Which segment are we on? (0 to 4)
-        segment_idx = int(t_norm * num_segments)
-        segment_idx = min(segment_idx, num_segments - 1)
-
-        # Progress within current segment [0, 1]
+        segment_idx = min(int(t_norm * num_segments), num_segments - 1)
         segment_progress = (t_norm * num_segments) % 1.0
 
-        # Linear interpolation between current and next point
         current_pos = self.path_positions[segment_idx]
         next_pos = self.path_positions[segment_idx + 1]
 
@@ -668,41 +585,28 @@ class StarPattern(TrajectoryPattern):
         return x, y
 
     def get_velocity(self, t):
-        # Normalize time to [0, 1]
         t_norm = (t % self.period) / self.period
-
         num_segments = len(self.path_positions) - 1
+        segment_idx = min(int(t_norm * num_segments), num_segments - 1)
 
-        # Which segment?
-        segment_idx = int(t_norm * num_segments)
-        segment_idx = min(segment_idx, num_segments - 1)
-
-        # Velocity is constant along each line segment
         current_pos = self.path_positions[segment_idx]
         next_pos = self.path_positions[segment_idx + 1]
 
-        # Distance for this segment
         dx = next_pos[0] - current_pos[0]
         dy = next_pos[1] - current_pos[1]
 
-        # Time per segment
         segment_time = self.period / num_segments
 
-        # Velocity (mm/s)
         vx = dx / segment_time
         vy = dy / segment_time
 
         return vx, vy
 
+
 class StaticPattern(TrajectoryPattern):
     """Static position (no movement)."""
 
     def __init__(self, x=0.0, y=0.0):
-        """
-        Args:
-            x: x position in mm
-            y: y position in mm
-        """
         self.x = x
         self.y = y
 

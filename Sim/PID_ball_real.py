@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Stewart Platform Real Hardware Controller - REFACTORED
-Uses base simulator framework with hardware-specific extensions
+Stewart Platform Real Hardware Controller
 
 Features:
 - 100Hz dedicated control thread
@@ -20,11 +19,10 @@ import threading
 import serial.tools.list_ports
 
 from base_simulator import BaseStewartSimulator
-from control_core import PIDController
-from hardware_controller_config import (
-    HardwareControllerConfig,
-    SerialController,
-    IKCache
+from hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
+from utils import (
+    ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG,
+    format_time, format_vector_2d
 )
 
 
@@ -32,26 +30,19 @@ class HardwareStewartSimulator(BaseStewartSimulator):
     """Hardware-specific Stewart Platform Simulator."""
 
     def __init__(self, root):
-        # Create hardware config
         config = HardwareControllerConfig()
-
-        # Initialize base simulator
         super().__init__(root, config)
 
-        # Override title
         self.root.title("Stewart Platform - Real Hardware Control (100Hz)")
 
-        # Hardware-specific state
         self.serial_controller = None
         self.connected = False
 
-        # Camera calibration
         self.pixy_width_mm = 350.0
         self.pixy_height_mm = 266.0
         self.pixels_to_mm_x = self.pixy_width_mm / 316.0
         self.pixels_to_mm_y = self.pixy_height_mm / 208.0
 
-        # Ball state (thread-safe)
         self.ball_pos_mm = (0.0, 0.0)
         self.ball_detected = False
         self.last_ball_update = 0
@@ -59,15 +50,12 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.ball_history_y = []
         self.max_history = 100
 
-        # IK cache for performance
         self.ik_cache = IKCache(max_size=5000)
 
-        # Control thread state
         self.control_thread = None
         self.last_sent_angles = None
         self.angle_change_threshold = 0.2
 
-        # Performance monitoring
         self.actual_fps = 0.0
         self.timing_stats = {
             'ik_time': [],
@@ -76,11 +64,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         }
         self.ik_timeout_count = 0
 
-        # GUI update timing (5Hz for hardware)
         self.last_gui_update = time.time()
         self.gui_update_count = 0
 
-        # Add hardware-specific widgets
         self._add_hardware_widgets()
 
         self.log("⚡ Hardware controller initialized (100Hz mode)")
@@ -88,13 +74,11 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def _add_hardware_widgets(self):
         """Add hardware-specific GUI widgets."""
-        # Find the left panel (first child of main_frame)
         for widget in self.root.winfo_children():
             if isinstance(widget, ttk.Frame):
                 main_frame = widget
                 break
 
-        # Get left panel
         left_panel = None
         for child in main_frame.winfo_children():
             if isinstance(child, ttk.Frame):
@@ -104,8 +88,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if left_panel is None:
             return
 
-        # Insert hardware widgets at the top
-        # Performance indicator
         perf_frame = ttk.LabelFrame(left_panel, text="⚡ 100Hz MODE", padding=10)
         perf_frame.pack(fill='x', pady=(0, 10), before=left_panel.winfo_children()[0])
 
@@ -125,7 +107,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         ttk.Button(perf_frame, text="Show Statistics",
                    command=self.show_timing_stats).pack(pady=(5, 0))
 
-        # Serial connection
         conn_frame = ttk.LabelFrame(left_panel, text="Serial Connection", padding=10)
         conn_frame.pack(fill='x', pady=(0, 10), before=left_panel.winfo_children()[1])
 
@@ -159,7 +140,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                                            foreground=self.colors['border'])
         self.conn_status_label.pack(pady=(5, 0))
 
-        # Disable simulation controls initially
         self.start_btn.config(state='disabled')
 
     def refresh_ports(self):
@@ -213,7 +193,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.start_btn.config(state='normal')
             self.log(f"✓ Connected to {port}")
 
-            # Configure servos
             time.sleep(0.5)
             self.serial_controller.set_servo_speed(0)
             time.sleep(0.1)
@@ -221,7 +200,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             time.sleep(0.2)
             self.log("✓ Servos: Speed=0 (unlimited), Accel=0")
 
-            # Pre-warm cache
             self.prewarm_ik_cache()
         else:
             messagebox.showerror("Error", message)
@@ -249,22 +227,15 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        kp_raw = float(sliders['kp'].get())
-        ki_raw = float(sliders['ki'].get())
-        kd_raw = float(sliders['kd'].get())
-
-        kp_scalar = self.controller_config.scalar_values[scalar_vars['kp'].get()]
-        ki_scalar = self.controller_config.scalar_values[scalar_vars['ki'].get()]
-        kd_scalar = self.controller_config.scalar_values[scalar_vars['kd'].get()]
-
-        kp = kp_raw * kp_scalar
-        ki = ki_raw * ki_scalar
-        kd = kd_raw * kd_scalar
+        kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
+        ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
+        kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
 
         self.controller = self.controller_config.create_controller(
-            kp=kp, ki=ki, kd=kd, output_limit=15.0,
-            derivative_filter_alpha=0.1
+            kp=kp, ki=ki, kd=kd, output_limit=15.0
         )
+
+        self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
     def on_controller_param_change(self):
         """Update controller when parameters change."""
@@ -274,17 +245,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        kp_raw = float(sliders['kp'].get())
-        ki_raw = float(sliders['ki'].get())
-        kd_raw = float(sliders['kd'].get())
-
-        kp_scalar = self.controller_config.scalar_values[scalar_vars['kp'].get()]
-        ki_scalar = self.controller_config.scalar_values[scalar_vars['ki'].get()]
-        kd_scalar = self.controller_config.scalar_values[scalar_vars['kd'].get()]
-
-        kp = kp_raw * kp_scalar
-        ki = ki_raw * ki_scalar
-        kd = kd_raw * kd_scalar
+        kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
+        ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
+        kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
 
         self.controller.set_gains(kp, ki, kd)
 
@@ -305,31 +268,27 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         self.log("▶ Control started (100Hz dedicated thread)")
 
-        # Start control thread
         self.control_thread = threading.Thread(target=self._control_thread_func,
                                                daemon=True)
         self.control_thread.start()
 
-        # Start GUI update loop (5Hz)
         self.last_gui_update = time.time()
         self.gui_update_count = 0
         self._gui_update_loop()
 
     def _control_thread_func(self):
         """Dedicated 100Hz control thread."""
-        loop_interval = 0.01  # 100Hz
-        max_ik_time = 0.008  # 8ms timeout
+        loop_interval = ControlLoopConfig.INTERVAL_S
+        max_ik_time = ControlLoopConfig.IK_TIMEOUT_S
 
         while self.simulation_running:
             loop_start = time.perf_counter()
 
-            # Get ball data from camera
             ball_data = self.serial_controller.get_latest_ball_data()
 
             if ball_data is not None:
                 self.last_ball_update = self.simulation_time
 
-                # Convert pixel coordinates to mm
                 pixy_x = ball_data['x']
                 pixy_y = ball_data['y']
 
@@ -346,23 +305,19 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                         self.ball_history_x.pop(0)
                         self.ball_history_y.pop(0)
 
-            # PID control
             if self.controller_enabled.get() and self.ball_detected:
                 pattern_time = self.simulation_time - self.pattern_start_time
                 target_x, target_y = self.current_pattern.get_position(pattern_time)
                 target_pos_mm = (target_x, target_y)
 
-                # PID update
                 rx, ry = self.controller.update(self.ball_pos_mm, target_pos_mm,
                                                 loop_interval)
 
-                # HARDWARE FIX: Invert ry for camera Y-axis
-                ry = -ry
+                ry = -ry  # Camera Y-axis inversion
 
                 self.dof_values['rx'] = rx
                 self.dof_values['ry'] = ry
 
-                # Calculate IK with caching
                 start_ik = time.perf_counter()
 
                 translation = np.array([
@@ -376,11 +331,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     self.dof_values['rz']
                 ])
 
-                # Try cache first
                 angles = self.ik_cache.get(translation, rotation)
 
                 if angles is None:
-                    # Cache miss - calculate IK
                     angles = self.ik.calculate_servo_angles(
                         translation, rotation,
                         self.use_top_surface_offset.get()
@@ -388,7 +341,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
                     ik_time = time.perf_counter() - start_ik
 
-                    # Timeout protection
                     if ik_time > max_ik_time:
                         if self.last_sent_angles is not None:
                             angles = self.last_sent_angles
@@ -400,7 +352,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     ik_time = time.perf_counter() - start_ik
                     self.timing_stats['ik_time'].append(ik_time * 1000)
 
-                # Send to servos
                 if angles is not None:
                     if (self.last_sent_angles is None or
                             not np.allclose(angles, self.last_sent_angles,
@@ -417,36 +368,32 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                             self.timing_stats['send_time'].append(send_time)
                             self.timing_stats['total_time'].append(total_time)
 
-                            # Keep only last 1000 samples
                             for key in self.timing_stats:
                                 if len(self.timing_stats[key]) > 1000:
                                     self.timing_stats[key].pop(0)
 
             self.simulation_time += loop_interval
 
-            # Sleep to maintain 100Hz
             elapsed = time.perf_counter() - loop_start
             sleep_time = loop_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
     def _gui_update_loop(self):
-        """Separate 5Hz GUI update loop."""
+        """Separate GUI update loop at lower frequency."""
         if not self.simulation_running:
             return
 
-        # Update ball state display
         if self.ball_detected:
             status = "Detected"
         else:
             status = "Not detected"
 
         self.ball_pos_label.config(
-            text=f"Position: ({self.ball_pos_mm[0]:.1f}, {self.ball_pos_mm[1]:.1f}) mm"
+            text=f"Position: {format_vector_2d(self.ball_pos_mm)}"
         )
         self.ball_vel_label.config(text=f"Status: {status}")
 
-        # Update PID output display
         if self.controller_enabled.get():
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
@@ -467,28 +414,24 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 text=f"Magnitude: {magnitude:.2f}° ({magnitude_percent:.1f}%)"
             )
             self.controller_error_label.config(
-                text=f"Error: ({error_x:.1f}, {error_y:.1f}) mm"
+                text=f"Error: {format_vector_2d((error_x, error_y))}"
             )
 
-        # Update servo angles
         if self.last_sent_angles is not None:
             for i in range(6):
                 self.cmd_angle_labels[i].config(
                     text=f"S{i + 1}: {self.last_sent_angles[i]:6.2f}°"
                 )
 
-        # Update time
-        self.sim_time_label.config(text=f"Time: {self.simulation_time:.2f}s")
+        self.sim_time_label.config(text=f"Time: {format_time(self.simulation_time)}")
 
-        # Update plot every other update (2.5Hz)
         self.gui_update_count += 1
         if self.gui_update_count % 2 == 0:
             self._update_hardware_plot()
 
-        # Update performance stats (1Hz)
         current_time = time.time()
         if current_time - self.last_gui_update >= 1.0:
-            self.fps_label.config(text="Control: 100.0 Hz")
+            self.fps_label.config(text=f"Control: {ControlLoopConfig.FREQUENCY_HZ:.1f} Hz")
 
             hit_rate = self.ik_cache.get_hit_rate()
             self.cache_label.config(text=f"IK Cache: {hit_rate * 100:.1f}%")
@@ -497,30 +440,25 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             self.last_gui_update = current_time
 
-        # Schedule next update at 200ms (5Hz)
-        self.root.after(200, self._gui_update_loop)
+        self.root.after(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
 
     def _update_hardware_plot(self):
         """Update plot with hardware data."""
         try:
-            # Update ball position
             if self.ball_detected:
                 self.ball_circle.center = self.ball_pos_mm
                 self.ball_circle.set_alpha(0.8)
             else:
                 self.ball_circle.set_alpha(0.2)
 
-            # Update ball trail
             if len(self.ball_history_x) > 1:
                 self.ball_trail.set_data(self.ball_history_x, self.ball_history_y)
 
-            # Update target and trajectory
             if self.pattern_type.get() != 'static':
                 pattern_time = self.simulation_time - self.pattern_start_time
                 target_x, target_y = self.current_pattern.get_position(pattern_time)
                 self.target_marker.set_data([target_x], [target_y])
 
-            # Update tilt arrow
             if self.tilt_arrow is not None:
                 self.tilt_arrow.remove()
                 self.tilt_arrow = None
@@ -577,16 +515,13 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         stats_msg += "Optimization:\n"
         stats_msg += f"  IK Timeouts: {self.ik_timeout_count}\n"
         stats_msg += f"  Cache Resolution: 1mm / 1°\n"
-        stats_msg += f"  Target Rate: 100 Hz (10ms)\n"
-        stats_msg += f"  GUI Update: 5 Hz (200ms)\n"
+        stats_msg += f"  Target Rate: {ControlLoopConfig.FREQUENCY_HZ} Hz\n"
+        stats_msg += f"  GUI Update: {GUIConfig.UPDATE_HZ} Hz\n"
 
         messagebox.showinfo("Performance Statistics", stats_msg)
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
-        """
-        Update controller (not used in hardware mode - control runs in thread).
-        This is just for compatibility with base class.
-        """
+        """Hardware controller update (compatibility with base class)."""
         return self.controller.update(ball_pos_mm, target_pos_mm, dt)
 
     def stop_simulation(self):
@@ -596,7 +531,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if self.control_thread:
             self.control_thread.join(timeout=1.0)
 
-        # Clear serial queue
         if self.serial_controller:
             while not self.serial_controller.command_queue.empty():
                 try:

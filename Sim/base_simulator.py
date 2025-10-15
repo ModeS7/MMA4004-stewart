@@ -3,11 +3,7 @@
 Stewart Platform Simulator - Base Class
 
 Reusable simulator with pluggable controller support.
-Eliminates duplication between PID and LQR implementations.
-
-Key improvement: Vector-based tilt limiting to respect servo constraints.
-The platform tilt is treated as a 2D vector (rx, ry) with magnitude limited to 15°.
-This prevents IK failures when both rx and ry are large.
+Uses vector-based tilt limiting to respect servo constraints.
 """
 
 import tkinter as tk
@@ -21,18 +17,19 @@ from matplotlib.patches import Rectangle, Circle
 from abc import ABC, abstractmethod
 
 from core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory
+from control_core import clip_tilt_vector
+from utils import (
+    MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM,
+    SimulationConfig, format_vector_2d, format_time, format_error_context
+)
 
 
 class ControllerConfig(ABC):
-    """
-    Abstract base for controller-specific configuration.
-
-    Defines interface for controller parameter UI and behavior.
-    """
+    """Abstract base for controller-specific configuration."""
 
     @abstractmethod
     def get_controller_name(self) -> str:
-        """Return display name for controller (e.g., 'PID', 'LQR')."""
+        """Return display name for controller."""
         pass
 
     @abstractmethod
@@ -41,53 +38,82 @@ class ControllerConfig(ABC):
         pass
 
     @abstractmethod
-    def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
-        """
-        Create controller-specific parameter widgets.
-
-        Args:
-            parent_frame: ttk.Frame to add widgets to
-            colors: dict of color scheme
-            on_param_change_callback: function to call when parameters change
-
-        Returns:
-            dict: {
-                'sliders': {name: slider_widget},
-                'value_labels': {name: label_widget},
-                'scalar_vars': {name: IntVar} (optional),
-                'update_fn': callable to update controller parameters
-            }
-        """
-        pass
-
-    @abstractmethod
     def get_scalar_values(self) -> list:
         """Return list of scalar multipliers for parameters."""
         pass
 
     @abstractmethod
-    def create_info_widgets(self, parent_frame, colors, controller_instance):
-        """
-        Create controller-specific info widgets (optional).
-
-        Args:
-            parent_frame: ttk.Frame to add widgets to
-            colors: dict of color scheme
-            controller_instance: the controller object
-        """
+    def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
+        """Create controller-specific parameter widgets."""
         pass
+
+    @abstractmethod
+    def create_info_widgets(self, parent_frame, colors, controller_instance):
+        """Create controller-specific info widgets (optional)."""
+        pass
+
+    def get_scaled_param(self, param_name, sliders, scalar_vars):
+        """Extract and scale a parameter value from widgets."""
+        raw = float(sliders[param_name].get())
+        scalar = self.scalar_values[scalar_vars[param_name].get()]
+        return raw * scalar
+
+    def create_parameter_slider(self, parent, param_name, label, default,
+                                sliders, value_labels, scalar_vars,
+                                on_change_callback):
+        """Create standard parameter slider with scalar multiplier."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill='x', pady=5)
+
+        ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(
+            row=0, column=0, sticky='w', pady=2
+        )
+
+        slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
+        slider.grid(row=0, column=1, sticky='ew', padx=10)
+        slider.set(default)
+        sliders[param_name] = slider
+
+        value_label = ttk.Label(frame, text=f"{default:.2f}",
+                                width=6, font=('Consolas', 9))
+        value_label.grid(row=0, column=2)
+        value_labels[param_name] = value_label
+
+        scalar_var = tk.IntVar(value=getattr(self, 'default_scalar_idx', 4))
+        scalar_vars[param_name] = scalar_var
+
+        scalar_combo = ttk.Combobox(
+            frame, width=12, state='readonly',
+            values=[f'×{s:.7g}' for s in self.scalar_values]
+        )
+        scalar_combo.grid(row=0, column=3, padx=(5, 0))
+        scalar_combo.current(scalar_var.get())
+
+        slider.config(command=lambda val, p=param_name:
+        self._on_slider_change(p, val, value_labels, on_change_callback))
+        scalar_combo.bind('<<ComboboxSelected>>',
+                          lambda e, c=scalar_combo, v=scalar_var, p=param_name:
+                          self._on_scalar_change(c, v, p, on_change_callback))
+
+        frame.columnconfigure(1, weight=1)
+
+    def _on_slider_change(self, param_name, value, value_labels, callback):
+        """Handle slider value change."""
+        val = float(value)
+        value_labels[param_name].config(text=f"{val:.2f}")
+        callback()
+
+    def _on_scalar_change(self, combo, var, param_name, callback):
+        """Handle scalar selection change."""
+        var.set(combo.current())
+        callback()
 
 
 class BaseStewartSimulator:
     """
     Base Stewart Platform Simulator with pluggable controller support.
 
-    Handles all common functionality:
-    - GUI layout and dark theme
-    - Simulation loop and physics
-    - Ball control and visualization
-    - Servo dynamics and kinematics
-    - Pattern/trajectory system
+    Handles all common functionality including GUI, physics, and kinematics.
     """
 
     def __init__(self, root, controller_config: ControllerConfig):
@@ -99,7 +125,6 @@ class BaseStewartSimulator:
         self.root.geometry("1400x900")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # Dark mode colors
         self.colors = {
             'bg': '#1e1e1e',
             'panel_bg': '#2d2d2d',
@@ -117,7 +142,6 @@ class BaseStewartSimulator:
         self.root.configure(bg=self.colors['bg'])
         self.setup_dark_theme()
 
-        # Platform setup
         self.platform_params = {
             "horn_length": 31.75,
             "rod_length": 145.0,
@@ -128,9 +152,10 @@ class BaseStewartSimulator:
             "top_surface_offset": 26.0
         }
         self.ik = StewartPlatformIK(**self.platform_params)
-        self.servos = [FirstOrderServo(K=1.0, tau=0.1, delay=0.0) for _ in range(6)]
+        self.servos = [FirstOrderServo(K=1.0, tau=SimulationConfig.DEFAULT_SERVO_TAU,
+                                       delay=SimulationConfig.DEFAULT_SERVO_DELAY)
+                       for _ in range(6)]
 
-        # Ball physics
         self.ball_physics = SimpleBallPhysics2D(
             ball_radius=0.04,
             ball_mass=0.0027,
@@ -139,29 +164,24 @@ class BaseStewartSimulator:
             sphere_type='hollow'
         )
 
-        # Controller (created by subclass config)
         self.controller = None
         self.controller_enabled = tk.BooleanVar(value=False)
 
-        # Trajectory pattern
         self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
         self.pattern_type = tk.StringVar(value='static')
         self.pattern_start_time = 0.0
 
-        # Ball state
         ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
         self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
         self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
         self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
 
-        # Simulation state
         self.simulation_running = False
         self.simulation_time = 0.0
         self.last_update_time = None
-        self.update_rate_ms = 20
+        self.update_rate_ms = SimulationConfig.UPDATE_RATE_MS
         self.simulation_loop_id = None
 
-        # DOF configuration
         self.use_top_surface_offset = tk.BooleanVar(value=True)
         self.dof_values = {
             'x': 0.0, 'y': 0.0, 'z': self.ik.home_height_top_surface,
@@ -174,24 +194,21 @@ class BaseStewartSimulator:
             'z': (self.ik.home_height_top_surface - 30,
                   self.ik.home_height_top_surface + 30,
                   0.1, self.ik.home_height_top_surface, "Z Height (mm)"),
-            'rx': (-15.0, 15.0, 0.1, 0.0, "Roll (°)"),
-            'ry': (-15.0, 15.0, 0.1, 0.0, "Pitch (°)"),
-            'rz': (-15.0, 15.0, 0.1, 0.0, "Yaw (°)")
+            'rx': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Roll (°)"),
+            'ry': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Pitch (°)"),
+            'rz': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Yaw (°)")
         }
 
         self.sliders = {}
         self.value_labels = {}
         self.update_timer = None
 
-        # Controller-specific widgets (populated by config)
         self.controller_widgets = {}
 
-        # Platform motion tracking
         self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
 
-        # Build GUI
         self.create_widgets()
 
     def setup_dark_theme(self):
@@ -271,12 +288,10 @@ class BaseStewartSimulator:
         right_panel = ttk.Frame(main_frame, style='TFrame')
         right_panel.pack(side='right', fill='both', expand=True, padx=(5, 0))
 
-        # Build panels
         self._create_left_panel(left_panel)
         self._create_middle_panel(middle_panel)
         self._create_right_panel(right_panel)
 
-        # Initialize controller
         self._initialize_controller()
 
         controller_name = self.controller_config.get_controller_name()
@@ -284,27 +299,30 @@ class BaseStewartSimulator:
         self.log(f"Configure {controller_name} parameters and enable to start automatic balancing")
 
     def _create_left_panel(self, parent):
-        """Create left panel widgets (control, parameters, ball, config, DOF)."""
-        # Simulation control
+        """Create left panel (control, parameters, ball, config, DOF)."""
         sim_frame = ttk.LabelFrame(parent, text="Simulation Control", padding=10)
         sim_frame.pack(fill='x', pady=(0, 10))
 
         btn_frame = ttk.Frame(sim_frame)
         btn_frame.pack(fill='x')
 
-        self.start_btn = ttk.Button(btn_frame, text="▶ Start", command=self.start_simulation, width=10)
+        self.start_btn = ttk.Button(btn_frame, text="▶ Start",
+                                    command=self.start_simulation, width=10)
         self.start_btn.pack(side='left', padx=5)
 
-        self.stop_btn = ttk.Button(btn_frame, text="⏸ Stop", command=self.stop_simulation, state='disabled', width=10)
+        self.stop_btn = ttk.Button(btn_frame, text="⏸ Stop",
+                                   command=self.stop_simulation,
+                                   state='disabled', width=10)
         self.stop_btn.pack(side='left', padx=5)
 
-        self.reset_btn = ttk.Button(btn_frame, text="↻ Reset", command=self.reset_simulation, width=10)
+        self.reset_btn = ttk.Button(btn_frame, text="↻ Reset",
+                                    command=self.reset_simulation, width=10)
         self.reset_btn.pack(side='left', padx=5)
 
-        self.sim_time_label = ttk.Label(sim_frame, text="Time: 0.00s", font=('Consolas', 10, 'bold'))
+        self.sim_time_label = ttk.Label(sim_frame, text="Time: 0.00s",
+                                        font=('Consolas', 10, 'bold'))
         self.sim_time_label.pack(pady=(10, 0))
 
-        # Controller frame
         controller_name = self.controller_config.get_controller_name()
         ctrl_frame = ttk.LabelFrame(parent, text=f"{controller_name} Ball Balancing", padding=10)
         ctrl_frame.pack(fill='x', pady=(0, 10))
@@ -321,22 +339,20 @@ class BaseStewartSimulator:
                                                  font=('Segoe UI', 14))
         self.controller_status_label.pack(side='left', padx=(10, 0))
 
-        # Controller-specific parameter widgets
         self.controller_widgets = self.controller_config.create_parameter_widgets(
             ctrl_frame, self.colors, self.on_controller_param_change
         )
 
-        # Controller-specific info widgets
         self.controller_config.create_info_widgets(ctrl_frame, self.colors, self.controller)
 
-        # Trajectory pattern
         pattern_frame = ttk.LabelFrame(ctrl_frame, text="Trajectory Pattern", padding=10)
         pattern_frame.pack(fill='x', pady=(10, 0))
 
         selector_frame = ttk.Frame(pattern_frame)
         selector_frame.pack(fill='x', pady=(0, 5))
 
-        ttk.Label(selector_frame, text="Pattern:", font=('Segoe UI', 9)).pack(side='left', padx=(0, 10))
+        ttk.Label(selector_frame, text="Pattern:",
+                  font=('Segoe UI', 9)).pack(side='left', padx=(0, 10))
 
         pattern_combo = ttk.Combobox(selector_frame, textvariable=self.pattern_type,
                                      width=15, state='readonly',
@@ -344,7 +360,8 @@ class BaseStewartSimulator:
         pattern_combo.pack(side='left', padx=5)
         pattern_combo.bind('<<ComboboxSelected>>', self.on_pattern_change)
 
-        ttk.Button(selector_frame, text="Reset", command=self.reset_pattern, width=8).pack(side='left', padx=5)
+        ttk.Button(selector_frame, text="Reset",
+                   command=self.reset_pattern, width=8).pack(side='left', padx=5)
 
         self.pattern_info_label = ttk.Label(pattern_frame,
                                             text="Tracking: Center (0, 0)",
@@ -352,27 +369,30 @@ class BaseStewartSimulator:
                                             foreground=self.colors['success'])
         self.pattern_info_label.pack(anchor='w', pady=(5, 0))
 
-        # Ball control
         ball_frame = ttk.LabelFrame(parent, text="Ball Control", padding=10)
         ball_frame.pack(fill='x', pady=(0, 10))
 
         ball_btn_frame = ttk.Frame(ball_frame)
         ball_btn_frame.pack()
 
-        ttk.Button(ball_btn_frame, text="⟲ Reset Ball", command=self.reset_ball, width=15).pack(side='left', padx=5)
-        ttk.Button(ball_btn_frame, text="⇝ Push Ball", command=self.push_ball, width=15).pack(side='left', padx=5)
+        ttk.Button(ball_btn_frame, text="⟲ Reset Ball",
+                   command=self.reset_ball, width=15).pack(side='left', padx=5)
+        ttk.Button(ball_btn_frame, text="⇝ Push Ball",
+                   command=self.push_ball, width=15).pack(side='left', padx=5)
 
-        # Ball state
         ball_info_frame = ttk.LabelFrame(parent, text="Ball State", padding=10)
         ball_info_frame.pack(fill='x', pady=(0, 10))
 
-        self.ball_pos_label = ttk.Label(ball_info_frame, text="Position: (0.0, 0.0) mm", font=('Consolas', 9))
+        self.ball_pos_label = ttk.Label(ball_info_frame,
+                                        text="Position: (0.0, 0.0) mm",
+                                        font=('Consolas', 9))
         self.ball_pos_label.pack(anchor='w', pady=2)
 
-        self.ball_vel_label = ttk.Label(ball_info_frame, text="Velocity: (0.0, 0.0) mm/s", font=('Consolas', 9))
+        self.ball_vel_label = ttk.Label(ball_info_frame,
+                                        text="Velocity: (0.0, 0.0) mm/s",
+                                        font=('Consolas', 9))
         self.ball_vel_label.pack(anchor='w', pady=2)
 
-        # Config
         config_frame = ttk.LabelFrame(parent, text="Configuration", padding=10)
         config_frame.pack(fill='x', pady=(0, 10))
 
@@ -380,82 +400,91 @@ class BaseStewartSimulator:
                         variable=self.use_top_surface_offset,
                         command=self.on_offset_toggle).pack(anchor='w')
 
-        # Manual DOF sliders
         sliders_frame = ttk.LabelFrame(parent, text="Manual Pose Control (6 DOF)", padding=10)
         sliders_frame.pack(fill='both', expand=True)
 
         for idx, (dof, (min_val, max_val, res, default, label)) in enumerate(self.dof_config.items()):
-            ttk.Label(sliders_frame, text=label, font=('Segoe UI', 9)).grid(row=idx, column=0, sticky='w', pady=8)
+            ttk.Label(sliders_frame, text=label,
+                      font=('Segoe UI', 9)).grid(row=idx, column=0, sticky='w', pady=8)
 
-            slider = ttk.Scale(sliders_frame, from_=min_val, to=max_val, orient='horizontal',
+            slider = ttk.Scale(sliders_frame, from_=min_val, to=max_val,
+                               orient='horizontal',
                                command=lambda val, d=dof: self.on_slider_change(d, val))
             slider.grid(row=idx, column=1, sticky='ew', padx=10, pady=8)
             self.sliders[dof] = slider
 
-            value_label = ttk.Label(sliders_frame, text=f"{default:.2f}", width=8, font=('Consolas', 9))
+            value_label = ttk.Label(sliders_frame, text=f"{default:.2f}",
+                                    width=8, font=('Consolas', 9))
             value_label.grid(row=idx, column=2, pady=8)
             self.value_labels[dof] = value_label
             slider.set(default)
 
         sliders_frame.columnconfigure(1, weight=1)
 
-        # Add tilt magnitude indicator below sliders
         tilt_info_frame = ttk.Frame(sliders_frame)
-        tilt_info_frame.grid(row=len(self.dof_config), column=0, columnspan=3, sticky='ew', pady=(10, 5))
+        tilt_info_frame.grid(row=len(self.dof_config), column=0,
+                             columnspan=3, sticky='ew', pady=(10, 5))
 
-        ttk.Label(tilt_info_frame, text="Tilt Vector:", font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 10))
-        self.manual_tilt_magnitude_label = ttk.Label(tilt_info_frame, text="0.00° (0.0%)",
+        ttk.Label(tilt_info_frame, text="Tilt Vector:",
+                  font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 10))
+        self.manual_tilt_magnitude_label = ttk.Label(tilt_info_frame,
+                                                     text="0.00° (0.0%)",
                                                      font=('Consolas', 9),
                                                      foreground=self.colors['success'])
         self.manual_tilt_magnitude_label.pack(side='left')
 
     def _create_middle_panel(self, parent):
-        """Create middle panel widgets (angles, FK, output, log)."""
-        # Commanded angles
+        """Create middle panel (angles, FK, output, log)."""
         cmd_angles_frame = ttk.LabelFrame(parent, text="Commanded Servo Angles (IK)", padding=10)
         cmd_angles_frame.pack(fill='x', pady=(0, 10))
 
         self.cmd_angle_labels = []
         for i in range(6):
-            label = ttk.Label(cmd_angles_frame, text=f"S{i + 1}: 0.00°", font=('Consolas', 9))
+            label = ttk.Label(cmd_angles_frame, text=f"S{i + 1}: 0.00°",
+                              font=('Consolas', 9))
             label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
             self.cmd_angle_labels.append(label)
 
-        # Actual angles
         actual_angles_frame = ttk.LabelFrame(parent, text="Actual Servo Angles", padding=10)
         actual_angles_frame.pack(fill='x', pady=(0, 10))
 
         self.actual_angle_labels = []
         for i in range(6):
-            label = ttk.Label(actual_angles_frame, text=f"S{i + 1}: 0.00°", font=('Consolas', 9))
+            label = ttk.Label(actual_angles_frame, text=f"S{i + 1}: 0.00°",
+                              font=('Consolas', 9))
             label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
             self.actual_angle_labels.append(label)
 
-        # FK
         fk_frame = ttk.LabelFrame(parent, text="Platform Pose (FK)", padding=10)
         fk_frame.pack(fill='x', pady=(0, 10))
 
-        self.fk_pos_label = ttk.Label(fk_frame, text="X: 0.00  Y: 0.00  Z: 0.00 mm", font=('Consolas', 9))
+        self.fk_pos_label = ttk.Label(fk_frame, text="X: 0.00  Y: 0.00  Z: 0.00 mm",
+                                      font=('Consolas', 9))
         self.fk_pos_label.pack(anchor='w', pady=2)
 
-        self.fk_rot_label = ttk.Label(fk_frame, text="Roll: 0.00  Pitch: 0.00  Yaw: 0.00°", font=('Consolas', 9))
+        self.fk_rot_label = ttk.Label(fk_frame, text="Roll: 0.00  Pitch: 0.00  Yaw: 0.00°",
+                                      font=('Consolas', 9))
         self.fk_rot_label.pack(anchor='w', pady=2)
 
-        # Controller output
         controller_name = self.controller_config.get_controller_name()
         output_frame = ttk.LabelFrame(parent, text=f"{controller_name} Output", padding=10)
         output_frame.pack(fill='x', pady=(0, 10))
 
-        self.controller_output_label = ttk.Label(output_frame, text="Tilt: rx=0.00°  ry=0.00°", font=('Consolas', 9))
+        self.controller_output_label = ttk.Label(output_frame,
+                                                 text="Tilt: rx=0.00°  ry=0.00°",
+                                                 font=('Consolas', 9))
         self.controller_output_label.pack(anchor='w', pady=2)
 
-        self.tilt_magnitude_label = ttk.Label(output_frame, text="Magnitude: 0.00° (0%)", font=('Consolas', 9))
+        self.tilt_magnitude_label = ttk.Label(output_frame,
+                                              text="Magnitude: 0.00° (0%)",
+                                              font=('Consolas', 9))
         self.tilt_magnitude_label.pack(anchor='w', pady=2)
 
-        self.controller_error_label = ttk.Label(output_frame, text="Error: (0.0, 0.0) mm", font=('Consolas', 9))
+        self.controller_error_label = ttk.Label(output_frame,
+                                                text="Error: (0.0, 0.0) mm",
+                                                font=('Consolas', 9))
         self.controller_error_label.pack(anchor='w', pady=2)
 
-        # Log
         log_frame = ttk.LabelFrame(parent, text="Debug Log", padding=10)
         log_frame.pack(fill='both', expand=True)
 
@@ -474,7 +503,7 @@ class BaseStewartSimulator:
         self.log_text.pack(fill='both', expand=True)
 
     def _create_right_panel(self, parent):
-        """Create right panel widgets (visualization)."""
+        """Create right panel (visualization)."""
         plot_frame = ttk.LabelFrame(parent, text="Ball Position (Top View)", padding=10)
         plot_frame.pack(fill='both', expand=True)
 
@@ -494,7 +523,8 @@ class BaseStewartSimulator:
         self.ax.set_ylim(-120, 120)
         self.ax.set_xlabel('X (mm)', color=self.colors['fg'], fontsize=10)
         self.ax.set_ylabel('Y (mm)', color=self.colors['fg'], fontsize=10)
-        self.ax.set_title('Ball Position (Top View)', color=self.colors['fg'], fontsize=11, fontweight='bold')
+        self.ax.set_title('Ball Position (Top View)', color=self.colors['fg'],
+                          fontsize=11, fontweight='bold')
         self.ax.grid(True, alpha=0.2, linestyle='--', color=self.colors['fg'])
         self.ax.set_aspect('equal')
         self.ax.tick_params(colors=self.colors['fg'])
@@ -502,7 +532,8 @@ class BaseStewartSimulator:
         for spine in self.ax.spines.values():
             spine.set_color(self.colors['border'])
 
-        platform_square = Rectangle((-100, -100), 200, 200,
+        platform_square = Rectangle((-PLATFORM_HALF_SIZE_MM, -PLATFORM_HALF_SIZE_MM),
+                                    PLATFORM_HALF_SIZE_MM * 2, PLATFORM_HALF_SIZE_MM * 2,
                                     fill=False,
                                     edgecolor=self.colors['fg'],
                                     linewidth=2,
@@ -522,8 +553,10 @@ class BaseStewartSimulator:
 
         self.tilt_arrow = None
 
-        legend = self.ax.legend(loc='upper right', fontsize=8, facecolor=self.colors['panel_bg'],
-                                edgecolor=self.colors['border'], labelcolor=self.colors['fg'])
+        legend = self.ax.legend(loc='upper right', fontsize=8,
+                                facecolor=self.colors['panel_bg'],
+                                edgecolor=self.colors['border'],
+                                labelcolor=self.colors['fg'])
         legend.get_frame().set_alpha(0.9)
 
         self.canvas.draw()
@@ -577,8 +610,7 @@ class BaseStewartSimulator:
         self.canvas.draw_idle()
 
     def _initialize_controller(self):
-        """Initialize controller using config (called after widgets created)."""
-        # Controller config should handle creating the controller with proper params
+        """Initialize controller (implemented by subclass)."""
         pass
 
     def on_controller_toggle(self):
@@ -591,13 +623,11 @@ class BaseStewartSimulator:
             self.controller_status_label.config(foreground=self.colors['success'])
 
             controller_name = self.controller_config.get_controller_name()
-            self.log(f"{controller_name} control ENABLED - automatic balancing active")
+            self.log(f"{controller_name} control ENABLED")
 
-            # Disable manual tilt controls
             self.sliders['rx'].config(state='disabled')
             self.sliders['ry'].config(state='disabled')
 
-            # Initialize with zero tilt
             self.dof_values['rx'] = 0.0
             self.dof_values['ry'] = 0.0
             self.value_labels['rx'].config(text="0.00")
@@ -607,9 +637,8 @@ class BaseStewartSimulator:
         else:
             self.controller_status_label.config(foreground=self.colors['border'])
             controller_name = self.controller_config.get_controller_name()
-            self.log(f"{controller_name} control DISABLED - manual control active")
+            self.log(f"{controller_name} control DISABLED")
 
-            # Re-enable manual tilt controls
             self.sliders['rx'].config(state='normal')
             self.sliders['ry'].config(state='normal')
 
@@ -617,7 +646,7 @@ class BaseStewartSimulator:
             self.sliders['ry'].set(self.dof_values['ry'])
 
     def on_controller_param_change(self):
-        """Callback when controller parameters change."""
+        """Callback when controller parameters change (implemented by subclass)."""
         if 'update_fn' in self.controller_widgets:
             self.controller_widgets['update_fn']()
 
@@ -647,13 +676,13 @@ class BaseStewartSimulator:
         """Reset pattern timing."""
         self.pattern_start_time = self.simulation_time
         self.current_pattern.reset()
-        self.log(f"Pattern reset at t={self.simulation_time:.2f}s")
+        self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
 
         if self.controller_enabled.get():
             self.controller.reset()
 
     def apply_random_tilt(self, max_degrees=1.0):
-        """Apply small random tilt (simulates disturbance)."""
+        """Apply small random tilt to simulate disturbance."""
         if not self.controller_enabled.get():
             return
 
@@ -667,7 +696,7 @@ class BaseStewartSimulator:
         self.value_labels['ry'].config(text=f"{random_ry:.2f}")
 
         self.calculate_ik()
-        self.log(f"Platform disturbance: rx={random_rx:.2f}°, ry={random_ry:.2f}°")
+        self.log(f"Disturbance: rx={random_rx:.2f}°, ry={random_ry:.2f}°")
 
     def reset_ball(self):
         """Reset ball to center."""
@@ -694,7 +723,7 @@ class BaseStewartSimulator:
 
     def log(self, message):
         """Add message to debug log."""
-        self.log_text.insert(tk.END, f"[{self.simulation_time:.2f}s] {message}\n")
+        self.log_text.insert(tk.END, f"[{format_time(self.simulation_time)}] {message}\n")
         self.log_text.see(tk.END)
 
     def on_offset_toggle(self):
@@ -716,34 +745,27 @@ class BaseStewartSimulator:
         val = float(value)
         self.dof_values[dof] = val
 
-        # For tilt angles, check if combined magnitude exceeds limit
         if dof in ['rx', 'ry'] and hasattr(self, 'manual_tilt_magnitude_label'):
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
-            magnitude = np.sqrt(rx ** 2 + ry ** 2)
-            magnitude_percent = (magnitude / 15.0) * 100
+            _, _, magnitude = clip_tilt_vector(rx, ry, MAX_TILT_ANGLE_DEG)
+            magnitude_percent = (magnitude / MAX_TILT_ANGLE_DEG) * 100
 
-            # Update manual tilt magnitude display
-            if magnitude > 15.0:
-                # Show warning color if exceeds limit
-                self.value_labels[dof].config(
-                    text=f"{val:.2f}",
-                    foreground=self.colors['warning']
-                )
+            if magnitude > MAX_TILT_ANGLE_DEG:
+                self.value_labels[dof].config(text=f"{val:.2f}",
+                                              foreground=self.colors['warning'])
                 self.manual_tilt_magnitude_label.config(
                     text=f"{magnitude:.2f}° ({magnitude_percent:.1f}%) ⚠ LIMIT",
                     foreground=self.colors['warning']
                 )
             else:
-                self.value_labels[dof].config(
-                    text=f"{val:.2f}",
-                    foreground=self.colors['fg']
-                )
-                # Color code based on proximity to limit
+                self.value_labels[dof].config(text=f"{val:.2f}",
+                                              foreground=self.colors['fg'])
+
                 if magnitude_percent > 80:
                     color = self.colors['warning']
                 elif magnitude_percent > 60:
-                    color = '#ffa500'  # Orange
+                    color = '#ffa500'
                 else:
                     color = self.colors['success']
 
@@ -758,53 +780,29 @@ class BaseStewartSimulator:
             self.root.after_cancel(self.update_timer)
         self.update_timer = self.root.after(50, self.calculate_ik)
 
-    def _clip_tilt_vector(self, rx, ry, max_magnitude=15.0):
-        """
-        Clip tilt vector to maximum magnitude.
-
-        Treats (rx, ry) as a 2D vector and scales it down if magnitude exceeds limit.
-        This prevents servo limit violations when both rx and ry are large.
-
-        Args:
-            rx: Roll angle in degrees
-            ry: Pitch angle in degrees
-            max_magnitude: Maximum allowed tilt magnitude in degrees
-
-        Returns:
-            (rx_clipped, ry_clipped, magnitude): Clipped angles and actual magnitude
-        """
-        magnitude = np.sqrt(rx ** 2 + ry ** 2)
-
-        if magnitude > max_magnitude:
-            # Scale down to max_magnitude
-            scale = max_magnitude / magnitude
-            rx_clipped = rx * scale
-            ry_clipped = ry * scale
-            return rx_clipped, ry_clipped, magnitude
-        else:
-            return rx, ry, magnitude
-
     def calculate_ik(self):
         """Calculate inverse kinematics for current pose."""
-        translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
+        translation = np.array([self.dof_values['x'],
+                                self.dof_values['y'],
+                                self.dof_values['z']])
 
-        # Apply vector-based tilt limiting
-        rx_raw = self.dof_values['rx']
-        ry_raw = self.dof_values['ry']
-        rx_limited, ry_limited, tilt_mag = self._clip_tilt_vector(rx_raw, ry_raw, max_magnitude=15.0)
+        rx_limited, ry_limited, tilt_mag = clip_tilt_vector(
+            self.dof_values['rx'],
+            self.dof_values['ry'],
+            MAX_TILT_ANGLE_DEG
+        )
 
-        # Update display if values were clipped
-        if tilt_mag > 15.0:
+        if tilt_mag > MAX_TILT_ANGLE_DEG:
             self.value_labels['rx'].config(text=f"{rx_limited:.2f}")
             self.value_labels['ry'].config(text=f"{ry_limited:.2f}")
             if not self.controller_enabled.get():
-                # Only update actual values if manual control (not during controller operation)
                 self.dof_values['rx'] = rx_limited
                 self.dof_values['ry'] = ry_limited
 
         rotation = np.array([rx_limited, ry_limited, self.dof_values['rz']])
 
-        angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset.get())
+        angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                self.use_top_surface_offset.get())
 
         if angles is not None:
             for i in range(6):
@@ -880,7 +878,6 @@ class BaseStewartSimulator:
             dt = current_time - self.last_update_time
             self.simulation_time += dt
 
-            # Controller update
             if self.controller_enabled.get():
                 try:
                     ball_x_mm = self.ball_pos[0, 0].item() * 1000
@@ -892,8 +889,6 @@ class BaseStewartSimulator:
                     target_x, target_y = self.current_pattern.get_position(pattern_time)
                     target_pos_mm = (target_x, target_y)
 
-                    # Call controller update (signature depends on controller type)
-                    # This is handled by subclass implementation
                     rx_raw, ry_raw = self._update_controller(
                         (ball_x_mm, ball_y_mm),
                         (ball_vx_mm_s, ball_vy_mm_s),
@@ -901,14 +896,12 @@ class BaseStewartSimulator:
                         dt
                     )
 
-                    # Apply vector-based tilt limiting to controller output
-                    rx, ry, tilt_mag = self._clip_tilt_vector(rx_raw, ry_raw, max_magnitude=15.0)
+                    rx, ry, tilt_mag = clip_tilt_vector(rx_raw, ry_raw, MAX_TILT_ANGLE_DEG)
 
-                    # Log if controller output was clipped
-                    if tilt_mag > 15.0:
+                    if tilt_mag > MAX_TILT_ANGLE_DEG:
                         controller_name = self.controller_config.get_controller_name()
-                        self.log(f"{controller_name} output clipped: ({rx_raw:.2f}, {ry_raw:.2f}) → "
-                                 f"({rx:.2f}, {ry:.2f}) [mag: {tilt_mag:.2f}° → 15.0°]")
+                        self.log(f"{controller_name} output clipped: "
+                                 f"({rx_raw:.2f}, {ry_raw:.2f}) → ({rx:.2f}, {ry:.2f})")
 
                     self.dof_values['rx'] = rx
                     self.dof_values['ry'] = ry
@@ -918,18 +911,21 @@ class BaseStewartSimulator:
 
                     error_x = ball_x_mm - target_pos_mm[0]
                     error_y = ball_y_mm - target_pos_mm[1]
+                    magnitude_percent = (tilt_mag / MAX_TILT_ANGLE_DEG) * 100
+
                     self.controller_output_label.config(text=f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
+                    self.tilt_magnitude_label.config(
+                        text=f"Magnitude: {tilt_mag:.2f}° ({magnitude_percent:.1f}%)"
+                    )
                     self.controller_error_label.config(text=f"Error: ({error_x:.1f}, {error_y:.1f}) mm")
 
-                    if int(self.simulation_time * 0.5) % 2 == 0 and int((self.simulation_time - dt) * 0.5) % 2 == 1:
-                        self.log(f"Target: ({target_x:.1f},{target_y:.1f})mm "
-                                 f"Ball: ({ball_x_mm:.1f},{ball_y_mm:.1f})mm "
-                                 f"Error: ({error_x:.1f},{error_y:.1f})mm")
-
-                    translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
+                    translation = np.array([self.dof_values['x'],
+                                            self.dof_values['y'],
+                                            self.dof_values['z']])
                     rotation = np.array([rx, ry, self.dof_values['rz']])
 
-                    angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset.get())
+                    angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                            self.use_top_surface_offset.get())
 
                     if angles is not None:
                         for i in range(6):
@@ -941,11 +937,16 @@ class BaseStewartSimulator:
 
                 except Exception as e:
                     controller_name = self.controller_config.get_controller_name()
-                    self.log(f"{controller_name} control error: {str(e)}")
+                    error_msg = format_error_context(
+                        self.simulation_time,
+                        (ball_x_mm, ball_y_mm),
+                        (ball_vx_mm_s, ball_vy_mm_s),
+                        str(e)
+                    )
+                    self.log(f"{controller_name} error:\n{error_msg}")
                     self.controller_enabled.set(False)
                     self.on_controller_toggle()
 
-            # Update servos
             for servo in self.servos:
                 servo.update(dt, self.simulation_time)
 
@@ -988,14 +989,18 @@ class BaseStewartSimulator:
                     vel_x_mm = self.ball_vel[0, 0].item() * 1000
                     vel_y_mm = self.ball_vel[0, 1].item() * 1000
 
-                    self.ball_pos_label.config(text=f"Position: ({ball_x_mm:.1f}, {ball_y_mm:.1f}) mm")
-                    self.ball_vel_label.config(text=f"Velocity: ({vel_x_mm:.1f}, {vel_y_mm:.1f}) mm/s")
+                    self.ball_pos_label.config(text=f"Position: {format_vector_2d((ball_x_mm, ball_y_mm))}")
+                    self.ball_vel_label.config(text=f"Velocity: {format_vector_2d((vel_x_mm, vel_y_mm), 'mm/s')}")
 
                 except Exception as e:
-                    self.log(f"Physics error: {str(e)}")
+                    self.log(format_error_context(
+                        self.simulation_time,
+                        self.ball_pos[0, :2],
+                        self.ball_vel[0, :2] * 1000,
+                        f"Physics error: {str(e)}"
+                    ))
                     self.reset_ball()
 
-                # Update platform angular acceleration
                 rx_now = rotation[0]
                 ry_now = rotation[1]
 
@@ -1016,27 +1021,18 @@ class BaseStewartSimulator:
             self.update_plot()
 
         self.last_update_time = current_time
-        self.sim_time_label.config(text=f"Time: {self.simulation_time:.2f}s")
+        self.sim_time_label.config(text=f"Time: {format_time(self.simulation_time)}")
 
         self.simulation_loop_id = self.root.after(self.update_rate_ms, self.simulation_loop)
 
+    @abstractmethod
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """
-        Update controller and return control output.
-
-        Override in subclass if needed to handle different controller signatures.
-
-        Args:
-            ball_pos_mm: (x, y) ball position in mm
-            ball_vel_mm_s: (vx, vy) ball velocity in mm/s
-            target_pos_mm: (x, y) target position in mm
-            dt: timestep in seconds
+        Update controller and return control output (implemented by subclass).
 
         Returns:
             (rx, ry): platform tilt angles in degrees
         """
-        # Default implementation assumes controller.update takes position and target
-        # Override for controllers with different signatures
         raise NotImplementedError("Subclass must implement _update_controller")
 
     def on_closing(self):

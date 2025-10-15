@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 Stewart Platform Simulator with LQR Ball Balancing Control
-Refactored version using base simulator architecture
 
 Usage:
-    python LQR_ball_sim_refactored.py
+    python LQR_ball_sim.py
 """
 
 import tkinter as tk
 from tkinter import ttk
 import numpy as np
 
-# Import required base classes
 from base_simulator import ControllerConfig, BaseStewartSimulator
 from control_core import LQRController
 
@@ -20,7 +18,8 @@ class LQRControllerConfig(ControllerConfig):
     """Configuration for LQR controller."""
 
     def __init__(self, ball_physics_params):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
+                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
         self.default_weights = {'Q_pos': 1.0, 'Q_vel': 1.0, 'R': 1.0}
         self.default_scalar_indices = {
             'Q_pos': 7,  # 1.0
@@ -28,7 +27,7 @@ class LQRControllerConfig(ControllerConfig):
             'R': 5  # 0.01
         }
         self.ball_physics_params = ball_physics_params
-        self.controller_ref = None  # Will be set after controller creation
+        self.controller_ref = None
 
     def get_controller_name(self) -> str:
         return "LQR"
@@ -54,60 +53,20 @@ class LQRControllerConfig(ControllerConfig):
         value_labels = {}
         scalar_vars = {}
 
-        for weight_name, label, default in weights:
-            frame = ttk.Frame(parent_frame)
-            frame.pack(fill='x', pady=5)
-
-            ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(
-                row=0, column=0, sticky='w', pady=2
+        for param_name, label, default in weights:
+            self.default_scalar_idx = self.default_scalar_indices[param_name]
+            self.create_parameter_slider(
+                parent_frame, param_name, label, default,
+                sliders, value_labels, scalar_vars,
+                on_param_change_callback
             )
-
-            slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
-            slider.grid(row=0, column=1, sticky='ew', padx=10)
-            slider.set(default)
-            sliders[weight_name] = slider
-
-            value_label = ttk.Label(frame, text=f"{default:.2f}", width=6, font=('Consolas', 9))
-            value_label.grid(row=0, column=2)
-            value_labels[weight_name] = value_label
-
-            default_idx = self.default_scalar_indices[weight_name]
-            scalar_var = tk.IntVar(value=default_idx)
-            scalar_vars[weight_name] = scalar_var
-
-            scalar_combo = ttk.Combobox(
-                frame, width=12, state='readonly',
-                values=[f'×{s:.7g}' for s in self.scalar_values]
-            )
-            scalar_combo.grid(row=0, column=3, padx=(5, 0))
-            scalar_combo.current(default_idx)
-
-            # Bind events
-            slider.config(command=lambda val, w=weight_name: self._on_slider_change(
-                w, val, sliders, value_labels, on_param_change_callback
-            ))
-            scalar_combo.bind('<<ComboboxSelected>>', lambda e, combo=scalar_combo, var=scalar_var, w=weight_name:
-            self._on_scalar_change(combo, var, w, on_param_change_callback))
-
-            frame.columnconfigure(1, weight=1)
 
         return {
             'sliders': sliders,
             'value_labels': value_labels,
             'scalar_vars': scalar_vars,
-            'update_fn': lambda: None  # Not needed, handled by callback
+            'update_fn': lambda: None
         }
-
-    def _on_slider_change(self, weight_name, value, sliders, value_labels, callback):
-        """Handle slider value change."""
-        val = float(value)
-        value_labels[weight_name].config(text=f"{val:.2f}")
-        callback()
-
-    def _on_scalar_change(self, combo, var, weight_name, callback):
-        """Handle scalar selection change."""
-        var.set(combo.current())
-        callback()
 
     def get_scalar_values(self) -> list:
         return self.scalar_values
@@ -132,13 +91,11 @@ class LQRControllerConfig(ControllerConfig):
             print("Error: LQR gain matrix not computed")
             return
 
-        # Create popup window
         popup = tk.Toplevel(parent_widget)
         popup.title("LQR Gain Matrix")
         popup.configure(bg=colors['bg'])
         popup.geometry("500x300")
 
-        # Create text widget
         text = tk.Text(popup,
                        bg=colors['widget_bg'],
                        fg=colors['fg'],
@@ -146,7 +103,6 @@ class LQRControllerConfig(ControllerConfig):
                        wrap='none')
         text.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # Format gain matrix
         text.insert('1.0', "LQR Gain Matrix K (2x4):\n")
         text.insert('end', "State: [x(m), y(m), vx(m/s), vy(m/s)]\n")
         text.insert('end', "Control: [ry(deg), rx(deg)]\n\n")
@@ -165,12 +121,11 @@ class LQRStewartSimulator(BaseStewartSimulator):
     """LQR-specific Stewart Platform Simulator."""
 
     def __init__(self, root):
-        # Ball physics parameters needed for LQR linearization
         ball_physics_params = {
             'radius': 0.04,
             'mass': 0.0027,
             'gravity': 9.81,
-            'mass_factor': 1.667  # For hollow sphere: I = (2/3)*m*r²
+            'mass_factor': 1.667
         }
 
         config = LQRControllerConfig(ball_physics_params)
@@ -181,30 +136,16 @@ class LQRStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        # Get raw slider values
-        Q_pos_raw = float(sliders['Q_pos'].get())
-        Q_vel_raw = float(sliders['Q_vel'].get())
-        R_raw = float(sliders['R'].get())
+        Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+        Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+        R = self.controller_config.get_scaled_param('R', sliders, scalar_vars)
 
-        # Get scalar multipliers
-        Q_pos_scalar = self.controller_config.scalar_values[scalar_vars['Q_pos'].get()]
-        Q_vel_scalar = self.controller_config.scalar_values[scalar_vars['Q_vel'].get()]
-        R_scalar = self.controller_config.scalar_values[scalar_vars['R'].get()]
-
-        # Compute final weights
-        Q_pos = Q_pos_raw * Q_pos_scalar
-        Q_vel = Q_vel_raw * Q_vel_scalar
-        R = R_raw * R_scalar
-
-        # Create controller
         self.controller = self.controller_config.create_controller(
             Q_pos=Q_pos, Q_vel=Q_vel, R=R, output_limit=15.0
         )
 
-        # Store reference for gain matrix display
         self.controller_config.controller_ref = self.controller
 
-        # Log initial weights
         self.log(f"LQR initialized: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
     def on_controller_param_change(self):
@@ -215,44 +156,17 @@ class LQRStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        # Get raw slider values
-        Q_pos_raw = float(sliders['Q_pos'].get())
-        Q_vel_raw = float(sliders['Q_vel'].get())
-        R_raw = float(sliders['R'].get())
+        Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+        Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+        R = self.controller_config.get_scaled_param('R', sliders, scalar_vars)
 
-        # Get scalar multipliers
-        Q_pos_scalar = self.controller_config.scalar_values[scalar_vars['Q_pos'].get()]
-        Q_vel_scalar = self.controller_config.scalar_values[scalar_vars['Q_vel'].get()]
-        R_scalar = self.controller_config.scalar_values[scalar_vars['R'].get()]
-
-        # Compute final weights
-        Q_pos = Q_pos_raw * Q_pos_scalar
-        Q_vel = Q_vel_raw * Q_vel_scalar
-        R = R_raw * R_scalar
-
-        # Update controller weights (recomputes gain matrix)
         self.controller.set_weights(Q_pos=Q_pos, Q_vel=Q_vel, R=R)
 
-        # Log update
         if self.controller_enabled.get():
             self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
-        """
-        Update LQR controller.
-
-        LQR requires both position AND velocity for optimal control.
-        Unlike PID, LQR doesn't need dt since it's a state-feedback controller.
-
-        Args:
-            ball_pos_mm: (x, y) ball position in mm
-            ball_vel_mm_s: (vx, vy) ball velocity in mm/s
-            target_pos_mm: (x, y) target position in mm
-            dt: timestep (not used by LQR)
-
-        Returns:
-            (rx, ry): platform tilt angles in degrees
-        """
+        """Update LQR controller."""
         return self.controller.update(ball_pos_mm, ball_vel_mm_s, target_pos_mm)
 
 
@@ -261,7 +175,6 @@ def main():
     root = tk.Tk()
     app = LQRStewartSimulator(root)
 
-    # Display startup message in log
     app.log("=" * 50)
     app.log("LQR Ball Balancing Control - Ready")
     app.log("=" * 50)

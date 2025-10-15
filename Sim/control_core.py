@@ -2,24 +2,23 @@
 """
 Stewart Platform Control Core
 
-- PIDController: PID controller for ball balancing
+Controllers:
+- PIDController: PID control for ball balancing
 - LQRController: Linear Quadratic Regulator for optimal control
-
-Updated: Vector-based output limiting to respect servo constraints
 """
 import numpy as np
 from scipy import linalg
+from utils import MAX_TILT_ANGLE_DEG
 
 
-def clip_tilt_vector(rx, ry, max_magnitude):
+def clip_tilt_vector(rx, ry, max_magnitude=MAX_TILT_ANGLE_DEG):
     """
     Clip tilt vector to maximum magnitude.
 
-    Treats (rx, ry) as a 2D vector and scales it down if magnitude exceeds limit.
-    This prevents servo limit violations when both rx and ry are large.
+    Treats (rx, ry) as a 2D vector and scales proportionally if magnitude exceeds limit.
+    Prevents servo constraint violations when both rx and ry are large.
 
-    Example:
-        (11, 11) has magnitude 15.56° → scaled to (10.6, 10.6) with magnitude 15°
+    Example: (11, 11) → magnitude 15.56° → scaled to (10.6, 10.6) at 15°
 
     Args:
         rx: Roll angle in degrees
@@ -27,42 +26,36 @@ def clip_tilt_vector(rx, ry, max_magnitude):
         max_magnitude: Maximum allowed tilt magnitude in degrees
 
     Returns:
-        (rx_clipped, ry_clipped): Clipped angles
+        (rx_clipped, ry_clipped, actual_magnitude)
     """
     magnitude = np.sqrt(rx ** 2 + ry ** 2)
 
     if magnitude > max_magnitude:
-        # Scale down to max_magnitude
         scale = max_magnitude / magnitude
-        return rx * scale, ry * scale
-    else:
-        return rx, ry
+        return rx * scale, ry * scale, magnitude
+
+    return rx, ry, magnitude
 
 
 class PIDController:
     """
     2D PID Controller for ball position control.
 
-    Controls platform tilt (rx, ry) to keep ball at target position.
-    Separate PID for X and Y axes.
-
-    Features:
-    - Vector-based output limiting (respects servo constraints)
-    - Optional derivative filtering (reduces noise)
+    Controls platform tilt (rx, ry) to maintain ball at target position.
+    Separate PID loops for X and Y axes with vector-based output limiting.
     """
 
-    def __init__(self, kp=1.0, ki=0.0, kd=0.5, output_limit=15.0,
+    def __init__(self, kp=1.0, ki=0.0, kd=0.5,
+                 output_limit=MAX_TILT_ANGLE_DEG,
                  derivative_filter_alpha=0.0):
         """
-        Initialize PID controller.
-
         Args:
             kp: Proportional gain
             ki: Integral gain
             kd: Derivative gain
-            output_limit: Maximum tilt angle output (vector magnitude)
-            derivative_filter_alpha: Derivative filtering factor (0=no filter, 0.1=light, 0.5=heavy)
-                                    Set >0 for hardware to reduce camera noise
+            output_limit: Maximum tilt angle (vector magnitude)
+            derivative_filter_alpha: Low-pass filter coefficient (0=none, 0.1=light, 0.5=heavy)
+                                    Use >0 for hardware to reduce camera noise
         """
         self.kp = kp
         self.ki = ki
@@ -70,17 +63,15 @@ class PIDController:
         self.output_limit = output_limit
         self.derivative_filter_alpha = derivative_filter_alpha
 
-        # State for X axis
         self.integral_x = 0.0
         self.prev_error_x = 0.0
         self.filtered_derivative_x = 0.0
 
-        # State for Y axis
         self.integral_y = 0.0
         self.prev_error_y = 0.0
         self.filtered_derivative_y = 0.0
 
-        self.integral_limit = 100.0  # Anti-windup
+        self.integral_limit = 100.0
 
     def update(self, ball_pos_mm, target_pos_mm, dt):
         """
@@ -88,20 +79,18 @@ class PIDController:
 
         Args:
             ball_pos_mm: (x, y) current ball position in mm
-            target_pos_mm: (x, y) target ball position in mm
-            dt: time step in seconds
+            target_pos_mm: (x, y) target position in mm
+            dt: timestep in seconds
 
         Returns:
-            (rx, ry) platform tilt angles in degrees
+            (rx, ry): platform tilt angles in degrees
         """
         if dt <= 0:
             return 0.0, 0.0
 
-        # Compute errors
         error_x = ball_pos_mm[0] - target_pos_mm[0]
         error_y = ball_pos_mm[1] - target_pos_mm[1]
 
-        # Compute PID for each axis
         output_x = self._compute_pid_axis(error_x, dt, 'x')
         output_y = self._compute_pid_axis(error_y, dt, 'y')
 
@@ -109,20 +98,15 @@ class PIDController:
         rx_raw = output_y
         ry_raw = output_x
 
-        # Apply vector-based limiting
-        rx, ry = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
-
+        rx, ry, _ = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
         return rx, ry
 
     def _compute_pid_axis(self, error, dt, axis):
-        """Compute PID output for a single axis."""
-        # Update integral with anti-windup
+        """Compute PID output for single axis with anti-windup and optional filtering."""
         integral = getattr(self, f'integral_{axis}')
-        integral += error * dt
-        integral = np.clip(integral, -self.integral_limit, self.integral_limit)
+        integral = np.clip(integral + error * dt, -self.integral_limit, self.integral_limit)
         setattr(self, f'integral_{axis}', integral)
 
-        # Compute derivative with optional filtering
         prev_error = getattr(self, f'prev_error_{axis}')
         raw_derivative = (error - prev_error) / dt
 
@@ -159,49 +143,37 @@ class LQRController:
     """
     Linear Quadratic Regulator (LQR) for ball position control.
 
-    Controls platform tilt (rx, ry) to keep ball at target position.
-    Uses optimal control theory to minimize both position error and control effort.
+    Uses optimal control theory to minimize position error and control effort.
 
-    State space model:
-        x = [pos_x, pos_y, vel_x, vel_y]
-        u = [tilt_ry, tilt_rx]
+    State: [pos_x, pos_y, vel_x, vel_y]
+    Control: [tilt_ry, tilt_rx]
 
-    Linearized dynamics around equilibrium (ball at center, zero velocity):
+    Linearized dynamics around equilibrium (ball centered, zero velocity):
         dx/dt = A*x + B*u
-
-    Updated: Uses vector-based output limiting.
     """
 
-    def __init__(self,
-                 Q_pos=1.0,
-                 Q_vel=1.0,
-                 R=0.01,
-                 output_limit=15.0,
+    def __init__(self, Q_pos=1.0, Q_vel=1.0, R=0.01,
+                 output_limit=MAX_TILT_ANGLE_DEG,
                  ball_physics_params=None):
         """
-        Initialize LQR controller.
-
         Args:
-            Q_pos: State cost weight for position error (higher = more aggressive position correction)
-            Q_vel: State cost weight for velocity (higher = more damping)
-            R: Control cost weight (higher = less aggressive control, smoother motion)
-            output_limit: Maximum tilt angle output in degrees (applied as vector magnitude)
+            Q_pos: Position error cost weight (higher = tighter tracking)
+            Q_vel: Velocity cost weight (higher = more damping)
+            R: Control effort cost weight (higher = smoother, less aggressive)
+            output_limit: Maximum tilt angle in degrees (vector magnitude)
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
         """
-        # Cost matrix weights
         self.Q_pos = Q_pos
         self.Q_vel = Q_vel
         self.R_weight = R
         self.output_limit = output_limit
 
-        # Ball physics parameters (needed for linearization)
         if ball_physics_params is None:
-            # Default values matching SimpleBallPhysics2D defaults
             ball_physics_params = {
                 'radius': 0.04,
                 'mass': 0.0027,
                 'gravity': 9.81,
-                'mass_factor': 1.667  # For hollow sphere
+                'mass_factor': 1.667
             }
 
         self.ball_radius = ball_physics_params['radius']
@@ -209,77 +181,46 @@ class LQRController:
         self.g = ball_physics_params['gravity']
         self.mass_factor = ball_physics_params['mass_factor']
 
-        # Compute gain matrix
         self.K = None
         self.compute_lqr_gain()
 
     def compute_lqr_gain(self):
         """
-        Compute LQR gain matrix by solving the algebraic Riccati equation.
+        Compute LQR gain matrix by solving algebraic Riccati equation.
 
-        System linearization:
-        For a ball on a tilted surface with small angles:
-            acceleration = (g / mass_factor) * sin(tilt) ≈ (g / mass_factor) * tilt_radians
-
-        State space:
-            x = [x_pos(m), y_pos(m), x_vel(m/s), y_vel(m/s)]
-            u = [ry(deg), rx(deg)]  # Platform roll and pitch
-
-            dx/dt = A*x + B*u
+        Linearization: acceleration = (g / mass_factor) * tilt_radians
         """
-        # Linearization coefficient: acceleration per degree of tilt
-        # For small angles: sin(θ) ≈ θ (in radians)
-        # k = (g / mass_factor) * (π/180)  [m/s² per degree]
         k = (self.g / self.mass_factor) * (np.pi / 180.0)
 
-        # State transition matrix A (4x4)
-        # States: [x, y, vx, vy]
-        # Dynamics: dx = vx, dy = vy, dvx = 0, dvy = 0 (with no control)
         A = np.array([
-            [0, 0, 1, 0],  # dx/dt = vx
-            [0, 0, 0, 1],  # dy/dt = vy
-            [0, 0, 0, 0],  # dvx/dt = 0 (without control)
-            [0, 0, 0, 0]  # dvy/dt = 0 (without control)
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
         ])
 
-        # Control input matrix B (4x2)
-        # Controls: [ry, rx]
-        # Effect: tilt in +ry causes -x acceleration, tilt in +rx causes -y acceleration
         B = np.array([
-            [0, 0],  # Position not directly affected
-            [0, 0],  # Position not directly affected
-            [-k, 0],  # dvx/dt = -k * ry (tilt in ry moves ball in -x)
-            [0, -k]  # dvy/dt = -k * rx (tilt in rx moves ball in -y)
+            [0, 0],
+            [0, 0],
+            [-k, 0],
+            [0, -k]
         ])
 
-        # State cost matrix Q (4x4) - penalizes deviation from target
-        Q = np.diag([
-            self.Q_pos,  # x position error cost
-            self.Q_pos,  # y position error cost
-            self.Q_vel,  # x velocity cost (damping)
-            self.Q_vel  # y velocity cost (damping)
-        ])
-
-        # Control cost matrix R (2x2) - penalizes control effort
+        Q = np.diag([self.Q_pos, self.Q_pos, self.Q_vel, self.Q_vel])
         R = np.eye(2) * self.R_weight
 
-        # Solve continuous-time algebraic Riccati equation
         try:
             P = linalg.solve_continuous_are(A, B, Q, R)
-
-            # Compute optimal gain: K = R^-1 * B^T * P
             self.K = np.linalg.inv(R) @ B.T @ P
 
-            # Verify stability (closed-loop eigenvalues should have negative real parts)
             eig_vals = np.linalg.eigvals(A - B @ self.K)
             max_real = np.max(np.real(eig_vals))
 
             if max_real >= 0:
-                print(f"Warning: LQR controller may be unstable (max eigenvalue real part: {max_real:.4f})")
+                print(f"Warning: LQR may be unstable (max eigenvalue: {max_real:.4f})")
 
         except np.linalg.LinAlgError as e:
             print(f"Error solving Riccati equation: {e}")
-            # Fallback to simple gain
             self.K = np.array([[1.0, 0.0, 1.0, 0.0],
                                [0.0, 1.0, 0.0, 1.0]])
 
@@ -288,47 +229,30 @@ class LQRController:
         Compute LQR control output.
 
         Args:
-            ball_pos_mm: (x, y) current ball position in mm
-            ball_vel_mm_s: (vx, vy) current ball velocity in mm/s
-            target_pos_mm: (x, y) target ball position in mm
+            ball_pos_mm: (x, y) current position in mm
+            ball_vel_mm_s: (vx, vy) current velocity in mm/s
+            target_pos_mm: (x, y) target position in mm
 
         Returns:
-            (rx, ry) platform tilt angles in degrees
+            (rx, ry): platform tilt angles in degrees
         """
-        # Convert to meters for state vector
-        x_error = (ball_pos_mm[0] - target_pos_mm[0]) / 1000.0  # m
-        y_error = (ball_pos_mm[1] - target_pos_mm[1]) / 1000.0  # m
-        vx = ball_vel_mm_s[0] / 1000.0  # m/s
-        vy = ball_vel_mm_s[1] / 1000.0  # m/s
+        x_error = (ball_pos_mm[0] - target_pos_mm[0]) / 1000.0
+        y_error = (ball_pos_mm[1] - target_pos_mm[1]) / 1000.0
+        vx = ball_vel_mm_s[0] / 1000.0
+        vy = ball_vel_mm_s[1] / 1000.0
 
-        # State vector: [x, y, vx, vy]
         state = np.array([x_error, y_error, vx, vy])
-
-        # Optimal control: u = -K * x
         u = -self.K @ state
 
-        # u = [ry, rx] in degrees
-        ry_raw = u[0]
-        rx_raw = u[1]
-
-        # Apply vector-based limiting (prevents servo violations)
-        rx, ry = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
-
+        rx, ry, _ = clip_tilt_vector(u[1], u[0], self.output_limit)
         return rx, ry
 
     def reset(self):
-        """Reset controller state (LQR is stateless, so this is a no-op)."""
+        """Reset controller state (LQR is stateless)."""
         pass
 
     def set_weights(self, Q_pos=None, Q_vel=None, R=None):
-        """
-        Update cost matrix weights and recompute gain.
-
-        Args:
-            Q_pos: State cost weight for position
-            Q_vel: State cost weight for velocity
-            R: Control cost weight
-        """
+        """Update cost weights and recompute gain matrix."""
         if Q_pos is not None:
             self.Q_pos = Q_pos
         if Q_vel is not None:
@@ -339,7 +263,7 @@ class LQRController:
         self.compute_lqr_gain()
 
     def get_weights(self):
-        """Get current cost matrix weights."""
+        """Get current cost weights."""
         return {
             'Q_pos': self.Q_pos,
             'Q_vel': self.Q_vel,
@@ -347,5 +271,5 @@ class LQRController:
         }
 
     def get_gain_matrix(self):
-        """Get the current LQR gain matrix."""
+        """Get current LQR gain matrix."""
         return self.K.copy() if self.K is not None else None
