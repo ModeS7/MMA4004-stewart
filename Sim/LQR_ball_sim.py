@@ -54,7 +54,7 @@ class StewartSimulatorGUI:
             "top_surface_offset": 26.0
         }
         self.ik = StewartPlatformIK(**self.platform_params)
-        self.servos = [FirstOrderServo(K=1.0, tau=0.1, delay=0.35) for _ in range(6)]
+        self.servos = [FirstOrderServo(K=1.0, tau=0.1, delay=0.0) for _ in range(6)]
 
         self.ball_physics = SimpleBallPhysics2D(
             ball_radius=0.04,

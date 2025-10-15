@@ -16,7 +16,7 @@ from collections import deque
 class FirstOrderServo:
     """First-order servo model with command delay."""
 
-    def __init__(self, K=1.0, tau=0.1, delay=0.35):
+    def __init__(self, K=1.0, tau=0.1, delay=0.0):
         self.K = K
         self.tau = tau
         self.delay = delay
