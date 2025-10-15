@@ -40,8 +40,8 @@ class IMUConfig:
 
     # Axis orientation: [X, Y, Z] multipliers (+1 or -1)
     # Default: Z-axis inverted based on physical mounting
-    accel_axis_flip: np.ndarray = field(default_factory=lambda: np.array([1, 1, -1]))
-    gyro_axis_flip: np.ndarray = field(default_factory=lambda: np.array([1, 1, 1]))
+    accel_axis_flip: np.ndarray = field(default_factory=lambda: np.array([-1, 1, -1]))
+    gyro_axis_flip: np.ndarray = field(default_factory=lambda: np.array([-1, 1, 1]))
 
     # Frame alignment: 3x3 rotation matrices for 90°/180° corrections
     # Set to None if no rotation needed
@@ -96,7 +96,7 @@ class SystemIDConfig:
     # Manual mode parameters
     K: float = 1.0
     tau: float = 0.1
-    delay: float = 0.35 + 0.196 #0.159
+    delay: float = 0.5
 
     # Auto-fit mode initial guesses
     initial_K: float = 1.0
@@ -431,10 +431,6 @@ class StewartPlatformIK:
 # SYSTEM IDENTIFICATION
 # ============================================================================
 
-# ============================================================================
-# SYSTEM IDENTIFICATION
-# ============================================================================
-
 class FirstOrderSystemID:
     """First-order transfer function identification.
 
@@ -486,6 +482,8 @@ class FirstOrderSystemID:
             K, tau, delay = self.params
 
             step_magnitude = np.abs(commanded[-1] - commanded[0])
+            if step_magnitude < 0.1:
+                return None
             actual_normalized = (actual - actual[0]) / step_magnitude
             time_normalized = time - time[0]
 
@@ -564,152 +562,6 @@ class FirstOrderSystemID:
         return commanded[0] + response * step_magnitude
 
 
-class SecondOrderSystemID:
-    """Second-order transfer function identification with time delay.
-
-    Model: H(s) = K·ωn²·exp(-Td·s) / (s² + 2ζωn·s + ωn²)
-
-    Parameters:
-        K: Steady-state gain [dimensionless]
-        ζ: Damping ratio [dimensionless]
-        ωn: Natural frequency [rad/s]
-        Td: Time delay [s]
-    """
-
-    def __init__(self, config: SystemIDConfig):
-        self.config = config
-        self.params = None
-
-        if config.mode == 'manual':
-            self.params = np.array([config.K, config.zeta, config.wn, config.delay])
-
-    @staticmethod
-    def second_order_response(t, K, zeta, wn, delay):
-        """Compute second-order step response.
-
-        Args:
-            t: Time vector [s]
-            K: Steady-state gain
-            zeta: Damping ratio
-            wn: Natural frequency [rad/s]
-            delay: Time delay [s]
-
-        Returns:
-            Step response amplitude
-        """
-        response = np.zeros_like(t)
-        mask = t >= delay
-        t_delayed = t[mask] - delay
-
-        if zeta < 1:
-            wd = wn * np.sqrt(1 - zeta ** 2)
-            response[mask] = K * (1 - np.exp(-zeta * wn * t_delayed) *
-                                  (np.cos(wd * t_delayed) +
-                                   (zeta / np.sqrt(1 - zeta ** 2)) * np.sin(wd * t_delayed)))
-        elif zeta == 1:
-            response[mask] = K * (1 - np.exp(-wn * t_delayed) * (1 + wn * t_delayed))
-        else:
-            s1 = -zeta * wn + wn * np.sqrt(zeta ** 2 - 1)
-            s2 = -zeta * wn - wn * np.sqrt(zeta ** 2 - 1)
-            response[mask] = K * (1 - (s1 * np.exp(s2 * t_delayed) - s2 * np.exp(s1 * t_delayed)) / (s1 - s2))
-
-        return response
-
-    def fit(self, time: np.ndarray, commanded: np.ndarray, actual: np.ndarray) -> dict:
-        """Identify transfer function parameters from step response data.
-
-        Args:
-            time: Time vector [s]
-            commanded: Commanded input signal
-            actual: Measured output signal
-
-        Returns:
-            Dictionary containing identified parameters and fit quality (R²)
-        """
-        if self.config.mode == 'manual':
-            K, zeta, wn, delay = self.params
-
-            step_magnitude = np.abs(commanded[-1] - commanded[0])
-            actual_normalized = (actual - actual[0]) / step_magnitude
-            time_normalized = time - time[0]
-
-            predicted = self.second_order_response(time_normalized, K, zeta, wn, delay)
-            residuals = actual_normalized - predicted
-            ss_res = np.sum(residuals ** 2)
-            ss_tot = np.sum((actual_normalized - np.mean(actual_normalized)) ** 2)
-            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-
-            return {
-                'K': K,
-                'zeta': zeta,
-                'wn': wn,
-                'delay': delay,
-                'r_squared': r_squared,
-                'params': self.params,
-                'mode': 'manual'
-            }
-
-        step_magnitude = np.abs(commanded[-1] - commanded[0])
-
-        if step_magnitude < 0.1:
-            return None
-
-        actual_normalized = (actual - actual[0]) / step_magnitude
-        time_normalized = time - time[0]
-
-        try:
-            popt, pcov = curve_fit(
-                self.second_order_response,
-                time_normalized,
-                actual_normalized,
-                p0=[self.config.initial_K, self.config.initial_zeta, self.config.initial_wn, self.config.initial_delay],
-                bounds=([0.5, 0.1, 1.0, 0], [1.5, 2.0, 50.0, 0.5]),
-                maxfev=10000
-            )
-
-            K, zeta, wn, delay = popt
-
-            residuals = actual_normalized - self.second_order_response(time_normalized, *popt)
-            ss_res = np.sum(residuals ** 2)
-            ss_tot = np.sum((actual_normalized - np.mean(actual_normalized)) ** 2)
-            r_squared = 1 - (ss_res / ss_tot)
-
-            self.params = popt
-
-            return {
-                'K': K,
-                'zeta': zeta,
-                'wn': wn,
-                'delay': delay,
-                'r_squared': r_squared,
-                'params': popt,
-                'mode': 'fit'
-            }
-        except Exception as e:
-            print(f"Parameter fitting failed: {e}")
-            return None
-
-    def predict(self, time: np.ndarray, commanded: np.ndarray) -> np.ndarray:
-        """Generate model prediction for given input signal.
-
-        Args:
-            time: Time vector [s]
-            commanded: Commanded input signal
-
-        Returns:
-            Predicted output signal
-        """
-        if self.params is None:
-            return None
-
-        K, zeta, wn, delay = self.params
-        step_magnitude = commanded[-1] - commanded[0]
-        time_normalized = time - time[0]
-
-        response = self.second_order_response(time_normalized, K, zeta, wn, delay)
-        return commanded[0] + response * step_magnitude
-
-
 # ============================================================================
 # MAIN PROCESSING PIPELINE
 # ============================================================================
@@ -745,15 +597,15 @@ def process_experiment(csv_file: str):
 
     print(f"  System identification mode: {sysid_config.mode}")
 
-    time = df['timestamp_pc'].values - df['timestamp_pc'].values[0]
+    # Convert Teensy timestamps to seconds (from microseconds)
+    time = (df['timestamp_us'].values - df['timestamp_us'].values[0]) / 1e6
+    command_time = (df['command_time_us'].values - df['timestamp_us'].values[0]) / 1e6
 
-    rx_cmd = np.radians(df['rx'].values)
-    ry_cmd = np.radians(df['ry'].values)
+    # Servo angles directly from Teensy
+    theta_cmd = df[['theta0', 'theta1', 'theta2', 'theta3', 'theta4', 'theta5']].values
 
     accel_raw = df[['accel_x', 'accel_y', 'accel_z']].values
     gyro_raw = df[['gyro_x', 'gyro_y', 'gyro_z']].values
-
-    theta_cmd = df[['theta0', 'theta1', 'theta2', 'theta3', 'theta4', 'theta5']].values
 
     print("  Processing IMU data...")
     rx_est = np.zeros(len(df))
@@ -792,46 +644,50 @@ def process_experiment(csv_file: str):
 
     print("  Performing system identification...")
 
-    rx_diff = np.diff(rx_cmd)
-    step_idx = np.where(np.abs(rx_diff) > np.radians(1))[0]
+    # Find where command time changes (indicates new command)
+    command_time_diff = np.abs(np.diff(command_time))
+    step_indices = np.where(command_time_diff > 0.001)[0]  # >1ms change
 
     fit_result = None
-    rx_model = None
-    ry_model = None
     theta_model = None
 
-    if len(step_idx) > 0:
-        step_start = max(0, step_idx[0] - 10)
-        step_end = min(len(time), step_idx[0] + int(2.0 / np.mean(np.diff(time))))
+    if len(step_indices) > 0:
+        # Use first step
+        step_idx = step_indices[0]
+        step_time = command_time[step_idx + 1]
 
-        theta_cmd_avg = np.mean(theta_cmd[step_start:step_end], axis=1)
-        theta_est_avg = np.mean(theta_est[step_start:step_end], axis=1)
+        print(f"    Step detected at index {step_idx + 1}")
+        print(f"    Command sent at t={step_time:.3f}s")
 
+        # Find which servo has the largest change
+        theta_changes = np.abs(theta_cmd[step_idx + 1] - theta_cmd[step_idx])
+        max_servo = np.argmax(theta_changes)
+
+        print(f"    Largest change in servo {max_servo}: {theta_changes[max_servo]:.2f} degrees")
+
+        # Time relative to command
+        time_from_cmd = time - step_time
+
+        # Analysis window: -10ms to +2s from command
+        mask = (time_from_cmd >= -0.01) & (time_from_cmd <= 2.0)
+
+        # Use the servo with largest change
         fit_result = sysid.fit(
-            time[step_start:step_end],
-            theta_cmd_avg,
-            theta_est_avg
+            time_from_cmd[mask],
+            theta_cmd[mask, max_servo],
+            theta_est[mask, max_servo]
         )
 
         if fit_result:
             mode_str = fit_result.get('mode', 'fit')
 
-            print(f"\n  System ID Results (All Servos) - Mode: {mode_str.upper()}")
+            print(f"\n  System ID Results (Servo {max_servo}) - Mode: {mode_str.upper()}")
             print(f"    K (Gain):       {fit_result['K']:.4f}")
             print(f"    τ (Time const): {fit_result['tau']:.4f} s")
-            print(f"    Td (Delay):     {fit_result['delay']:.4f} s")
+            print(f"    Td (Delay):     {fit_result['delay']:.4f} s ({fit_result['delay']*1000:.1f} ms)")
             print(f"    R²:             {fit_result['r_squared']:.4f}")
 
-            if mode_str == 'manual':
-                print(f"    Note: Using manually specified parameters")
-            else:
-                print(f"    Note: Parameters auto-fitted from step response data")
-
             print("  Generating model predictions...")
-
-            rx_model = sysid.predict(time, rx_cmd)
-            ry_model = sysid.predict(time, ry_cmd)
-
             theta_model = np.zeros_like(theta_cmd)
             for i in range(6):
                 pred = sysid.predict(time, theta_cmd[:, i])
@@ -842,19 +698,17 @@ def process_experiment(csv_file: str):
 
     fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
 
-    ax1.plot(time, np.degrees(rx_cmd), 'b-', label='Commanded', linewidth=2)
-    ax1.plot(time, np.degrees(rx_est), 'r--', label='IMU Estimated', linewidth=1.5)
-    if rx_model is not None:
-        ax1.plot(time, np.degrees(rx_model), 'g:', label='Model Prediction', linewidth=2)
+    ax1.plot(time, np.degrees(rx_est), 'r-', label='IMU Roll Estimate', linewidth=1.5)
+    if len(step_indices) > 0:
+        ax1.axvline(x=step_time, color='g', linestyle='--', label='Command Sent', linewidth=2)
     ax1.set_ylabel('Roll (rx) [deg]')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    ax1.set_title('Orientation Comparison: Commanded vs IMU vs Model')
+    ax1.set_title('IMU Orientation Estimate')
 
-    ax2.plot(time, np.degrees(ry_cmd), 'b-', label='Commanded', linewidth=2)
-    ax2.plot(time, np.degrees(ry_est), 'r--', label='IMU Estimated', linewidth=1.5)
-    if ry_model is not None:
-        ax2.plot(time, np.degrees(ry_model), 'g:', label='Model Prediction', linewidth=2)
+    ax2.plot(time, np.degrees(ry_est), 'b-', label='IMU Pitch Estimate', linewidth=1.5)
+    if len(step_indices) > 0:
+        ax2.axvline(x=step_time, color='g', linestyle='--', label='Command Sent', linewidth=2)
     ax2.set_xlabel('Time [s]')
     ax2.set_ylabel('Pitch (ry) [deg]')
     ax2.legend()
@@ -870,6 +724,8 @@ def process_experiment(csv_file: str):
         axes[i].plot(time, theta_est[:, i], 'r--', label='IMU-IK', linewidth=1.5)
         if theta_model is not None:
             axes[i].plot(time, theta_model[:, i], 'g:', label='Model', linewidth=2)
+        if len(step_indices) > 0:
+            axes[i].axvline(x=step_time, color='gray', linestyle='--', alpha=0.5, linewidth=1)
         axes[i].set_ylabel(f'θ{i} [deg]')
         axes[i].legend(fontsize=8)
         axes[i].grid(True, alpha=0.3)
@@ -894,23 +750,7 @@ if __name__ == "__main__":
         print("=" * 70)
         print("\nUsage:")
         print("  python script.py <experiment_csv_file>")
-        print("\nConfiguration:")
-        print("  Edit dataclass definitions at top of script:")
-        print("\n  1. IMUConfig")
-        print("     - Sensor scaling factors (LSM303DLHC + L3GD20)")
-        print("     - Axis orientation corrections")
-        print("     - Frame rotation matrices")
-        print("\n  2. KalmanConfig")
-        print("     - Process noise covariance")
-        print("     - Measurement noise covariance")
-        print("\n  3. SystemIDConfig")
-        print("     - mode: 'fit' (auto) or 'manual' (user-specified)")
-        print("     - Parameters: K, τ, Td")
-        print("\nTransfer Function:")
-        print("  H(s) = K·exp(-Td·s) / (τ·s + 1)")
-        print("\nOutput:")
-        print("  - Console: Identified parameters and fit quality (R²)")
-        print("  - Plots: Orientation and servo angle comparisons")
+        print("\nNew: Uses Teensy-timestamped data for accurate delay measurement")
         print("=" * 70)
         sys.exit(1)
 

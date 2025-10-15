@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Stewart Platform Automated Experiments with IMU Logging
-Combines servo control with high-frequency IMU data collection
-FIXED: Proper command timestamp tracking
+Optimized: Theta sent only on change, IMU at full speed
 """
 
 import tkinter as tk
@@ -162,6 +161,7 @@ class IMUReader(threading.Thread):
         self.log_callback = log_callback
         self.running = False
         self.debug_counter = 0
+        self.parse_errors = 0
 
     def run(self):
         self.running = True
@@ -181,22 +181,54 @@ class IMUReader(threading.Thread):
 
                     if line.startswith("IMU,"):
                         parts = line.split(',')
-                        if len(parts) == 8:
+                        # Format: IMU,imu_micros,cmd_micros,ax,ay,az,gx,gy,gz
+                        if len(parts) == 9:
                             try:
                                 timestamp_us = int(parts[1])
-                                accel = [int(parts[2]), int(parts[3]), int(parts[4])]
-                                gyro = [int(parts[5]), int(parts[6]), int(parts[7])]
+                                command_time_us = int(parts[2])
+                                accel = [int(parts[3]), int(parts[4]), int(parts[5])]
+                                gyro = [int(parts[6]), int(parts[7]), int(parts[8])]
 
                                 self.data_queue.put({
+                                    'type': 'imu',
                                     'timestamp_us': timestamp_us,
+                                    'command_time_us': command_time_us,
                                     'timestamp_pc': time.time(),
                                     'accel': accel,
                                     'gyro': gyro
                                 })
-                            except ValueError as e:
-                                if self.debug_counter < 20:
-                                    self.log_callback(f"Parse error: {e}")
-                                    self.debug_counter += 1
+
+                                self.parse_errors = 0
+
+                            except (ValueError, IndexError) as e:
+                                if self.parse_errors < 5:
+                                    self.log_callback(f"IMU parse error: {e}")
+                                    self.parse_errors += 1
+                        else:
+                            if self.parse_errors < 5:
+                                self.log_callback(f"Wrong IMU format: got {len(parts)} parts, expected 9")
+                                self.parse_errors += 1
+
+                    elif line.startswith("CMD,"):
+                        parts = line.split(',')
+                        # Format: CMD,cmd_us,theta0,theta1,theta2,theta3,theta4,theta5
+                        if len(parts) == 8:
+                            try:
+                                command_time_us = int(parts[1])
+                                theta = [float(parts[2]), float(parts[3]), float(parts[4]),
+                                         float(parts[5]), float(parts[6]), float(parts[7])]
+
+                                self.data_queue.put({
+                                    'type': 'cmd',
+                                    'command_time_us': command_time_us,
+                                    'timestamp_pc': time.time(),
+                                    'theta': theta
+                                })
+
+                            except (ValueError, IndexError) as e:
+                                if self.parse_errors < 5:
+                                    self.log_callback(f"CMD parse error: {e}")
+                                    self.parse_errors += 1
 
                     elif line.startswith("IMU_"):
                         self.log_callback(line)
@@ -204,10 +236,15 @@ class IMUReader(threading.Thread):
                         self.log_callback("Teensy ready")
                     elif line == "OK" or line == "OK_SPD":
                         pass
+                    else:
+                        if self.debug_counter < 20:
+                            self.log_callback(f"Unknown: {line}")
+                            self.debug_counter += 1
+
             except Exception as e:
-                if self.debug_counter < 20:
+                if self.parse_errors < 5:
                     self.log_callback(f"IMU thread error: {e}")
-                    self.debug_counter += 1
+                    self.parse_errors += 1
 
             time.sleep(0.0001)
 
@@ -288,15 +325,11 @@ class StewartControlGUI:
 
         self.use_top_surface_offset = tk.BooleanVar(value=True)
 
-        self.dof_values = {
-            'x': 0.0, 'y': 0.0, 'z': self.ik.home_height_top_surface,
-            'rx': 0.0, 'ry': 0.0, 'rz': 0.0
-        }
-
         self.current_angles = np.zeros(6)
 
-        # FIXED: Track command timestamp
-        self.last_command_time = 0.0
+        # Track latest theta values from CMD messages
+        self.latest_theta = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        self.latest_command_time_us = 0
 
         self.create_widgets()
 
@@ -415,17 +448,25 @@ class StewartControlGUI:
 
         try:
             self.log(f"Connecting to {port}...")
-            self.serial_conn = serial.Serial(port, 2000000, timeout=0.1)
+            self.serial_conn = serial.Serial(port, 2000000, timeout=0.5)
+            self.log("Serial port opened, waiting for Teensy startup...")
+
             time.sleep(2)
 
+            # Read startup messages
             startup_lines = []
-            while self.serial_conn.in_waiting:
-                line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    startup_lines.append(line)
-
-            for line in startup_lines:
-                self.log(f"Teensy: {line}")
+            start_time = time.time()
+            while time.time() - start_time < 1.0:
+                if self.serial_conn.in_waiting:
+                    try:
+                        line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
+                        if line:
+                            startup_lines.append(line)
+                            self.log(f"Teensy: {line}")
+                    except:
+                        break
+                else:
+                    time.sleep(0.1)
 
             self.log("Setting servo speed to maximum...")
             self.serial_conn.write(b"SPD:0\n")
@@ -440,11 +481,22 @@ class StewartControlGUI:
             self.run_exp_btn.config(state='normal')
 
             self.log("Connection established successfully")
+            self.log("Waiting for IMU data...")
+
+            time.sleep(0.5)
+
             self.home_position()
 
         except Exception as e:
             messagebox.showerror("Connection Error", str(e))
             self.log(f"Connection error: {e}")
+
+            if self.serial_conn:
+                try:
+                    self.serial_conn.close()
+                except:
+                    pass
+                self.serial_conn = None
 
     def disconnect(self):
         if self.imu_reader:
@@ -469,18 +521,30 @@ class StewartControlGUI:
         try:
             while not self.imu_queue.empty():
                 data = self.imu_queue.get_nowait()
-                self.imu_samples_received += 1
 
-                accel = data['accel']
-                gyro = data['gyro']
+                if data['type'] == 'imu':
+                    self.imu_samples_received += 1
 
-                accel_str = ', '.join([f"{a:6d}" for a in accel])
-                gyro_str = ', '.join([f"{g:6d}" for g in gyro])
+                    accel = data['accel']
+                    gyro = data['gyro']
 
-                self.imu_label.config(text=f"Accel: [{accel_str}] | Gyro: [{gyro_str}]")
+                    accel_str = ', '.join([f"{a:6d}" for a in accel])
+                    gyro_str = ', '.join([f"{g:6d}" for g in gyro])
 
-                if self.is_recording and self.csv_writer:
-                    self.write_csv_row(data)
+                    self.imu_label.config(text=f"Accel: [{accel_str}] | Gyro: [{gyro_str}]")
+
+                    if self.is_recording and self.csv_writer:
+                        self.write_csv_row(data)
+
+                elif data['type'] == 'cmd':
+                    # Update latest theta values
+                    self.latest_theta = data['theta']
+                    self.latest_command_time_us = data['command_time_us']
+
+                    # Update angle display
+                    for i in range(6):
+                        self.angle_labels[i].config(text=f"θ{i + 1}: {self.latest_theta[i]:6.2f}°")
+
         except Empty:
             pass
 
@@ -497,10 +561,8 @@ class StewartControlGUI:
             self.csv_file = open(filename, 'w', newline='', buffering=1)
             self.csv_writer = csv.writer(self.csv_file)
 
-            # FIXED: Added command_time_pc column
             self.csv_writer.writerow([
-                'timestamp_us', 'timestamp_pc', 'command_time_pc',
-                'x', 'y', 'z', 'rx', 'ry', 'rz',
+                'timestamp_us', 'command_time_us', 'timestamp_pc',
                 'theta0', 'theta1', 'theta2', 'theta3', 'theta4', 'theta5',
                 'accel_x', 'accel_y', 'accel_z',
                 'gyro_x', 'gyro_y', 'gyro_z'
@@ -524,18 +586,12 @@ class StewartControlGUI:
 
     def write_csv_row(self, imu_data):
         try:
-            # FIXED: Include command timestamp
+            # Merge IMU data with latest theta values
             row = [
                 imu_data['timestamp_us'],
+                imu_data['command_time_us'],
                 imu_data['timestamp_pc'],
-                self.last_command_time,  # Command timestamp
-                self.dof_values['x'],
-                self.dof_values['y'],
-                self.dof_values['z'],
-                self.dof_values['rx'],
-                self.dof_values['ry'],
-                self.dof_values['rz'],
-                *self.current_angles,
+                *self.latest_theta,
                 *imu_data['accel'],
                 *imu_data['gyro']
             ]
@@ -545,13 +601,6 @@ class StewartControlGUI:
             self.log(f"ERROR writing CSV: {e}")
 
     def send_position(self, x, y, z, rx, ry, rz):
-        self.dof_values['x'] = x
-        self.dof_values['y'] = y
-        self.dof_values['z'] = z
-        self.dof_values['rx'] = rx
-        self.dof_values['ry'] = ry
-        self.dof_values['rz'] = rz
-
         translation = np.array([x, y, z])
         rotation = np.array([rx, ry, rz])
 
@@ -561,13 +610,8 @@ class StewartControlGUI:
         if angles is not None:
             self.current_angles = angles
 
-            for i in range(6):
-                self.angle_labels[i].config(text=f"θ{i + 1}: {angles[i]:6.2f}°")
-
             if self.is_connected and self.serial_conn:
                 command = ",".join([f"{angle:.3f}" for angle in angles]) + "\n"
-                # FIXED: Capture exact send time
-                self.last_command_time = time.time()
                 self.serial_conn.write(command.encode())
                 return True
         else:

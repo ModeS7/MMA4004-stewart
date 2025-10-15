@@ -1,8 +1,9 @@
 /*
-  Stewart Platform - Combined Servo Control + IMU Streaming
+  Stewart Platform - Optimized IMU Streaming
   
   Receives servo commands: "theta0,theta1,theta2,theta3,theta4,theta5\n"
-  Sends IMU data: "IMU,micros,ax,ay,az,gx,gy,gz\n"
+  Sends IMU: "IMU,imu_us,cmd_us,ax,ay,az,gx,gy,gz\n"
+  Sends CMD: "CMD,cmd_us,theta0,theta1,theta2,theta3,theta4,theta5\n" (only on change)
 */
 
 #include "PololuMaestro.h"
@@ -31,6 +32,9 @@ float range[6][2] = {
 float offset[6] = {-0.5, 7, -2, 4, -2.5, 5.5};
 float theta[6] = {0, 0, 0, 0, 0, 0};
 
+// Track when command was received
+unsigned long commandTimestamp = 0;
+
 // IMU data
 int16_t accelData[3] = {0, 0, 0};
 int16_t gyroData[3] = {0, 0, 0};
@@ -38,6 +42,9 @@ unsigned long lastAccelTime = 0;
 unsigned long lastGyroTime = 0;
 
 bool imuInitialized = false;
+
+// Buffer for faster serial output
+char msgBuffer[128];
 
 void setup() {
   Serial.begin(2000000);
@@ -77,6 +84,7 @@ void setup() {
   
   lastAccelTime = micros();
   lastGyroTime = micros();
+  commandTimestamp = micros();
 }
 
 void loop() {
@@ -142,10 +150,17 @@ void loop() {
       }
       
       if (valid) {
+        commandTimestamp = micros();
+        
         for (int i = 0; i < 6; i++) {
           theta[i] = angles[i];
         }
+        
         moveServos();
+        
+        // Send command update message
+        sendCommand(commandTimestamp);
+        
         Serial.println("OK");
       } else {
         Serial.println("ERROR");
@@ -204,28 +219,37 @@ void readGyro() {
 }
 
 void sendIMU(unsigned long timestamp) {
-  Serial.print("IMU,");
-  Serial.print(timestamp);
-  Serial.print(",");
-  Serial.print(accelData[0]);
-  Serial.print(",");
-  Serial.print(accelData[1]);
-  Serial.print(",");
-  Serial.print(accelData[2]);
-  Serial.print(",");
-  Serial.print(gyroData[0]);
-  Serial.print(",");
-  Serial.print(gyroData[1]);
-  Serial.print(",");
-  Serial.println(gyroData[2]);
+  // Optimized: use sprintf for speed (single serial write)
+  // Format: IMU,imu_us,cmd_us,ax,ay,az,gx,gy,gz
+  sprintf(msgBuffer, "IMU,%lu,%lu,%d,%d,%d,%d,%d,%d",
+          timestamp, commandTimestamp,
+          accelData[0], accelData[1], accelData[2],
+          gyroData[0], gyroData[1], gyroData[2]);
+  Serial.println(msgBuffer);
+}
+
+void sendCommand(unsigned long timestamp) {
+  // Format: CMD,cmd_us,theta0,theta1,theta2,theta3,theta4,theta5
+  // Use dtostrf for float formatting
+  char t0[8], t1[8], t2[8], t3[8], t4[8], t5[8];
+  dtostrf(theta[0], 6, 3, t0);
+  dtostrf(theta[1], 6, 3, t1);
+  dtostrf(theta[2], 6, 3, t2);
+  dtostrf(theta[3], 6, 3, t3);
+  dtostrf(theta[4], 6, 3, t4);
+  dtostrf(theta[5], 6, 3, t5);
+  
+  sprintf(msgBuffer, "CMD,%lu,%s,%s,%s,%s,%s,%s",
+          timestamp, t0, t1, t2, t3, t4, t5);
+  Serial.println(msgBuffer);
 }
 
 void moveServos() {
   for (int i = 0; i < 6; i++) {
     float pos = theta[i] + offset[i];
     pos = map(pos, range[i][0], range[i][1], abs_0, abs_90);
-    maestro.setSpeed(i, 0);  // Maximum speed
-    maestro.setAcceleration(i, 0);  // Maximum acceleration
+    maestro.setSpeed(i, 0);
+    maestro.setAcceleration(i, 0);
     maestro.setTarget(i, pos);
   }
 }
