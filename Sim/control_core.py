@@ -4,9 +4,39 @@ Stewart Platform Control Core
 
 - PIDController: PID controller for ball balancing
 - LQRController: Linear Quadratic Regulator for optimal control
+
+Updated: Vector-based output limiting to respect servo constraints
 """
 import numpy as np
 from scipy import linalg
+
+
+def clip_tilt_vector(rx, ry, max_magnitude):
+    """
+    Clip tilt vector to maximum magnitude.
+
+    Treats (rx, ry) as a 2D vector and scales it down if magnitude exceeds limit.
+    This prevents servo limit violations when both rx and ry are large.
+
+    Example:
+        (11, 11) has magnitude 15.56° → scaled to (10.6, 10.6) with magnitude 15°
+
+    Args:
+        rx: Roll angle in degrees
+        ry: Pitch angle in degrees
+        max_magnitude: Maximum allowed tilt magnitude in degrees
+
+    Returns:
+        (rx_clipped, ry_clipped): Clipped angles
+    """
+    magnitude = np.sqrt(rx ** 2 + ry ** 2)
+
+    if magnitude > max_magnitude:
+        # Scale down to max_magnitude
+        scale = max_magnitude / magnitude
+        return rx * scale, ry * scale
+    else:
+        return rx, ry
 
 
 class PIDController:
@@ -15,6 +45,8 @@ class PIDController:
 
     Controls platform tilt (rx, ry) to keep ball at target position.
     Separate PID for X and Y axes.
+
+    Updated: Uses vector-based output limiting.
     """
 
     def __init__(self, kp=1.0, ki=0.0, kd=0.5, output_limit=15.0):
@@ -67,10 +99,13 @@ class PIDController:
         self.prev_error_y = error_y
 
         # Map PID output to platform tilt angles
-        # Ball at +X needs platform to tilt to bring it back
-        # Ball at +Y needs platform to tilt to bring it back
-        rx = np.clip(output_y, -self.output_limit, self.output_limit)
-        ry = np.clip(output_x, -self.output_limit, self.output_limit)
+        # Ball at +X needs platform to tilt in +Y to bring it back
+        # Ball at +Y needs platform to tilt in +X to bring it back
+        rx_raw = output_y
+        ry_raw = output_x
+
+        # Apply vector-based limiting (prevents servo violations)
+        rx, ry = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
 
         return rx, ry
 
@@ -101,6 +136,8 @@ class LQRController:
 
     Linearized dynamics around equilibrium (ball at center, zero velocity):
         dx/dt = A*x + B*u
+
+    Updated: Uses vector-based output limiting.
     """
 
     def __init__(self,
@@ -116,7 +153,7 @@ class LQRController:
             Q_pos: State cost weight for position error (higher = more aggressive position correction)
             Q_vel: State cost weight for velocity (higher = more damping)
             R: Control cost weight (higher = less aggressive control, smoother motion)
-            output_limit: Maximum tilt angle output in degrees
+            output_limit: Maximum tilt angle output in degrees (applied as vector magnitude)
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
         """
         # Cost matrix weights
@@ -239,8 +276,11 @@ class LQRController:
         u = -self.K @ state
 
         # u = [ry, rx] in degrees
-        ry = np.clip(u[0], -self.output_limit, self.output_limit)
-        rx = np.clip(u[1], -self.output_limit, self.output_limit)
+        ry_raw = u[0]
+        rx_raw = u[1]
+
+        # Apply vector-based limiting (prevents servo violations)
+        rx, ry = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
 
         return rx, ry
 

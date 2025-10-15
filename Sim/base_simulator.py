@@ -4,6 +4,10 @@ Stewart Platform Simulator - Base Class
 
 Reusable simulator with pluggable controller support.
 Eliminates duplication between PID and LQR implementations.
+
+Key improvement: Vector-based tilt limiting to respect servo constraints.
+The platform tilt is treated as a 2D vector (rx, ry) with magnitude limited to 15°.
+This prevents IK failures when both rx and ry are large.
 """
 
 import tkinter as tk
@@ -395,6 +399,16 @@ class BaseStewartSimulator:
 
         sliders_frame.columnconfigure(1, weight=1)
 
+        # Add tilt magnitude indicator below sliders
+        tilt_info_frame = ttk.Frame(sliders_frame)
+        tilt_info_frame.grid(row=len(self.dof_config), column=0, columnspan=3, sticky='ew', pady=(10, 5))
+
+        ttk.Label(tilt_info_frame, text="Tilt Vector:", font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 10))
+        self.manual_tilt_magnitude_label = ttk.Label(tilt_info_frame, text="0.00° (0.0%)",
+                                                     font=('Consolas', 9),
+                                                     foreground=self.colors['success'])
+        self.manual_tilt_magnitude_label.pack(side='left')
+
     def _create_middle_panel(self, parent):
         """Create middle panel widgets (angles, FK, output, log)."""
         # Commanded angles
@@ -434,6 +448,9 @@ class BaseStewartSimulator:
 
         self.controller_output_label = ttk.Label(output_frame, text="Tilt: rx=0.00°  ry=0.00°", font=('Consolas', 9))
         self.controller_output_label.pack(anchor='w', pady=2)
+
+        self.tilt_magnitude_label = ttk.Label(output_frame, text="Magnitude: 0.00° (0%)", font=('Consolas', 9))
+        self.tilt_magnitude_label.pack(anchor='w', pady=2)
 
         self.controller_error_label = ttk.Label(output_frame, text="Error: (0.0, 0.0) mm", font=('Consolas', 9))
         self.controller_error_label.pack(anchor='w', pady=2)
@@ -698,16 +715,94 @@ class BaseStewartSimulator:
         """Handle manual DOF slider change."""
         val = float(value)
         self.dof_values[dof] = val
-        self.value_labels[dof].config(text=f"{val:.2f}")
+
+        # For tilt angles, check if combined magnitude exceeds limit
+        if dof in ['rx', 'ry'] and hasattr(self, 'manual_tilt_magnitude_label'):
+            rx = self.dof_values['rx']
+            ry = self.dof_values['ry']
+            magnitude = np.sqrt(rx ** 2 + ry ** 2)
+            magnitude_percent = (magnitude / 15.0) * 100
+
+            # Update manual tilt magnitude display
+            if magnitude > 15.0:
+                # Show warning color if exceeds limit
+                self.value_labels[dof].config(
+                    text=f"{val:.2f}",
+                    foreground=self.colors['warning']
+                )
+                self.manual_tilt_magnitude_label.config(
+                    text=f"{magnitude:.2f}° ({magnitude_percent:.1f}%) ⚠ LIMIT",
+                    foreground=self.colors['warning']
+                )
+            else:
+                self.value_labels[dof].config(
+                    text=f"{val:.2f}",
+                    foreground=self.colors['fg']
+                )
+                # Color code based on proximity to limit
+                if magnitude_percent > 80:
+                    color = self.colors['warning']
+                elif magnitude_percent > 60:
+                    color = '#ffa500'  # Orange
+                else:
+                    color = self.colors['success']
+
+                self.manual_tilt_magnitude_label.config(
+                    text=f"{magnitude:.2f}° ({magnitude_percent:.1f}%)",
+                    foreground=color
+                )
+        else:
+            self.value_labels[dof].config(text=f"{val:.2f}")
 
         if self.update_timer is not None:
             self.root.after_cancel(self.update_timer)
         self.update_timer = self.root.after(50, self.calculate_ik)
 
+    def _clip_tilt_vector(self, rx, ry, max_magnitude=15.0):
+        """
+        Clip tilt vector to maximum magnitude.
+
+        Treats (rx, ry) as a 2D vector and scales it down if magnitude exceeds limit.
+        This prevents servo limit violations when both rx and ry are large.
+
+        Args:
+            rx: Roll angle in degrees
+            ry: Pitch angle in degrees
+            max_magnitude: Maximum allowed tilt magnitude in degrees
+
+        Returns:
+            (rx_clipped, ry_clipped, magnitude): Clipped angles and actual magnitude
+        """
+        magnitude = np.sqrt(rx ** 2 + ry ** 2)
+
+        if magnitude > max_magnitude:
+            # Scale down to max_magnitude
+            scale = max_magnitude / magnitude
+            rx_clipped = rx * scale
+            ry_clipped = ry * scale
+            return rx_clipped, ry_clipped, magnitude
+        else:
+            return rx, ry, magnitude
+
     def calculate_ik(self):
         """Calculate inverse kinematics for current pose."""
         translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
-        rotation = np.array([self.dof_values['rx'], self.dof_values['ry'], self.dof_values['rz']])
+
+        # Apply vector-based tilt limiting
+        rx_raw = self.dof_values['rx']
+        ry_raw = self.dof_values['ry']
+        rx_limited, ry_limited, tilt_mag = self._clip_tilt_vector(rx_raw, ry_raw, max_magnitude=15.0)
+
+        # Update display if values were clipped
+        if tilt_mag > 15.0:
+            self.value_labels['rx'].config(text=f"{rx_limited:.2f}")
+            self.value_labels['ry'].config(text=f"{ry_limited:.2f}")
+            if not self.controller_enabled.get():
+                # Only update actual values if manual control (not during controller operation)
+                self.dof_values['rx'] = rx_limited
+                self.dof_values['ry'] = ry_limited
+
+        rotation = np.array([rx_limited, ry_limited, self.dof_values['rz']])
 
         angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset.get())
 
@@ -799,12 +894,21 @@ class BaseStewartSimulator:
 
                     # Call controller update (signature depends on controller type)
                     # This is handled by subclass implementation
-                    rx, ry = self._update_controller(
+                    rx_raw, ry_raw = self._update_controller(
                         (ball_x_mm, ball_y_mm),
                         (ball_vx_mm_s, ball_vy_mm_s),
                         target_pos_mm,
                         dt
                     )
+
+                    # Apply vector-based tilt limiting to controller output
+                    rx, ry, tilt_mag = self._clip_tilt_vector(rx_raw, ry_raw, max_magnitude=15.0)
+
+                    # Log if controller output was clipped
+                    if tilt_mag > 15.0:
+                        controller_name = self.controller_config.get_controller_name()
+                        self.log(f"{controller_name} output clipped: ({rx_raw:.2f}, {ry_raw:.2f}) → "
+                                 f"({rx:.2f}, {ry:.2f}) [mag: {tilt_mag:.2f}° → 15.0°]")
 
                     self.dof_values['rx'] = rx
                     self.dof_values['ry'] = ry
