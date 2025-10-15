@@ -46,22 +46,39 @@ class PIDController:
     Controls platform tilt (rx, ry) to keep ball at target position.
     Separate PID for X and Y axes.
 
-    Updated: Uses vector-based output limiting.
+    Features:
+    - Vector-based output limiting (respects servo constraints)
+    - Optional derivative filtering (reduces noise)
     """
 
-    def __init__(self, kp=1.0, ki=0.0, kd=0.5, output_limit=15.0):
+    def __init__(self, kp=1.0, ki=0.0, kd=0.5, output_limit=15.0,
+                 derivative_filter_alpha=0.0):
+        """
+        Initialize PID controller.
+
+        Args:
+            kp: Proportional gain
+            ki: Integral gain
+            kd: Derivative gain
+            output_limit: Maximum tilt angle output (vector magnitude)
+            derivative_filter_alpha: Derivative filtering factor (0=no filter, 0.1=light, 0.5=heavy)
+                                    Set >0 for hardware to reduce camera noise
+        """
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.output_limit = output_limit
+        self.derivative_filter_alpha = derivative_filter_alpha
 
         # State for X axis
         self.integral_x = 0.0
         self.prev_error_x = 0.0
+        self.filtered_derivative_x = 0.0
 
         # State for Y axis
         self.integral_y = 0.0
         self.prev_error_y = 0.0
+        self.filtered_derivative_y = 0.0
 
         self.integral_limit = 100.0  # Anti-windup
 
@@ -80,41 +97,56 @@ class PIDController:
         if dt <= 0:
             return 0.0, 0.0
 
-        # Compute errors (ball position - target position)
+        # Compute errors
         error_x = ball_pos_mm[0] - target_pos_mm[0]
         error_y = ball_pos_mm[1] - target_pos_mm[1]
 
-        # X axis PID
-        self.integral_x += error_x * dt
-        self.integral_x = np.clip(self.integral_x, -self.integral_limit, self.integral_limit)
-        derivative_x = (error_x - self.prev_error_x) / dt if dt > 0 else 0.0
-        output_x = self.kp * error_x + self.ki * self.integral_x + self.kd * derivative_x
-        self.prev_error_x = error_x
+        # Compute PID for each axis
+        output_x = self._compute_pid_axis(error_x, dt, 'x')
+        output_y = self._compute_pid_axis(error_y, dt, 'y')
 
-        # Y axis PID
-        self.integral_y += error_y * dt
-        self.integral_y = np.clip(self.integral_y, -self.integral_limit, self.integral_limit)
-        derivative_y = (error_y - self.prev_error_y) / dt if dt > 0 else 0.0
-        output_y = self.kp * error_y + self.ki * self.integral_y + self.kd * derivative_y
-        self.prev_error_y = error_y
-
-        # Map PID output to platform tilt angles
-        # Ball at +X needs platform to tilt in +Y to bring it back
-        # Ball at +Y needs platform to tilt in +X to bring it back
+        # Map to platform tilt (axes swapped)
         rx_raw = output_y
         ry_raw = output_x
 
-        # Apply vector-based limiting (prevents servo violations)
+        # Apply vector-based limiting
         rx, ry = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
 
         return rx, ry
+
+    def _compute_pid_axis(self, error, dt, axis):
+        """Compute PID output for a single axis."""
+        # Update integral with anti-windup
+        integral = getattr(self, f'integral_{axis}')
+        integral += error * dt
+        integral = np.clip(integral, -self.integral_limit, self.integral_limit)
+        setattr(self, f'integral_{axis}', integral)
+
+        # Compute derivative with optional filtering
+        prev_error = getattr(self, f'prev_error_{axis}')
+        raw_derivative = (error - prev_error) / dt
+
+        if self.derivative_filter_alpha > 0:
+            filtered = getattr(self, f'filtered_derivative_{axis}')
+            filtered = (self.derivative_filter_alpha * raw_derivative +
+                        (1 - self.derivative_filter_alpha) * filtered)
+            setattr(self, f'filtered_derivative_{axis}', filtered)
+            derivative = filtered
+        else:
+            derivative = raw_derivative
+
+        setattr(self, f'prev_error_{axis}', error)
+
+        return self.kp * error + self.ki * integral + self.kd * derivative
 
     def reset(self):
         """Reset PID state."""
         self.integral_x = 0.0
         self.prev_error_x = 0.0
+        self.filtered_derivative_x = 0.0
         self.integral_y = 0.0
         self.prev_error_y = 0.0
+        self.filtered_derivative_y = 0.0
 
     def set_gains(self, kp, ki, kd):
         """Update PID gains."""
