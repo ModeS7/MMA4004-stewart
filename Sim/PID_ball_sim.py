@@ -25,7 +25,8 @@ class PIDControllerConfig(ControllerConfig):
             kp=kwargs.get('kp', 0.003),
             ki=kwargs.get('ki', 0.001),
             kd=kwargs.get('kd', 0.003),
-            output_limit=kwargs.get('output_limit', 15.0)
+            output_limit=kwargs.get('output_limit', 15.0),
+            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', 0.0)  # No filtering for simulation
         )
 
     def create_parameter_widgets(self, parent_frame, colors, on_param_change_callback):
