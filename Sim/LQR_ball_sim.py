@@ -58,7 +58,7 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define GUI layout for LQR simulator."""
-        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
+        layout = create_standard_layout(scrollable_columns=False, include_plot=True)
 
         layout['columns'][0]['modules'] = [
             {'type': 'simulation_control'},

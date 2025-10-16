@@ -8,9 +8,9 @@ Usage:
 
 import tkinter as tk
 
-from Sim.setup.base_simulator import ControllerConfig, BaseStewartSimulator
-from Sim.core.control_core import PIDController
-from Sim.gui.gui_builder import create_standard_layout
+from setup.base_simulator import ControllerConfig, BaseStewartSimulator
+from core.control_core import PIDController
+from gui.gui_builder import create_standard_layout
 
 
 class PIDControllerConfig(ControllerConfig):
@@ -48,7 +48,7 @@ class PIDStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define GUI layout for PID simulator."""
-        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
+        layout = create_standard_layout(scrollable_columns=False, include_plot=True)
 
         layout['columns'][0]['modules'] = [
             {'type': 'simulation_control'},

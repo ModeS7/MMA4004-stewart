@@ -23,11 +23,11 @@ import gc
 import sys
 import ctypes
 
-from Sim.setup.base_simulator import BaseStewartSimulator
-from Sim.setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from Sim.core.control_core import BallPositionFilter
-from Sim.core.utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
-from Sim.gui.gui_builder import create_standard_layout
+from setup.base_simulator import BaseStewartSimulator
+from setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
+from core.control_core import BallPositionFilter
+from core.utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
+from gui.gui_builder import create_standard_layout
 
 
 THREAD_PRIORITY_IDLE = -15
@@ -120,7 +120,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.port_var = tk.StringVar()
         config = HardwareControllerConfig()
 
-        self.ball_filter = BallPositionFilter(alpha=0.3)
+        self.ball_filter = BallPositionFilter(alpha=0.7)
 
         super().__init__(root, config)
 
@@ -176,9 +176,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
     def _create_controller_param_widgets(self):
         """Override to use hardware-specific defaults."""
         self.param_definitions = [
-            ('kp', 'P (Proportional)', 3.0, 3),
-            ('ki', 'I (Integral)', 1.0, 3),
-            ('kd', 'D (Derivative)', 3.0, 3)
+            ('kp', 'P (Proportional)', 1.0, 6),
+            ('ki', 'I (Integral)', 1.0, 6),
+            ('kd', 'D (Derivative)', 4.0, 5)
         ]
 
         self.controller_widgets = {
@@ -191,7 +191,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define hardware-specific GUI layout with scrollable columns."""
-        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
+        layout = create_standard_layout(scrollable_columns=False, include_plot=True)
 
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
@@ -664,7 +664,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                         max_val = np.max(data)
                         min_val = np.min(data)
 
-                        marker = " ⚠️ SPIKE SOURCE!" if max_val > 50 else ""
+                        marker = "SPIKE SOURCE!" if max_val > 50 else ""
 
                         print(f"{name}:{marker}")
                         print(f"  Average: {avg:.3f} ms")
@@ -716,7 +716,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         stats_msg += f"  Windows Timer 1ms + Pre-allocated buffers\n"
         stats_msg += f"  IK Timeouts: {self.ik_timeout_count}\n\n"
 
-        stats_msg += "⚠️ DETAILED BREAKDOWN PRINTED TO CONSOLE ⚠️"
+        stats_msg += "DETAILED BREAKDOWN PRINTED TO CONSOLE"
 
         messagebox.showinfo("Performance Statistics", stats_msg)
 
@@ -827,11 +827,11 @@ def main():
     app.log("=" * 50)
     app.log("")
     app.log("Optimizations Active:")
-    app.log("  ✓ EMA Ball Filter")
-    app.log("  ✓ GC Optimization")
-    app.log("  ✓ Optimized Baud Rates")
-    app.log("  ✓ Windows Thread Priority")
-    app.log("  ✓ Windows Timer + Pre-allocated Arrays")
+    app.log("   EMA Ball Filter")
+    app.log("   GC Optimization")
+    app.log("   Optimized Baud Rates")
+    app.log("   Windows Thread Priority")
+    app.log("   Windows Timer + Pre-allocated Arrays")
     app.log("")
     app.log("Quick Start:")
     app.log("1. Select serial port and click 'Connect'")
