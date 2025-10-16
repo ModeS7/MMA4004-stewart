@@ -3,6 +3,8 @@
 Hardware Stewart Platform Controller Configuration
 Real-time control with Pixy2 camera and Maestro servos
 
+Phase 3: Baud rate optimized to 200000
+
 Key differences from simulation:
 - Real camera data (no physics simulation)
 - Serial communication with hardware
@@ -10,6 +12,7 @@ Key differences from simulation:
 - Camera Y-axis inversion (ry = -ry)
 - Performance optimization with IK caching
 - Derivative filtering for camera noise reduction
+- High-speed serial (200000 baud)
 """
 
 import tkinter as tk
@@ -69,13 +72,13 @@ class IKCache:
 
 
 # ============================================================================
-# SERIAL CONTROLLER
+# SERIAL CONTROLLER (Phase 3: 200000 baud)
 # ============================================================================
 
 class SerialController:
     """High-performance serial communication with hardware."""
 
-    def __init__(self, port, baudrate=115200):
+    def __init__(self, port, baudrate=200000):  # Phase 3: Changed from 115200
         self.port = port
         self.baudrate = baudrate
         self.serial = None
@@ -287,7 +290,7 @@ class HardwareControllerConfig(ControllerConfig):
 
 def main():
     """Launch hardware controller (placeholder for now)."""
-    print("Hardware controller configuration loaded.")
+    print("Hardware controller configuration loaded (Phase 3: 200000 baud).")
     print("Use HardwareStewartSimulator to run with real hardware.")
 
 

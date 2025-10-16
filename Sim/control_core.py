@@ -5,6 +5,7 @@ Stewart Platform Control Core
 Controllers:
 - PIDController: PID control for ball balancing
 - LQRController: Linear Quadratic Regulator for optimal control
+- BallPositionFilter: EMA filter for camera noise reduction
 """
 import numpy as np
 from scipy import linalg
@@ -273,3 +274,73 @@ class LQRController:
     def get_gain_matrix(self):
         """Get current LQR gain matrix."""
         return self.K.copy() if self.K is not None else None
+
+
+class BallPositionFilter:
+    """
+    Exponential Moving Average (EMA) filter for ball position.
+
+    Reduces camera noise and vibration while maintaining responsiveness.
+
+    Formula:
+        filtered = alpha * raw + (1 - alpha) * filtered_prev
+
+    Where alpha (0 to 1):
+        0.0 = no filtering (all old value)
+        0.3 = light filtering (responsive)
+        0.5 = moderate filtering (balanced)
+        0.7 = heavy filtering (smooth but laggy)
+        1.0 = no filtering (all new value)
+    """
+
+    def __init__(self, alpha=0.3):
+        """
+        Args:
+            alpha: Filter coefficient (0.0 to 1.0). Default 0.3 for responsiveness.
+        """
+        self.alpha = np.clip(float(alpha), 0.0, 1.0)
+        self.x_filtered = 0.0
+        self.y_filtered = 0.0
+        self.initialized = False
+
+    def update(self, x_raw, y_raw):
+        """
+        Apply EMA filter to raw ball position.
+
+        Args:
+            x_raw: Raw X position (mm)
+            y_raw: Raw Y position (mm)
+
+        Returns:
+            (x_filtered, y_filtered): Filtered position in mm
+        """
+        if not self.initialized:
+            # First measurement: initialize with raw values
+            self.x_filtered = x_raw
+            self.y_filtered = y_raw
+            self.initialized = True
+        else:
+            # Apply EMA: blend new measurement with previous filtered value
+            self.x_filtered = self.alpha * x_raw + (1.0 - self.alpha) * self.x_filtered
+            self.y_filtered = self.alpha * y_raw + (1.0 - self.alpha) * self.y_filtered
+
+        return self.x_filtered, self.y_filtered
+
+    def set_alpha(self, alpha):
+        """
+        Update filter coefficient on-the-fly.
+
+        Args:
+            alpha: New filter coefficient (0.0 to 1.0)
+        """
+        self.alpha = np.clip(float(alpha), 0.0, 1.0)
+
+    def get_alpha(self):
+        """Get current filter coefficient."""
+        return self.alpha
+
+    def reset(self):
+        """Reset filter state."""
+        self.initialized = False
+        self.x_filtered = 0.0
+        self.y_filtered = 0.0

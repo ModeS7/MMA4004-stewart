@@ -763,3 +763,60 @@ class PerformanceStatsModule(GUIModule):
 
         if 'ik_timeouts' in state:
             self.timeout_label.config(text=f"IK Timeouts: {state['ik_timeouts']}")
+
+
+# ============================================================================
+# BALL POSITION FILTER (Hardware only)
+# ============================================================================
+
+class BallFilterModule(GUIModule):
+    """Ball position EMA filter control (hardware only)."""
+
+    def __init__(self, parent, colors, callbacks, ball_filter):
+        super().__init__(parent, colors, callbacks)
+        self.ball_filter = ball_filter
+
+    def create(self):
+        self.frame = ttk.LabelFrame(self.parent, text="Ball Position Filter (EMA)", padding=10)
+
+        # Alpha slider with label
+        slider_frame = ttk.Frame(self.frame)
+        slider_frame.pack(fill='x')
+
+        ttk.Label(slider_frame, text="α:",
+                  font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 5))
+
+        # Slider from 0 to 1
+        self.alpha_slider = ttk.Scale(
+            slider_frame, from_=0.0, to=1.0, orient='horizontal',
+            command=self._on_alpha_change
+        )
+        self.alpha_slider.pack(side='left', fill='x', expand=True, padx=5)
+
+        # Current value display
+        self.alpha_value_label = ttk.Label(
+            slider_frame, text=f"{self.ball_filter.get_alpha():.2f}",
+            width=4, font=('Consolas', 10, 'bold'),
+            foreground=self.colors['highlight']
+        )
+        self.alpha_value_label.pack(side='left', padx=(5, 0))
+
+        # Info text on second line
+        info_label = ttk.Label(
+            self.frame,
+            text="0=Smooth/Lag  →  1=Raw/Responsive",
+            font=('Segoe UI', 7, 'italic'),
+            foreground=self.colors['border']
+        )
+        info_label.pack(anchor='w', pady=(3, 0))
+
+        # Set slider LAST (after all widgets created) to avoid callback before init
+        self.alpha_slider.set(self.ball_filter.get_alpha())
+
+        return self.frame
+
+    def _on_alpha_change(self, value):
+        """Handle alpha slider change."""
+        alpha = float(value)
+        self.ball_filter.set_alpha(alpha)
+        self.alpha_value_label.config(text=f"{alpha:.2f}")

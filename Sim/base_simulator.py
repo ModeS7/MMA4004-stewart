@@ -322,6 +322,7 @@ class BaseStewartSimulator:
             'debug_log': gm.DebugLogModule,
             'serial_connection': gm.SerialConnectionModule,
             'performance_stats': gm.PerformanceStatsModule,
+            'ball_filter': gm.BallFilterModule,  # ADD THIS LINE
         }
 
         layout_config = self.get_layout_config()
@@ -620,6 +621,8 @@ class BaseStewartSimulator:
 
         if self.controller_enabled.get():
             self.controller.reset()
+
+        self.ball_filter.reset()
 
     def reset_ball(self):
         """Reset ball to center."""

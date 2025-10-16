@@ -1,6 +1,11 @@
 /*
   Stewart Platform Ball Balance Controller
-  Teensy 4.1 - All speed restrictions removed
+  Teensy 4.1 - Phase 3: Optimized Baud Rates
+
+  USB (Teensy ↔ PC): 200000 baud
+  Serial1 (Teensy ↔ Maestro): 250000 baud (as configured in Maestro Control Center)
+
+  All speed restrictions removed
 */
 
 #include <Pixy2SPI_SS.h>
@@ -43,7 +48,7 @@ unsigned long lastSerialCheck = 0;
 unsigned long startTime = 0;
 
 // ===== SERIAL INPUT BUFFER (OPTIMIZED) =====
-const int MAX_CMD_LENGTH = 64;  // Reduced from 128
+const int MAX_CMD_LENGTH = 64;
 char inputBuffer[MAX_CMD_LENGTH];
 int bufferIndex = 0;
 
@@ -66,19 +71,19 @@ bool ledState = false;
 // ===== SETUP =====
 void setup() {
   pinMode(LED_PIN, OUTPUT);
-  
-  // USB Serial
-  USB_SERIAL.begin(115200);
+
+  // USB Serial (Teensy ↔ PC): 200000 baud
+  USB_SERIAL.begin(200000);
   unsigned long waitStart = millis();
   while (!USB_SERIAL && millis() - waitStart < 2000) {
     delay(10);
   }
 
-  // Maestro servo controller
-  MAESTRO_SERIAL.begin(115200);
+  // Maestro Serial (Teensy ↔ Maestro): 250000 baud
+  MAESTRO_SERIAL.begin(250000);
 
   // Initialize Pixy2
-  USB_SERIAL.println("INIT:Starting MAX SPEED mode...");
+  USB_SERIAL.println("INIT:Starting MAX SPEED mode (USB: 200k, Maestro: 250k baud)...");
   int result = pixy.init();
 
   if (result < 0) {
@@ -95,23 +100,23 @@ void setup() {
     maestro.setAcceleration(i, 0);
   }
 
-  USB_SERIAL.println("READY:Teensy online");
+  USB_SERIAL.println("READY:Teensy online (Phase 3: Dual baud rates)");
   USB_SERIAL.println("FORMAT:BALL:timestamp,x,y,detected,error_x,error_y");
-  
+
   startTime = millis();
-  
+
   // Clear buffers
   while (USB_SERIAL.available()) {
     USB_SERIAL.read();
   }
-  
+
   delay(100);
 }
 
 // ===== MAIN LOOP =====
 void loop() {
   loopTimer = 0;
-  
+
   unsigned long now = millis();
 
   // Read ball position at 50Hz
@@ -139,7 +144,7 @@ void loop() {
   if (currentLoopTime > maxLoopTime) {
     maxLoopTime = currentLoopTime;
   }
-  
+
   // Clear buffer if overfull
   if (USB_SERIAL.available() > 800) {
     USB_SERIAL.clear();
@@ -152,7 +157,7 @@ void readAndSendBallPosition(unsigned long timestamp) {
   if (!USB_SERIAL || USB_SERIAL.availableForWrite() < 64) {
     return;
   }
-  
+
   int8_t num_blocks = pixy.ccc.getBlocks(false, CCC_SIG1, 1);
 
   float ball_x, ball_y;
@@ -184,7 +189,7 @@ void readAndSendBallPosition(unsigned long timestamp) {
   USB_SERIAL.print(error_x, 2);
   USB_SERIAL.print(",");
   USB_SERIAL.println(error_y, 2);
-  
+
   USB_SERIAL.flush();
 }
 
@@ -192,7 +197,7 @@ void readAndSendBallPosition(unsigned long timestamp) {
 void checkSerialCommandsNonBlocking() {
   while (USB_SERIAL.available() > 0) {
     char c = USB_SERIAL.read();
-    
+
     if (c == '\n' || c == '\r') {
       if (bufferIndex > 0) {
         inputBuffer[bufferIndex] = '\0';
@@ -220,7 +225,7 @@ void processCommand(char* cmd) {
     return;
   }
 
-  // Speed command (allows user override if needed)
+  // Speed command
   if (strncmp(cmd, "SPD:", 4) == 0) {
     servoSpeed = constrain(atoi(cmd + 4), 0, 255);
     for (int i = 0; i < 6; i++) {
@@ -250,9 +255,9 @@ void processCommand(char* cmd) {
 void parseAndExecuteAngles(char* cmd) {
   float angles[6];
   int angleCount = 0;
-  
+
   char* token = strtok(cmd, ",");
-  
+
   while (token != NULL && angleCount < 6) {
     angles[angleCount] = atof(token);
     angleCount++;
@@ -296,8 +301,7 @@ void moveServos() {
     float pos = theta[i] + offset[i];
     pos = map_float(pos, range[i][0], range[i][1], abs_0, abs_90);
     pos = constrain(pos, 3000, 9000);
-    
-    // Always use current speed settings
+
     maestro.setSpeed(i, servoSpeed);
     maestro.setAcceleration(i, servoAcceleration);
     maestro.setTarget(i, (uint16_t)pos);
@@ -311,10 +315,10 @@ float map_float(float x, float in_min, float in_max, float out_min, float out_ma
 
 void sendPerformanceStats() {
   float uptime = (millis() - startTime) / 1000.0;
-  
+
   USB_SERIAL.println();
   USB_SERIAL.println("======== PERFORMANCE STATS ========");
-  USB_SERIAL.print("Mode: MAX SPEED");
+  USB_SERIAL.print("Baud Rates: USB=200000, Maestro=250000");
   USB_SERIAL.print(" | Speed=");
   USB_SERIAL.print(servoSpeed);
   USB_SERIAL.print(" | Accel=");
