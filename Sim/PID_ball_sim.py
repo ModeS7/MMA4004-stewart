@@ -8,9 +8,9 @@ Usage:
 
 import tkinter as tk
 
-from base_simulator import ControllerConfig, BaseStewartSimulator
-from control_core import PIDController
-from gui_builder import create_standard_layout
+from Sim.setup.base_simulator import ControllerConfig, BaseStewartSimulator
+from Sim.core.control_core import PIDController
+from Sim.gui.gui_builder import create_standard_layout
 
 
 class PIDControllerConfig(ControllerConfig):

@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import serial.tools.list_ports
 
-from utils import format_time, format_vector_2d, MAX_TILT_ANGLE_DEG
+from core.utils import format_time, format_vector_2d, MAX_TILT_ANGLE_DEG
 
 
 # ============================================================================

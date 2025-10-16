@@ -25,8 +25,8 @@ import serial.tools.list_ports
 from queue import Queue, Empty
 
 from base_simulator import ControllerConfig
-from control_core import PIDController
-from utils import ControlLoopConfig, GUIConfig
+from core.control_core import PIDController
+from core.utils import ControlLoopConfig, GUIConfig
 
 
 # ============================================================================

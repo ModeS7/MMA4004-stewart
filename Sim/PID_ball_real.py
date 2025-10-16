@@ -23,11 +23,11 @@ import gc
 import sys
 import ctypes
 
-from base_simulator import BaseStewartSimulator
-from hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from control_core import BallPositionFilter
-from utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
-from gui_builder import create_standard_layout
+from Sim.setup.base_simulator import BaseStewartSimulator
+from Sim.setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
+from Sim.core.control_core import BallPositionFilter
+from Sim.core.utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
+from Sim.gui.gui_builder import create_standard_layout
 
 
 # ============================================================================
@@ -813,8 +813,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                                 self.dof_values['y'],
                                 self.dof_values['z']])
 
-        from control_core import clip_tilt_vector
-        from utils import MAX_TILT_ANGLE_DEG
+        from Sim.core.control_core import clip_tilt_vector
+        from Sim.core.utils import MAX_TILT_ANGLE_DEG
 
         rx_limited, ry_limited, tilt_mag = clip_tilt_vector(
             self.dof_values['rx'],

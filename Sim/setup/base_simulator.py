@@ -15,14 +15,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle, Circle
 from abc import ABC, abstractmethod
 
-from core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory
-from control_core import clip_tilt_vector
-from utils import (
+from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory
+from core.control_core import clip_tilt_vector
+from core.utils import (
     MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM,
     SimulationConfig, format_vector_2d, format_time, format_error_context
 )
-from gui_builder import GUIBuilder, create_standard_layout
-import gui_modules as gm
+from gui.gui_builder import GUIBuilder, create_standard_layout
+from gui import gui_modules as gm
 
 
 class ControllerConfig(ABC):

@@ -9,7 +9,8 @@ Controllers:
 """
 import numpy as np
 from scipy import linalg
-from utils import MAX_TILT_ANGLE_DEG
+
+from core.utils import MAX_TILT_ANGLE_DEG
 
 
 def clip_tilt_vector(rx, ry, max_magnitude=MAX_TILT_ANGLE_DEG):

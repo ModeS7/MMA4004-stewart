@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from collections import deque
 
-from utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM
+from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM
 
 
 class FirstOrderServo:

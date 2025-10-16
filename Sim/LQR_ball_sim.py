@@ -10,9 +10,9 @@ import tkinter as tk
 from tkinter import ttk
 import numpy as np
 
-from base_simulator import ControllerConfig, BaseStewartSimulator
-from control_core import LQRController
-from gui_builder import create_standard_layout
+from setup.base_simulator import ControllerConfig, BaseStewartSimulator
+from core.control_core import LQRController
+from gui.gui_builder import create_standard_layout
 
 
 class LQRControllerConfig(ControllerConfig):
