@@ -13,10 +13,6 @@ import serial.tools.list_ports
 from core.utils import format_time, format_vector_2d, MAX_TILT_ANGLE_DEG
 
 
-# ============================================================================
-# BASE MODULE
-# ============================================================================
-
 class GUIModule:
     """Base class for all GUI modules."""
 
@@ -33,17 +29,13 @@ class GUIModule:
         self.frame = None
 
     def create(self):
-        """Create and return the module's frame. Override in subclasses."""
+        """Create and return the module's frame."""
         raise NotImplementedError
 
     def update(self, state):
-        """Update module with new state. Optional - only if module needs updates."""
+        """Update module with new state."""
         pass
 
-
-# ============================================================================
-# SIMULATION CONTROL
-# ============================================================================
 
 class SimulationControlModule(GUIModule):
     """Start/Stop/Reset simulation controls."""
@@ -76,14 +68,9 @@ class SimulationControlModule(GUIModule):
         return self.frame
 
     def update(self, state):
-        """Update time display."""
         if 'simulation_time' in state:
             self.time_label.config(text=f"Time: {format_time(state['simulation_time'])}")
 
-
-# ============================================================================
-# CONTROLLER PANEL (PID/LQR)
-# ============================================================================
 
 class ControllerModule(GUIModule):
     """Controller enable/disable and parameter tuning."""
@@ -98,7 +85,6 @@ class ControllerModule(GUIModule):
         controller_name = self.controller_config.get_controller_name()
         self.frame = ttk.LabelFrame(self.parent, text=f"{controller_name} Ball Balancing", padding=10)
 
-        # Enable checkbox
         enable_frame = ttk.Frame(self.frame)
         enable_frame.pack(fill='x', pady=(0, 10))
 
@@ -111,7 +97,6 @@ class ControllerModule(GUIModule):
                                       font=('Segoe UI', 14))
         self.status_label.pack(side='left', padx=(10, 0))
 
-        # Create parameter widgets here
         if 'param_definitions' in self.controller_widgets:
             param_definitions = self.controller_widgets['param_definitions']
             sliders = self.controller_widgets['sliders']
@@ -123,9 +108,8 @@ class ControllerModule(GUIModule):
                     param_name, label, default, default_scalar_idx = param_def
                 else:
                     param_name, label, default = param_def
-                    default_scalar_idx = 4  # Default
+                    default_scalar_idx = 4
 
-                # Temporarily set the default_scalar_idx on config
                 old_idx = getattr(self.controller_config, 'default_scalar_idx', 4)
                 self.controller_config.default_scalar_idx = default_scalar_idx
 
@@ -135,22 +119,16 @@ class ControllerModule(GUIModule):
                     self.callbacks.get('param_change')
                 )
 
-                # Restore old value
                 self.controller_config.default_scalar_idx = old_idx
 
         return self.frame
 
     def update(self, state):
-        """Update controller status indicator."""
         if 'controller_enabled' in state and state['controller_enabled']:
             self.status_label.config(foreground=self.colors['success'])
         else:
             self.status_label.config(foreground=self.colors['border'])
 
-
-# ============================================================================
-# TRAJECTORY PATTERN WITH DYNAMIC PARAMETER SLIDERS
-# ============================================================================
 
 class TrajectoryPatternModule(GUIModule):
     """Trajectory pattern selection with dynamic parameter controls."""
@@ -163,7 +141,6 @@ class TrajectoryPatternModule(GUIModule):
     def create(self):
         self.frame = ttk.LabelFrame(self.parent, text="Trajectory Pattern", padding=10)
 
-        # Pattern selector
         selector_frame = ttk.Frame(self.frame)
         selector_frame.pack(fill='x', pady=(0, 5))
 
@@ -180,38 +157,32 @@ class TrajectoryPatternModule(GUIModule):
                    command=self.callbacks.get('pattern_reset'),
                    width=8).pack(side='left', padx=5)
 
-        # Pattern info label
         self.info_label = ttk.Label(self.frame,
                                     text="Tracking: Center (0, 0)",
                                     font=('Consolas', 8),
                                     foreground=self.colors['success'])
         self.info_label.pack(anchor='w', pady=(5, 0))
 
-        # Dynamic parameter container
         self.params_container = ttk.Frame(self.frame)
         self.params_container.pack(fill='x', pady=(10, 0))
 
-        # Initialize with current pattern
         self._update_pattern_params()
 
         return self.frame
 
     def _on_pattern_change(self, event=None):
-        """Handle pattern change."""
         self._update_pattern_params()
         if self.callbacks.get('pattern_change'):
             self.callbacks['pattern_change']()
 
     def _update_pattern_params(self):
         """Update parameter sliders based on selected pattern."""
-        # Clear existing widgets
         for widget in self.params_container.winfo_children():
             widget.destroy()
         self.param_widgets.clear()
 
         pattern_type = self.pattern_var.get()
 
-        # Define parameters for each pattern type
         pattern_params = {
             'static': [],
             'circle': [
@@ -238,29 +209,24 @@ class TrajectoryPatternModule(GUIModule):
                      foreground=self.colors['border']).pack(pady=5)
             return
 
-        # Create sliders for each parameter
         for param_name, label, min_val, max_val, default, resolution in params:
             self._create_param_slider(param_name, label, min_val, max_val, default, resolution)
 
     def _create_param_slider(self, param_name, label, min_val, max_val, default, resolution):
-        """Create a parameter slider."""
         frame = ttk.Frame(self.params_container)
         frame.pack(fill='x', pady=3)
 
         ttk.Label(frame, text=label,
                   font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', padx=(0, 5))
 
-        # Slider
         slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
         slider.grid(row=0, column=1, sticky='ew', padx=5)
         slider.set(default)
 
-        # Value label
         value_label = ttk.Label(frame, text=f"{default:.1f}",
                                width=6, font=('Consolas', 9))
         value_label.grid(row=0, column=2)
 
-        # Update callback
         def on_change(val):
             value = float(val)
             value_label.config(text=f"{value:.1f}")
@@ -268,10 +234,8 @@ class TrajectoryPatternModule(GUIModule):
                 self.callbacks['pattern_param_change'](param_name, value)
 
         slider.config(command=on_change)
-
         frame.columnconfigure(1, weight=1)
 
-        # Store references
         self.param_widgets[param_name] = {
             'slider': slider,
             'label': value_label,
@@ -279,14 +243,9 @@ class TrajectoryPatternModule(GUIModule):
         }
 
     def update(self, state):
-        """Update pattern info text."""
         if 'pattern_info' in state:
             self.info_label.config(text=state['pattern_info'])
 
-
-# ============================================================================
-# BALL CONTROL
-# ============================================================================
 
 class BallControlModule(GUIModule):
     """Ball reset and push buttons."""
@@ -307,10 +266,6 @@ class BallControlModule(GUIModule):
         return self.frame
 
 
-# ============================================================================
-# BALL STATE
-# ============================================================================
-
 class BallStateModule(GUIModule):
     """Ball position and velocity display."""
 
@@ -330,26 +285,17 @@ class BallStateModule(GUIModule):
         return self.frame
 
     def update(self, state):
-        """Update ball state display."""
         if 'ball_pos' in state:
             self.pos_label.config(text=f"Position: {format_vector_2d(state['ball_pos'])}")
         if 'ball_vel' in state:
-            # Check if it's a status string (hardware mode) or velocity tuple (simulation)
             if isinstance(state['ball_vel'], tuple) and len(state['ball_vel']) == 2:
                 if isinstance(state['ball_vel'][0], str):
-                    # Hardware mode: first element is status string
                     self.vel_label.config(text=f"Status: {state['ball_vel'][0]}")
                 else:
-                    # Simulation mode: actual velocity
                     self.vel_label.config(text=f"Velocity: {format_vector_2d(state['ball_vel'], 'mm/s')}")
             elif isinstance(state['ball_vel'], str):
-                # Direct status string
                 self.vel_label.config(text=f"Status: {state['ball_vel']}")
 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
 class ConfigurationModule(GUIModule):
     """Configuration options."""
@@ -367,10 +313,6 @@ class ConfigurationModule(GUIModule):
 
         return self.frame
 
-
-# ============================================================================
-# MANUAL POSE CONTROL (6 DOF)
-# ============================================================================
 
 class ManualPoseControlModule(GUIModule):
     """6 DOF manual control sliders."""
@@ -402,7 +344,6 @@ class ManualPoseControlModule(GUIModule):
 
         self.frame.columnconfigure(1, weight=1)
 
-        # Tilt magnitude display
         tilt_info_frame = ttk.Frame(self.frame)
         tilt_info_frame.grid(row=len(self.dof_config), column=0,
                              columnspan=3, sticky='ew', pady=(10, 5))
@@ -418,7 +359,6 @@ class ManualPoseControlModule(GUIModule):
         return self.frame
 
     def _on_slider_change(self, dof, value):
-        """Handle slider change."""
         val = float(value)
         self.value_labels[dof].config(text=f"{val:.2f}")
 
@@ -426,7 +366,6 @@ class ManualPoseControlModule(GUIModule):
             self.callbacks['slider_change'](dof, val)
 
     def update(self, state):
-        """Update slider values and tilt magnitude."""
         if 'dof_values' in state:
             for dof, val in state['dof_values'].items():
                 if dof in self.value_labels:
@@ -449,10 +388,6 @@ class ManualPoseControlModule(GUIModule):
             )
 
 
-# ============================================================================
-# SERVO ANGLES DISPLAY
-# ============================================================================
-
 class ServoAnglesModule(GUIModule):
     """Display commanded and actual servo angles."""
 
@@ -463,7 +398,6 @@ class ServoAnglesModule(GUIModule):
     def create(self):
         container = ttk.Frame(self.parent)
 
-        # Commanded angles
         cmd_frame = ttk.LabelFrame(container, text="Commanded Servo Angles (IK)", padding=10)
         cmd_frame.pack(fill='x', pady=(0, 10))
 
@@ -474,7 +408,6 @@ class ServoAnglesModule(GUIModule):
             label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
             self.cmd_labels.append(label)
 
-        # Actual angles (optional)
         if self.show_actual:
             actual_frame = ttk.LabelFrame(container, text="Actual Servo Angles", padding=10)
             actual_frame.pack(fill='x')
@@ -490,7 +423,6 @@ class ServoAnglesModule(GUIModule):
         return self.frame
 
     def update(self, state):
-        """Update servo angle displays."""
         if 'cmd_angles' in state:
             for i, angle in enumerate(state['cmd_angles']):
                 self.cmd_labels[i].config(text=f"S{i + 1}: {angle:6.2f}°")
@@ -499,10 +431,6 @@ class ServoAnglesModule(GUIModule):
             for i, angle in enumerate(state['actual_angles']):
                 self.actual_labels[i].config(text=f"S{i + 1}: {angle:6.2f}°")
 
-
-# ============================================================================
-# PLATFORM POSE (FK)
-# ============================================================================
 
 class PlatformPoseModule(GUIModule):
     """Display platform pose from forward kinematics."""
@@ -521,7 +449,6 @@ class PlatformPoseModule(GUIModule):
         return self.frame
 
     def update(self, state):
-        """Update FK display."""
         if 'fk_translation' in state:
             t = state['fk_translation']
             self.pos_label.config(
@@ -534,10 +461,6 @@ class PlatformPoseModule(GUIModule):
                 text=f"Roll: {r[0]:6.2f}  Pitch: {r[1]:6.2f}  Yaw: {r[2]:6.2f}°"
             )
 
-
-# ============================================================================
-# CONTROLLER OUTPUT
-# ============================================================================
 
 class ControllerOutputModule(GUIModule):
     """Display controller output and error."""
@@ -567,7 +490,6 @@ class ControllerOutputModule(GUIModule):
         return self.frame
 
     def update(self, state):
-        """Update controller output display."""
         if 'controller_output' in state:
             rx, ry = state['controller_output']
             self.output_label.config(text=f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
@@ -580,10 +502,6 @@ class ControllerOutputModule(GUIModule):
             error = state['controller_error']
             self.error_label.config(text=f"Error: {format_vector_2d(error)}")
 
-
-# ============================================================================
-# DEBUG LOG
-# ============================================================================
 
 class DebugLogModule(GUIModule):
     """Debug log display."""
@@ -612,7 +530,6 @@ class DebugLogModule(GUIModule):
         return self.frame
 
     def log(self, message, timestamp=None):
-        """Add message to log."""
         if timestamp is not None:
             msg = f"[{format_time(timestamp)}] {message}\n"
         else:
@@ -620,10 +537,6 @@ class DebugLogModule(GUIModule):
         self.log_text.insert(tk.END, msg)
         self.log_text.see(tk.END)
 
-
-# ============================================================================
-# SERIAL CONNECTION (Hardware only)
-# ============================================================================
 
 class SerialConnectionModule(GUIModule):
     """Serial port connection for hardware."""
@@ -637,7 +550,6 @@ class SerialConnectionModule(GUIModule):
     def create(self):
         self.frame = ttk.LabelFrame(self.parent, text="Serial Connection", padding=10)
 
-        # Port selection
         port_frame = ttk.Frame(self.frame)
         port_frame.pack(fill='x', pady=(0, 5))
 
@@ -651,13 +563,11 @@ class SerialConnectionModule(GUIModule):
                    command=self._refresh_ports,
                    width=8).pack(side='left')
 
-        # Port status label
         self.port_status_label = ttk.Label(self.frame, text="",
                                            font=('Consolas', 8),
                                            foreground=self.colors['fg'])
         self.port_status_label.pack(fill='x', pady=(0, 5))
 
-        # Connection buttons
         btn_frame = ttk.Frame(self.frame)
         btn_frame.pack(fill='x', pady=(5, 0))
 
@@ -671,18 +581,15 @@ class SerialConnectionModule(GUIModule):
                                          state='disabled', width=12)
         self.disconnect_btn.pack(side='left', padx=5)
 
-        # Status
         self.status_label = ttk.Label(self.frame, text="Not connected",
                                       foreground=self.colors['border'])
         self.status_label.pack(pady=(5, 0))
 
-        # Initial port refresh (do it ourselves, no callback needed)
         self._refresh_ports()
 
         return self.frame
 
     def _refresh_ports(self):
-        """Refresh serial ports (internal method)."""
         try:
             ports = list(serial.tools.list_ports.comports())
             port_names = [port.device for port in ports]
@@ -711,7 +618,6 @@ class SerialConnectionModule(GUIModule):
             self.connect_btn.config(state='disabled')
 
     def update(self, state):
-        """Update connection status."""
         if 'connected' in state:
             if state['connected']:
                 self.status_label.config(text="Connected",
@@ -724,10 +630,6 @@ class SerialConnectionModule(GUIModule):
                 self.connect_btn.config(state='normal')
                 self.disconnect_btn.config(state='disabled')
 
-
-# ============================================================================
-# PERFORMANCE STATS (Hardware only)
-# ============================================================================
 
 class PerformanceStatsModule(GUIModule):
     """Performance statistics for 100Hz hardware mode."""
@@ -754,7 +656,6 @@ class PerformanceStatsModule(GUIModule):
         return self.frame
 
     def update(self, state):
-        """Update performance stats."""
         if 'fps' in state:
             self.fps_label.config(text=f"Control: {state['fps']:.1f} Hz")
 
@@ -765,12 +666,8 @@ class PerformanceStatsModule(GUIModule):
             self.timeout_label.config(text=f"IK Timeouts: {state['ik_timeouts']}")
 
 
-# ============================================================================
-# BALL POSITION FILTER (Hardware only)
-# ============================================================================
-
 class BallFilterModule(GUIModule):
-    """Ball position EMA filter control (hardware only)."""
+    """Ball position EMA filter control."""
 
     def __init__(self, parent, colors, callbacks, ball_filter):
         super().__init__(parent, colors, callbacks)
@@ -779,21 +676,18 @@ class BallFilterModule(GUIModule):
     def create(self):
         self.frame = ttk.LabelFrame(self.parent, text="Ball Position Filter (EMA)", padding=10)
 
-        # Alpha slider with label
         slider_frame = ttk.Frame(self.frame)
         slider_frame.pack(fill='x')
 
         ttk.Label(slider_frame, text="α:",
                   font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 5))
 
-        # Slider from 0 to 1
         self.alpha_slider = ttk.Scale(
             slider_frame, from_=0.0, to=1.0, orient='horizontal',
             command=self._on_alpha_change
         )
         self.alpha_slider.pack(side='left', fill='x', expand=True, padx=5)
 
-        # Current value display
         self.alpha_value_label = ttk.Label(
             slider_frame, text=f"{self.ball_filter.get_alpha():.2f}",
             width=4, font=('Consolas', 10, 'bold'),
@@ -801,7 +695,6 @@ class BallFilterModule(GUIModule):
         )
         self.alpha_value_label.pack(side='left', padx=(5, 0))
 
-        # Info text on second line
         info_label = ttk.Label(
             self.frame,
             text="0=Smooth/Lag  →  1=Raw/Responsive",
@@ -810,13 +703,11 @@ class BallFilterModule(GUIModule):
         )
         info_label.pack(anchor='w', pady=(3, 0))
 
-        # Set slider LAST (after all widgets created) to avoid callback before init
         self.alpha_slider.set(self.ball_filter.get_alpha())
 
         return self.frame
 
     def _on_alpha_change(self, value):
-        """Handle alpha slider change."""
         alpha = float(value)
         self.ball_filter.set_alpha(alpha)
         self.alpha_value_label.config(text=f"{alpha:.2f}")

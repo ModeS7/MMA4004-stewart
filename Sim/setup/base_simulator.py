@@ -89,13 +89,11 @@ class ControllerConfig(ABC):
         frame.columnconfigure(1, weight=1)
 
     def _on_slider_change(self, param_name, value, value_labels, callback):
-        """Handle slider value change."""
         val = float(value)
         value_labels[param_name].config(text=f"{val:.2f}")
         callback()
 
     def _on_scalar_change(self, combo, var, param_name, callback):
-        """Handle scalar selection change."""
         var.set(combo.current())
         callback()
 
@@ -133,7 +131,6 @@ class BaseStewartSimulator:
         self.root.configure(bg=self.colors['bg'])
         self.setup_dark_theme()
 
-        # Initialize simulation components
         self.platform_params = {
             "horn_length": 31.75,
             "rod_length": 145.0,
@@ -156,30 +153,25 @@ class BaseStewartSimulator:
             sphere_type='hollow'
         )
 
-        # Controller state
         self.controller = None
         self.controller_enabled = tk.BooleanVar(value=False)
 
-        # Pattern state with parameter tracking
         self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
         self.pattern_type = tk.StringVar(value='static')
         self.pattern_start_time = 0.0
-        self.pattern_params = {}  # Store current pattern parameters
+        self.pattern_params = {}
 
-        # Ball state
         ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
         self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
         self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
         self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
 
-        # Simulation state
         self.simulation_running = False
         self.simulation_time = 0.0
         self.last_update_time = None
         self.update_rate_ms = SimulationConfig.UPDATE_RATE_MS
         self.simulation_loop_id = None
 
-        # DOF configuration
         self.use_top_surface_offset = tk.BooleanVar(value=True)
         self.dof_values = {
             'x': 0.0, 'y': 0.0, 'z': self.ik.home_height_top_surface,
@@ -197,25 +189,18 @@ class BaseStewartSimulator:
             'rz': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Yaw (°)")
         }
 
-        # Platform angular state (for physics)
         self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
 
-        # Tracking variables for GUI updates
         self.last_cmd_angles = np.zeros(6)
         self.last_fk_translation = np.zeros(3)
         self.last_fk_rotation = np.zeros(3)
 
         self.update_timer = None
 
-        # Create controller parameter widgets first (needed for GUI builder)
         self._create_controller_param_widgets()
-
-        # Build modular GUI
         self._build_modular_gui()
-
-        # Initialize controller
         self._initialize_controller()
 
     def setup_dark_theme(self):
@@ -280,7 +265,7 @@ class BaseStewartSimulator:
         self.root.option_add('*TCombobox*Listbox.font', ('Segoe UI', 9))
 
     def _create_controller_param_widgets(self):
-        """Create controller parameter widgets (for controller module)."""
+        """Create controller parameter widgets."""
         controller_name = self.controller_config.get_controller_name()
 
         if controller_name == "PID":
@@ -322,7 +307,7 @@ class BaseStewartSimulator:
             'debug_log': gm.DebugLogModule,
             'serial_connection': gm.SerialConnectionModule,
             'performance_stats': gm.PerformanceStatsModule,
-            'ball_filter': gm.BallFilterModule,  # ADD THIS LINE
+            'ball_filter': gm.BallFilterModule,
         }
 
         layout_config = self.get_layout_config()
@@ -345,7 +330,7 @@ class BaseStewartSimulator:
             'param_change': self.on_controller_param_change,
             'pattern_change': self.on_pattern_change,
             'pattern_reset': self.reset_pattern,
-            'pattern_param_change': self.on_pattern_param_change,  # Centralized here
+            'pattern_param_change': self.on_pattern_param_change,
             'reset_ball': self.reset_ball,
             'push_ball': self.push_ball,
             'toggle_offset': self.on_offset_toggle,
@@ -353,16 +338,11 @@ class BaseStewartSimulator:
         }
 
     def on_pattern_param_change(self, param_name, value):
-        """
-        Centralized pattern parameter update handler.
-        Called when pattern sliders change - updates pattern with new parameters.
-        """
+        """Update pattern with new parameters."""
         pattern_type = self.pattern_type.get()
 
-        # Update stored parameters
         self.pattern_params[param_name] = value
 
-        # Create new pattern with updated parameters
         if pattern_type == 'circle':
             radius = self.pattern_params.get('radius', 50.0)
             period = self.pattern_params.get('period', 10.0)
@@ -387,7 +367,6 @@ class BaseStewartSimulator:
                                                          radius=radius,
                                                          period=period)
 
-        # Reset pattern timing and update visualization
         self.reset_pattern()
         self.update_plot()
 
@@ -590,7 +569,6 @@ class BaseStewartSimulator:
         """Handle pattern selection change."""
         pattern_type = self.pattern_type.get()
 
-        # Reset parameter storage for new pattern
         self.pattern_params.clear()
 
         pattern_configs = {
@@ -603,9 +581,8 @@ class BaseStewartSimulator:
         if pattern_type in pattern_configs:
             pattern_name, params = pattern_configs[pattern_type]
 
-            # Store initial parameters
             for key, value in params.items():
-                if key != 'clockwise':  # Don't store non-adjustable params
+                if key != 'clockwise':
                     self.pattern_params[key] = value
 
             self.current_pattern = PatternFactory.create(pattern_name, **params)

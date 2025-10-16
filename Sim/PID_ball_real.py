@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Stewart Platform Real Hardware Controller - PHASE 5 COMPLETE
+Stewart Platform Real Hardware Controller
 
 Features:
 - 100Hz dedicated control thread
 - Pixy2 camera integration
 - Modular GUI with scrollable columns
-- Phase 1: Ball position EMA filtering
-- Phase 2: Garbage collection optimization
-- Phase 3: Optimized baud rates (USB 200k, Maestro 250k)
-- Phase 4: Windows thread priority
-- Phase 5: Windows timer resolution + Pre-allocated NumPy arrays
+- Ball position EMA filtering
+- Garbage collection optimization
+- Optimized baud rates (USB 200k, Maestro 250k)
+- Windows thread priority
+- Windows timer resolution + Pre-allocated NumPy arrays
 """
 
 import tkinter as tk
@@ -30,17 +30,17 @@ from Sim.core.utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, fo
 from Sim.gui.gui_builder import create_standard_layout
 
 
-# ============================================================================
-# PHASE 5: WINDOWS TIMER RESOLUTION MANAGER
-# ============================================================================
+THREAD_PRIORITY_IDLE = -15
+THREAD_PRIORITY_LOWEST = -2
+THREAD_PRIORITY_BELOW_NORMAL = -1
+THREAD_PRIORITY_NORMAL = 0
+THREAD_PRIORITY_ABOVE_NORMAL = 1
+THREAD_PRIORITY_HIGHEST = 2
+THREAD_PRIORITY_TIME_CRITICAL = 15
+
 
 class WindowsTimerManager:
-    """
-    Windows multimedia timer resolution manager.
-
-    Reduces Windows default timer granularity from 15.6ms to 1ms,
-    making time.sleep() much more accurate for control loops.
-    """
+    """Windows multimedia timer resolution manager. Reduces timer granularity from 15.6ms to 1ms."""
 
     def __init__(self):
         self.timer_set = False
@@ -54,7 +54,7 @@ class WindowsTimerManager:
         try:
             timeBeginPeriod = ctypes.windll.winmm.timeBeginPeriod
             result = timeBeginPeriod(1)
-            if result == 0:  # TIMERR_NOERROR
+            if result == 0:
                 self.timer_set = True
                 return True, "Windows timer set to 1ms"
             else:
@@ -73,27 +73,8 @@ class WindowsTimerManager:
                 pass
 
 
-# ============================================================================
-# PHASE 4: WINDOWS THREAD PRIORITY MANAGER
-# ============================================================================
-
-# Windows thread priority constants
-THREAD_PRIORITY_IDLE = -15
-THREAD_PRIORITY_LOWEST = -2
-THREAD_PRIORITY_BELOW_NORMAL = -1
-THREAD_PRIORITY_NORMAL = 0
-THREAD_PRIORITY_ABOVE_NORMAL = 1
-THREAD_PRIORITY_HIGHEST = 2
-THREAD_PRIORITY_TIME_CRITICAL = 15
-
-
 class ThreadPriorityManager:
-    """
-    Windows thread priority manager.
-
-    Elevates control thread priority to reduce context switches and jitter.
-    No-op on Linux/Mac.
-    """
+    """Windows thread priority manager. Elevates control thread priority to reduce jitter."""
 
     def __init__(self):
         self.is_windows = sys.platform.startswith('win')
@@ -111,7 +92,7 @@ class ThreadPriorityManager:
 
         Args:
             thread_id: Thread ID from thread.ident
-            priority: 1=ABOVE_NORMAL, 2=HIGHEST
+            priority: Priority level (1=ABOVE_NORMAL, 2=HIGHEST)
 
         Returns:
             True if successful, False otherwise
@@ -128,13 +109,9 @@ class ThreadPriorityManager:
             self.kernel32.CloseHandle(handle)
 
             return bool(result)
-        except Exception as e:
+        except Exception:
             return False
 
-
-# ============================================================================
-# HARDWARE CONTROLLER
-# ============================================================================
 
 class HardwareStewartSimulator(BaseStewartSimulator):
     """Hardware-specific Stewart Platform Simulator with modular GUI."""
@@ -143,7 +120,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.port_var = tk.StringVar()
         config = HardwareControllerConfig()
 
-        # Initialize ball filter BEFORE calling super().__init__()
         self.ball_filter = BallPositionFilter(alpha=0.3)
 
         super().__init__(root, config)
@@ -167,7 +143,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         self.ik_cache = IKCache(max_size=5000)
 
-        # Phase 5: Pre-allocated NumPy buffers (avoid allocations in control loop)
         self._translation_buffer = np.zeros(3, dtype=np.float64)
         self._rotation_buffer = np.zeros(3, dtype=np.float64)
 
@@ -175,11 +150,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.last_sent_angles = None
         self.angle_change_threshold = 0.2
 
-        # Phase 4: Thread priority manager
         self.priority_manager = ThreadPriorityManager()
         self.control_thread_id = None
 
-        # Phase 5: Windows timer manager
         self.timer_manager = WindowsTimerManager()
 
         self.actual_fps = 0.0
@@ -188,22 +161,17 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'send_time': [],
             'total_time': []
         }
-        self.timing_breakpoints = {}  # Will be populated by control thread
+        self.timing_breakpoints = {}
         self.ik_timeout_count = 0
 
         self.last_gui_update = time.time()
         self.gui_update_count = 0
 
-        # Disable start button until connected
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
         self.log("Hardware controller initialized (100Hz mode)")
-        self.log("Phase 1: Ball EMA filter enabled")
-        self.log("Phase 2: GC optimization enabled")
-        self.log("Phase 3: Baud rates optimized (USB 200k, Maestro 250k)")
-        self.log("Phase 4: Thread priority manager ready (Windows only)")
-        self.log("Phase 5: Windows timer + pre-allocated buffers ready")
+        self.log("Optimizations: EMA filter, GC optimization, optimized baud rates, thread priority, timer resolution")
 
     def _create_controller_param_widgets(self):
         """Override to use hardware-specific defaults."""
@@ -223,41 +191,27 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define hardware-specific GUI layout with scrollable columns."""
+        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
-        layout = create_standard_layout(
-            scrollable_columns=True,
-            include_plot=True
-        )
-
-        # Column 1 (400px, scrollable): Hardware controls and configuration
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
-            {'type': 'ball_filter',
-             'args': {'ball_filter': self.ball_filter}},
-            {'type': 'serial_connection',
-             'args': {'port_var': self.port_var}},
+            {'type': 'ball_filter', 'args': {'ball_filter': self.ball_filter}},
+            {'type': 'serial_connection', 'args': {'port_var': self.port_var}},
             {'type': 'simulation_control'},
             {'type': 'controller',
              'args': {'controller_config': self.controller_config,
                       'controller_widgets': self.controller_widgets}},
-            {'type': 'trajectory_pattern',
-             'args': {'pattern_var': self.pattern_type}},
+            {'type': 'trajectory_pattern', 'args': {'pattern_var': self.pattern_type}},
             {'type': 'ball_state'},
-            {'type': 'configuration',
-             'args': {'use_offset_var': self.use_top_surface_offset}},
+            {'type': 'configuration', 'args': {'use_offset_var': self.use_top_surface_offset}},
         ]
 
-        # Column 2 (450px, scrollable): Status displays, manual control, and log
         layout['columns'][1]['modules'] = [
-            {'type': 'servo_angles',
-             'args': {'show_actual': False}},
+            {'type': 'servo_angles', 'args': {'show_actual': False}},
             {'type': 'platform_pose'},
-            {'type': 'controller_output',
-             'args': {'controller_name': 'PID (Hardware)'}},
-            {'type': 'manual_pose',
-             'args': {'dof_config': self.dof_config}},
-            {'type': 'debug_log',
-             'args': {'height': 8}},
+            {'type': 'controller_output', 'args': {'controller_name': 'PID (Hardware)'}},
+            {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
+            {'type': 'debug_log', 'args': {'height': 8}},
         ]
 
         return layout
@@ -325,13 +279,11 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             time.sleep(0.2)
             self.log("Servos: Speed=0 (unlimited), Accel=0")
 
-            # Phase 5: Set high-resolution timer
             success_timer, msg_timer = self.timer_manager.set_high_resolution()
             self.log(msg_timer)
 
             self.prewarm_ik_cache()
 
-            # Enable start button
             if 'simulation_control' in self.gui_modules:
                 self.gui_modules['simulation_control'].start_btn.config(state='normal')
         else:
@@ -348,11 +300,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         self.connected = False
 
-        # Disable start button
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
-        # Reset filter
         self.ball_filter.reset()
 
         self.log("Disconnected")
@@ -398,21 +348,18 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.simulation_time = 0.0
         self.ik_timeout_count = 0
 
-        # Phase 2: Disable garbage collection during control loop
         gc.disable()
         self.log("Control started (100Hz, GC disabled)")
 
-        self.control_thread = threading.Thread(target=self._control_thread_func,
-                                               daemon=True)
+        self.control_thread = threading.Thread(target=self._control_thread_func, daemon=True)
         self.control_thread.start()
 
-        # Phase 4: Set control thread to high priority (Windows only)
         self.control_thread_id = self.control_thread.ident
         if self.priority_manager.set_thread_priority(self.control_thread_id, THREAD_PRIORITY_TIME_CRITICAL):
-            self.log("Thread priority: ABOVE_NORMAL (Phase 4)")
+            self.log("Thread priority: TIME_CRITICAL")
         else:
             if sys.platform.startswith('win'):
-                self.log("Note: Could not set thread priority (admin may be required)")
+                self.log("Note: Could not set thread priority")
 
         self.last_gui_update = time.time()
         self.gui_update_count = 0
@@ -423,7 +370,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         loop_interval = ControlLoopConfig.INTERVAL_S
         max_ik_time = ControlLoopConfig.IK_TIMEOUT_S
 
-        # Timing instrumentation for spike detection
         timing_breakpoints = {
             'ball_read': [],
             'ball_process': [],
@@ -435,19 +381,16 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         }
         max_breakpoint_samples = 1000
 
-        # CRITICAL: Assign to self immediately so stats can read it while running
         self.timing_breakpoints = timing_breakpoints
 
         while self.simulation_running:
             loop_start = time.perf_counter()
 
-            # === BREAKPOINT 1: Ball data read ===
             t0 = time.perf_counter()
             ball_data = self.serial_controller.get_latest_ball_data()
             ball_read_time = (time.perf_counter() - t0) * 1000
             timing_breakpoints['ball_read'].append(ball_read_time)
 
-            # === BREAKPOINT 2: Ball data processing ===
             if ball_data is not None:
                 t1 = time.perf_counter()
                 self.last_ball_update = self.simulation_time
@@ -458,7 +401,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ball_x_mm = (pixy_x - 158.0) * self.pixels_to_mm_x
                 ball_y_mm = -(pixy_y - 104.0) * self.pixels_to_mm_y
 
-                # Phase 1: Apply EMA filter to smooth camera noise
                 ball_x_mm_filtered, ball_y_mm_filtered = self.ball_filter.update(
                     ball_x_mm, ball_y_mm
                 )
@@ -475,12 +417,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ball_process_time = (time.perf_counter() - t1) * 1000
                 timing_breakpoints['ball_process'].append(ball_process_time)
             else:
-                # No ball data - record 0
                 timing_breakpoints['ball_process'].append(0.0)
 
-            # === BREAKPOINT 3-6: Controller section ===
             if self.controller_enabled.get() and self.ball_detected:
-                # === BREAKPOINT 3: Pattern calculation ===
                 t2 = time.perf_counter()
                 pattern_time = self.simulation_time - self.pattern_start_time
                 target_x, target_y = self.current_pattern.get_position(pattern_time)
@@ -488,21 +427,17 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 pattern_calc_time = (time.perf_counter() - t2) * 1000
                 timing_breakpoints['pattern_calc'].append(pattern_calc_time)
 
-                # === BREAKPOINT 4: PID update ===
                 t3 = time.perf_counter()
-                rx, ry = self.controller.update(self.ball_pos_mm, target_pos_mm,
-                                                loop_interval)
-                ry = -ry  # Camera Y-axis inversion
+                rx, ry = self.controller.update(self.ball_pos_mm, target_pos_mm, loop_interval)
+                ry = -ry
                 pid_update_time = (time.perf_counter() - t3) * 1000
                 timing_breakpoints['pid_update'].append(pid_update_time)
 
                 self.dof_values['rx'] = rx
                 self.dof_values['ry'] = ry
 
-                # === BREAKPOINT 5: IK calculation ===
                 start_ik = time.perf_counter()
 
-                # ===== PHASE 5: USE PRE-ALLOCATED BUFFERS =====
                 self._translation_buffer[0] = self.dof_values['x']
                 self._translation_buffer[1] = self.dof_values['y']
                 self._translation_buffer[2] = self.dof_values['z']
@@ -540,7 +475,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ik_total_time = (time.perf_counter() - start_ik) * 1000
                 timing_breakpoints['ik_total'].append(ik_total_time)
 
-                # === BREAKPOINT 6: Serial send ===
                 if angles is not None:
                     if (self.last_sent_angles is None or
                             not np.allclose(angles, self.last_sent_angles,
@@ -562,13 +496,10 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                                 if len(self.timing_stats[key]) > 1000:
                                     self.timing_stats[key].pop(0)
                     else:
-                        # Servo angles didn't change enough - no send
                         timing_breakpoints['serial_send'].append(0.0)
                 else:
-                    # No valid angles - no send
                     timing_breakpoints['serial_send'].append(0.0)
             else:
-                # Controller not enabled or ball not detected - record zeros
                 timing_breakpoints['pattern_calc'].append(0.0)
                 timing_breakpoints['pid_update'].append(0.0)
                 timing_breakpoints['ik_total'].append(0.0)
@@ -576,39 +507,30 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             self.simulation_time += loop_interval
 
-            # === BREAKPOINT 7: Sleep timing ===
             t_sleep = time.perf_counter()
             elapsed = time.perf_counter() - loop_start
 
-            # CRITICAL: Detect Windows preemption spikes
-            if elapsed > 0.050:  # 50ms - way too long!
-                # Windows interrupted us - don't try to compensate with tiny sleep
+            if elapsed > 0.050:
                 self.log(f"WARNING: Loop took {elapsed * 1000:.1f}ms - Windows preemption detected")
                 timing_breakpoints['sleep'].append(0.0)
             else:
-                # Normal case - sleep to maintain 100Hz
                 sleep_time = loop_interval - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 sleep_actual_time = (time.perf_counter() - t_sleep) * 1000
                 timing_breakpoints['sleep'].append(sleep_actual_time)
 
-            # Limit breakpoint storage
             for key in timing_breakpoints:
                 if len(timing_breakpoints[key]) > max_breakpoint_samples:
                     timing_breakpoints[key].pop(0)
-
-        # Thread finished - timing_breakpoints already assigned to self at start
 
     def _gui_update_loop(self):
         """Separate GUI update loop at lower frequency."""
         if not self.simulation_running:
             return
 
-        # Update GUI modules
         self.update_gui_modules()
 
-        # Update plot
         if self.gui_update_count % 2 == 0:
             self._update_hardware_plot()
 
@@ -632,7 +554,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'ik_timeouts': self.ik_timeout_count,
         }
 
-        # Controller output
         if self.controller_enabled.get():
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
@@ -648,11 +569,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             state['controller_magnitude'] = (magnitude, magnitude_percent)
             state['controller_error'] = (error_x, error_y)
 
-        # Servo angles
         if self.last_sent_angles is not None:
             state['cmd_angles'] = self.last_sent_angles
 
-        # Pattern info
         pattern_configs = {
             'static': "Tracking: Center (0, 0)",
             'circle': "Tracking: Circle (r=50mm, T=10s)",
@@ -664,7 +583,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.gui_builder.update_modules(state)
 
     def setup_plot(self):
-        """Setup plot for hardware (override base class)."""
+        """Setup plot for hardware."""
         super().setup_plot()
 
         self.ball_trail, = self.ax.plot([], [], 'r-', alpha=0.3, linewidth=1,
@@ -722,10 +641,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def show_timing_stats(self):
         """Show performance statistics with detailed breakpoint analysis."""
-
-        # Print detailed breakdown to CONSOLE (messagebox is too small)
         print("\n" + "=" * 70)
-        print("DETAILED TIMING BREAKDOWN (Finding the 77ms spike)")
+        print("DETAILED TIMING BREAKDOWN")
         print("=" * 70 + "\n")
 
         if hasattr(self, 'timing_breakpoints') and self.timing_breakpoints:
@@ -741,13 +658,12 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             for key, name in breakpoint_names.items():
                 if key in self.timing_breakpoints and self.timing_breakpoints[key]:
-                    data = [x for x in self.timing_breakpoints[key] if x > 0]  # Filter out zeros
+                    data = [x for x in self.timing_breakpoints[key] if x > 0]
                     if data:
                         avg = np.mean(data)
                         max_val = np.max(data)
                         min_val = np.min(data)
 
-                        # Highlight if this is the culprit (max > 50ms)
                         marker = " ⚠️ SPIKE SOURCE!" if max_val > 50 else ""
 
                         print(f"{name}:{marker}")
@@ -755,7 +671,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                         print(f"  Min: {min_val:.3f} ms")
                         print(f"  Max: {max_val:.3f} ms")
 
-                        # Show percentile if we have potential spikes
                         if max_val > 10:
                             p95 = np.percentile(data, 95)
                             p99 = np.percentile(data, 99)
@@ -767,8 +682,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         print("=" * 70 + "\n")
 
-        # Show simplified summary in messagebox
-        stats_msg = "Performance Statistics (100Hz Hardware Mode - Phase 5)\n"
+        stats_msg = "Performance Statistics (100Hz Hardware Mode)\n"
         stats_msg += "=" * 60 + "\n\n"
 
         if self.timing_stats['ik_time']:
@@ -795,15 +709,14 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         stats_msg += f"  Cache Size: {len(self.ik_cache.cache)}/{self.ik_cache.max_size}\n\n"
 
         stats_msg += "Optimizations Active:\n"
-        stats_msg += f"  Phase 1: EMA Filter (α={self.ball_filter.get_alpha():.2f})\n"
-        stats_msg += f"  Phase 2: GC Disabled during control\n"
-        stats_msg += f"  Phase 3: USB 200k, Maestro 250k baud\n"
-        stats_msg += f"  Phase 4: Thread Priority ABOVE_NORMAL\n"
-        stats_msg += f"  Phase 5: Windows Timer 1ms + Pre-allocated buffers\n"
+        stats_msg += f"  EMA Filter (α={self.ball_filter.get_alpha():.2f})\n"
+        stats_msg += f"  GC Disabled during control\n"
+        stats_msg += f"  USB 200k, Maestro 250k baud\n"
+        stats_msg += f"  Thread Priority TIME_CRITICAL\n"
+        stats_msg += f"  Windows Timer 1ms + Pre-allocated buffers\n"
         stats_msg += f"  IK Timeouts: {self.ik_timeout_count}\n\n"
 
-        stats_msg += "⚠️ DETAILED BREAKDOWN PRINTED TO CONSOLE ⚠️\n"
-        stats_msg += "Check your terminal/PowerShell window for full timing data!"
+        stats_msg += "⚠️ DETAILED BREAKDOWN PRINTED TO CONSOLE ⚠️"
 
         messagebox.showinfo("Performance Statistics", stats_msg)
 
@@ -883,7 +796,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 except:
                     break
 
-        # Phase 2: Re-enable GC and clean up
         gc.enable()
         gc.collect()
 
@@ -897,10 +809,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if self.connected:
             self.disconnect_serial()
 
-        # Phase 5: Restore default timer resolution
         self.timer_manager.restore_default()
 
-        # Ensure GC is re-enabled on exit
         gc.enable()
         gc.collect()
 
@@ -913,15 +823,15 @@ def main():
     app = HardwareStewartSimulator(root)
 
     app.log("=" * 50)
-    app.log("Hardware Controller - Phase 5 Complete")
+    app.log("Hardware Controller - Ready")
     app.log("=" * 50)
     app.log("")
     app.log("Optimizations Active:")
-    app.log("  ✓ Phase 1: EMA Ball Filter")
-    app.log("  ✓ Phase 2: GC Optimization")
-    app.log("  ✓ Phase 3: Optimized Baud Rates")
-    app.log("  ✓ Phase 4: Windows Thread Priority")
-    app.log("  ✓ Phase 5: Windows Timer + Pre-allocated Arrays")
+    app.log("  ✓ EMA Ball Filter")
+    app.log("  ✓ GC Optimization")
+    app.log("  ✓ Optimized Baud Rates")
+    app.log("  ✓ Windows Thread Priority")
+    app.log("  ✓ Windows Timer + Pre-allocated Arrays")
     app.log("")
     app.log("Quick Start:")
     app.log("1. Select serial port and click 'Connect'")

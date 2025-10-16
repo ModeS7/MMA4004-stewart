@@ -221,12 +221,11 @@ class StewartPlatformIK:
             translation += pose_update[:3]
             rotation += pose_update[3:]
 
-            # Convergence bounds for FK iteration (wider than control limits)
             if np.linalg.norm(translation[:2]) > PLATFORM_HALF_SIZE_MM:
                 return None, None, False, iteration
             if translation[2] < 0 or translation[2] > 300:
                 return None, None, False, iteration
-            if np.any(np.abs(rotation) > 45):  # FK convergence limit, not control limit
+            if np.any(np.abs(rotation) > 45):
                 return None, None, False, iteration
 
         return None, None, False, max_iterations
@@ -262,11 +261,9 @@ class SimpleBallPhysics2D:
 
     Physics model:
     - Ball rolls (not slides) on tilted surface
-    - Angular velocity tracked and coupled to linear velocity
     - Rolling constraint: v = omega × r
-    - Acceleration depends on moment of inertia:
-        * Solid sphere: a = (5/7) * g * sin(theta)
-        * Hollow sphere: a = (3/5) * g * sin(theta)
+    - Acceleration: a = (g * sin(theta)) / mass_factor
+      where mass_factor = 1 + I/(m*r²)
     - Rolling resistance for energy dissipation
     """
 
@@ -295,7 +292,6 @@ class SimpleBallPhysics2D:
         else:
             raise ValueError(f"Unknown sphere_type: {sphere_type}. Use 'solid' or 'hollow'")
 
-        # Effective mass factor for rolling: m_eff = m * (1 + I/(m*r²))
         self.mass_factor = 1.0 + self.I / (self.mass * self.radius ** 2)
 
     def step(self, ball_pos, ball_vel, ball_omega, platform_pose, dt, platform_angular_accel=None):
@@ -329,8 +325,7 @@ class SimpleBallPhysics2D:
             platform_angular_accel
         )
 
-        # Check platform boundary
-        max_xy = PLATFORM_HALF_SIZE_MM / 1000.0  # Convert mm to meters
+        max_xy = PLATFORM_HALF_SIZE_MM / 1000.0
         fell_off = (torch.abs(new_xy_pos[:, 0]) > max_xy) | (torch.abs(new_xy_pos[:, 1]) > max_xy)
 
         contact_info = {'fell_off': False}
@@ -371,14 +366,7 @@ class SimpleBallPhysics2D:
         return d_pos, d_vel, d_omega
 
     def _compute_accelerations(self, xy_pos, xy_vel, xy_omega, platform_pose, platform_angular_accel=None):
-        """
-        Compute accelerations for rolling ball on tilted surface.
-
-        Accounts for:
-        - Gravitational component down the slope
-        - Platform vertical acceleration (changes effective gravity)
-        - Rolling dynamics (moment of inertia)
-        """
+        """Compute accelerations for rolling ball on tilted surface."""
         batch_size = xy_pos.shape[0]
 
         rx = torch.deg2rad(platform_pose[:, 3])
@@ -400,22 +388,18 @@ class SimpleBallPhysics2D:
         gx = -g_eff * torch.sin(ry)
         gy = -g_eff * torch.sin(rx)
 
-        # Rolling reduces acceleration by mass factor
         ax = gx / self.mass_factor
         ay = gy / self.mass_factor
 
         accel_linear = torch.stack([ax, ay], dim=1)
 
-        # Rolling resistance
         vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
         rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + 1e-8)
 
         accel_linear = accel_linear + rolling_resistance
 
-        # Angular acceleration from rolling constraint
         accel_angular = accel_linear / self.radius
 
-        # Angular velocity damping
         omega_damping = -self.mu_roll * xy_omega
         accel_angular = accel_angular + omega_damping
 
@@ -471,38 +455,18 @@ def rk4_step(state, derivative_fn, dt, *args):
 
 
 class TrajectoryPattern:
-    """
-    Base class for trajectory patterns.
-
-    All patterns return positions in millimeters and velocities in mm/s.
-    """
+    """Base class for trajectory patterns. All patterns return positions in mm and velocities in mm/s."""
 
     def get_position(self, t):
-        """
-        Get (x, y) position at time t.
-
-        Args:
-            t: time in seconds
-
-        Returns:
-            (x, y): position in millimeters
-        """
+        """Get (x, y) position at time t in seconds."""
         raise NotImplementedError
 
     def get_velocity(self, t):
-        """
-        Get (vx, vy) velocity at time t.
-
-        Args:
-            t: time in seconds
-
-        Returns:
-            (vx, vy): velocity in mm/s
-        """
+        """Get (vx, vy) velocity at time t in seconds."""
         raise NotImplementedError
 
     def reset(self):
-        """Reset pattern state (if stateful)."""
+        """Reset pattern state."""
         pass
 
 

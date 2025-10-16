@@ -24,13 +24,10 @@ class ScrollableColumn:
             self.outer_frame.configure(width=width)
             self.outer_frame.pack_propagate(False)
 
-        # Canvas for scrolling with dark background
-        self.canvas = tk.Canvas(self.outer_frame, highlightthickness=0,
-                                bg=bg_color)
+        self.canvas = tk.Canvas(self.outer_frame, highlightthickness=0, bg=bg_color)
         self.scrollbar = ttk.Scrollbar(self.outer_frame, orient="vertical",
                                        command=self.canvas.yview)
 
-        # Inner frame that holds content
         self.inner_frame = ttk.Frame(self.canvas)
         self.canvas_window = self.canvas.create_window((0, 0),
                                                        window=self.inner_frame,
@@ -38,15 +35,12 @@ class ScrollableColumn:
 
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
-        # Pack widgets
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
-        # Update scroll region when content changes
         self.inner_frame.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mouse wheel scrolling
         self._bind_mousewheel()
 
     def _on_frame_configure(self, event=None):
@@ -90,9 +84,9 @@ class GUIBuilder:
     {
         'columns': [
             {
-                'width': 400,          # Fixed width (optional)
-                'scrollable': True,    # Enable scrolling (optional)
-                'modules': [           # List of module configs
+                'width': 400,
+                'scrollable': True,
+                'modules': [
                     {'type': 'simulation_control', 'args': {...}},
                     {'type': 'ball_control', 'args': {...}},
                     ...
@@ -100,10 +94,7 @@ class GUIBuilder:
             },
             ...
         ],
-        'plot': {
-            'enabled': True,          # Show plot panel (optional)
-            'title': 'Ball Position'  # Plot title (optional)
-        }
+        'plot': {'enabled': True, 'title': 'Ball Position'}
     }
     """
 
@@ -130,11 +121,9 @@ class GUIBuilder:
         Returns:
             dict: References to created modules by name
         """
-        # Main container
         main_frame = ttk.Frame(self.root, style='TFrame')
         main_frame.pack(fill='both', expand=True, padx=5, pady=5)
 
-        # Create columns
         column_configs = layout_config.get('columns', [])
 
         for col_idx, col_config in enumerate(column_configs):
@@ -142,7 +131,6 @@ class GUIBuilder:
             scrollable = col_config.get('scrollable', False)
 
             if scrollable:
-                # Scrollable column
                 column = ScrollableColumn(main_frame, width=width,
                                           bg_color=colors.get('bg', '#1e1e1e'))
                 column.pack(side='left', fill='both',
@@ -151,7 +139,6 @@ class GUIBuilder:
                 container = column.get_container()
                 self.columns.append(column)
             else:
-                # Regular frame
                 column = ttk.Frame(main_frame, style='TFrame')
                 if width:
                     column.configure(width=width)
@@ -162,12 +149,10 @@ class GUIBuilder:
                 container = column
                 self.columns.append(column)
 
-            # Add modules to column
             module_configs = col_config.get('modules', [])
             for mod_config in module_configs:
                 self._create_module(container, mod_config, colors, callbacks)
 
-        # Plot panel (if enabled)
         if layout_config.get('plot', {}).get('enabled', False):
             self._create_plot_panel(main_frame, layout_config['plot'], colors)
 
@@ -183,27 +168,19 @@ class GUIBuilder:
             print(f"Warning: Unknown module type '{module_type}'")
             return
 
-        # Get module class
         module_class = self.module_registry[module_type]
-
-        # Create module instance
         module = module_class(parent, colors, callbacks, **module_args)
 
-        # Create and pack module frame
         frame = module.create()
         if frame:
             pack_config = module_config.get('pack', {'fill': 'x', 'pady': (0, 10)})
             frame.pack(**pack_config)
-
-            # Store reference
             self.modules[module_name] = module
 
     def _create_plot_panel(self, parent, plot_config, colors):
-        """Create plot panel (placeholder - actual plot created by simulator)."""
+        """Create plot panel (actual plot created by simulator)."""
         plot_panel = ttk.Frame(parent, style='TFrame')
         plot_panel.pack(side='right', fill='both', expand=True, padx=(5, 0))
-
-        # Store reference for simulator to add plot to
         self.modules['plot_panel'] = plot_panel
 
     def update_modules(self, state):
@@ -217,8 +194,7 @@ class GUIBuilder:
             if hasattr(module, 'update'):
                 try:
                     module.update(state)
-                except Exception as e:
-                    # Silently ignore module update errors to maintain performance
+                except Exception:
                     pass
 
 
@@ -238,12 +214,12 @@ def create_standard_layout(scrollable_columns=True, include_plot=True):
             {
                 'width': 400,
                 'scrollable': scrollable_columns,
-                'modules': []  # To be filled by simulator
+                'modules': []
             },
             {
                 'width': 450,
                 'scrollable': scrollable_columns,
-                'modules': []  # To be filled by simulator
+                'modules': []
             }
         ],
         'plot': {

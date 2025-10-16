@@ -15,12 +15,10 @@ from core.utils import MAX_TILT_ANGLE_DEG
 
 def clip_tilt_vector(rx, ry, max_magnitude=MAX_TILT_ANGLE_DEG):
     """
-    Clip tilt vector to maximum magnitude.
+    Clip tilt vector to maximum magnitude while preserving direction.
 
-    Treats (rx, ry) as a 2D vector and scales proportionally if magnitude exceeds limit.
+    Treats (rx, ry) as 2D vector and scales proportionally if magnitude exceeds limit.
     Prevents servo constraint violations when both rx and ry are large.
-
-    Example: (11, 11) → magnitude 15.56° → scaled to (10.6, 10.6) at 15°
 
     Args:
         rx: Roll angle in degrees
@@ -56,8 +54,7 @@ class PIDController:
             ki: Integral gain
             kd: Derivative gain
             output_limit: Maximum tilt angle (vector magnitude)
-            derivative_filter_alpha: Low-pass filter coefficient (0=none, 0.1=light, 0.5=heavy)
-                                    Use >0 for hardware to reduce camera noise
+            derivative_filter_alpha: Low-pass filter coefficient (0=none, >0=filtering)
         """
         self.kp = kp
         self.ki = ki
@@ -96,7 +93,6 @@ class PIDController:
         output_x = self._compute_pid_axis(error_x, dt, 'x')
         output_y = self._compute_pid_axis(error_y, dt, 'y')
 
-        # Map to platform tilt (axes swapped)
         rx_raw = output_y
         ry_raw = output_x
 
@@ -146,12 +142,10 @@ class LQRController:
     Linear Quadratic Regulator (LQR) for ball position control.
 
     Uses optimal control theory to minimize position error and control effort.
+    Linearized dynamics around equilibrium (ball centered, zero velocity).
 
     State: [pos_x, pos_y, vel_x, vel_y]
     Control: [tilt_ry, tilt_rx]
-
-    Linearized dynamics around equilibrium (ball centered, zero velocity):
-        dx/dt = A*x + B*u
     """
 
     def __init__(self, Q_pos=1.0, Q_vel=1.0, R=0.01,
@@ -159,9 +153,9 @@ class LQRController:
                  ball_physics_params=None):
         """
         Args:
-            Q_pos: Position error cost weight (higher = tighter tracking)
-            Q_vel: Velocity cost weight (higher = more damping)
-            R: Control effort cost weight (higher = smoother, less aggressive)
+            Q_pos: Position error cost weight
+            Q_vel: Velocity cost weight
+            R: Control effort cost weight
             output_limit: Maximum tilt angle in degrees (vector magnitude)
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
         """
@@ -187,11 +181,7 @@ class LQRController:
         self.compute_lqr_gain()
 
     def compute_lqr_gain(self):
-        """
-        Compute LQR gain matrix by solving algebraic Riccati equation.
-
-        Linearization: acceleration = (g / mass_factor) * tilt_radians
-        """
+        """Compute LQR gain matrix by solving algebraic Riccati equation."""
         k = (self.g / self.mass_factor) * (np.pi / 180.0)
 
         A = np.array([
@@ -282,22 +272,19 @@ class BallPositionFilter:
     Exponential Moving Average (EMA) filter for ball position.
 
     Reduces camera noise and vibration while maintaining responsiveness.
+    Formula: filtered = alpha * raw + (1 - alpha) * filtered_prev
 
-    Formula:
-        filtered = alpha * raw + (1 - alpha) * filtered_prev
-
-    Where alpha (0 to 1):
-        0.0 = no filtering (all old value)
+    Alpha values:
+        0.0 = maximum smoothing (all old value)
         0.3 = light filtering (responsive)
-        0.5 = moderate filtering (balanced)
-        0.7 = heavy filtering (smooth but laggy)
+        0.5 = moderate filtering
         1.0 = no filtering (all new value)
     """
 
     def __init__(self, alpha=0.3):
         """
         Args:
-            alpha: Filter coefficient (0.0 to 1.0). Default 0.3 for responsiveness.
+            alpha: Filter coefficient (0.0 to 1.0)
         """
         self.alpha = np.clip(float(alpha), 0.0, 1.0)
         self.x_filtered = 0.0
@@ -316,24 +303,17 @@ class BallPositionFilter:
             (x_filtered, y_filtered): Filtered position in mm
         """
         if not self.initialized:
-            # First measurement: initialize with raw values
             self.x_filtered = x_raw
             self.y_filtered = y_raw
             self.initialized = True
         else:
-            # Apply EMA: blend new measurement with previous filtered value
             self.x_filtered = self.alpha * x_raw + (1.0 - self.alpha) * self.x_filtered
             self.y_filtered = self.alpha * y_raw + (1.0 - self.alpha) * self.y_filtered
 
         return self.x_filtered, self.y_filtered
 
     def set_alpha(self, alpha):
-        """
-        Update filter coefficient on-the-fly.
-
-        Args:
-            alpha: New filter coefficient (0.0 to 1.0)
-        """
+        """Update filter coefficient on-the-fly."""
         self.alpha = np.clip(float(alpha), 0.0, 1.0)
 
     def get_alpha(self):

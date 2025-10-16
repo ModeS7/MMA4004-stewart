@@ -3,18 +3,12 @@
 Shared utilities and constants for Stewart Platform simulators.
 """
 
-# ============================================================================
-# PHYSICAL CONSTANTS
-# ============================================================================
-
+# Physical constants
 MAX_TILT_ANGLE_DEG = 15.0
 MAX_SERVO_ANGLE_DEG = 40.0
 PLATFORM_SIZE_MM = 200.0
 PLATFORM_HALF_SIZE_MM = 100.0
 
-# ============================================================================
-# TIMING CONSTANTS
-# ============================================================================
 
 class ControlLoopConfig:
     """Configuration for real-time control loop."""
@@ -37,10 +31,6 @@ class SimulationConfig:
     DEFAULT_SERVO_TAU = 0.1
     DEFAULT_SERVO_DELAY = 0.0
 
-
-# ============================================================================
-# FORMATTING UTILITIES
-# ============================================================================
 
 def format_vector_2d(vec, units="mm", decimals=1):
     """Format 2D vector for display."""
@@ -65,10 +55,6 @@ def format_error_context(sim_time, ball_pos, ball_vel, error_msg):
         f"vel={format_vector_2d(ball_vel[:2], 'mm/s')}"
     )
 
-
-# ============================================================================
-# VALIDATION UTILITIES
-# ============================================================================
 
 def is_position_in_bounds(x, y, max_size=PLATFORM_HALF_SIZE_MM):
     """Check if position is within platform bounds."""

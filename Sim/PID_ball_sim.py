@@ -20,11 +20,7 @@ class PIDControllerConfig(ControllerConfig):
         self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
                               0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
         self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
-        self.default_scalar_indices = {
-            'kp': 4,  # 0.001
-            'ki': 4,  # 0.001
-            'kd': 4   # 0.001
-        }
+        self.default_scalar_indices = {'kp': 4, 'ki': 4, 'kd': 4}
         self.controller_ref = None
 
     def get_controller_name(self) -> str:
@@ -36,7 +32,7 @@ class PIDControllerConfig(ControllerConfig):
             ki=kwargs.get('ki', 0.001),
             kd=kwargs.get('kd', 0.003),
             output_limit=kwargs.get('output_limit', 15.0),
-            derivative_filter_alpha=0.0  # No filtering in simulation
+            derivative_filter_alpha=0.0
         )
 
     def get_scalar_values(self) -> list:
@@ -52,12 +48,8 @@ class PIDStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define GUI layout for PID simulator."""
-        layout = create_standard_layout(
-            scrollable_columns=True,
-            include_plot=True
-        )
+        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
-        # Column 1: Controls and configuration
         layout['columns'][0]['modules'] = [
             {'type': 'simulation_control'},
             {'type': 'controller',
@@ -71,17 +63,12 @@ class PIDStewartSimulator(BaseStewartSimulator):
              'args': {'use_offset_var': self.use_top_surface_offset}},
         ]
 
-        # Column 2: Servo angles, FK, output, log, and manual pose
         layout['columns'][1]['modules'] = [
-            {'type': 'servo_angles',
-             'args': {'show_actual': True}},
+            {'type': 'servo_angles', 'args': {'show_actual': True}},
             {'type': 'platform_pose'},
-            {'type': 'controller_output',
-             'args': {'controller_name': 'PID'}},
-            {'type': 'manual_pose',
-             'args': {'dof_config': self.dof_config}},
-            {'type': 'debug_log',
-             'args': {'height': 8}},
+            {'type': 'controller_output', 'args': {'controller_name': 'PID'}},
+            {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
+            {'type': 'debug_log', 'args': {'height': 8}},
         ]
 
         return layout
@@ -100,7 +87,6 @@ class PIDStewartSimulator(BaseStewartSimulator):
         )
 
         self.controller_config.controller_ref = self.controller
-
         self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
     def on_controller_param_change(self):

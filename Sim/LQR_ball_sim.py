@@ -22,11 +22,7 @@ class LQRControllerConfig(ControllerConfig):
         self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
                               0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
         self.default_weights = {'Q_pos': 1.0, 'Q_vel': 1.0, 'R': 1.0}
-        self.default_scalar_indices = {
-            'Q_pos': 7,  # 1.0
-            'Q_vel': 6,  # 0.1
-            'R': 5  # 0.01
-        }
+        self.default_scalar_indices = {'Q_pos': 7, 'Q_vel': 6, 'R': 5}
         self.ball_physics_params = ball_physics_params
         self.controller_ref = None
 
@@ -62,12 +58,8 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define GUI layout for LQR simulator."""
-        layout = create_standard_layout(
-            scrollable_columns=True,
-            include_plot=True
-        )
+        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
-        # Column 1: Controls and configuration
         layout['columns'][0]['modules'] = [
             {'type': 'simulation_control'},
             {'type': 'controller',
@@ -81,17 +73,12 @@ class LQRStewartSimulator(BaseStewartSimulator):
              'args': {'use_offset_var': self.use_top_surface_offset}},
         ]
 
-        # Column 2: Servo angles, FK, output, log, and manual pose
         layout['columns'][1]['modules'] = [
-            {'type': 'servo_angles',
-             'args': {'show_actual': True}},
+            {'type': 'servo_angles', 'args': {'show_actual': True}},
             {'type': 'platform_pose'},
-            {'type': 'controller_output',
-             'args': {'controller_name': 'LQR'}},
-            {'type': 'manual_pose',
-             'args': {'dof_config': self.dof_config}},
-            {'type': 'debug_log',
-             'args': {'height': 8}},
+            {'type': 'controller_output', 'args': {'controller_name': 'LQR'}},
+            {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
+            {'type': 'debug_log', 'args': {'height': 8}},
         ]
 
         return layout
@@ -106,7 +93,6 @@ class LQRStewartSimulator(BaseStewartSimulator):
         """Override to add gain matrix button after GUI is built."""
         super()._build_modular_gui()
 
-        # Add show gain matrix button to controller module
         if 'controller' in self.gui_modules:
             controller_frame = self.gui_modules['controller'].frame
 
@@ -167,7 +153,6 @@ class LQRStewartSimulator(BaseStewartSimulator):
         )
 
         self.controller_config.controller_ref = self.controller
-
         self.log(f"LQR initialized: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
     def on_controller_param_change(self):

@@ -3,8 +3,6 @@
 Hardware Stewart Platform Controller Configuration
 Real-time control with Pixy2 camera and Maestro servos
 
-Phase 3: Baud rate optimized to 200000
-
 Key differences from simulation:
 - Real camera data (no physics simulation)
 - Serial communication with hardware
@@ -28,10 +26,6 @@ from base_simulator import ControllerConfig
 from core.control_core import PIDController
 from core.utils import ControlLoopConfig, GUIConfig
 
-
-# ============================================================================
-# OPTIMIZED IK CACHE
-# ============================================================================
 
 class IKCache:
     """Cache IK results with coarse resolution for higher hit rate."""
@@ -71,14 +65,10 @@ class IKCache:
         self.misses = 0
 
 
-# ============================================================================
-# SERIAL CONTROLLER (Phase 3: 200000 baud)
-# ============================================================================
-
 class SerialController:
     """High-performance serial communication with hardware."""
 
-    def __init__(self, port, baudrate=200000):  # Phase 3: Changed from 115200
+    def __init__(self, port, baudrate=200000):
         self.port = port
         self.baudrate = baudrate
         self.serial = None
@@ -259,23 +249,19 @@ class SerialController:
             return None
 
 
-# ============================================================================
-# HARDWARE CONTROLLER CONFIGURATION
-# ============================================================================
-
 class HardwareControllerConfig(ControllerConfig):
+    """Hardware PID controller configuration with derivative filtering."""
+
     def __init__(self):
-        # Don't call super().__init__() - implement directly
         self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
                               0.001, 0.01, 0.1, 1.0, 10.0]
         self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
-        self.default_scalar_idx = 3  # 0.0001 for hardware
+        self.default_scalar_idx = 3
 
     def get_controller_name(self) -> str:
         return "PID (Hardware)"
 
     def create_controller(self, **kwargs):
-        # Don't call super() - create PIDController directly
         return PIDController(
             kp=kwargs.get('kp', 0.0003),
             ki=kwargs.get('ki', 0.0001),
@@ -289,8 +275,8 @@ class HardwareControllerConfig(ControllerConfig):
 
 
 def main():
-    """Launch hardware controller (placeholder for now)."""
-    print("Hardware controller configuration loaded (Phase 3: 200000 baud).")
+    """Launch hardware controller."""
+    print("Hardware controller configuration loaded (200000 baud).")
     print("Use HardwareStewartSimulator to run with real hardware.")
 
 
