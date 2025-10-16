@@ -29,7 +29,7 @@ from utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time
 from gui_builder import create_standard_layout
 
 # ============================================================================
-# PHASE 4: WINDOWS THREAD PRIORITY MANAGER
+# WINDOWS THREAD PRIORITY MANAGER
 # ============================================================================
 
 # Windows thread priority constants
