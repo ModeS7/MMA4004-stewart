@@ -149,19 +149,21 @@ class ControllerModule(GUIModule):
 
 
 # ============================================================================
-# TRAJECTORY PATTERN
+# TRAJECTORY PATTERN WITH DYNAMIC PARAMETER SLIDERS
 # ============================================================================
 
 class TrajectoryPatternModule(GUIModule):
-    """Trajectory pattern selection."""
+    """Trajectory pattern selection with dynamic parameter controls."""
 
     def __init__(self, parent, colors, callbacks, pattern_var):
         super().__init__(parent, colors, callbacks)
         self.pattern_var = pattern_var
+        self.param_widgets = {}
 
     def create(self):
         self.frame = ttk.LabelFrame(self.parent, text="Trajectory Pattern", padding=10)
 
+        # Pattern selector
         selector_frame = ttk.Frame(self.frame)
         selector_frame.pack(fill='x', pady=(0, 5))
 
@@ -172,20 +174,109 @@ class TrajectoryPatternModule(GUIModule):
                                      width=15, state='readonly',
                                      values=['static', 'circle', 'figure8', 'star'])
         pattern_combo.pack(side='left', padx=5)
-        pattern_combo.bind('<<ComboboxSelected>>',
-                           lambda e: self.callbacks.get('pattern_change')())
+        pattern_combo.bind('<<ComboboxSelected>>', self._on_pattern_change)
 
         ttk.Button(selector_frame, text="Reset",
                    command=self.callbacks.get('pattern_reset'),
                    width=8).pack(side='left', padx=5)
 
+        # Pattern info label
         self.info_label = ttk.Label(self.frame,
                                     text="Tracking: Center (0, 0)",
                                     font=('Consolas', 8),
                                     foreground=self.colors['success'])
         self.info_label.pack(anchor='w', pady=(5, 0))
 
+        # Dynamic parameter container
+        self.params_container = ttk.Frame(self.frame)
+        self.params_container.pack(fill='x', pady=(10, 0))
+
+        # Initialize with current pattern
+        self._update_pattern_params()
+
         return self.frame
+
+    def _on_pattern_change(self, event=None):
+        """Handle pattern change."""
+        self._update_pattern_params()
+        if self.callbacks.get('pattern_change'):
+            self.callbacks['pattern_change']()
+
+    def _update_pattern_params(self):
+        """Update parameter sliders based on selected pattern."""
+        # Clear existing widgets
+        for widget in self.params_container.winfo_children():
+            widget.destroy()
+        self.param_widgets.clear()
+
+        pattern_type = self.pattern_var.get()
+
+        # Define parameters for each pattern type
+        pattern_params = {
+            'static': [],
+            'circle': [
+                ('radius', 'Radius (mm)', 10.0, 100.0, 50.0, 1.0),
+                ('period', 'Period (s)', 3.0, 30.0, 10.0, 0.5)
+            ],
+            'figure8': [
+                ('width', 'Width (mm)', 10.0, 150.0, 60.0, 1.0),
+                ('height', 'Height (mm)', 10.0, 100.0, 40.0, 1.0),
+                ('period', 'Period (s)', 3.0, 30.0, 12.0, 0.5)
+            ],
+            'star': [
+                ('radius', 'Radius (mm)', 10.0, 100.0, 60.0, 1.0),
+                ('period', 'Period (s)', 3.0, 30.0, 15.0, 0.5)
+            ]
+        }
+
+        params = pattern_params.get(pattern_type, [])
+
+        if not params:
+            ttk.Label(self.params_container,
+                     text="No adjustable parameters",
+                     font=('Segoe UI', 8, 'italic'),
+                     foreground=self.colors['border']).pack(pady=5)
+            return
+
+        # Create sliders for each parameter
+        for param_name, label, min_val, max_val, default, resolution in params:
+            self._create_param_slider(param_name, label, min_val, max_val, default, resolution)
+
+    def _create_param_slider(self, param_name, label, min_val, max_val, default, resolution):
+        """Create a parameter slider."""
+        frame = ttk.Frame(self.params_container)
+        frame.pack(fill='x', pady=3)
+
+        ttk.Label(frame, text=label,
+                  font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', padx=(0, 5))
+
+        # Slider
+        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
+        slider.grid(row=0, column=1, sticky='ew', padx=5)
+        slider.set(default)
+
+        # Value label
+        value_label = ttk.Label(frame, text=f"{default:.1f}",
+                               width=6, font=('Consolas', 9))
+        value_label.grid(row=0, column=2)
+
+        # Update callback
+        def on_change(val):
+            value = float(val)
+            value_label.config(text=f"{value:.1f}")
+            if self.callbacks.get('pattern_param_change'):
+                self.callbacks['pattern_param_change'](param_name, value)
+
+        slider.config(command=on_change)
+
+        frame.columnconfigure(1, weight=1)
+
+        # Store references
+        self.param_widgets[param_name] = {
+            'slider': slider,
+            'label': value_label,
+            'frame': frame
+        }
 
     def update(self, state):
         """Update pattern info text."""

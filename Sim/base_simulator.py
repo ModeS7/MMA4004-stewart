@@ -160,10 +160,11 @@ class BaseStewartSimulator:
         self.controller = None
         self.controller_enabled = tk.BooleanVar(value=False)
 
-        # Pattern state
+        # Pattern state with parameter tracking
         self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
         self.pattern_type = tk.StringVar(value='static')
         self.pattern_start_time = 0.0
+        self.pattern_params = {}  # Store current pattern parameters
 
         # Ball state
         ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
@@ -280,27 +281,23 @@ class BaseStewartSimulator:
 
     def _create_controller_param_widgets(self):
         """Create controller parameter widgets (for controller module)."""
-        # Note: We don't create the frame here - the ControllerModule will create it
-        # We just prepare the data needed to create the widgets
-
         controller_name = self.controller_config.get_controller_name()
 
         if controller_name == "PID":
             self.param_definitions = [
-                ('kp', 'P (Proportional)', 3.0, 4),  # default_scalar_idx
+                ('kp', 'P (Proportional)', 3.0, 4),
                 ('ki', 'I (Integral)', 1.0, 4),
                 ('kd', 'D (Derivative)', 3.0, 4)
             ]
         elif controller_name == "LQR":
             self.param_definitions = [
-                ('Q_pos', 'Q Position Weight', 1.0, 7),  # 1.0 scalar
-                ('Q_vel', 'Q Velocity Weight', 1.0, 6),  # 0.1 scalar
-                ('R', 'R Control Weight', 1.0, 5)  # 0.01 scalar
+                ('Q_pos', 'Q Position Weight', 1.0, 7),
+                ('Q_vel', 'Q Velocity Weight', 1.0, 6),
+                ('R', 'R Control Weight', 1.0, 5)
             ]
         else:
             self.param_definitions = []
 
-        # These will be populated when the module creates them
         self.controller_widgets = {
             'sliders': {},
             'value_labels': {},
@@ -311,8 +308,6 @@ class BaseStewartSimulator:
 
     def _build_modular_gui(self):
         """Build GUI using modular system."""
-
-        # Create module registry
         module_registry = {
             'simulation_control': gm.SimulationControlModule,
             'controller': gm.ControllerModule,
@@ -329,55 +324,75 @@ class BaseStewartSimulator:
             'performance_stats': gm.PerformanceStatsModule,
         }
 
-        # Get layout configuration from subclass
         layout_config = self.get_layout_config()
-
-        # Build callbacks dict
         callbacks = self._create_callbacks()
 
-        # Build GUI
         self.gui_builder = GUIBuilder(self.root, module_registry)
         self.gui_modules = self.gui_builder.build(layout_config, self.colors, callbacks)
 
-        # Setup plot if enabled
         if 'plot_panel' in self.gui_modules:
             self._create_plot(self.gui_modules['plot_panel'])
 
     def _create_callbacks(self):
         """Create callback dictionary for modules."""
         return {
-            # Simulation control
             'start': self.start_simulation,
             'stop': self.stop_simulation,
             'reset': self.reset_simulation,
-
-            # Controller
             'controller_enabled_var': self.controller_enabled,
             'toggle_controller': self.on_controller_toggle,
             'param_change': self.on_controller_param_change,
-
-            # Trajectory
             'pattern_change': self.on_pattern_change,
             'pattern_reset': self.reset_pattern,
-
-            # Ball
+            'pattern_param_change': self.on_pattern_param_change,  # Centralized here
             'reset_ball': self.reset_ball,
             'push_ball': self.push_ball,
-
-            # Configuration
             'toggle_offset': self.on_offset_toggle,
-
-            # Manual pose
             'slider_change': self.on_slider_change,
         }
 
+    def on_pattern_param_change(self, param_name, value):
+        """
+        Centralized pattern parameter update handler.
+        Called when pattern sliders change - updates pattern with new parameters.
+        """
+        pattern_type = self.pattern_type.get()
+
+        # Update stored parameters
+        self.pattern_params[param_name] = value
+
+        # Create new pattern with updated parameters
+        if pattern_type == 'circle':
+            radius = self.pattern_params.get('radius', 50.0)
+            period = self.pattern_params.get('period', 10.0)
+            self.current_pattern = PatternFactory.create('circle',
+                                                         radius=radius,
+                                                         period=period,
+                                                         clockwise=True)
+
+        elif pattern_type == 'figure8':
+            width = self.pattern_params.get('width', 60.0)
+            height = self.pattern_params.get('height', 40.0)
+            period = self.pattern_params.get('period', 12.0)
+            self.current_pattern = PatternFactory.create('figure8',
+                                                         width=width,
+                                                         height=height,
+                                                         period=period)
+
+        elif pattern_type == 'star':
+            radius = self.pattern_params.get('radius', 60.0)
+            period = self.pattern_params.get('period', 15.0)
+            self.current_pattern = PatternFactory.create('star',
+                                                         radius=radius,
+                                                         period=period)
+
+        # Reset pattern timing and update visualization
+        self.reset_pattern()
+        self.update_plot()
+
     @abstractmethod
     def get_layout_config(self):
-        """
-        Return layout configuration for this simulator.
-
-        Subclasses override this to define their GUI layout.
-        """
+        """Return layout configuration for this simulator."""
         raise NotImplementedError
 
     def _create_plot(self, parent):
@@ -511,7 +526,6 @@ class BaseStewartSimulator:
             'fk_rotation': self.last_fk_rotation,
         }
 
-        # Controller output
         if self.controller_enabled.get():
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
@@ -527,13 +541,11 @@ class BaseStewartSimulator:
             error_y = ball_y_mm - target_y
             state['controller_error'] = (error_x, error_y)
 
-        # Tilt magnitude
         rx = self.dof_values['rx']
         ry = self.dof_values['ry']
         _, _, magnitude = clip_tilt_vector(rx, ry, MAX_TILT_ANGLE_DEG)
         state['tilt_magnitude'] = magnitude
 
-        # Pattern info
         pattern_configs = {
             'static': "Tracking: Center (0, 0)",
             'circle': "Tracking: Circle (r=50mm, T=10s)",
@@ -555,7 +567,6 @@ class BaseStewartSimulator:
             controller_name = self.controller_config.get_controller_name()
             self.log(f"{controller_name} control ENABLED")
 
-            # Disable manual tilt control
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
                 manual_pose.sliders['rx'].config(state='disabled')
@@ -569,7 +580,6 @@ class BaseStewartSimulator:
             controller_name = self.controller_config.get_controller_name()
             self.log(f"{controller_name} control DISABLED")
 
-            # Enable manual tilt control
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
                 manual_pose.sliders['rx'].config(state='normal')
@@ -578,6 +588,9 @@ class BaseStewartSimulator:
     def on_pattern_change(self, event=None):
         """Handle pattern selection change."""
         pattern_type = self.pattern_type.get()
+
+        # Reset parameter storage for new pattern
+        self.pattern_params.clear()
 
         pattern_configs = {
             'static': ('static', {'x': 0.0, 'y': 0.0}),
@@ -588,6 +601,12 @@ class BaseStewartSimulator:
 
         if pattern_type in pattern_configs:
             pattern_name, params = pattern_configs[pattern_type]
+
+            # Store initial parameters
+            for key, value in params.items():
+                if key != 'clockwise':  # Don't store non-adjustable params
+                    self.pattern_params[key] = value
+
             self.current_pattern = PatternFactory.create(pattern_name, **params)
             self.reset_pattern()
             self.update_plot()
@@ -685,7 +704,6 @@ class BaseStewartSimulator:
         self.last_update_time = time.time()
         self.log("Simulation started")
 
-        # Update button states through modules
         if 'simulation_control' in self.gui_modules:
             sim_ctrl = self.gui_modules['simulation_control']
             sim_ctrl.start_btn.config(state='disabled')
@@ -701,7 +719,6 @@ class BaseStewartSimulator:
             self.root.after_cancel(self.simulation_loop_id)
             self.simulation_loop_id = None
 
-        # Update button states
         if 'simulation_control' in self.gui_modules:
             sim_ctrl = self.gui_modules['simulation_control']
             sim_ctrl.start_btn.config(state='normal')
@@ -860,7 +877,6 @@ class BaseStewartSimulator:
                 self.prev_platform_angles['rx'] = rx_now
                 self.prev_platform_angles['ry'] = ry_now
 
-            # Update GUI modules and plot
             self.update_gui_modules()
             self.update_plot()
 

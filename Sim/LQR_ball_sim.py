@@ -62,7 +62,6 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define GUI layout for LQR simulator."""
-
         layout = create_standard_layout(
             scrollable_columns=True,
             include_plot=True
@@ -207,6 +206,7 @@ def main():
     app.log("2. Click 'Start' to begin simulation")
     app.log("3. Use 'Push Ball' to test disturbance rejection")
     app.log("4. Select different trajectory patterns to track")
+    app.log("5. Adjust pattern size/speed with sliders")
     app.log("")
     app.log("Tuning Tips:")
     app.log("- Increase Q_pos for tighter position control")
