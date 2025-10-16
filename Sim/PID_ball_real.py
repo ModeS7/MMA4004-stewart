@@ -454,6 +454,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         legend.get_frame().set_alpha(0.9)
 
         self.canvas.draw()
+
+    def _update_hardware_plot(self):
         """Update plot with hardware data."""
         try:
             if self.ball_detected:
@@ -463,8 +465,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 self.ball_circle.set_alpha(0.2)
 
             if len(self.ball_history_x) > 1:
-                self.ball_trail, = self.ax.plot(self.ball_history_x, self.ball_history_y,
-                                                'r-', alpha=0.3, linewidth=1)
+                self.ball_trail.set_data(self.ball_history_x, self.ball_history_y)
 
             if self.pattern_type.get() != 'static':
                 pattern_time = self.simulation_time - self.pattern_start_time
