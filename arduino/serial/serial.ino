@@ -33,7 +33,7 @@ int servoAcceleration = 20; // 0 = unlimited (fastest)
 
 void setup() {
   Serial.begin(115200);
-  maestroSerial.begin(9600);
+  maestroSerial.begin(250000);
 
   Serial.println("Stewart Platform Servo Controller");
   Serial.println("Commands:");
