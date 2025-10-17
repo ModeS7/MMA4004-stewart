@@ -21,10 +21,95 @@ import threading
 import serial
 import serial.tools.list_ports
 from queue import Queue, Empty
+import sys
+import ctypes
 
 from setup.base_simulator import ControllerConfig
 from core.control_core import PIDController
 from core.utils import ControlLoopConfig, GUIConfig
+
+
+THREAD_PRIORITY_IDLE = -15
+THREAD_PRIORITY_LOWEST = -2
+THREAD_PRIORITY_BELOW_NORMAL = -1
+THREAD_PRIORITY_NORMAL = 0
+THREAD_PRIORITY_ABOVE_NORMAL = 1
+THREAD_PRIORITY_HIGHEST = 2
+THREAD_PRIORITY_TIME_CRITICAL = 15
+
+
+class WindowsTimerManager:
+    """Windows multimedia timer resolution manager. Reduces timer granularity from 15.6ms to 1ms."""
+
+    def __init__(self):
+        self.timer_set = False
+        self.is_windows = sys.platform.startswith('win')
+
+    def set_high_resolution(self):
+        """Set Windows timer to 1ms resolution."""
+        if not self.is_windows:
+            return False, "Not Windows - timer not set"
+
+        try:
+            timeBeginPeriod = ctypes.windll.winmm.timeBeginPeriod
+            result = timeBeginPeriod(1)
+            if result == 0:
+                self.timer_set = True
+                return True, "Windows timer set to 1ms"
+            else:
+                return False, f"Timer set failed: {result}"
+        except Exception as e:
+            return False, f"Timer error: {str(e)}"
+
+    def restore_default(self):
+        """Restore default timer resolution."""
+        if self.timer_set:
+            try:
+                timeEndPeriod = ctypes.windll.winmm.timeEndPeriod
+                timeEndPeriod(1)
+                self.timer_set = False
+            except:
+                pass
+
+
+class ThreadPriorityManager:
+    """Windows thread priority manager. Elevates control thread priority to reduce jitter."""
+
+    def __init__(self):
+        self.is_windows = sys.platform.startswith('win')
+        self.kernel32 = None
+
+        if self.is_windows:
+            try:
+                self.kernel32 = ctypes.windll.kernel32
+            except (AttributeError, OSError):
+                self.is_windows = False
+
+    def set_thread_priority(self, thread_id, priority=THREAD_PRIORITY_ABOVE_NORMAL):
+        """
+        Set thread priority on Windows.
+
+        Args:
+            thread_id: Thread ID from thread.ident
+            priority: Priority level (1=ABOVE_NORMAL, 2=HIGHEST)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.is_windows or self.kernel32 is None:
+            return False
+
+        try:
+            handle = self.kernel32.OpenThread(0x0020, False, thread_id)
+            if not handle:
+                return False
+
+            result = self.kernel32.SetThreadPriority(handle, priority)
+            self.kernel32.CloseHandle(handle)
+
+            return bool(result)
+        except Exception:
+            return False
 
 
 class IKCache:
