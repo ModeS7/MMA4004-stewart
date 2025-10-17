@@ -16,9 +16,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Circle, Rectangle
 import torch
-import time
 
 from core.core import StewartPlatformIK, SimpleBallPhysics2D, FirstOrderServo
 from core.utils import SimulationConfig
@@ -80,29 +78,30 @@ class ValidationSimulator:
 
         # Initialize ball physics
         self.ball_physics = SimpleBallPhysics2D(
-            ball_radius=0.04,
+            ball_radius=0.02,
             ball_mass=0.0027,
             gravity=9.81,
-            rolling_friction=0.001,
+            rolling_friction=0.0225,
             sphere_type='hollow'
         )
 
         # Simulation state
-        self.simulation_running = False
         self.simulation_time = 0.0
-        self.playback_speed = 1.0
         self.data_index = 0
-        self.last_update_time = None
 
         # Ball states
         self.sim_ball_pos = None
         self.sim_ball_vel = None
         self.sim_ball_omega = None
         self.hw_ball_pos = (0.0, 0.0)
+        self.ball_active = True  # Track if ball is still on platform
+
+        # Trajectory history
+        self.sim_trajectory = {'time': [], 'x': [], 'y': []}
+        self.hw_trajectory = {'time': [], 'x': [], 'y': []}
 
         # Error tracking
         self.error_history = []
-        self.max_error_history = 100
 
         self._build_gui()
         self.load_test_run(0)
@@ -206,39 +205,7 @@ class ValidationSimulator:
 
         ttk.Button(btn_frame, text="◀ Prev", command=self.prev_run, width=10).pack(side='left', padx=5)
         ttk.Button(btn_frame, text="Next ▶", command=self.next_run, width=10).pack(side='left', padx=5)
-
-        # Playback controls
-        playback_frame = ttk.LabelFrame(parent, text="Playback", padding=10)
-        playback_frame.pack(fill='x', pady=(0, 10))
-
-        self.time_label = ttk.Label(playback_frame, text="Time: 0.00s", font=('Consolas', 10, 'bold'))
-        self.time_label.pack()
-
-        pb_btn_frame = ttk.Frame(playback_frame)
-        pb_btn_frame.pack(fill='x', pady=(5, 0))
-
-        self.play_btn = ttk.Button(pb_btn_frame, text="▶ Play", command=self.start_simulation, width=10)
-        self.play_btn.pack(side='left', padx=5)
-
-        self.stop_btn = ttk.Button(pb_btn_frame, text="⏸ Stop", command=self.stop_simulation,
-                                   state='disabled', width=10)
-        self.stop_btn.pack(side='left', padx=5)
-
-        ttk.Button(pb_btn_frame, text="↻ Reset", command=self.reset_simulation, width=10).pack(side='left', padx=5)
-
-        # Speed control
-        speed_frame = ttk.Frame(playback_frame)
-        speed_frame.pack(fill='x', pady=(10, 0))
-
-        ttk.Label(speed_frame, text="Speed:", font=('Segoe UI', 9)).pack(side='left')
-
-        self.speed_slider = ttk.Scale(speed_frame, from_=0.1, to=2.0, orient='horizontal',
-                                      command=self.on_speed_change)
-        self.speed_slider.set(1.0)
-        self.speed_slider.pack(side='left', fill='x', expand=True, padx=5)
-
-        self.speed_label = ttk.Label(speed_frame, text="1.0x", width=5, font=('Consolas', 9))
-        self.speed_label.pack(side='left')
+        ttk.Button(btn_frame, text="↻ Re-run", command=self.run_simulation, width=10).pack(side='left', padx=5)
 
         # Servo parameters
         servo_frame = ttk.LabelFrame(parent, text="Servo Dynamics", padding=10)
@@ -249,7 +216,7 @@ class ValidationSimulator:
 
         servo_params = [
             ('tau', 'Time Constant τ (s)', 0.01, 0.5, 0.1),
-            ('delay', 'Delay (s)', 0.0, 1.0, 0.0),
+            ('delay', 'Delay (s)', 0.0, 2.0, 0.0),
         ]
 
         for param_name, label, min_val, max_val, default in servo_params:
@@ -264,7 +231,7 @@ class ValidationSimulator:
         self.physics_labels = {}
 
         physics_params = [
-            ('friction', 'Rolling Friction', 0.0, 0.01, 0.001),
+            ('friction', 'Rolling Friction', 0.0, 0.05, 0.0225),
             ('mass', 'Mass (kg)', 0.001, 0.01, 0.0027),
             ('radius', 'Radius (m)', 0.01, 0.08, 0.04),
             ('air_density', 'Air Density (kg/m³)', 0.0, 2.0, 1.225),
@@ -336,19 +303,21 @@ class ValidationSimulator:
         elif param == 'air_density':
             self.ball_physics.set_air_resistance(air_density=value)
 
-    def on_speed_change(self, value):
-        """Update playback speed."""
-        self.playback_speed = float(value)
-        self.speed_label.config(text=f"{self.playback_speed:.1f}x")
-
     def _build_plot_panel(self, parent):
         """Build plot panel."""
-        plot_frame = ttk.LabelFrame(parent, text="Ball Trajectory (Top View)", padding=10)
+        plot_frame = ttk.LabelFrame(parent, text="Position vs Time", padding=10)
         plot_frame.pack(fill='both', expand=True)
 
         plt.style.use('dark_background')
-        self.fig, self.ax = plt.subplots(figsize=(8, 8), facecolor=self.colors['panel_bg'])
-        self.ax.set_facecolor(self.colors['widget_bg'])
+        self.fig = plt.figure(figsize=(12, 8), facecolor=self.colors['panel_bg'])
+
+        # Create 2 subplots: X vs time, Y vs time
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.3)
+        self.ax_x = self.fig.add_subplot(gs[0])
+        self.ax_y = self.fig.add_subplot(gs[1])
+
+        for ax in [self.ax_x, self.ax_y]:
+            ax.set_facecolor(self.colors['widget_bg'])
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
@@ -356,50 +325,52 @@ class ValidationSimulator:
         self.setup_plot()
 
     def setup_plot(self):
-        """Setup matplotlib plot."""
-        self.ax.clear()
-        self.ax.set_xlim(-120, 120)
-        self.ax.set_ylim(-120, 120)
-        self.ax.set_xlabel('X (mm)', color=self.colors['fg'], fontsize=11)
-        self.ax.set_ylabel('Y (mm)', color=self.colors['fg'], fontsize=11)
-        self.ax.set_title('Ball Position (Top View)', color=self.colors['fg'],
-                          fontsize=12, fontweight='bold')
-        self.ax.grid(True, alpha=0.2, linestyle='--', color=self.colors['fg'])
-        self.ax.set_aspect('equal')
-        self.ax.tick_params(colors=self.colors['fg'])
+        """Setup matplotlib plots."""
+        # === X vs Time Plot ===
+        self.ax_x.clear()
+        self.ax_x.set_xlabel('Time (s)', color=self.colors['fg'], fontsize=10)
+        self.ax_x.set_ylabel('X Position (mm)', color=self.colors['fg'], fontsize=10)
+        self.ax_x.set_title('X Coordinate vs Time', color=self.colors['fg'],
+                            fontsize=11, fontweight='bold')
+        self.ax_x.grid(True, alpha=0.2, linestyle='--', color=self.colors['fg'])
+        self.ax_x.tick_params(colors=self.colors['fg'], labelsize=8)
 
-        for spine in self.ax.spines.values():
+        for spine in self.ax_x.spines.values():
             spine.set_color(self.colors['border'])
 
-        # Platform boundary
-        platform_square = Rectangle((-100, -100), 200, 200,
-                                    fill=False,
-                                    edgecolor=self.colors['fg'],
-                                    linewidth=2,
-                                    linestyle='--',
-                                    alpha=0.5)
-        self.ax.add_patch(platform_square)
+        self.sim_x_line, = self.ax_x.plot([], [], color=self.colors['highlight'],
+                                          linewidth=2, label='Sim X')
+        self.hw_x_line, = self.ax_x.plot([], [], 'o', color='#ff4444',
+                                         markersize=3, alpha=0.6, label='HW X')
 
-        # Trajectory lines
-        self.sim_trail, = self.ax.plot([], [], color=self.colors['highlight'],
-                                       linewidth=2, alpha=0.7, label='Simulation')
-        self.hw_trail, = self.ax.plot([], [], 'o', color='#ff4444',
-                                      markersize=4, alpha=0.5, label='Hardware')
+        legend_x = self.ax_x.legend(loc='upper right', fontsize=8,
+                                    facecolor=self.colors['panel_bg'],
+                                    edgecolor=self.colors['border'],
+                                    labelcolor=self.colors['fg'])
+        legend_x.get_frame().set_alpha(0.9)
 
-        # Ball markers
-        self.sim_ball = Circle((0, 0), 3.0, color=self.colors['highlight'],
-                               alpha=0.8, zorder=10)
-        self.ax.add_patch(self.sim_ball)
+        # === Y vs Time Plot ===
+        self.ax_y.clear()
+        self.ax_y.set_xlabel('Time (s)', color=self.colors['fg'], fontsize=10)
+        self.ax_y.set_ylabel('Y Position (mm)', color=self.colors['fg'], fontsize=10)
+        self.ax_y.set_title('Y Coordinate vs Time', color=self.colors['fg'],
+                            fontsize=11, fontweight='bold')
+        self.ax_y.grid(True, alpha=0.2, linestyle='--', color=self.colors['fg'])
+        self.ax_y.tick_params(colors=self.colors['fg'], labelsize=8)
 
-        self.hw_ball = Circle((0, 0), 3.0, color='#ff4444',
-                              alpha=0.8, zorder=10)
-        self.ax.add_patch(self.hw_ball)
+        for spine in self.ax_y.spines.values():
+            spine.set_color(self.colors['border'])
 
-        legend = self.ax.legend(loc='upper right', fontsize=9,
-                                facecolor=self.colors['panel_bg'],
-                                edgecolor=self.colors['border'],
-                                labelcolor=self.colors['fg'])
-        legend.get_frame().set_alpha(0.9)
+        self.sim_y_line, = self.ax_y.plot([], [], color=self.colors['highlight'],
+                                          linewidth=2, label='Sim Y')
+        self.hw_y_line, = self.ax_y.plot([], [], 'o', color='#ff4444',
+                                         markersize=3, alpha=0.6, label='HW Y')
+
+        legend_y = self.ax_y.legend(loc='upper right', fontsize=8,
+                                    facecolor=self.colors['panel_bg'],
+                                    edgecolor=self.colors['border'],
+                                    labelcolor=self.colors['fg'])
+        legend_y.get_frame().set_alpha(0.9)
 
         self.canvas.draw()
 
@@ -416,7 +387,7 @@ class ValidationSimulator:
                  f"rx={self.current_run['rx']:+.1f}°, ry={self.current_run['ry']:+.1f}°"
         )
 
-        self.reset_simulation()
+        self.run_simulation()
 
     def prev_run(self):
         """Load previous test run."""
@@ -429,12 +400,15 @@ class ValidationSimulator:
             self.load_test_run(self.current_run_idx + 1)
 
     def reset_simulation(self):
-        """Reset simulation to start."""
-        self.stop_simulation()
-
+        """Reset simulation state."""
         self.simulation_time = 0.0
         self.data_index = 0
         self.error_history = []
+        self.ball_active = True
+
+        # Clear trajectory history
+        self.sim_trajectory = {'time': [], 'x': [], 'y': []}
+        self.hw_trajectory = {'time': [], 'x': [], 'y': []}
 
         # Reset servos
         for servo in self.servos:
@@ -462,89 +436,68 @@ class ValidationSimulator:
         self.sim_ball_vel = torch.zeros((1, 3), dtype=torch.float32)
         self.sim_ball_omega = torch.zeros((1, 3), dtype=torch.float32)
 
-        self.sim_trail.set_data([], [])
-        self.hw_trail.set_data([], [])
+        self.sim_x_line.set_data([], [])
+        self.hw_x_line.set_data([], [])
+        self.sim_y_line.set_data([], [])
+        self.hw_y_line.set_data([], [])
 
-        self.update_plot()
+    def run_simulation(self):
+        """Run simulation as fast as possible."""
+        self.reset_simulation()
 
-    def start_simulation(self):
-        """Start playback."""
-        self.simulation_running = True
-        self.last_update_time = time.time()
+        df = self.current_run['data']
 
-        self.play_btn.config(state='disabled')
-        self.stop_btn.config(state='normal')
+        # Run through all data points as fast as possible
+        for idx in range(len(df)):
+            self.data_index = idx
 
-        self.simulation_loop()
+            # Get time step
+            if idx > 0:
+                sim_dt = df.loc[idx, 'time'] - df.loc[idx - 1, 'time']
+            else:
+                sim_dt = df.loc[idx, 'time']
 
-    def stop_simulation(self):
-        """Stop playback."""
-        self.simulation_running = False
+            self.simulation_time = df.loc[idx, 'time']
 
-        self.play_btn.config(state='normal')
-        self.stop_btn.config(state='disabled')
+            # Get servo angles from CSV
+            servo_angles = np.array([
+                df.loc[idx, 's0'],
+                df.loc[idx, 's1'],
+                df.loc[idx, 's2'],
+                df.loc[idx, 's3'],
+                df.loc[idx, 's4'],
+                df.loc[idx, 's5']
+            ])
 
-    def simulation_loop(self):
-        """Main simulation update loop."""
-        if not self.simulation_running:
-            return
+            # Send to servos
+            for i, servo in enumerate(self.servos):
+                servo.send_command(servo_angles[i], self.simulation_time)
 
-        current_time = time.time()
-        if self.last_update_time is not None:
-            real_dt = current_time - self.last_update_time
-            sim_dt = real_dt * self.playback_speed
+            # Update servos
+            for servo in self.servos:
+                servo.update(sim_dt, self.simulation_time)
 
-            self.simulation_time += sim_dt
+            # Get actual servo angles
+            actual_angles = np.array([servo.get_angle() for servo in self.servos])
 
-            # Update based on CSV data
-            df = self.current_run['data']
+            # Forward kinematics
+            translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
+                actual_angles, use_top_surface_offset=True
+            )
 
-            # Find current data point based on simulation time
-            while self.data_index < len(df) - 1:
-                if df.loc[self.data_index + 1, 'time'] <= self.simulation_time:
-                    self.data_index += 1
-                else:
-                    break
+            if success:
+                # Create platform pose
+                platform_pose = torch.tensor([[
+                    translation[0] / 1000,
+                    translation[1] / 1000,
+                    translation[2] / 1000,
+                    rotation[0],
+                    rotation[1],
+                    rotation[2]
+                ]], dtype=torch.float32)
 
-            if self.data_index < len(df):
-                # Get servo angles from CSV
-                servo_angles = np.array([
-                    df.loc[self.data_index, 's0'],
-                    df.loc[self.data_index, 's1'],
-                    df.loc[self.data_index, 's2'],
-                    df.loc[self.data_index, 's3'],
-                    df.loc[self.data_index, 's4'],
-                    df.loc[self.data_index, 's5']
-                ])
-
-                # Send to servos
-                for i, servo in enumerate(self.servos):
-                    servo.send_command(servo_angles[i], self.simulation_time)
-
-                # Update servos
-                for servo in self.servos:
-                    servo.update(sim_dt, self.simulation_time)
-
-                # Get actual servo angles
-                actual_angles = np.array([servo.get_angle() for servo in self.servos])
-
-                # Forward kinematics
-                translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
-                    actual_angles, use_top_surface_offset=True
-                )
-
-                if success:
-                    # Create platform pose
-                    platform_pose = torch.tensor([[
-                        translation[0] / 1000,
-                        translation[1] / 1000,
-                        translation[2] / 1000,
-                        rotation[0],
-                        rotation[1],
-                        rotation[2]
-                    ]], dtype=torch.float32)
-
-                    # Step physics
+                # Step physics only if ball is still active
+                if self.ball_active:
                     self.sim_ball_pos, self.sim_ball_vel, self.sim_ball_omega, _ = \
                         self.ball_physics.step(
                             self.sim_ball_pos,
@@ -554,37 +507,44 @@ class ValidationSimulator:
                             sim_dt
                         )
 
-                # Get hardware ball position
-                if df.loc[self.data_index, 'ball_detected'] and \
-                        not pd.isna(df.loc[self.data_index, 'ball_x_mm']):
-                    hw_x = df.loc[self.data_index, 'ball_x_mm']
-                    hw_y = df.loc[self.data_index, 'ball_y_mm']
-                    self.hw_ball_pos = (hw_x, hw_y)
+                    # Check if ball has fallen off platform
+                    sim_x = self.sim_ball_pos[0, 0].item() * 1000
+                    sim_y = self.sim_ball_pos[0, 1].item() * 1000
+                    if abs(sim_x) > 100 or abs(sim_y) > 100:
+                        self.ball_active = False
 
-                    # Calculate error
+                # Store simulation trajectory only if ball is active
+                if self.ball_active:
+                    sim_x = self.sim_ball_pos[0, 0].item() * 1000
+                    sim_y = self.sim_ball_pos[0, 1].item() * 1000
+                    self.sim_trajectory['time'].append(self.simulation_time)
+                    self.sim_trajectory['x'].append(sim_x)
+                    self.sim_trajectory['y'].append(sim_y)
+
+            # Get hardware ball position
+            if df.loc[idx, 'ball_detected'] and not pd.isna(df.loc[idx, 'ball_x_mm']):
+                hw_x = df.loc[idx, 'ball_x_mm']
+                hw_y = df.loc[idx, 'ball_y_mm']
+                self.hw_ball_pos = (hw_x, hw_y)
+
+                # Store hardware trajectory
+                self.hw_trajectory['time'].append(self.simulation_time)
+                self.hw_trajectory['x'].append(hw_x)
+                self.hw_trajectory['y'].append(hw_y)
+
+                # Calculate error only if ball is still active
+                if self.ball_active:
                     sim_x = self.sim_ball_pos[0, 0].item() * 1000
                     sim_y = self.sim_ball_pos[0, 1].item() * 1000
                     error = np.sqrt((sim_x - hw_x) ** 2 + (sim_y - hw_y) ** 2)
                     self.error_history.append(error)
-                    if len(self.error_history) > self.max_error_history:
-                        self.error_history.pop(0)
 
-                self.update_gui()
-                self.update_plot()
-
-            # Check if finished
-            if self.data_index >= len(df) - 1:
-                self.stop_simulation()
-
-        self.last_update_time = current_time
-
-        if self.simulation_running:
-            self.root.after(20, self.simulation_loop)
+        # Update GUI and plots once at the end
+        self.update_gui()
+        self.update_plot()
 
     def update_gui(self):
         """Update GUI labels."""
-        self.time_label.config(text=f"Time: {self.simulation_time:.2f}s")
-
         if self.error_history:
             current_error = self.error_history[-1]
             mean_error = np.mean(self.error_history)
@@ -595,41 +555,43 @@ class ValidationSimulator:
             self.max_error_label.config(text=f"Max Error: {max_error:.1f} mm")
 
     def update_plot(self):
-        """Update plot."""
-        # Simulation ball
-        sim_x = self.sim_ball_pos[0, 0].item() * 1000
-        sim_y = self.sim_ball_pos[0, 1].item() * 1000
-        self.sim_ball.center = (sim_x, sim_y)
+        """Update all plots."""
+        # === X vs Time ===
+        if len(self.sim_trajectory['time']) > 0:
+            self.sim_x_line.set_data(self.sim_trajectory['time'], self.sim_trajectory['x'])
 
-        # Hardware ball
-        self.hw_ball.center = self.hw_ball_pos
+        if len(self.hw_trajectory['time']) > 0:
+            self.hw_x_line.set_data(self.hw_trajectory['time'], self.hw_trajectory['x'])
 
-        # Update trails
-        df = self.current_run['data']
+        # Auto-scale X plot
+        if len(self.sim_trajectory['time']) > 0 or len(self.hw_trajectory['time']) > 0:
+            all_times = self.sim_trajectory['time'] + self.hw_trajectory['time']
+            all_x = self.sim_trajectory['x'] + self.hw_trajectory['x']
+            if all_times and all_x:
+                self.ax_x.set_xlim(min(all_times), max(all_times) + 0.1)
+                x_margin = (max(all_x) - min(all_x)) * 0.1 + 1
+                self.ax_x.set_ylim(min(all_x) - x_margin, max(all_x) + x_margin)
 
-        # Sim trail
-        sim_trail_x = []
-        sim_trail_y = []
-        for i in range(max(0, self.data_index - 50), self.data_index + 1):
-            if i < len(df):
-                # Would need to store sim positions, for now just show current
-                pass
+        # === Y vs Time ===
+        if len(self.sim_trajectory['time']) > 0:
+            self.sim_y_line.set_data(self.sim_trajectory['time'], self.sim_trajectory['y'])
 
-        # HW trail
-        hw_trail_x = []
-        hw_trail_y = []
-        for i in range(max(0, self.data_index - 50), self.data_index + 1):
-            if i < len(df) and df.loc[i, 'ball_detected']:
-                hw_trail_x.append(df.loc[i, 'ball_x_mm'])
-                hw_trail_y.append(df.loc[i, 'ball_y_mm'])
+        if len(self.hw_trajectory['time']) > 0:
+            self.hw_y_line.set_data(self.hw_trajectory['time'], self.hw_trajectory['y'])
 
-        self.hw_trail.set_data(hw_trail_x, hw_trail_y)
+        # Auto-scale Y plot
+        if len(self.sim_trajectory['time']) > 0 or len(self.hw_trajectory['time']) > 0:
+            all_times = self.sim_trajectory['time'] + self.hw_trajectory['time']
+            all_y = self.sim_trajectory['y'] + self.hw_trajectory['y']
+            if all_times and all_y:
+                self.ax_y.set_xlim(min(all_times), max(all_times) + 0.1)
+                y_margin = (max(all_y) - min(all_y)) * 0.1 + 1
+                self.ax_y.set_ylim(min(all_y) - y_margin, max(all_y) + y_margin)
 
-        self.canvas.draw_idle()
+        self.canvas.draw()
 
     def on_closing(self):
         """Clean shutdown."""
-        self.simulation_running = False
         self.root.quit()
         self.root.destroy()
 
