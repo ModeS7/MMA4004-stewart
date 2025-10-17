@@ -434,7 +434,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
                 t3 = time.perf_counter()
                 rx, ry = self.controller.update(self.ball_pos_mm, target_pos_mm, loop_interval)
-                #ry = -ry
+
                 pid_update_time = (time.perf_counter() - t3) * 1000
                 timing_breakpoints['pid_update'].append(pid_update_time)
 
