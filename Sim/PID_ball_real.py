@@ -25,10 +25,9 @@ import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from core.control_core import BallPositionFilter
-from core.utils import ControlLoopConfig, GUIConfig, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
+from core.control_core import BallPositionFilter, clip_tilt_vector
+from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
 from gui.gui_builder import create_standard_layout
-
 
 THREAD_PRIORITY_IDLE = -15
 THREAD_PRIORITY_LOWEST = -2
@@ -398,8 +397,14 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 pixy_x = ball_data['x']
                 pixy_y = ball_data['y']
 
-                ball_x_mm = (pixy_x - 158.0) * self.pixels_to_mm_x
-                ball_y_mm = -(pixy_y - 104.0) * self.pixels_to_mm_y
+                # Camera dimensions: 316×208 pixels, origin at top-left
+                # Invert Y so (0,0) moves to bottom-left, then center it
+                CAMERA_HEIGHT_PIXELS = 208.0
+                CAMERA_CENTER_X = 158.0
+                CAMERA_CENTER_Y = 104.0
+
+                ball_x_mm = (pixy_x - CAMERA_CENTER_X) * self.pixels_to_mm_x
+                ball_y_mm = ((CAMERA_HEIGHT_PIXELS - pixy_y) - CAMERA_CENTER_Y) * self.pixels_to_mm_y
 
                 ball_x_mm_filtered, ball_y_mm_filtered = self.ball_filter.update(
                     ball_x_mm, ball_y_mm
@@ -429,7 +434,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
                 t3 = time.perf_counter()
                 rx, ry = self.controller.update(self.ball_pos_mm, target_pos_mm, loop_interval)
-                ry = -ry
+                #ry = -ry
                 pid_update_time = (time.perf_counter() - t3) * 1000
                 timing_breakpoints['pid_update'].append(pid_update_time)
 
@@ -725,9 +730,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         translation = np.array([self.dof_values['x'],
                                 self.dof_values['y'],
                                 self.dof_values['z']])
-
-        from Sim.core.control_core import clip_tilt_vector
-        from Sim.core.utils import MAX_TILT_ANGLE_DEG
 
         rx_limited, ry_limited, tilt_mag = clip_tilt_vector(
             self.dof_values['rx'],

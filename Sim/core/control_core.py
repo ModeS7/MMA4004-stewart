@@ -94,7 +94,7 @@ class PIDController:
         output_y = self._compute_pid_axis(error_y, dt, 'y')
 
         rx_raw = output_y
-        ry_raw = output_x
+        ry_raw = -output_x
 
         rx, ry, _ = clip_tilt_vector(rx_raw, ry_raw, self.output_limit)
         return rx, ry
@@ -194,7 +194,7 @@ class LQRController:
         B = np.array([
             [0, 0],
             [0, 0],
-            [-k, 0],
+            [k, 0],
             [0, -k]
         ])
 

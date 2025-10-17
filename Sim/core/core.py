@@ -385,8 +385,14 @@ class SimpleBallPhysics2D:
             g_eff = self.g - a_z_platform
             g_eff = torch.clamp(g_eff, 0.1 * self.g, 2.0 * self.g)
 
-        gx = -g_eff * torch.sin(ry)
-        gy = -g_eff * torch.sin(rx)
+        cos_rx = torch.cos(rx)
+        cos_ry = torch.cos(ry)
+        sin_rx = torch.sin(rx)
+        sin_ry = torch.sin(ry)
+
+        # Gravity vector in tilted frame
+        gx = g_eff * sin_ry * cos_ry * cos_rx
+        gy = -g_eff * sin_rx * cos_rx * cos_ry
 
         ax = gx / self.mass_factor
         ay = gy / self.mass_factor
@@ -417,7 +423,7 @@ class SimpleBallPhysics2D:
         dx = xy_pos[:, 0] - px
         dy = xy_pos[:, 1] - py
 
-        height = pz + dx * torch.tan(ry) - dy * torch.tan(rx)
+        height = pz - dx * torch.tan(ry) - dy * torch.tan(rx)
 
         return height
 
