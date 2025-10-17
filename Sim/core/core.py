@@ -272,12 +272,19 @@ class SimpleBallPhysics2D:
                  ball_mass=0.0027,
                  gravity=9.81,
                  rolling_friction=0.01,
-                 sphere_type='hollow'):
+                 sphere_type='hollow',
+                 air_density=1.225,
+                 drag_coefficient=0.47):
         self.radius = ball_radius
         self.mass = ball_mass
         self.g = gravity
         self.mu_roll = rolling_friction
         self.sphere_type = sphere_type
+
+        # Air resistance parameters
+        self.air_density = air_density
+        self.drag_coefficient = drag_coefficient
+        self.cross_section_area = np.pi * self.radius ** 2
 
         self.update_sphere_type(sphere_type)
 
@@ -402,7 +409,14 @@ class SimpleBallPhysics2D:
         vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
         rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + 1e-8)
 
-        accel_linear = accel_linear + rolling_resistance
+        # Air resistance (quadratic drag)
+        # F_drag = -1/2 * ρ * C_d * A * v² * v_hat
+        # a_drag = F_drag / m
+        vel_squared = vel_magnitude ** 2
+        drag_magnitude = 0.5 * self.air_density * self.drag_coefficient * self.cross_section_area * vel_squared / self.mass
+        air_resistance = -drag_magnitude * xy_vel / (vel_magnitude + 1e-8)
+
+        accel_linear = accel_linear + rolling_resistance + air_resistance
 
         accel_angular = accel_linear / self.radius
 
@@ -426,6 +440,19 @@ class SimpleBallPhysics2D:
         height = pz - dx * torch.tan(ry) - dy * torch.tan(rx)
 
         return height
+
+    def set_air_resistance(self, air_density=None, drag_coefficient=None):
+        """
+        Update air resistance parameters.
+
+        Args:
+            air_density: Air density in kg/m³ (None to keep current)
+            drag_coefficient: Drag coefficient (None to keep current)
+        """
+        if air_density is not None:
+            self.air_density = air_density
+        if drag_coefficient is not None:
+            self.drag_coefficient = drag_coefficient
 
 
 def rk4_step(state, derivative_fn, dt, *args):
