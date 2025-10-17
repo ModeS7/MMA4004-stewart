@@ -146,10 +146,10 @@ class BaseStewartSimulator:
                        for _ in range(6)]
 
         self.ball_physics = SimpleBallPhysics2D(
-            ball_radius=0.04,
+            ball_radius=0.02,
             ball_mass=0.0027,
             gravity=9.81,
-            rolling_friction=0.001,
+            rolling_friction=0.0225,
             sphere_type='hollow'
         )
 

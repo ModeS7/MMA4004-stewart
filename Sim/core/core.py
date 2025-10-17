@@ -268,10 +268,10 @@ class SimpleBallPhysics2D:
     """
 
     def __init__(self,
-                 ball_radius=0.01,
+                 ball_radius=0.02,
                  ball_mass=0.0027,
                  gravity=9.81,
-                 rolling_friction=0.01,
+                 rolling_friction=0.0225,
                  sphere_type='hollow',
                  air_density=1.225,
                  drag_coefficient=0.47):

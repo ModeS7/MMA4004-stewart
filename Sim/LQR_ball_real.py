@@ -203,7 +203,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.port_var = tk.StringVar()
 
         ball_physics_params = {
-            'radius': 0.04,
+            'radius': 0.02,
             'mass': 0.0027,
             'gravity': 9.81,
             'mass_factor': 1.667
