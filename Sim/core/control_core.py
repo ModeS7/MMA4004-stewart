@@ -150,8 +150,7 @@ class LQRController:
 
     def __init__(self, Q_pos=1.0, Q_vel=1.0, R=0.01,
                  output_limit=MAX_TILT_ANGLE_DEG,
-                 ball_physics_params=None,
-                 dt_nominal=0.01):
+                 ball_physics_params=None):
         """
         Args:
             Q_pos: Position error cost weight
@@ -159,13 +158,11 @@ class LQRController:
             R: Control effort cost weight
             output_limit: Maximum tilt angle in degrees (vector magnitude)
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
-            dt_nominal: Nominal sampling period in seconds (default 0.01 = 100Hz)
         """
         self.Q_pos = Q_pos
         self.Q_vel = Q_vel
         self.R_weight = R
         self.output_limit = output_limit
-        self.dt_nominal = dt_nominal
 
         if ball_physics_params is None:
             ball_physics_params = {
@@ -187,54 +184,35 @@ class LQRController:
         """Compute LQR gain matrix by solving algebraic Riccati equation."""
         k = (self.g / self.mass_factor) * (np.pi / 180.0)
 
-        A_c = np.array([
+        A = np.array([
             [0, 0, 1, 0],
             [0, 0, 0, 1],
             [0, 0, 0, 0],
             [0, 0, 0, 0]
         ])
 
-        B_c = np.array([
+        B = np.array([
             [0, 0],
             [0, 0],
             [k, 0],
             [0, -k]
         ])
 
-        # Discretize using exact matrix exponential (zero-order hold)
-        # For simple integrator dynamics, this is straightforward:
-        # x[k+1] = A_d * x[k] + B_d * u[k]
-        # where A_d = I + A_c*dt, B_d = B_c*dt (for small dt)
-
-        dt = self.dt_nominal
-        A_d = np.eye(4) + A_c * dt
-        B_d = B_c * dt
-
-        # Cost matrices
         Q = np.diag([self.Q_pos, self.Q_pos, self.Q_vel, self.Q_vel])
         R = np.eye(2) * self.R_weight
 
         try:
-            # Solve discrete-time Algebraic Riccati Equation (DARE)
-            P = linalg.solve_discrete_are(A_d, B_d, Q, R)
+            P = linalg.solve_continuous_are(A, B, Q, R)
+            self.K = np.linalg.inv(R) @ B.T @ P
 
-            # Compute discrete-time LQR gain
-            # K = (R + B_d^T P B_d)^{-1} B_d^T P A_d
-            self.K = np.linalg.inv(R + B_d.T @ P @ B_d) @ (B_d.T @ P @ A_d)
+            eig_vals = np.linalg.eigvals(A - B @ self.K)
+            max_real = np.max(np.real(eig_vals))
 
-            # Check closed-loop stability
-            A_cl = A_d - B_d @ self.K
-            eig_vals = np.linalg.eigvals(A_cl)
-            max_magnitude = np.max(np.abs(eig_vals))
-
-            if max_magnitude >= 1.0:
-                print(f"Warning: Discrete LQR may be unstable (max |eigenvalue|: {max_magnitude:.4f})")
-            else:
-                print(f"Discrete LQR stable (max |eigenvalue|: {max_magnitude:.4f})")
+            if max_real >= 0:
+                print(f"Warning: LQR may be unstable (max eigenvalue: {max_real:.4f})")
 
         except np.linalg.LinAlgError as e:
-            print(f"Error solving discrete Riccati equation: {e}")
-            # Fallback to simple proportional control
+            print(f"Error solving Riccati equation: {e}")
             self.K = np.array([[1.0, 0.0, 1.0, 0.0],
                                [0.0, 1.0, 0.0, 1.0]])
 
@@ -281,23 +259,12 @@ class LQRController:
         return {
             'Q_pos': self.Q_pos,
             'Q_vel': self.Q_vel,
-            'R': self.R_weight,
-            'dt_nominal': self.dt_nominal
+            'R': self.R_weight
         }
 
     def get_gain_matrix(self):
         """Get current LQR gain matrix."""
         return self.K.copy() if self.K is not None else None
-
-    def set_nominal_dt(self, dt_nominal):
-        """
-        Update nominal sampling period and recompute gains.
-
-        Args:
-            dt_nominal: New nominal sampling period in seconds
-        """
-        self.dt_nominal = dt_nominal
-        self.compute_lqr_gain()
 
 
 class BallPositionFilter:
