@@ -35,7 +35,8 @@ class LQRControllerConfig(ControllerConfig):
             Q_vel=kwargs.get('Q_vel', 0.1),
             R=kwargs.get('R', 0.01),
             output_limit=kwargs.get('output_limit', 15.0),
-            ball_physics_params=self.ball_physics_params
+            ball_physics_params=self.ball_physics_params,
+            dt_nominal=0.01
         )
 
     def get_scalar_values(self) -> list:
