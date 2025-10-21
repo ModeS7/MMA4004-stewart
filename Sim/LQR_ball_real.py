@@ -4,8 +4,7 @@ Stewart Platform Real Hardware Controller - LQR
 Features:
 - 100Hz dedicated control thread
 - Pixy2 camera integration
-- Minimal position smoothing (α=0.95) for clean velocity estimates
-- Full LQR control with position + velocity feedback
+- Full LQR control with position
 - Modular GUI with scrollable columns
 - Velocity saturation to reject extreme spikes
 - Garbage collection optimization
@@ -227,6 +226,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
             {'type': 'serial_connection', 'args': {'port_var': self.port_var}},
+            {'type': 'ball_filter', 'args': {'ball_filter': self.ball_filter}},
             {'type': 'simulation_control'},
             {'type': 'controller',
              'args': {'controller_config': self.controller_config,
@@ -383,7 +383,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
-        self.velocity_estimator.reset()
+        self.ball_filter.reset()
+        self.prev_filtered_pos = (0.0, 0.0)
 
         self.log("Disconnected")
 
@@ -840,7 +841,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         stats_msg += f"  Cache Size: {len(self.ik_cache.cache)}/{self.ik_cache.max_size}\n\n"
 
         stats_msg += "Optimizations Active:\n"
-        stats_msg += f"  Position smoothing (α=0.95) for clean velocity\n"
         stats_msg += f"  Velocity saturation (500 mm/s max)\n"
         stats_msg += f"  GC Disabled during control\n"
         stats_msg += f"  USB 200k, Maestro 250k baud\n"
@@ -885,7 +885,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         if enabled:
             self.controller.reset()
-            self.velocity_estimator.reset()
+            self.ball_filter.reset()
+            self.prev_filtered_pos = (0.0, 0.0)
             self.reset_pattern()
             self.log("LQR control ENABLED")
 
@@ -916,7 +917,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if self.controller_enabled.get():
             self.controller.reset()
 
-        # Reset filter and velocity tracking
         self.ball_filter.reset()
         self.prev_filtered_pos = (0.0, 0.0)
 
@@ -986,7 +986,6 @@ def main():
     app.log("")
     app.log("LQR Tuning Tips:")
     app.log("- Position smoothing: α=0.95 (95% new, 5% old)")
-    app.log("- This gives clean velocity for LQR feedback")
     app.log("- Increase Q_pos for tighter position control")
     app.log("- Increase Q_vel for more damping")
     app.log("- Decrease R for more aggressive control")
