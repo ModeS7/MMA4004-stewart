@@ -711,3 +711,265 @@ class BallFilterModule(GUIModule):
         alpha = float(value)
         self.ball_filter.set_alpha(alpha)
         self.alpha_value_label.config(text=f"{alpha:.2f}")
+
+
+class Pixy2CameraModule(GUIModule):
+    """Pixy2 camera noise model configuration and control."""
+
+    def __init__(self, parent, colors, callbacks, camera=None):
+        super().__init__(parent, colors, callbacks)
+        self.camera = camera
+
+    def create(self):
+        self.frame = ttk.LabelFrame(self.parent, text="Pixy2 Camera Model", padding=10)
+
+        # Enable/Disable camera noise
+        enable_frame = ttk.Frame(self.frame)
+        enable_frame.pack(fill='x', pady=(0, 10))
+
+        self.camera_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(enable_frame, text="Enable Camera Noise",
+                        variable=self.camera_enabled,
+                        command=self._on_enable_toggle).pack(side='left')
+
+        self.status_indicator = ttk.Label(enable_frame, text="●",
+                                          foreground=self.colors['success'],
+                                          font=('Segoe UI', 14))
+        self.status_indicator.pack(side='left', padx=(10, 0))
+
+        # Separator
+        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+
+        # Pixel size parameter
+        self._create_parameter_row(
+            "Pixel Size:",
+            min_val=0.5,
+            max_val=3.0,
+            default=1.4,
+            resolution=0.1,
+            param_name='pixel_size',
+            unit='mm'
+        )
+
+        # Sub-pixel noise parameter
+        self._create_parameter_row(
+            "Sub-pixel Noise:",
+            min_val=0.0,
+            max_val=1.0,
+            default=0.4,
+            resolution=0.01,
+            param_name='noise_std',
+            unit='mm'
+        )
+
+        # Detection rate parameter
+        self._create_parameter_row(
+            "Detection Rate:",
+            min_val=0.90,
+            max_val=1.0,
+            default=0.999,
+            resolution=0.001,
+            param_name='detection_rate',
+            unit='',
+            format_str="{:.3f}"
+        )
+
+        # Sample rate parameter
+        self._create_parameter_row(
+            "Sample Rate:",
+            min_val=0.0,
+            max_val=60.0,
+            default=19.3,
+            resolution=0.1,
+            param_name='sample_rate',
+            unit='Hz',
+            format_str="{:.1f}"
+        )
+
+        # Info label for sample rate
+        info_label = ttk.Label(
+            self.frame,
+            text="(0 Hz = sample every frame)",
+            font=('Segoe UI', 7, 'italic'),
+            foreground=self.colors['border']
+        )
+        info_label.pack(anchor='w', pady=(0, 10))
+
+        # Separator
+        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+
+        # Camera statistics display
+        stats_frame = ttk.Frame(self.frame)
+        stats_frame.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(stats_frame, text="Camera Stats:",
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 5))
+
+        self.measurement_label = ttk.Label(stats_frame,
+                                           text="Raw: (0.0, 0.0) mm",
+                                           font=('Consolas', 8))
+        self.measurement_label.pack(anchor='w', pady=2)
+
+        self.quantized_label = ttk.Label(stats_frame,
+                                         text="Quantized: (0.0, 0.0) mm",
+                                         font=('Consolas', 8))
+        self.quantized_label.pack(anchor='w', pady=2)
+
+        self.sample_status_label = ttk.Label(stats_frame,
+                                             text="Last sample: never",
+                                             font=('Consolas', 8))
+        self.sample_status_label.pack(anchor='w', pady=2)
+
+        # Control buttons
+        btn_frame = ttk.Frame(self.frame)
+        btn_frame.pack(fill='x', pady=(10, 0))
+
+        ttk.Button(btn_frame, text="Reset Camera",
+                   command=self._on_reset_camera,
+                   width=15).pack(side='left', padx=5)
+
+        ttk.Button(btn_frame, text="Preset: Real",
+                   command=self._load_real_preset,
+                   width=15).pack(side='left', padx=5)
+
+        # Preset info
+        preset_info = ttk.Label(
+            self.frame,
+            text="Real preset: measured values from actual Pixy2",
+            font=('Segoe UI', 7, 'italic'),
+            foreground=self.colors['border']
+        )
+        preset_info.pack(anchor='w', pady=(5, 0))
+
+        return self.frame
+
+    def _create_parameter_row(self, label, min_val, max_val, default,
+                              resolution, param_name, unit='', format_str="{:.2f}"):
+        """Create a parameter control row with slider and value display."""
+        frame = ttk.Frame(self.frame)
+        frame.pack(fill='x', pady=5)
+
+        ttk.Label(frame, text=label,
+                  font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', padx=(0, 10))
+
+        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
+        slider.grid(row=0, column=1, sticky='ew', padx=5)
+        slider.set(default)
+
+        value_text = format_str.format(default) + (f" {unit}" if unit else "")
+        value_label = ttk.Label(frame, text=value_text,
+                                width=10, font=('Consolas', 9),
+                                foreground=self.colors['highlight'])
+        value_label.grid(row=0, column=2)
+
+        # Store references
+        if not hasattr(self, 'sliders'):
+            self.sliders = {}
+            self.value_labels = {}
+
+        self.sliders[param_name] = slider
+        self.value_labels[param_name] = value_label
+
+        # Bind slider change
+        def on_change(val):
+            value = float(val)
+            value_text = format_str.format(value) + (f" {unit}" if unit else "")
+            value_label.config(text=value_text)
+            self._on_param_change(param_name, value)
+
+        slider.config(command=on_change)
+        frame.columnconfigure(1, weight=1)
+
+    def _on_enable_toggle(self):
+        """Handle camera enable/disable."""
+        enabled = self.camera_enabled.get()
+
+        if enabled:
+            self.status_indicator.config(foreground=self.colors['success'])
+            # Enable all sliders
+            for slider in self.sliders.values():
+                slider.config(state='normal')
+        else:
+            self.status_indicator.config(foreground=self.colors['border'])
+            # Disable all sliders
+            for slider in self.sliders.values():
+                slider.config(state='disabled')
+
+        if self.callbacks.get('camera_enable_change'):
+            self.callbacks['camera_enable_change'](enabled)
+
+    def _on_param_change(self, param_name, value):
+        """Handle parameter change."""
+        if not self.camera or not self.camera_enabled.get():
+            return
+
+        # Update camera parameters
+        if param_name == 'pixel_size':
+            self.camera.pixel_size = value
+        elif param_name == 'noise_std':
+            self.camera.set_noise_level(value)
+        elif param_name == 'detection_rate':
+            self.camera.detection_rate = value
+        elif param_name == 'sample_rate':
+            self.camera.set_sample_rate(value)
+
+        if self.callbacks.get('camera_param_change'):
+            self.callbacks['camera_param_change'](param_name, value)
+
+    def _on_reset_camera(self):
+        """Reset camera state."""
+        if self.camera:
+            self.camera.reset()
+
+        if self.callbacks.get('camera_reset'):
+            self.callbacks['camera_reset']()
+
+    def _load_real_preset(self):
+        """Load real-world measured parameters."""
+        # Measured values from your noise analysis
+        presets = {
+            'pixel_size': 1.4,
+            'noise_std': 0.4,  # Tuned to match your X-axis std dev
+            'detection_rate': 0.999,
+            'sample_rate': 19.3
+        }
+
+        for param_name, value in presets.items():
+            if param_name in self.sliders:
+                self.sliders[param_name].set(value)
+                # Trigger update
+                self._on_param_change(param_name, value)
+
+        if self.callbacks.get('log'):
+            self.callbacks['log']("Loaded real Pixy2 camera preset")
+
+    def update(self, state):
+        """Update camera statistics display."""
+        if 'camera_raw_measurement' in state:
+            x, y = state['camera_raw_measurement']
+            if x is not None and y is not None:
+                self.measurement_label.config(
+                    text=f"Raw: ({x:.2f}, {y:.2f}) mm"
+                )
+
+        if 'camera_quantized_measurement' in state:
+            x, y = state['camera_quantized_measurement']
+            if x is not None and y is not None:
+                self.quantized_label.config(
+                    text=f"Quantized: ({x:.2f}, {y:.2f}) mm"
+                )
+
+        if 'camera_last_sample_time' in state:
+            time_val = state['camera_last_sample_time']
+            if time_val >= 0:
+                self.sample_status_label.config(
+                    text=f"Last sample: {time_val:.3f}s"
+                )
+
+        if 'camera_is_new_sample' in state and state['camera_is_new_sample']:
+            # Flash the status indicator briefly
+            original_color = self.status_indicator.cget('foreground')
+            self.status_indicator.config(foreground='#ffffff')
+            self.frame.after(50, lambda: self.status_indicator.config(
+                foreground=original_color
+            ))

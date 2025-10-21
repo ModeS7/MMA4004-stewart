@@ -646,3 +646,157 @@ class PatternFactory:
     def list_patterns():
         """Get list of available pattern types."""
         return ['static', 'circle', 'figure8', 'star']
+
+
+class Pixy2Camera:
+    """
+    Realistic Pixy2 camera model with quantization and measurement noise.
+
+    Models actual camera behavior:
+    - Pixel grid discretization (1.4mm resolution)
+    - Sub-pixel noise causes jumping between adjacent pixels
+    - When ball aligns with pixel: stable reading
+    - When ball between pixels: oscillates between them
+    - Realistic sample rate (19.3 Hz measured)
+
+    Physics:
+    - Ball on pixel center → stable measurements (low variance)
+    - Ball between pixels → jumps between adjacent pixels (high variance)
+    """
+
+    def __init__(self,
+                 pixel_size_mm=1.4,
+                 subpixel_noise_std=0.4,
+                 detection_rate=0.999,
+                 sample_rate_hz=19.3):
+        """
+        Args:
+            pixel_size_mm: Physical size of one pixel (1.4mm for Pixy2)
+            subpixel_noise_std: Gaussian noise std before quantization (mm)
+                               Controls pixel jumping behavior
+            detection_rate: Probability of detecting ball (0.999 = 99.9%)
+            sample_rate_hz: Camera update rate in Hz (0 = sample every call)
+        """
+        self.pixel_size = pixel_size_mm
+        self.subpixel_noise_std = subpixel_noise_std
+        self.detection_rate = detection_rate
+
+        if sample_rate_hz > 0:
+            self.sample_period = 1.0 / sample_rate_hz
+        else:
+            self.sample_period = 0.0  # Always sample
+
+        # Timing state for sample rate
+        self.last_sample_time = -float('inf')  # Force first sample
+        self.cached_measurement = (None, None)
+        self.cached_detected = False
+
+    def measure(self, true_position_mm, current_time):
+        """
+        Take a camera measurement with realistic noise and sample rate.
+
+        Args:
+            true_position_mm: (x, y) tuple or array of true ball position in mm
+            current_time: Current simulation time in seconds
+
+        Returns:
+            (x_measured, y_measured, detected, is_new_sample):
+                - x_measured, y_measured: Measured position in mm (None if not detected)
+                - detected: Boolean, True if ball was detected
+                - is_new_sample: Boolean, True if this is a fresh measurement
+        """
+        # Check if enough time has passed for new sample
+        time_since_last = current_time - self.last_sample_time
+
+        if self.sample_period > 0 and time_since_last < self.sample_period:
+            # Return cached measurement (camera hasn't updated yet)
+            return (self.cached_measurement[0],
+                    self.cached_measurement[1],
+                    self.cached_detected,
+                    False)
+
+        # Time for new measurement
+        self.last_sample_time = current_time
+
+        # Detection dropout
+        detected = np.random.random() < self.detection_rate
+
+        if not detected:
+            self.cached_measurement = (None, None)
+            self.cached_detected = False
+            return None, None, False, True
+
+        # Add sub-pixel noise (causes jumping between pixels)
+        x_true, y_true = true_position_mm
+        x_noisy = x_true + np.random.normal(0, self.subpixel_noise_std)
+        y_noisy = y_true + np.random.normal(0, self.subpixel_noise_std)
+
+        # Quantize to pixel grid
+        x_measured = np.round(x_noisy / self.pixel_size) * self.pixel_size
+        y_measured = np.round(y_noisy / self.pixel_size) * self.pixel_size
+
+        self.cached_measurement = (x_measured, y_measured)
+        self.cached_detected = True
+
+        return x_measured, y_measured, True, True
+
+    def measure_batch(self, true_positions_mm, current_time=None):
+        """
+        Batch measurement for PyTorch tensors (for vectorized simulation).
+
+        Note: Batch mode ignores sample rate timing - all measurements are fresh.
+        For sample rate modeling, use single measure() calls.
+
+        Args:
+            true_positions_mm: (batch, 2) tensor of true positions
+            current_time: Ignored in batch mode
+
+        Returns:
+            measured_positions: (batch, 2) tensor
+            detected: (batch,) boolean tensor
+        """
+        batch_size = true_positions_mm.shape[0]
+        device = true_positions_mm.device
+
+        # Detection mask
+        detection_probs = torch.rand(batch_size, device=device)
+        detected = detection_probs < self.detection_rate
+
+        # Sub-pixel noise
+        noise = torch.randn_like(true_positions_mm) * self.subpixel_noise_std
+        noisy_positions = true_positions_mm + noise
+
+        # Quantize to pixel grid
+        measured = torch.round(noisy_positions / self.pixel_size) * self.pixel_size
+
+        # Set undetected measurements to zero
+        measured[~detected] = 0.0
+
+        return measured, detected
+
+    def reset(self):
+        """Reset camera state (timing and cached measurements)."""
+        self.last_sample_time = -float('inf')
+        self.cached_measurement = (None, None)
+        self.cached_detected = False
+
+    def set_sample_rate(self, sample_rate_hz):
+        """Update camera sample rate on the fly."""
+        if sample_rate_hz > 0:
+            self.sample_period = 1.0 / sample_rate_hz
+        else:
+            self.sample_period = 0.0
+
+    def get_sample_rate(self):
+        """Get current sample rate in Hz."""
+        if self.sample_period > 0:
+            return 1.0 / self.sample_period
+        return float('inf')
+
+    def set_noise_level(self, subpixel_noise_std):
+        """Update noise level on the fly."""
+        self.subpixel_noise_std = subpixel_noise_std
+
+    def get_noise_level(self):
+        """Get current noise standard deviation."""
+        return self.subpixel_noise_std

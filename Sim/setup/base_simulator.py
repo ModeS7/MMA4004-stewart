@@ -15,8 +15,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle, Circle
 from abc import ABC, abstractmethod
 
-from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory
-from core.control_core import clip_tilt_vector
+from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
+from core.control_core import clip_tilt_vector, BallPositionFilter
 from core.utils import (
     MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM,
     SimulationConfig, format_vector_2d, format_time, format_error_context
@@ -152,6 +152,17 @@ class BaseStewartSimulator:
             rolling_friction=0.0225,
             sphere_type='hollow'
         )
+
+        self.pixy_camera = Pixy2Camera(
+            pixel_size_mm=1.4,
+            subpixel_noise_std=0.4,
+            detection_rate=0.999,
+            sample_rate_hz=19.3
+        )
+        self.camera_enabled = True
+
+        # Ball position filter for camera noise
+        self.ball_filter = BallPositionFilter(alpha=0.3)
 
         self.controller = None
         self.controller_enabled = tk.BooleanVar(value=False)
@@ -308,6 +319,7 @@ class BaseStewartSimulator:
             'serial_connection': gm.SerialConnectionModule,
             'performance_stats': gm.PerformanceStatsModule,
             'ball_filter': gm.BallFilterModule,
+            'pixy2_camera': gm.Pixy2CameraModule,
         }
 
         layout_config = self.get_layout_config()
@@ -335,6 +347,10 @@ class BaseStewartSimulator:
             'push_ball': self.push_ball,
             'toggle_offset': self.on_offset_toggle,
             'slider_change': self.on_slider_change,
+            'camera_enable_change': self.on_camera_enable_change,
+            'camera_param_change': self.on_camera_param_change,
+            'camera_reset': self.on_camera_reset,
+            'log': self.log,
         }
 
     def on_pattern_param_change(self, param_name, value):
@@ -749,17 +765,56 @@ class BaseStewartSimulator:
 
             if self.controller_enabled.get():
                 try:
-                    ball_x_mm = self.ball_pos[0, 0].item() * 1000
-                    ball_y_mm = self.ball_pos[0, 1].item() * 1000
+                    # Get true ball position
+                    ball_x_mm_true = self.ball_pos[0, 0].item() * 1000
+                    ball_y_mm_true = self.ball_pos[0, 1].item() * 1000
                     ball_vx_mm_s = self.ball_vel[0, 0].item() * 1000
                     ball_vy_mm_s = self.ball_vel[0, 1].item() * 1000
+
+                    # Apply camera noise if enabled
+                    if self.camera_enabled:
+                        measured_x, measured_y, detected, is_new = self.pixy_camera.measure(
+                            (ball_x_mm_true, ball_y_mm_true),
+                            self.simulation_time
+                        )
+
+                        # Update camera stats for GUI
+                        camera_state = {
+                            'camera_raw_measurement': (ball_x_mm_true, ball_y_mm_true),
+                            'camera_quantized_measurement': (measured_x, measured_y) if detected else (None, None),
+                            'camera_last_sample_time': self.pixy_camera.last_sample_time,
+                            'camera_is_new_sample': is_new
+                        }
+                        if 'pixy2_camera' in self.gui_modules:
+                            self.gui_modules['pixy2_camera'].update(camera_state)
+
+                        if not detected:
+                            # Ball not detected - use last known position
+                            if self.pixy_camera.cached_measurement[0] is not None:
+                                ball_x_mm_raw = self.pixy_camera.cached_measurement[0]
+                                ball_y_mm_raw = self.pixy_camera.cached_measurement[1]
+                            else:
+                                # No previous measurement, skip this control cycle
+                                ball_x_mm_raw = ball_x_mm_true
+                                ball_y_mm_raw = ball_y_mm_true
+                        else:
+                            # Use measured position
+                            ball_x_mm_raw = measured_x
+                            ball_y_mm_raw = measured_y
+
+                        # Apply filter to measured position
+                        ball_x_mm, ball_y_mm = self.ball_filter.update(ball_x_mm_raw, ball_y_mm_raw)
+                    else:
+                        # Camera disabled - use true position (no filtering needed)
+                        ball_x_mm = ball_x_mm_true
+                        ball_y_mm = ball_y_mm_true
 
                     pattern_time = self.simulation_time - self.pattern_start_time
                     target_x, target_y = self.current_pattern.get_position(pattern_time)
                     target_pos_mm = (target_x, target_y)
 
                     rx_raw, ry_raw = self._update_controller(
-                        (ball_x_mm, ball_y_mm),
+                        (ball_x_mm, ball_y_mm),  # Use filtered position
                         (ball_vx_mm_s, ball_vy_mm_s),
                         target_pos_mm,
                         dt
@@ -899,3 +954,24 @@ class BaseStewartSimulator:
             self.root.destroy()
         except:
             pass
+
+    def on_camera_enable_change(self, enabled):
+        """Handle camera enable/disable."""
+        self.camera_enabled = enabled
+        self.log(f"Camera noise: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_camera_param_change(self, param_name, value):
+        """Handle camera parameter change."""
+        param_labels = {
+            'pixel_size': 'Pixel size',
+            'noise_std': 'Noise std',
+            'detection_rate': 'Detection rate',
+            'sample_rate': 'Sample rate'
+        }
+        label = param_labels.get(param_name, param_name)
+        self.log(f"Camera {label}: {value:.3f}")
+
+    def on_camera_reset(self):
+        """Handle camera reset."""
+        self.ball_filter.reset()
+        self.log("Camera and filter reset")
