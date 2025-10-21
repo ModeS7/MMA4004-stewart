@@ -1,16 +1,3 @@
-def reset_pattern(self):
-    """Reset pattern timing."""
-    self.pattern_start_time = self.simulation_time
-    self.current_pattern.reset()
-    self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
-
-    if self.controller_enabled.get():
-        self.controller.reset()
-
-    # Reset velocity estimator (no ball_filter in hardware)
-    self.velocity_estimator.reset()  # !/usr/bin/env python3
-
-
 """
 Stewart Platform Real Hardware Controller - LQR
 
@@ -42,7 +29,7 @@ import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import SerialController, IKCache, WindowsTimerManager, ThreadPriorityManager
-from core.control_core import clip_tilt_vector, LQRController
+from core.control_core import clip_tilt_vector, LQRController, BallPositionFilter
 from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, \
     format_vector_2d
 from gui.gui_builder import create_standard_layout
@@ -131,71 +118,6 @@ class LQRHardwareControllerConfig:
         callback()
 
 
-class VelocityEstimator:
-    """Estimate velocity from position with minimal smoothing for noise rejection."""
-
-    def __init__(self, max_velocity_mm_s=500.0, position_alpha=0.95):
-        """
-        Args:
-            max_velocity_mm_s: Maximum velocity saturation limit
-            position_alpha: Position filter coefficient (0.95 = 95% new, 5% old)
-        """
-        self.prev_pos_x = 0.0
-        self.prev_pos_y = 0.0
-        self.filtered_pos_x = 0.0
-        self.filtered_pos_y = 0.0
-        self.initialized = False
-        self.max_velocity = max_velocity_mm_s
-        self.position_alpha = position_alpha
-
-    def update(self, pos_x_raw, pos_y_raw, dt):
-        """
-        Estimate velocity from position with minimal smoothing.
-
-        Args:
-            pos_x_raw: Raw X position from camera (mm)
-            pos_y_raw: Raw Y position from camera (mm)
-            dt: Time step (seconds)
-
-        Returns:
-            (pos_x_filtered, pos_y_filtered, vel_x, vel_y)
-        """
-        if not self.initialized:
-            self.filtered_pos_x = pos_x_raw
-            self.filtered_pos_y = pos_y_raw
-            self.prev_pos_x = pos_x_raw
-            self.prev_pos_y = pos_y_raw
-            self.initialized = True
-            return pos_x_raw, pos_y_raw, 0.0, 0.0
-
-        # Minimal position smoothing (α=0.95: 95% new, 5% old)
-        self.filtered_pos_x = (self.position_alpha * pos_x_raw +
-                               (1.0 - self.position_alpha) * self.filtered_pos_x)
-        self.filtered_pos_y = (self.position_alpha * pos_y_raw +
-                               (1.0 - self.position_alpha) * self.filtered_pos_y)
-
-        if dt <= 0:
-            return self.filtered_pos_x, self.filtered_pos_y, 0.0, 0.0
-
-        # Velocity from filtered position (much cleaner)
-        vel_x_raw = (self.filtered_pos_x - self.prev_pos_x) / dt
-        vel_y_raw = (self.filtered_pos_y - self.prev_pos_y) / dt
-
-        # Saturate to reject any remaining extreme spikes
-        vel_x = np.clip(vel_x_raw, -self.max_velocity, self.max_velocity)
-        vel_y = np.clip(vel_y_raw, -self.max_velocity, self.max_velocity)
-
-        # Update previous filtered position
-        self.prev_pos_x = self.filtered_pos_x
-        self.prev_pos_y = self.filtered_pos_y
-
-        return self.filtered_pos_x, self.filtered_pos_y, vel_x, vel_y
-
-    def reset(self):
-        """Reset estimator state."""
-        self.initialized = False
-
-
 class HardwareStewartSimulator(BaseStewartSimulator):
     """Hardware-specific Stewart Platform Simulator with LQR control."""
 
@@ -211,13 +133,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         config = LQRHardwareControllerConfig(ball_physics_params)
 
-        # Velocity estimator with minimal position smoothing
-        # α=0.95: 95% new data, 5% old (barely noticeable lag, removes camera jitter)
-        # Max velocity: 500 mm/s is reasonable for ping pong ball
-        self.velocity_estimator = VelocityEstimator(
-            max_velocity_mm_s=500.0,
-            position_alpha=0.95
-        )
+        self.ball_filter = BallPositionFilter(alpha=0.3)
+        self.prev_filtered_pos = (0.0, 0.0)
+        self.max_velocity = 500.0
 
         super().__init__(root, config)
 
@@ -281,8 +199,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
         self.log("LQR Hardware controller initialized (100Hz mode)")
-        self.log("Position: Minimal smoothing (α=0.95, barely noticeable lag)")
-        self.log("Velocity: Clean estimates from filtered position")
+        self.log("Position: EMA filter (α=0.3 by default)")
+        self.log("Velocity: Computed from filtered position with saturation")
         self.log("Debug: Control values logged to console every 0.5s")
         self.log("Optimizations: GC optimization, optimized baud rates")
 
@@ -571,13 +489,16 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ball_x_mm = (pixy_x - CAMERA_CENTER_X) * self.pixels_to_mm_x
                 ball_y_mm = ((CAMERA_HEIGHT_PIXELS - pixy_y) - CAMERA_CENTER_Y) * self.pixels_to_mm_y
 
-                # Store raw position (no filtering)
-                self.ball_pos_mm = (ball_x_mm, ball_y_mm)
+                # Apply position filter
+                ball_x_filtered, ball_y_filtered = self.ball_filter.update(ball_x_mm, ball_y_mm)
+
+                # Store raw position
+                self.ball_pos_mm = (ball_x_filtered, ball_y_filtered)
                 self.ball_detected = ball_data['detected']
 
                 if self.ball_detected:
-                    self.ball_history_x.append(ball_x_mm)
-                    self.ball_history_y.append(ball_y_mm)
+                    self.ball_history_x.append(ball_x_filtered)
+                    self.ball_history_y.append(ball_y_filtered)
                     if len(self.ball_history_x) > self.max_history:
                         self.ball_history_x.pop(0)
                         self.ball_history_y.pop(0)
@@ -585,12 +506,23 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ball_process_time = (time.perf_counter() - t1) * 1000
                 timing_breakpoints['ball_process'].append(ball_process_time)
 
-                # Estimate velocity from raw position
+                # Compute velocity from filtered position
                 t2 = time.perf_counter()
-                pos_x_filtered, pos_y_filtered, vel_x_mm_s, vel_y_mm_s = self.velocity_estimator.update(
-                    ball_x_mm, ball_y_mm, loop_interval
-                )
-                self.ball_vel_mm_s = (vel_x_mm_s, vel_y_mm_s)
+                if loop_interval > 0:
+                    vel_x_raw = (ball_x_filtered - self.prev_filtered_pos[0]) / loop_interval
+                    vel_y_raw = (ball_y_filtered - self.prev_filtered_pos[1]) / loop_interval
+
+                    # Saturate velocity to reject spikes
+                    vel_x_mm_s = np.clip(vel_x_raw, -self.max_velocity, self.max_velocity)
+                    vel_y_mm_s = np.clip(vel_y_raw, -self.max_velocity, self.max_velocity)
+
+                    self.ball_vel_mm_s = (vel_x_mm_s, vel_y_mm_s)
+                else:
+                    self.ball_vel_mm_s = (0.0, 0.0)
+
+                # Update previous position
+                self.prev_filtered_pos = (ball_x_filtered, ball_y_filtered)
+
                 vel_estimate_time = (time.perf_counter() - t2) * 1000
                 timing_breakpoints['vel_estimate'].append(vel_estimate_time)
             else:
@@ -976,7 +908,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 manual_pose.sliders['z'].config(state='normal')
 
     def reset_pattern(self):
-        """Override to avoid calling non-existent ball_filter."""
+        """Reset pattern timing."""
         self.pattern_start_time = self.simulation_time
         self.current_pattern.reset()
         self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
@@ -984,8 +916,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if self.controller_enabled.get():
             self.controller.reset()
 
-        # Reset velocity estimator (no ball_filter in this hardware version)
-        self.velocity_estimator.reset()
+        # Reset filter and velocity tracking
+        self.ball_filter.reset()
+        self.prev_filtered_pos = (0.0, 0.0)
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Hardware controller update (not used - control thread handles it)."""
@@ -1036,7 +969,8 @@ def main():
     app.log("=" * 50)
     app.log("")
     app.log("Optimizations Active:")
-    app.log("   Minimal Position Smoothing (α=0.95)")
+    app.log("   Position Filter (BallPositionFilter, α=0.3)")
+    app.log("   Velocity from filtered position difference")
     app.log("   Velocity Saturation (500 mm/s)")
     app.log("   Debug Logging (console every 0.5s)")
     app.log("   GC Optimization")
