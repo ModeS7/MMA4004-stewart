@@ -23,7 +23,7 @@ import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import SerialController, IKCache, WindowsTimerManager, ThreadPriorityManager
-from core.control_core import clip_tilt_vector, LQRController
+from core.control_core import clip_tilt_vector, LQRController, KalmanFilter  # ADD KalmanFilter
 from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, \
     format_vector_2d
 from gui.gui_builder import create_standard_layout
@@ -127,6 +127,15 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         config = LQRHardwareControllerConfig(ball_physics_params)
 
+        # Kalman filter for ball state estimation
+        self.kalman_filter = KalmanFilter(
+            process_noise_scale=1.0,
+            measurement_noise_scale=1.0,
+            ball_physics_params=ball_physics_params,
+            dt=ControlLoopConfig.INTERVAL_S
+        )
+        self.kalman_enabled = False
+
         super().__init__(root, config)
 
         self.root.title("Stewart Platform - Real Hardware Control (LQR, 100Hz)")
@@ -228,6 +237,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             {'type': 'platform_pose'},
             {'type': 'controller_output', 'args': {'controller_name': 'LQR (Hardware)'}},
             {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
+            {'type': 'kalman_filter',
+             'args': {'kalman_filter': self.kalman_filter}},
             {'type': 'debug_log', 'args': {'height': 8}},
         ]
 
@@ -241,6 +252,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'connect': self.connect_serial,
             'disconnect': self.disconnect_serial,
             'show_stats': self.show_timing_stats,
+            'kalman_enable_change': self.on_kalman_enable_change,
+            'kalman_param_change': self.on_kalman_param_change,
+            'kalman_reset': self.on_kalman_reset,
         })
 
         return callbacks
@@ -405,6 +419,27 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if self.controller_enabled.get():
             self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
+    def on_kalman_enable_change(self, enabled):
+        """Handle Kalman filter enable/disable."""
+        self.kalman_enabled = enabled
+        if enabled:
+            self.kalman_filter.reset(self.ball_pos_mm)
+        self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_kalman_param_change(self, param_name, value):
+        """Handle Kalman parameter change."""
+        param_labels = {
+            'process_noise': 'Process noise',
+            'measurement_noise': 'Measurement noise'
+        }
+        label = param_labels.get(param_name, param_name)
+        self.log(f"Kalman {label}: {value:.2f}")
+
+    def on_kalman_reset(self):
+        """Handle Kalman filter reset."""
+        self.kalman_filter.reset(self.ball_pos_mm)
+        self.log("Kalman filter reset")
+
     def start_simulation(self):
         """Start 100Hz hardware control thread."""
         if not self.connected:
@@ -440,6 +475,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'ball_read': [],
             'ball_process': [],
             'pattern_calc': [],
+            'kalman_predict': [],
+            'kalman_update': [],
             'lqr_update': [],
             'ik_total': [],
             'serial_send': [],
@@ -489,7 +526,41 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             else:
                 timing_breakpoints['ball_process'].append(0.0)
 
+            if self.kalman_enabled:
+                t_kalman_pred = time.perf_counter()
+
+                # Get platform angles from FK (actual angles, not commanded)
+                if hasattr(self, 'last_fk_rotation'):
+                    rx_deg = self.last_fk_rotation[0]
+                    ry_deg = self.last_fk_rotation[1]
+                else:
+                    rx_deg = self.dof_values['rx']
+                    ry_deg = self.dof_values['ry']
+
+                self.kalman_filter.predict([rx_deg, ry_deg])
+
+                kalman_pred_time = (time.perf_counter() - t_kalman_pred) * 1000
+                timing_breakpoints['kalman_predict'].append(kalman_pred_time)
+            else:
+                timing_breakpoints['kalman_predict'].append(0.0)
+
             if self.controller_enabled.get() and self.ball_detected:
+                if self.kalman_enabled:
+                    t_kalman_upd = time.perf_counter()
+                    self.kalman_filter.update(self.ball_pos_mm, self.simulation_time)
+                    kalman_upd_time = (time.perf_counter() - t_kalman_upd) * 1000
+                    timing_breakpoints['kalman_update'].append(kalman_upd_time)
+
+                    # Get filtered estimates
+                    filtered_x, filtered_y = self.kalman_filter.get_position_mm()
+                    filtered_vx, filtered_vy = self.kalman_filter.get_velocity_mm_s()
+                    ball_pos_mm = (filtered_x, filtered_y)
+                    ball_vel_mm_s = (filtered_vx, filtered_vy)
+                else:
+                    timing_breakpoints['kalman_update'].append(0.0)
+                    ball_pos_mm = self.ball_pos_mm
+                    ball_vel_mm_s = (0.0, 0.0)  # No velocity without Kalman
+
                 # Calculate target from pattern
                 t3 = time.perf_counter()
                 pattern_time = self.simulation_time - self.pattern_start_time
@@ -502,7 +573,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 t4 = time.perf_counter()
                 rx, ry = self.controller.update(
                     self.ball_pos_mm,
-                    (0.0, 0.0),
+                    ball_vel_mm_s,
                     target_pos_mm
                 )
                 lqr_update_time = (time.perf_counter() - t4) * 1000
@@ -586,6 +657,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     timing_breakpoints['serial_send'].append(0.0)
             else:
                 timing_breakpoints['pattern_calc'].append(0.0)
+                timing_breakpoints['kalman_update'].append(0.0)
                 timing_breakpoints['lqr_update'].append(0.0)
                 timing_breakpoints['ik_total'].append(0.0)
                 timing_breakpoints['serial_send'].append(0.0)
@@ -668,6 +740,21 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
 
         self.gui_builder.update_modules(state)
+
+        if self.kalman_enabled and hasattr(self, 'kalman_filter'):
+            pos, vel, _ = self.kalman_filter.get_state()
+            std_pos = self.kalman_filter.get_position_uncertainty()
+            stats = self.kalman_filter.get_statistics()
+
+            kalman_state = {
+                'kalman_position': pos,
+                'kalman_velocity': vel,
+                'kalman_uncertainty': std_pos,
+                'kalman_stats': stats
+            }
+
+            if 'kalman_filter' in self.gui_modules:
+                self.gui_modules['kalman_filter'].update(kalman_state)
 
     def setup_plot(self):
         """Setup plot for hardware."""

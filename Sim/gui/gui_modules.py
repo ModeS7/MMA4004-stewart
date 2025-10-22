@@ -973,3 +973,247 @@ class Pixy2CameraModule(GUIModule):
             self.frame.after(50, lambda: self.status_indicator.config(
                 foreground=original_color
             ))
+
+
+class KalmanFilterModule(GUIModule):
+    """Kalman filter configuration and monitoring."""
+
+    def __init__(self, parent, colors, callbacks, kalman_filter=None):
+        super().__init__(parent, colors, callbacks)
+        self.kalman_filter = kalman_filter
+
+    def create(self):
+        self.frame = ttk.LabelFrame(self.parent, text="Kalman Filter", padding=10)
+
+        # Enable/Disable control
+        enable_frame = ttk.Frame(self.frame)
+        enable_frame.pack(fill='x', pady=(0, 10))
+
+        self.filter_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(enable_frame, text="Enable Kalman Filter",
+                        variable=self.filter_enabled,
+                        command=self._on_enable_toggle).pack(side='left')
+
+        self.status_indicator = ttk.Label(enable_frame, text="●",
+                                          foreground=self.colors['border'],
+                                          font=('Segoe UI', 14))
+        self.status_indicator.pack(side='left', padx=(10, 0))
+
+        # Separator
+        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+
+        # Process Noise slider
+        self._create_parameter_slider(
+            label="Process Noise (Q):",
+            min_val=0.01,
+            max_val=10.0,
+            default=1.0,
+            param_name='process_noise',
+            tooltip="Model trust: Lower=trust model, Higher=trust measurements"
+        )
+
+        # Measurement Noise slider
+        self._create_parameter_slider(
+            label="Measurement Noise (R):",
+            min_val=0.01,
+            max_val=10.0,
+            default=1.0,
+            param_name='measurement_noise',
+            tooltip="Camera trust: Lower=trust camera, Higher=smooth more"
+        )
+
+        # Separator
+        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(10, 10))
+
+        # Filter state display
+        state_frame = ttk.Frame(self.frame)
+        state_frame.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(state_frame, text="Filter State:",
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 5))
+
+        self.position_label = ttk.Label(state_frame,
+                                        text="Position: (0.0, 0.0) mm",
+                                        font=('Consolas', 8))
+        self.position_label.pack(anchor='w', pady=2)
+
+        self.velocity_label = ttk.Label(state_frame,
+                                        text="Velocity: (0.0, 0.0) mm/s",
+                                        font=('Consolas', 8))
+        self.velocity_label.pack(anchor='w', pady=2)
+
+        self.uncertainty_label = ttk.Label(state_frame,
+                                           text="Uncertainty: ±0.0 mm",
+                                           font=('Consolas', 8))
+        self.uncertainty_label.pack(anchor='w', pady=2)
+
+        # Statistics display
+        stats_frame = ttk.Frame(self.frame)
+        stats_frame.pack(fill='x', pady=(5, 5))
+
+        self.stats_label = ttk.Label(stats_frame,
+                                     text="Updates: 0/0 (0.0%)",
+                                     font=('Consolas', 8),
+                                     foreground=self.colors['border'])
+        self.stats_label.pack(anchor='w', pady=2)
+
+        # Control buttons
+        btn_frame = ttk.Frame(self.frame)
+        btn_frame.pack(fill='x', pady=(10, 0))
+
+        ttk.Button(btn_frame, text="Reset Filter",
+                   command=self._on_reset_filter,
+                   width=15).pack(side='left', padx=5)
+
+        ttk.Button(btn_frame, text="Show Details",
+                   command=self._on_show_details,
+                   width=15).pack(side='left', padx=5)
+
+        return self.frame
+
+    def _create_parameter_slider(self, label, min_val, max_val, default,
+                                 param_name, tooltip=""):
+        """Create a parameter control row with slider and value display."""
+        frame = ttk.Frame(self.frame)
+        frame.pack(fill='x', pady=5)
+
+        label_widget = ttk.Label(frame, text=label,
+                                 font=('Segoe UI', 9))
+        label_widget.grid(row=0, column=0, sticky='w', padx=(0, 10))
+
+        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
+        slider.grid(row=0, column=1, sticky='ew', padx=5)
+        slider.set(default)
+
+        value_label = ttk.Label(frame, text=f"{default:.2f}",
+                                width=6, font=('Consolas', 9),
+                                foreground=self.colors['highlight'])
+        value_label.grid(row=0, column=2)
+
+        # Store references
+        if not hasattr(self, 'sliders'):
+            self.sliders = {}
+            self.value_labels = {}
+
+        self.sliders[param_name] = slider
+        self.value_labels[param_name] = value_label
+
+        # Bind slider change
+        def on_change(val):
+            value = float(val)
+            value_label.config(text=f"{value:.2f}")
+            self._on_param_change(param_name, value)
+
+        slider.config(command=on_change)
+        frame.columnconfigure(1, weight=1)
+
+        # Tooltip (optional)
+        if tooltip:
+            info_label = ttk.Label(frame, text="ⓘ",
+                                   font=('Segoe UI', 8),
+                                   foreground=self.colors['border'])
+            info_label.grid(row=0, column=3, padx=(2, 0))
+            # In a real implementation, you'd add a tooltip on hover
+
+    def _on_enable_toggle(self):
+        """Handle filter enable/disable."""
+        enabled = self.filter_enabled.get()
+
+        if enabled:
+            self.status_indicator.config(foreground=self.colors['success'])
+            # Enable sliders
+            for slider in self.sliders.values():
+                slider.config(state='normal')
+        else:
+            self.status_indicator.config(foreground=self.colors['border'])
+            # Disable sliders
+            for slider in self.sliders.values():
+                slider.config(state='disabled')
+
+        if self.callbacks.get('kalman_enable_change'):
+            self.callbacks['kalman_enable_change'](enabled)
+
+    def _on_param_change(self, param_name, value):
+        """Handle parameter change."""
+        if not self.kalman_filter or not self.filter_enabled.get():
+            return
+
+        # Update filter parameters
+        if param_name == 'process_noise':
+            self.kalman_filter.set_process_noise(value)
+        elif param_name == 'measurement_noise':
+            self.kalman_filter.set_measurement_noise(value)
+
+        if self.callbacks.get('kalman_param_change'):
+            self.callbacks['kalman_param_change'](param_name, value)
+
+    def _on_reset_filter(self):
+        """Reset filter state."""
+        if self.kalman_filter:
+            self.kalman_filter.reset()
+
+        if self.callbacks.get('kalman_reset'):
+            self.callbacks['kalman_reset']()
+
+    def _on_show_details(self):
+        """Show detailed filter information."""
+        if not self.kalman_filter:
+            return
+
+        from tkinter import messagebox
+
+        stats = self.kalman_filter.get_statistics()
+        pos, vel, _ = self.kalman_filter.get_state()
+        std_pos = self.kalman_filter.get_position_uncertainty()
+        std_vel = self.kalman_filter.get_velocity_uncertainty()
+
+        details = "Kalman Filter Details\n"
+        details += "=" * 50 + "\n\n"
+
+        details += "Current State:\n"
+        details += f"  Position: ({pos[0]:.2f}, {pos[1]:.2f}) mm\n"
+        details += f"  Velocity: ({vel[0]:.2f}, {vel[1]:.2f}) mm/s\n\n"
+
+        details += "Uncertainty (1σ):\n"
+        details += f"  Position: (±{std_pos[0]:.3f}, ±{std_pos[1]:.3f}) mm\n"
+        details += f"  Velocity: (±{std_vel[0]:.3f}, ±{std_vel[1]:.3f}) mm/s\n\n"
+
+        details += "Statistics:\n"
+        details += f"  Predictions: {stats['predictions']}\n"
+        details += f"  Updates: {stats['updates']}\n"
+        details += f"  Update ratio: {stats['update_ratio'] * 100:.1f}%\n"
+        details += f"  Last measurement: {stats['last_measurement_time']:.3f}s\n\n"
+
+        details += "Parameters:\n"
+        details += f"  Process noise scale: {stats['process_noise_scale']:.3f}\n"
+        details += f"  Measurement noise scale: {stats['measurement_noise_scale']:.3f}\n"
+
+        messagebox.showinfo("Kalman Filter Details", details)
+
+    def update(self, state):
+        """Update filter state display."""
+        if 'kalman_position' in state:
+            pos = state['kalman_position']
+            self.position_label.config(
+                text=f"Position: ({pos[0]:.2f}, {pos[1]:.2f}) mm"
+            )
+
+        if 'kalman_velocity' in state:
+            vel = state['kalman_velocity']
+            self.velocity_label.config(
+                text=f"Velocity: ({vel[0]:.2f}, {vel[1]:.2f}) mm/s"
+            )
+
+        if 'kalman_uncertainty' in state:
+            std = state['kalman_uncertainty']
+            avg_std = (std[0] + std[1]) / 2.0
+            self.uncertainty_label.config(
+                text=f"Uncertainty: ±{avg_std:.3f} mm"
+            )
+
+        if 'kalman_stats' in state:
+            stats = state['kalman_stats']
+            self.stats_label.config(
+                text=f"Updates: {stats['updates']}/{stats['predictions']} "
+                     f"({stats['update_ratio'] * 100:.1f}%)"
+            )

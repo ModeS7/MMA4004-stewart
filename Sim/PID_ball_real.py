@@ -13,7 +13,7 @@ Features:
 """
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 import numpy as np
 import time
 import threading
@@ -24,7 +24,7 @@ import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from core.control_core import clip_tilt_vector
+from core.control_core import clip_tilt_vector, PIDController, KalmanFilter
 from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
 from gui.gui_builder import create_standard_layout
 
@@ -118,6 +118,24 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.port_var = tk.StringVar()
         config = HardwareControllerConfig()
 
+        ball_physics_params = {
+            'radius': 0.02,
+            'mass': 0.0027,
+            'gravity': 9.81,
+            'mass_factor': 1.667
+        }
+
+        self.kalman_filter = KalmanFilter(
+            process_noise_scale=1.0,
+            measurement_noise_scale=1.0,
+            ball_physics_params=ball_physics_params,
+            dt=ControlLoopConfig.INTERVAL_S
+        )
+        self.kalman_enabled = False
+
+        # PID-specific: Option to use Kalman velocity for derivative
+        self.use_kalman_derivative = tk.BooleanVar(value=False)
+
         super().__init__(root, config)
 
         self.root.title("Stewart Platform - Real Hardware Control (100Hz)")
@@ -205,6 +223,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             {'type': 'platform_pose'},
             {'type': 'controller_output', 'args': {'controller_name': 'PID (Hardware)'}},
             {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
+            {'type': 'kalman_filter',
+             'args': {'kalman_filter': self.kalman_filter}},
             {'type': 'debug_log', 'args': {'height': 8}},
         ]
 
@@ -218,9 +238,37 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'connect': self.connect_serial,
             'disconnect': self.disconnect_serial,
             'show_stats': self.show_timing_stats,
+            'kalman_enable_change': self.on_kalman_enable_change,
+            'kalman_param_change': self.on_kalman_param_change,
+            'kalman_reset': self.on_kalman_reset,
         })
 
         return callbacks
+
+    def _build_modular_gui(self):
+        """Override to add PID Kalman derivative option."""
+        super()._build_modular_gui()
+
+        if 'controller' in self.gui_modules:
+            controller_frame = self.gui_modules['controller'].frame
+
+            derivative_frame = ttk.Frame(controller_frame)
+            derivative_frame.pack(fill='x', pady=(10, 0))
+
+            ttk.Checkbutton(
+                derivative_frame,
+                text="Use Kalman Velocity for Derivative",
+                variable=self.use_kalman_derivative,
+                command=self.on_kalman_derivative_toggle
+            ).pack(side='left')
+
+            self.derivative_status = ttk.Label(
+                derivative_frame,
+                text="ⓘ",
+                foreground=self.colors['border'],
+                font=('Segoe UI', 10)
+            )
+            self.derivative_status.pack(side='left', padx=(10, 0))
 
     def refresh_ports(self):
         """Refresh available serial ports."""
@@ -331,6 +379,50 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if self.controller_enabled.get():
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
+    def on_kalman_enable_change(self, enabled):
+        """Handle Kalman filter enable/disable."""
+        self.kalman_enabled = enabled
+        if enabled:
+            self.kalman_filter.reset(self.ball_pos_mm)
+        else:
+            # Disable Kalman derivative if Kalman is disabled
+            if self.use_kalman_derivative.get():
+                self.use_kalman_derivative.set(False)
+                self.on_kalman_derivative_toggle()
+        self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_kalman_param_change(self, param_name, value):
+        """Handle Kalman parameter change."""
+        param_labels = {
+            'process_noise': 'Process noise',
+            'measurement_noise': 'Measurement noise'
+        }
+        label = param_labels.get(param_name, param_name)
+        self.log(f"Kalman {label}: {value:.2f}")
+
+    def on_kalman_reset(self):
+        """Handle Kalman filter reset."""
+        self.kalman_filter.reset(self.ball_pos_mm)
+        self.log("Kalman filter reset")
+
+    def on_kalman_derivative_toggle(self):
+        """Handle PID derivative mode toggle."""
+        enabled = self.use_kalman_derivative.get()
+        if enabled and not self.kalman_enabled:
+            # Can't use Kalman derivative without Kalman enabled
+            self.use_kalman_derivative.set(False)
+            self.log("Enable Kalman filter first to use Kalman derivative")
+            return
+
+        mode = "Kalman velocity" if enabled else "finite difference"
+        self.log(f"PID derivative: {mode}")
+
+        if hasattr(self, 'derivative_status'):
+            self.derivative_status.config(
+                text="✓" if enabled else "ⓘ",
+                foreground=self.colors['success'] if enabled else self.colors['border']
+            )
+
     def start_simulation(self):
         """Start 100Hz hardware control thread."""
         if not self.connected:
@@ -366,6 +458,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'ball_read': [],
             'ball_process': [],
             'pattern_calc': [],
+            'kalman_predict': [],
+            'kalman_update': [],
             'pid_update': [],
             'ik_total': [],
             'serial_send': [],
@@ -415,7 +509,42 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             else:
                 timing_breakpoints['ball_process'].append(0.0)
 
+            if self.kalman_enabled:
+                t_kalman_pred = time.perf_counter()
+
+                # Get platform angles from FK
+                if hasattr(self, 'last_fk_rotation'):
+                    rx_deg = self.last_fk_rotation[0]
+                    ry_deg = self.last_fk_rotation[1]
+                else:
+                    rx_deg = self.dof_values['rx']
+                    ry_deg = self.dof_values['ry']
+
+                self.kalman_filter.predict([rx_deg, ry_deg])
+
+                kalman_pred_time = (time.perf_counter() - t_kalman_pred) * 1000
+                timing_breakpoints['kalman_predict'].append(kalman_pred_time)
+            else:
+                timing_breakpoints['kalman_predict'].append(0.0)
+
             if self.controller_enabled.get() and self.ball_detected:
+
+                if self.kalman_enabled:
+                    t_kalman_upd = time.perf_counter()
+                    self.kalman_filter.update(self.ball_pos_mm, self.simulation_time)
+                    kalman_upd_time = (time.perf_counter() - t_kalman_upd) * 1000
+                    timing_breakpoints['kalman_update'].append(kalman_upd_time)
+
+                    # Get filtered estimates
+                    filtered_x, filtered_y = self.kalman_filter.get_position_mm()
+                    filtered_vx, filtered_vy = self.kalman_filter.get_velocity_mm_s()
+                    ball_pos_mm = (filtered_x, filtered_y)
+                    ball_vel_mm_s = (filtered_vx, filtered_vy)
+                else:
+                    timing_breakpoints['kalman_update'].append(0.0)
+                    ball_pos_mm = self.ball_pos_mm
+                    ball_vel_mm_s = (0.0, 0.0)
+
                 t2 = time.perf_counter()
                 pattern_time = self.simulation_time - self.pattern_start_time
                 target_x, target_y = self.current_pattern.get_position(pattern_time)
@@ -424,7 +553,36 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 timing_breakpoints['pattern_calc'].append(pattern_calc_time)
 
                 t3 = time.perf_counter()
-                rx, ry = self.controller.update(self.ball_pos_mm, target_pos_mm, loop_interval)
+
+                if self.use_kalman_derivative.get() and self.kalman_enabled:
+                    # Use Kalman velocity for derivative term
+                    error_x = ball_pos_mm[0] - target_pos_mm[0]
+                    error_y = ball_pos_mm[1] - target_pos_mm[1]
+
+                    error_dot_x = ball_vel_mm_s[0]
+                    error_dot_y = ball_vel_mm_s[1]
+
+                    # Manual PID computation
+                    output_x = (self.controller.kp * error_x +
+                                self.controller.ki * self.controller.integral_x +
+                                self.controller.kd * error_dot_x)
+                    output_y = (self.controller.kp * error_y +
+                                self.controller.ki * self.controller.integral_y +
+                                self.controller.kd * error_dot_y)
+
+                    # Update integrals
+                    self.controller.integral_x += error_x * loop_interval
+                    self.controller.integral_y += error_y * loop_interval
+
+                    # Apply limits
+                    output_x = np.clip(output_x, -MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG)
+                    output_y = np.clip(output_y, -MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG)
+
+                    rx = output_y
+                    ry = -output_x
+                else:
+                    # Standard PID (finite difference derivative)
+                    rx, ry = self.controller.update(ball_pos_mm, target_pos_mm, loop_interval)
 
                 pid_update_time = (time.perf_counter() - t3) * 1000
                 timing_breakpoints['pid_update'].append(pid_update_time)
@@ -497,6 +655,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     timing_breakpoints['serial_send'].append(0.0)
             else:
                 timing_breakpoints['pattern_calc'].append(0.0)
+                timing_breakpoints['kalman_update'].append(0.0)
                 timing_breakpoints['pid_update'].append(0.0)
                 timing_breakpoints['ik_total'].append(0.0)
                 timing_breakpoints['serial_send'].append(0.0)
@@ -577,6 +736,21 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
 
         self.gui_builder.update_modules(state)
+
+        if self.kalman_enabled and hasattr(self, 'kalman_filter'):
+            pos, vel, _ = self.kalman_filter.get_state()
+            std_pos = self.kalman_filter.get_position_uncertainty()
+            stats = self.kalman_filter.get_statistics()
+
+            kalman_state = {
+                'kalman_position': pos,
+                'kalman_velocity': vel,
+                'kalman_uncertainty': std_pos,
+                'kalman_stats': stats
+            }
+
+            if 'kalman_filter' in self.gui_modules:
+                self.gui_modules['kalman_filter'].update(kalman_state)
 
     def setup_plot(self):
         """Setup plot for hardware."""
