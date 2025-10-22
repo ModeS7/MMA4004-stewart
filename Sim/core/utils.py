@@ -44,7 +44,7 @@ class GUIConfig:
 class SimulationConfig:
     """Configuration for simulation mode."""
     UPDATE_RATE_MS = 20  # Physics update interval (50 Hz)
-    DEFAULT_SERVO_TAU = 0.1  # Servo time constant (seconds)
+    DEFAULT_SERVO_TAU = 0.05  # Servo time constant (seconds)
     DEFAULT_SERVO_DELAY = 0.0  # Servo command delay (seconds)
     DEFAULT_SERVO_MAX_VELOCITY = 545.0  # Maximum servo velocity (deg/s)
     PHYSICS_SUBSTEPS = 1  # Physics integration substeps per update
