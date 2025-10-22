@@ -17,7 +17,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import torch
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.core import StewartPlatformIK, SimpleBallPhysics2D, FirstOrderServo
 from core.utils import SimulationConfig
 

@@ -19,7 +19,9 @@ import time
 import csv
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from setup.hardware_controller_config import SerialController
 from core.core import StewartPlatformIK
 
