@@ -21,12 +21,10 @@ from core.utils import (ControlLoopConfig, LQRConfig, BallPhysicsConfig, get_con
                         BallPhysicsConfig, KalmanFilterConfig, ControlLoopConfig)
 
 
-
 class LQRControllerConfig(ControllerConfig):
     """Configuration for LQR controller."""
 
     def __init__(self, mode='simulation'):
-
         config = get_controller_defaults('LQR', mode)
         self.scalar_values = config['scalar_values']
         self.default_weights = config['weights']
@@ -205,7 +203,9 @@ class LQRStewartSimulator(BaseStewartSimulator):
             ball_x_mm = self.ball_pos[0, 0].item() * 1000
             ball_y_mm = self.ball_pos[0, 1].item() * 1000
             self.kalman_filter.reset((ball_x_mm, ball_y_mm))
-        self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
+            self.log("Kalman filter: ENABLED (velocity feedback active)")
+        else:
+            self.log("Kalman filter: DISABLED (velocity = 0, Q_vel has no effect)")
 
     def on_kalman_param_change(self, param_name, value):
         """Handle Kalman parameter change."""
@@ -244,11 +244,13 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """
-        Update LQR controller with optional Kalman filtering.
+        Update LQR controller - MATCHES HARDWARE BEHAVIOR EXACTLY.
 
-        LQR requires velocity feedback, so:
-        - Without Kalman: uses raw ball_vel_mm_s from physics simulation
-        - With Kalman: uses filtered velocity estimate from Kalman filter
+        LQR requires velocity feedback:
+        - Without Kalman: velocity = (0.0, 0.0) → position-only control, Q_vel ignored
+        - With Kalman: velocity from filter estimates → full state feedback
+
+        This matches the hardware implementation in LQR_ball_real.py line 250-264.
         """
         if self.kalman_enabled:
             # Kalman predict step (using platform angles from FK)
@@ -271,11 +273,11 @@ class LQRStewartSimulator(BaseStewartSimulator):
             ball_pos_filtered = (filtered_x, filtered_y)
             ball_vel_filtered = (filtered_vx, filtered_vy)
         else:
-            # No filtering - use raw measurements
+            # No Kalman filter - no velocity available (EXACTLY like hardware)
             ball_pos_filtered = ball_pos_mm
-            ball_vel_filtered = ball_vel_mm_s
+            ball_vel_filtered = (0.0, 0.0)  # No velocity without Kalman
 
-        # LQR control (always uses velocity feedback)
+        # LQR control update
         return self.controller.update(ball_pos_filtered, ball_vel_filtered, target_pos_mm)
 
 
@@ -288,21 +290,26 @@ def main():
     app.log("LQR Ball Balancing Control - Ready")
     app.log("=" * 50)
     app.log("")
+    app.log("IMPORTANT: LQR Requires Velocity Feedback!")
+    app.log("- WITHOUT Kalman: velocity = 0 → position-only control")
+    app.log("- WITH Kalman: velocity estimated → full state feedback")
+    app.log("- Q_vel weight ONLY affects control when Kalman is enabled")
+    app.log("")
     app.log("Quick Start:")
-    app.log("1. Click 'Enable LQR Control' to activate automatic balancing")
-    app.log("2. Click 'Start' to begin simulation")
-    app.log("3. Use 'Push Ball' to test disturbance rejection")
-    app.log("4. Select different trajectory patterns to track")
-    app.log("5. Adjust pattern size/speed with sliders")
+    app.log("1. Enable Kalman Filter for proper LQR operation")
+    app.log("2. Click 'Enable LQR Control' to activate balancing")
+    app.log("3. Click 'Start' to begin simulation")
+    app.log("4. Use 'Push Ball' to test disturbance rejection")
+    app.log("5. Select different trajectory patterns to track")
     app.log("")
     app.log("Kalman Filter:")
-    app.log("- Enable Kalman filter to smooth camera noise")
-    app.log("- LQR uses filtered velocity for state feedback")
+    app.log("- Essential for LQR velocity feedback")
+    app.log("- Smooths camera noise and estimates velocity")
     app.log("- Tune process/measurement noise for best performance")
     app.log("")
     app.log("Tuning Tips:")
     app.log("- Increase Q_pos for tighter position control")
-    app.log("- Increase Q_vel for more damping")
+    app.log("- Increase Q_vel for more damping (needs Kalman enabled!)")
     app.log("- Decrease R for more aggressive control")
     app.log("- Click 'Show Gain Matrix' to see computed gains")
     app.log("")
