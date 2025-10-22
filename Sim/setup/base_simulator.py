@@ -761,26 +761,13 @@ class BaseStewartSimulator:
 
             if self.controller_enabled.get():
                 try:
-                    # Get true ball position and velocity
+                    # Get true ball position
                     ball_x_mm_true = self.ball_pos[0, 0].item() * 1000
                     ball_y_mm_true = self.ball_pos[0, 1].item() * 1000
-                    ball_vx_mm_s_true = self.ball_vel[0, 0].item() * 1000
-                    ball_vy_mm_s_true = self.ball_vel[0, 1].item() * 1000
+                    ball_vx_mm_s = self.ball_vel[0, 0].item() * 1000
+                    ball_vy_mm_s = self.ball_vel[0, 1].item() * 1000
 
-                    # Get platform tilt angles from FK for Kalman filter
-                    if hasattr(self, 'last_fk_rotation'):
-                        rx_deg = self.last_fk_rotation[0]
-                        ry_deg = self.last_fk_rotation[1]
-                    else:
-                        rx_deg = 0.0
-                        ry_deg = 0.0
-
-                    # ===== KALMAN FILTER PREDICTION (ALWAYS AT CONTROL RATE) =====
-                    if self.kalman_enabled:
-                        self.kalman_filter.predict([rx_deg, ry_deg])
-                    # ============================================================
-
-                    # Get measurements (with optional camera noise)
+                    # Apply camera noise if enabled
                     if self.camera_enabled:
                         measured_x, measured_y, detected, is_new = self.pixy_camera.measure(
                             (ball_x_mm_true, ball_y_mm_true),
@@ -797,50 +784,29 @@ class BaseStewartSimulator:
                         if 'pixy2_camera' in self.gui_modules:
                             self.gui_modules['pixy2_camera'].update(camera_state)
 
-                        # ===== KALMAN FILTER UPDATE (ONLY ON NEW MEASUREMENTS) =====
-                        if self.kalman_enabled and detected and is_new:
-                            self.kalman_filter.update([measured_x, measured_y], self.simulation_time)
-                        # ===========================================================
-
-                        # Choose what to use for controller
-                        if self.kalman_enabled:
-                            # Use Kalman filtered estimates
-                            ball_x_mm, ball_y_mm = self.kalman_filter.get_position_mm()
-                            ball_vx_mm_s, ball_vy_mm_s = self.kalman_filter.get_velocity_mm_s()
-                        elif detected:
-                            # Use raw camera measurement
+                        if not detected:
+                            # Use last known measurement or true position
+                            if self.pixy_camera.cached_measurement[0] is not None:
+                                ball_x_mm = self.pixy_camera.cached_measurement[0]
+                                ball_y_mm = self.pixy_camera.cached_measurement[1]
+                            else:
+                                ball_x_mm = ball_x_mm_true
+                                ball_y_mm = ball_y_mm_true
+                        else:
+                            # Use raw measured position
                             ball_x_mm = measured_x
                             ball_y_mm = measured_y
-                            ball_vx_mm_s = ball_vx_mm_s_true
-                            ball_vy_mm_s = ball_vy_mm_s_true
-                        else:
-                            # No detection, use true values
-                            ball_x_mm = ball_x_mm_true
-                            ball_y_mm = ball_y_mm_true
-                            ball_vx_mm_s = ball_vx_mm_s_true
-                            ball_vy_mm_s = ball_vy_mm_s_true
                     else:
-                        # Camera disabled - use true values
-                        if self.kalman_enabled:
-                            # Kalman still runs, treating true values as perfect measurements
-                            self.kalman_filter.update([ball_x_mm_true, ball_y_mm_true],
-                                                      self.simulation_time)
-                            ball_x_mm, ball_y_mm = self.kalman_filter.get_position_mm()
-                            ball_vx_mm_s, ball_vy_mm_s = self.kalman_filter.get_velocity_mm_s()
-                        else:
-                            ball_x_mm = ball_x_mm_true
-                            ball_y_mm = ball_y_mm_true
-                            ball_vx_mm_s = ball_vx_mm_s_true
-                            ball_vy_mm_s = ball_vy_mm_s_true
+                        # Camera disabled - use true position
+                        ball_x_mm = ball_x_mm_true
+                        ball_y_mm = ball_y_mm_true
 
-                    # Pattern tracking
                     pattern_time = self.simulation_time - self.pattern_start_time
                     target_x, target_y = self.current_pattern.get_position(pattern_time)
                     target_pos_mm = (target_x, target_y)
 
-                    # LQR controller update (uses filtered position and velocity)
                     rx_raw, ry_raw = self._update_controller(
-                        (ball_x_mm, ball_y_mm),
+                        (ball_x_mm, ball_y_mm),  # Use filtered position
                         (ball_vx_mm_s, ball_vy_mm_s),
                         target_pos_mm,
                         dt
@@ -884,8 +850,62 @@ class BaseStewartSimulator:
                     self.controller_enabled.set(False)
                     self.on_controller_toggle()
 
-            # Continue with rest of simulation loop (servos, FK, physics, etc.)
-            # Keep all existing code after this point...
+            for servo in self.servos:
+                servo.update(dt, self.simulation_time)
+
+            actual_angles = np.array([servo.get_angle() for servo in self.servos])
+
+            translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
+                actual_angles, use_top_surface_offset=self.use_top_surface_offset.get()
+            )
+
+            if success:
+                self.last_fk_translation = translation
+                self.last_fk_rotation = rotation
+
+                try:
+                    platform_pose = torch.tensor([[
+                        translation[0] / 1000, translation[1] / 1000, translation[2] / 1000,
+                        rotation[0], rotation[1], rotation[2]
+                    ]], dtype=torch.float32)
+
+                    self.ball_pos, self.ball_vel, self.ball_omega, contact_info = \
+                        self.ball_physics.step(
+                            self.ball_pos, self.ball_vel, self.ball_omega, platform_pose, dt,
+                            platform_angular_accel=self.platform_angular_accel
+                        )
+
+                    if contact_info.get('fell_off', False):
+                        self.log("Ball fell off platform")
+
+                except Exception as e:
+                    self.log(format_error_context(
+                        self.simulation_time,
+                        self.ball_pos[0, :2],
+                        self.ball_vel[0, :2] * 1000,
+                        f"Physics error: {str(e)}"
+                    ))
+                    self.reset_ball()
+
+                rx_now = rotation[0]
+                ry_now = rotation[1]
+
+                omega_rx = (rx_now - self.prev_platform_angles['rx']) / dt
+                omega_ry = (ry_now - self.prev_platform_angles['ry']) / dt
+
+                alpha_rx = (omega_rx - self.platform_angular_vel['rx']) / dt
+                alpha_ry = (omega_ry - self.platform_angular_vel['ry']) / dt
+
+                self.platform_angular_vel['rx'] = omega_rx
+                self.platform_angular_vel['ry'] = omega_ry
+                self.platform_angular_accel['rx'] = alpha_rx
+                self.platform_angular_accel['ry'] = alpha_ry
+
+                self.prev_platform_angles['rx'] = rx_now
+                self.prev_platform_angles['ry'] = ry_now
+
+            self.update_gui_modules()
+            self.update_plot()
 
         self.last_update_time = current_time
         self.simulation_loop_id = self.root.after(self.update_rate_ms, self.simulation_loop)
