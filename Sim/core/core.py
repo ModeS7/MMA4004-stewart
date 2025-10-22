@@ -18,10 +18,11 @@ from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM
 class FirstOrderServo:
     """First-order servo model with command delay."""
 
-    def __init__(self, K=1.0, tau=0.1, delay=0.0):
+    def __init__(self, K=1.0, tau=0.1, delay=0.0, max_velocity=545.0):
         self.K = K
         self.tau = tau
         self.delay = delay
+        self.max_velocity = max_velocity
         self.current_angle = 0.0
         self.target_angle = 0.0
         self.command_queue = deque()
@@ -35,9 +36,24 @@ class FirstOrderServo:
             _, angle = self.command_queue.popleft()
             self.target_angle = angle
 
-        error = self.target_angle - self.current_angle
-        d_angle = (self.K * error / self.tau) * dt
-        self.current_angle += d_angle
+        # Compute ideal response using analytical solution (unconditionally stable)
+        if self.tau > 1e-6:
+            alpha = np.exp(-self.K * dt / self.tau)
+            ideal_angle = self.target_angle + (self.current_angle - self.target_angle) * alpha
+        else:
+            # Instantaneous response for tau ≈ 0
+            ideal_angle = self.target_angle
+
+        # Apply velocity limiting (physical constraint: real servos have max speed)
+        angle_change = ideal_angle - self.current_angle
+        max_change = self.max_velocity * dt  # Maximum change in this timestep
+
+        # Clip the change to respect velocity limit
+        if abs(angle_change) > max_change:
+            # Servo is slew-rate limited
+            angle_change = np.sign(angle_change) * max_change
+
+        self.current_angle += angle_change
 
     def get_angle(self):
         return self.current_angle
@@ -480,7 +496,7 @@ def rk4_step(state, derivative_fn, dt, *args):
     k4 = derivative_fn(state_k4, *args)
 
     new_state = tuple(
-        s + (dt / 6.0) * (k1_i + 2 * k2_i + 2 * k3_i + 4 * k4_i)
+        s + (dt / 6.0) * (k1_i + 2 * k2_i + 2 * k3_i + k4_i)
         for s, k1_i, k2_i, k3_i, k4_i in zip(state, k1, k2, k3, k4)
     )
 

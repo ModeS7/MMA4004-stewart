@@ -141,9 +141,15 @@ class BaseStewartSimulator:
             "top_surface_offset": 26.0
         }
         self.ik = StewartPlatformIK(**self.platform_params)
-        self.servos = [FirstOrderServo(K=1.0, tau=SimulationConfig.DEFAULT_SERVO_TAU,
-                                       delay=SimulationConfig.DEFAULT_SERVO_DELAY)
-                       for _ in range(6)]
+        self.servos = [
+            FirstOrderServo(
+                K=1.0,
+                tau=SimulationConfig.DEFAULT_SERVO_TAU,
+                delay=SimulationConfig.DEFAULT_SERVO_DELAY,
+                max_velocity=SimulationConfig.DEFAULT_SERVO_MAX_VELOCITY
+            )
+            for _ in range(6)
+        ]
 
         self.ball_physics = SimpleBallPhysics2D(
             ball_radius=0.02,
@@ -756,7 +762,7 @@ class BaseStewartSimulator:
 
         current_time = time.time()
         if self.last_update_time is not None:
-            dt = current_time - self.last_update_time
+            dt = SimulationConfig.UPDATE_RATE_MS / 1000.0
             self.simulation_time += dt
 
             if self.controller_enabled.get():
