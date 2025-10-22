@@ -2,39 +2,49 @@
 """
 Stewart Platform Simulator with LQR Ball Balancing Control
 
+Features:
+- Kalman filter for ball state estimation
+- LQR optimal control with velocity feedback
+- Pixy2 camera noise model
+
 Usage:
     python LQR_ball_sim.py
 """
 
 import tkinter as tk
-from tkinter import ttk
-import numpy as np
+from tkinter import ttk, messagebox
 
 from setup.base_simulator import ControllerConfig, BaseStewartSimulator
-from core.control_core import LQRController
+from core.control_core import LQRController, KalmanFilter
 from gui.gui_builder import create_standard_layout
+from core.utils import (ControlLoopConfig, LQRConfig, BallPhysicsConfig, get_controller_defaults,
+                        BallPhysicsConfig, KalmanFilterConfig, ControlLoopConfig)
+
 
 
 class LQRControllerConfig(ControllerConfig):
     """Configuration for LQR controller."""
 
-    def __init__(self, ball_physics_params):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
-                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
-        self.default_weights = {'Q_pos': 1.0, 'Q_vel': 1.0, 'R': 1.0}
-        self.default_scalar_indices = {'Q_pos': 7, 'Q_vel': 6, 'R': 5}
-        self.ball_physics_params = ball_physics_params
+    def __init__(self, mode='simulation'):
+
+        config = get_controller_defaults('LQR', mode)
+        self.scalar_values = config['scalar_values']
+        self.default_weights = config['weights']
+        self.default_scalar_indices = config['scalar_indices']
+        self.output_limit = config['output_limit']
+        self.ball_physics_params = BallPhysicsConfig.as_dict()
         self.controller_ref = None
+        self.mode = mode
 
     def get_controller_name(self) -> str:
         return "LQR"
 
     def create_controller(self, **kwargs):
         return LQRController(
-            Q_pos=kwargs.get('Q_pos', 1.0),
-            Q_vel=kwargs.get('Q_vel', 0.1),
-            R=kwargs.get('R', 0.01),
-            output_limit=kwargs.get('output_limit', 15.0),
+            Q_pos=kwargs.get('Q_pos', self.default_weights['Q_pos']),
+            Q_vel=kwargs.get('Q_vel', self.default_weights['Q_vel']),
+            R=kwargs.get('R', self.default_weights['R']),
+            output_limit=kwargs.get('output_limit', self.output_limit),
             ball_physics_params=self.ball_physics_params
         )
 
@@ -43,21 +53,27 @@ class LQRControllerConfig(ControllerConfig):
 
 
 class LQRStewartSimulator(BaseStewartSimulator):
-    """LQR-specific Stewart Platform Simulator with modular GUI."""
+    """LQR-specific Stewart Platform Simulator with Kalman filter support."""
 
     def __init__(self, root):
-        ball_physics_params = {
-            'radius': 0.02,
-            'mass': 0.0027,
-            'gravity': 9.81,
-            'mass_factor': 1.667
-        }
 
-        config = LQRControllerConfig(ball_physics_params)
+        # Ball physics parameters from centralized config
+        ball_physics_params = BallPhysicsConfig.as_dict()
+
+        # Initialize Kalman filter with centralized defaults
+        self.kalman_filter = KalmanFilter(
+            process_noise_scale=KalmanFilterConfig.DEFAULT_PROCESS_NOISE_SCALE,
+            measurement_noise_scale=KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_SCALE,
+            ball_physics_params=ball_physics_params,
+            dt=ControlLoopConfig.INTERVAL_S
+        )
+        self.kalman_enabled = False
+
+        config = LQRControllerConfig(mode='simulation')
         super().__init__(root, config)
 
     def get_layout_config(self):
-        """Define GUI layout for LQR simulator."""
+        """Define GUI layout for LQR simulator with Kalman filter."""
         layout = create_standard_layout(scrollable_columns=False, include_plot=True)
 
         layout['columns'][0]['modules'] = [
@@ -70,6 +86,8 @@ class LQRStewartSimulator(BaseStewartSimulator):
              'args': {'use_offset_var': self.use_top_surface_offset}},
             {'type': 'pixy2_camera',
              'args': {'camera': self.pixy_camera}},
+            {'type': 'kalman_filter',
+             'args': {'kalman_filter': self.kalman_filter}},
         ]
 
         layout['columns'][1]['modules'] = [
@@ -88,7 +106,12 @@ class LQRStewartSimulator(BaseStewartSimulator):
     def _create_callbacks(self):
         """Override to add LQR-specific callbacks."""
         callbacks = super()._create_callbacks()
-        callbacks['show_gain_matrix'] = self.show_gain_matrix
+        callbacks.update({
+            'show_gain_matrix': self.show_gain_matrix,
+            'kalman_enable_change': self.on_kalman_enable_change,
+            'kalman_param_change': self.on_kalman_param_change,
+            'kalman_reset': self.on_kalman_reset,
+        })
         return callbacks
 
     def _build_modular_gui(self):
@@ -108,12 +131,12 @@ class LQRStewartSimulator(BaseStewartSimulator):
     def show_gain_matrix(self):
         """Display LQR gain matrix in popup."""
         if self.controller is None or not hasattr(self.controller, 'get_gain_matrix'):
-            print("Error: Controller not initialized")
+            messagebox.showerror("Error", "Controller not initialized")
             return
 
         K = self.controller.get_gain_matrix()
         if K is None:
-            print("Error: LQR gain matrix not computed")
+            messagebox.showerror("Error", "LQR gain matrix not computed")
             return
 
         popup = tk.Toplevel(self.root)
@@ -174,9 +197,86 @@ class LQRStewartSimulator(BaseStewartSimulator):
         if self.controller_enabled.get():
             self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
+    def on_kalman_enable_change(self, enabled):
+        """Handle Kalman filter enable/disable."""
+        self.kalman_enabled = enabled
+        if enabled:
+            # Reset filter with current ball position
+            ball_x_mm = self.ball_pos[0, 0].item() * 1000
+            ball_y_mm = self.ball_pos[0, 1].item() * 1000
+            self.kalman_filter.reset((ball_x_mm, ball_y_mm))
+        self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_kalman_param_change(self, param_name, value):
+        """Handle Kalman parameter change."""
+        param_labels = {
+            'process_noise': 'Process noise',
+            'measurement_noise': 'Measurement noise'
+        }
+        label = param_labels.get(param_name, param_name)
+        self.log(f"Kalman {label}: {value:.2f}")
+
+    def on_kalman_reset(self):
+        """Handle Kalman filter reset."""
+        ball_x_mm = self.ball_pos[0, 0].item() * 1000
+        ball_y_mm = self.ball_pos[0, 1].item() * 1000
+        self.kalman_filter.reset((ball_x_mm, ball_y_mm))
+        self.log("Kalman filter reset")
+
+    def update_gui_modules(self):
+        """Override to add Kalman filter state."""
+        super().update_gui_modules()
+
+        if self.kalman_enabled and hasattr(self, 'kalman_filter'):
+            pos, vel, _ = self.kalman_filter.get_state()
+            std_pos = self.kalman_filter.get_position_uncertainty()
+            stats = self.kalman_filter.get_statistics()
+
+            kalman_state = {
+                'kalman_position': pos,
+                'kalman_velocity': vel,
+                'kalman_uncertainty': std_pos,
+                'kalman_stats': stats
+            }
+
+            if 'kalman_filter' in self.gui_modules:
+                self.gui_modules['kalman_filter'].update(kalman_state)
+
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
-        """Update LQR controller."""
-        return self.controller.update(ball_pos_mm, ball_vel_mm_s, target_pos_mm)
+        """
+        Update LQR controller with optional Kalman filtering.
+
+        LQR requires velocity feedback, so:
+        - Without Kalman: uses raw ball_vel_mm_s from physics simulation
+        - With Kalman: uses filtered velocity estimate from Kalman filter
+        """
+        if self.kalman_enabled:
+            # Kalman predict step (using platform angles from FK)
+            if hasattr(self, 'last_fk_rotation'):
+                rx_deg = self.last_fk_rotation[0]
+                ry_deg = self.last_fk_rotation[1]
+            else:
+                rx_deg = self.dof_values['rx']
+                ry_deg = self.dof_values['ry']
+
+            self.kalman_filter.predict([rx_deg, ry_deg])
+
+            # Kalman update step (with camera measurement)
+            self.kalman_filter.update(ball_pos_mm, self.simulation_time)
+
+            # Get filtered estimates
+            filtered_x, filtered_y = self.kalman_filter.get_position_mm()
+            filtered_vx, filtered_vy = self.kalman_filter.get_velocity_mm_s()
+
+            ball_pos_filtered = (filtered_x, filtered_y)
+            ball_vel_filtered = (filtered_vx, filtered_vy)
+        else:
+            # No filtering - use raw measurements
+            ball_pos_filtered = ball_pos_mm
+            ball_vel_filtered = ball_vel_mm_s
+
+        # LQR control (always uses velocity feedback)
+        return self.controller.update(ball_pos_filtered, ball_vel_filtered, target_pos_mm)
 
 
 def main():
@@ -194,6 +294,11 @@ def main():
     app.log("3. Use 'Push Ball' to test disturbance rejection")
     app.log("4. Select different trajectory patterns to track")
     app.log("5. Adjust pattern size/speed with sliders")
+    app.log("")
+    app.log("Kalman Filter:")
+    app.log("- Enable Kalman filter to smooth camera noise")
+    app.log("- LQR uses filtered velocity for state feedback")
+    app.log("- Tune process/measurement noise for best performance")
     app.log("")
     app.log("Tuning Tips:")
     app.log("- Increase Q_pos for tighter position control")

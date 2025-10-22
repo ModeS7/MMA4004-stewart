@@ -2,37 +2,50 @@
 """
 Stewart Platform Simulator with PID Ball Balancing Control
 
+Features:
+- Kalman filter for ball state estimation
+- Optional Kalman velocity for PID derivative term
+- Pixy2 camera noise model
+
 Usage:
     python PID_ball_sim.py
 """
 
 import tkinter as tk
+from tkinter import ttk
 
 from setup.base_simulator import ControllerConfig, BaseStewartSimulator
-from core.control_core import PIDController
+from core.control_core import PIDController, KalmanFilter
 from gui.gui_builder import create_standard_layout
+from core.utils import (ControlLoopConfig, PIDConfig, get_controller_defaults,
+                        BallPhysicsConfig, KalmanFilterConfig, ControlLoopConfig)
 
 
 class PIDControllerConfig(ControllerConfig):
     """Configuration for PID controller."""
 
-    def __init__(self):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
-                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
-        self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
-        self.default_scalar_indices = {'kp': 4, 'ki': 4, 'kd': 4}
+    def __init__(self, mode='simulation'):
+
+        config = get_controller_defaults('PID', mode)
+        self.scalar_values = config['scalar_values']
+        self.default_gains = config['gains']
+        self.default_scalar_indices = config['scalar_indices']
+        self.output_limit = config['output_limit']
+        self.derivative_filter_alpha = config['derivative_filter']
         self.controller_ref = None
+        self.mode = mode
 
     def get_controller_name(self) -> str:
         return "PID"
 
     def create_controller(self, **kwargs):
         return PIDController(
-            kp=kwargs.get('kp', 0.003),
-            ki=kwargs.get('ki', 0.001),
-            kd=kwargs.get('kd', 0.003),
-            output_limit=kwargs.get('output_limit', 15.0),
-            derivative_filter_alpha=0.0
+            kp=kwargs.get('kp', self.default_gains['kp']),
+            ki=kwargs.get('ki', self.default_gains['ki']),
+            kd=kwargs.get('kd', self.default_gains['kd']),
+            output_limit=kwargs.get('output_limit', self.output_limit),
+            derivative_filter_alpha=kwargs.get('derivative_filter_alpha',
+                                               self.derivative_filter_alpha)
         )
 
     def get_scalar_values(self) -> list:
@@ -40,14 +53,30 @@ class PIDControllerConfig(ControllerConfig):
 
 
 class PIDStewartSimulator(BaseStewartSimulator):
-    """PID-specific Stewart Platform Simulator with modular GUI."""
+    """PID-specific Stewart Platform Simulator with Kalman filter support."""
 
     def __init__(self, root):
-        config = PIDControllerConfig()
+
+        # Ball physics parameters from centralized config
+        ball_physics_params = BallPhysicsConfig.as_dict()
+
+        # Initialize Kalman filter with centralized defaults
+        self.kalman_filter = KalmanFilter(
+            process_noise_scale=KalmanFilterConfig.DEFAULT_PROCESS_NOISE_SCALE,
+            measurement_noise_scale=KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_SCALE,
+            ball_physics_params=ball_physics_params,
+            dt=ControlLoopConfig.INTERVAL_S
+        )
+        self.kalman_enabled = False
+
+        # PID-specific: Option to use Kalman velocity for derivative
+        self.use_kalman_derivative = tk.BooleanVar(value=False)
+
+        config = PIDControllerConfig(mode='simulation')
         super().__init__(root, config)
 
     def get_layout_config(self):
-        """Define GUI layout for PID simulator."""
+        """Define GUI layout for PID simulator with Kalman filter."""
         layout = create_standard_layout(scrollable_columns=False, include_plot=True)
 
         layout['columns'][0]['modules'] = [
@@ -60,6 +89,8 @@ class PIDStewartSimulator(BaseStewartSimulator):
              'args': {'use_offset_var': self.use_top_surface_offset}},
             {'type': 'pixy2_camera',
              'args': {'camera': self.pixy_camera}},
+            {'type': 'kalman_filter',
+             'args': {'kalman_filter': self.kalman_filter}},
         ]
 
         layout['columns'][1]['modules'] = [
@@ -74,6 +105,41 @@ class PIDStewartSimulator(BaseStewartSimulator):
         ]
 
         return layout
+
+    def _create_callbacks(self):
+        """Override to add Kalman filter callbacks."""
+        callbacks = super()._create_callbacks()
+        callbacks.update({
+            'kalman_enable_change': self.on_kalman_enable_change,
+            'kalman_param_change': self.on_kalman_param_change,
+            'kalman_reset': self.on_kalman_reset,
+        })
+        return callbacks
+
+    def _build_modular_gui(self):
+        """Override to add PID Kalman derivative option."""
+        super()._build_modular_gui()
+
+        if 'controller' in self.gui_modules:
+            controller_frame = self.gui_modules['controller'].frame
+
+            derivative_frame = ttk.Frame(controller_frame)
+            derivative_frame.pack(fill='x', pady=(10, 0))
+
+            ttk.Checkbutton(
+                derivative_frame,
+                text="Use Kalman Velocity for Derivative",
+                variable=self.use_kalman_derivative,
+                command=self.on_kalman_derivative_toggle
+            ).pack(side='left')
+
+            self.derivative_status = ttk.Label(
+                derivative_frame,
+                text="ⓘ",
+                foreground=self.colors['border'],
+                font=('Segoe UI', 10)
+            )
+            self.derivative_status.pack(side='left', padx=(10, 0))
 
     def _initialize_controller(self):
         """Initialize PID controller with parameters from widgets."""
@@ -108,9 +174,142 @@ class PIDStewartSimulator(BaseStewartSimulator):
         if self.controller_enabled.get():
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
+    def on_kalman_enable_change(self, enabled):
+        """Handle Kalman filter enable/disable."""
+        self.kalman_enabled = enabled
+        if enabled:
+            # Reset filter with current ball position
+            ball_x_mm = self.ball_pos[0, 0].item() * 1000
+            ball_y_mm = self.ball_pos[0, 1].item() * 1000
+            self.kalman_filter.reset((ball_x_mm, ball_y_mm))
+        else:
+            # Disable Kalman derivative if Kalman is disabled
+            if self.use_kalman_derivative.get():
+                self.use_kalman_derivative.set(False)
+                self.on_kalman_derivative_toggle()
+        self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_kalman_param_change(self, param_name, value):
+        """Handle Kalman parameter change."""
+        param_labels = {
+            'process_noise': 'Process noise',
+            'measurement_noise': 'Measurement noise'
+        }
+        label = param_labels.get(param_name, param_name)
+        self.log(f"Kalman {label}: {value:.2f}")
+
+    def on_kalman_reset(self):
+        """Handle Kalman filter reset."""
+        ball_x_mm = self.ball_pos[0, 0].item() * 1000
+        ball_y_mm = self.ball_pos[0, 1].item() * 1000
+        self.kalman_filter.reset((ball_x_mm, ball_y_mm))
+        self.log("Kalman filter reset")
+
+    def on_kalman_derivative_toggle(self):
+        """Handle PID derivative mode toggle."""
+        enabled = self.use_kalman_derivative.get()
+        if enabled and not self.kalman_enabled:
+            # Can't use Kalman derivative without Kalman enabled
+            self.use_kalman_derivative.set(False)
+            self.log("Enable Kalman filter first to use Kalman derivative")
+            return
+
+        mode = "Kalman velocity" if enabled else "finite difference"
+        self.log(f"PID derivative: {mode}")
+
+        if hasattr(self, 'derivative_status'):
+            self.derivative_status.config(
+                text="✓" if enabled else "ⓘ",
+                foreground=self.colors['success'] if enabled else self.colors['border']
+            )
+
+    def update_gui_modules(self):
+        """Override to add Kalman filter state."""
+        super().update_gui_modules()
+
+        if self.kalman_enabled and hasattr(self, 'kalman_filter'):
+            pos, vel, _ = self.kalman_filter.get_state()
+            std_pos = self.kalman_filter.get_position_uncertainty()
+            stats = self.kalman_filter.get_statistics()
+
+            kalman_state = {
+                'kalman_position': pos,
+                'kalman_velocity': vel,
+                'kalman_uncertainty': std_pos,
+                'kalman_stats': stats
+            }
+
+            if 'kalman_filter' in self.gui_modules:
+                self.gui_modules['kalman_filter'].update(kalman_state)
+
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
-        """Update PID controller."""
-        return self.controller.update(ball_pos_mm, target_pos_mm, dt)
+        """
+        Update PID controller with optional Kalman filtering.
+
+        Uses Kalman filter if enabled for:
+        - Position filtering (smoothing quantized camera measurements)
+        - Velocity estimation (for derivative term if use_kalman_derivative is True)
+        """
+        import numpy as np
+
+        if self.kalman_enabled:
+            # Kalman predict step (using platform angles from FK)
+            if hasattr(self, 'last_fk_rotation'):
+                rx_deg = self.last_fk_rotation[0]
+                ry_deg = self.last_fk_rotation[1]
+            else:
+                rx_deg = self.dof_values['rx']
+                ry_deg = self.dof_values['ry']
+
+            self.kalman_filter.predict([rx_deg, ry_deg])
+
+            # Kalman update step (with camera measurement)
+            self.kalman_filter.update(ball_pos_mm, self.simulation_time)
+
+            # Get filtered estimates
+            filtered_x, filtered_y = self.kalman_filter.get_position_mm()
+            filtered_vx, filtered_vy = self.kalman_filter.get_velocity_mm_s()
+
+            filtered_pos = (filtered_x, filtered_y)
+            filtered_vel = (filtered_vx, filtered_vy)
+        else:
+            # No filtering - use raw measurements
+            filtered_pos = ball_pos_mm
+            filtered_vel = ball_vel_mm_s
+
+        # PID control with optional Kalman derivative
+        if self.use_kalman_derivative.get() and self.kalman_enabled:
+            # Use Kalman velocity for derivative term
+            error_x = filtered_pos[0] - target_pos_mm[0]
+            error_y = filtered_pos[1] - target_pos_mm[1]
+
+            error_dot_x = filtered_vel[0]
+            error_dot_y = filtered_vel[1]
+
+            # Manual PID computation with Kalman velocity
+            output_x = (self.controller.kp * error_x +
+                        self.controller.ki * self.controller.integral_x +
+                        self.controller.kd * error_dot_x)
+            output_y = (self.controller.kp * error_y +
+                        self.controller.ki * self.controller.integral_y +
+                        self.controller.kd * error_dot_y)
+
+            # Update integrals
+            self.controller.integral_x += error_x * dt
+            self.controller.integral_y += error_y * dt
+
+            # Apply limits
+            from core.utils import MAX_TILT_ANGLE_DEG
+            output_x = np.clip(output_x, -MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG)
+            output_y = np.clip(output_y, -MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG)
+
+            rx = output_y
+            ry = -output_x
+        else:
+            # Standard PID (finite difference derivative)
+            rx, ry = self.controller.update(filtered_pos, target_pos_mm, dt)
+
+        return rx, ry
 
 
 def main():
@@ -128,6 +327,11 @@ def main():
     app.log("3. Use 'Push Ball' to test disturbance rejection")
     app.log("4. Select different trajectory patterns to track")
     app.log("5. Adjust pattern size/speed with sliders")
+    app.log("")
+    app.log("Kalman Filter:")
+    app.log("- Enable Kalman filter to smooth camera noise")
+    app.log("- Optionally use Kalman velocity for PID derivative")
+    app.log("- Tune process/measurement noise for best performance")
     app.log("")
     app.log("Tuning Tips:")
     app.log("- Increase Kp for faster position correction")
