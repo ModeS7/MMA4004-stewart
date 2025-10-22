@@ -6,14 +6,9 @@ Features:
 - Pixy2 camera integration
 - Full LQR control with position
 - Modular GUI with scrollable columns
-- Velocity saturation to reject extreme spikes
 - Garbage collection optimization
 - Optimized baud rates (USB 200k, Maestro 250k)
 - Windows thread priority + timer resolution
-
-Filtering approach:
-- Position: 95% new data, 5% smoothed (minimal lag, removes jitter)
-- Velocity: Computed from smoothed position (clean, usable for control)
 """
 
 import tkinter as tk
@@ -28,7 +23,7 @@ import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import SerialController, IKCache, WindowsTimerManager, ThreadPriorityManager
-from core.control_core import clip_tilt_vector, LQRController, BallPositionFilter
+from core.control_core import clip_tilt_vector, LQRController
 from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, \
     format_vector_2d
 from gui.gui_builder import create_standard_layout
@@ -132,10 +127,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         config = LQRHardwareControllerConfig(ball_physics_params)
 
-        self.ball_filter = BallPositionFilter(alpha=0.3)
-        self.prev_filtered_pos = (0.0, 0.0)
-        self.max_velocity = 500.0
-
         super().__init__(root, config)
 
         self.root.title("Stewart Platform - Real Hardware Control (LQR, 100Hz)")
@@ -151,7 +142,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         # Ball state
         self.ball_pos_mm = (0.0, 0.0)
-        self.ball_vel_mm_s = (0.0, 0.0)
         self.ball_detected = False
         self.last_ball_update = 0
         self.ball_history_x = []
@@ -198,8 +188,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
         self.log("LQR Hardware controller initialized (100Hz mode)")
-        self.log("Position: EMA filter (α=0.3 by default)")
-        self.log("Velocity: Computed from filtered position with saturation")
         self.log("Debug: Control values logged to console every 0.5s")
         self.log("Optimizations: GC optimization, optimized baud rates")
 
@@ -207,7 +195,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         """Override to use LQR-specific defaults."""
         self.param_definitions = [
             ('Q_pos', 'Q Position Weight', 1.0, 7),
-            ('Q_vel', 'Q Velocity Weight', 1.0, 5),  # Moderate default with filtered velocity
+            ('Q_vel', 'Q Velocity Weight', 1.0, 5),
             ('R', 'R Control Weight', 1.0, 5)
         ]
 
@@ -226,7 +214,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
             {'type': 'serial_connection', 'args': {'port_var': self.port_var}},
-            {'type': 'ball_filter', 'args': {'ball_filter': self.ball_filter}},
             {'type': 'simulation_control'},
             {'type': 'controller',
              'args': {'controller_config': self.controller_config,
@@ -383,9 +370,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
-        self.ball_filter.reset()
-        self.prev_filtered_pos = (0.0, 0.0)
-
         self.log("Disconnected")
 
     def _initialize_controller(self):
@@ -455,7 +439,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         timing_breakpoints = {
             'ball_read': [],
             'ball_process': [],
-            'vel_estimate': [],
             'pattern_calc': [],
             'lqr_update': [],
             'ik_total': [],
@@ -490,45 +473,21 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ball_x_mm = (pixy_x - CAMERA_CENTER_X) * self.pixels_to_mm_x
                 ball_y_mm = ((CAMERA_HEIGHT_PIXELS - pixy_y) - CAMERA_CENTER_Y) * self.pixels_to_mm_y
 
-                # Apply position filter
-                ball_x_filtered, ball_y_filtered = self.ball_filter.update(ball_x_mm, ball_y_mm)
-
-                # Store raw position
-                self.ball_pos_mm = (ball_x_filtered, ball_y_filtered)
+                # Use raw position
+                self.ball_pos_mm = (ball_x_mm, ball_y_mm)
                 self.ball_detected = ball_data['detected']
 
                 if self.ball_detected:
-                    self.ball_history_x.append(ball_x_filtered)
-                    self.ball_history_y.append(ball_y_filtered)
+                    self.ball_history_x.append(ball_x_mm)
+                    self.ball_history_y.append(ball_y_mm)
                     if len(self.ball_history_x) > self.max_history:
                         self.ball_history_x.pop(0)
                         self.ball_history_y.pop(0)
 
                 ball_process_time = (time.perf_counter() - t1) * 1000
                 timing_breakpoints['ball_process'].append(ball_process_time)
-
-                # Compute velocity from filtered position
-                t2 = time.perf_counter()
-                if loop_interval > 0:
-                    vel_x_raw = (ball_x_filtered - self.prev_filtered_pos[0]) / loop_interval
-                    vel_y_raw = (ball_y_filtered - self.prev_filtered_pos[1]) / loop_interval
-
-                    # Saturate velocity to reject spikes
-                    vel_x_mm_s = np.clip(vel_x_raw, -self.max_velocity, self.max_velocity)
-                    vel_y_mm_s = np.clip(vel_y_raw, -self.max_velocity, self.max_velocity)
-
-                    self.ball_vel_mm_s = (vel_x_mm_s, vel_y_mm_s)
-                else:
-                    self.ball_vel_mm_s = (0.0, 0.0)
-
-                # Update previous position
-                self.prev_filtered_pos = (ball_x_filtered, ball_y_filtered)
-
-                vel_estimate_time = (time.perf_counter() - t2) * 1000
-                timing_breakpoints['vel_estimate'].append(vel_estimate_time)
             else:
                 timing_breakpoints['ball_process'].append(0.0)
-                timing_breakpoints['vel_estimate'].append(0.0)
 
             if self.controller_enabled.get() and self.ball_detected:
                 # Calculate target from pattern
@@ -543,7 +502,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 t4 = time.perf_counter()
                 rx, ry = self.controller.update(
                     self.ball_pos_mm,
-                    self.ball_vel_mm_s,
+                    (0.0, 0.0),
                     target_pos_mm
                 )
                 lqr_update_time = (time.perf_counter() - t4) * 1000
@@ -553,10 +512,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 self.debug_counter += 1
                 if self.debug_counter >= self.debug_interval:
                     self.debug_counter = 0
-                    vel_mag = np.sqrt(self.ball_vel_mm_s[0] ** 2 + self.ball_vel_mm_s[1] ** 2)
-                    vel_sat = " [SAT]" if vel_mag >= 490 else ""
                     print(f"[LQR] Pos:({self.ball_pos_mm[0]:.1f},{self.ball_pos_mm[1]:.1f})mm "
-                          f"Vel:({self.ball_vel_mm_s[0]:.1f},{self.ball_vel_mm_s[1]:.1f})mm/s{vel_sat} "
                           f"Target:({target_pos_mm[0]:.1f},{target_pos_mm[1]:.1f})mm "
                           f"Control:({rx:.2f},{ry:.2f})°")
 
@@ -641,7 +597,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             elapsed = time.perf_counter() - loop_start
 
             if elapsed > 0.050:
-                self.log(f"WARNING: Loop took {elapsed * 1000:.1f}ms - Windows preemption detected")
+                print(f"WARNING: Loop took {elapsed * 1000:.1f}ms - Windows preemption detected")
                 timing_breakpoints['sleep'].append(0.0)
             else:
                 sleep_time = loop_interval - elapsed
@@ -671,7 +627,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def update_gui_modules(self):
         """Override to add hardware-specific state."""
-        status = f"Detected | Vel: {format_vector_2d(self.ball_vel_mm_s, 'mm/s')}" if self.ball_detected else "Not detected"
+        status = "Detected" if self.ball_detected else "Not detected"
 
         state = {
             'simulation_time': self.simulation_time,
@@ -780,7 +736,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             breakpoint_names = {
                 'ball_read': 'Ball Data Read (Queue)',
                 'ball_process': 'Ball Processing (Transform/History)',
-                'vel_estimate': 'Velocity Estimation',
                 'pattern_calc': 'Pattern Calculation',
                 'lqr_update': 'LQR Controller Update',
                 'ik_total': 'IK Total (Cache+Calc)',
@@ -841,7 +796,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         stats_msg += f"  Cache Size: {len(self.ik_cache.cache)}/{self.ik_cache.max_size}\n\n"
 
         stats_msg += "Optimizations Active:\n"
-        stats_msg += f"  Velocity saturation (500 mm/s max)\n"
         stats_msg += f"  GC Disabled during control\n"
         stats_msg += f"  USB 200k, Maestro 250k baud\n"
         stats_msg += f"  Thread Priority TIME_CRITICAL\n"
@@ -885,8 +839,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         if enabled:
             self.controller.reset()
-            self.ball_filter.reset()
-            self.prev_filtered_pos = (0.0, 0.0)
             self.reset_pattern()
             self.log("LQR control ENABLED")
 
@@ -916,9 +868,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         if self.controller_enabled.get():
             self.controller.reset()
-
-        self.ball_filter.reset()
-        self.prev_filtered_pos = (0.0, 0.0)
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Hardware controller update (not used - control thread handles it)."""
@@ -968,15 +917,6 @@ def main():
     app.log("LQR Hardware Controller - Ready")
     app.log("=" * 50)
     app.log("")
-    app.log("Optimizations Active:")
-    app.log("   Position Filter (BallPositionFilter, α=0.3)")
-    app.log("   Velocity from filtered position difference")
-    app.log("   Velocity Saturation (500 mm/s)")
-    app.log("   Debug Logging (console every 0.5s)")
-    app.log("   GC Optimization")
-    app.log("   Optimized Baud Rates")
-    app.log("   Windows Thread Priority")
-    app.log("   Windows Timer + Pre-allocated Arrays")
     app.log("")
     app.log("Quick Start:")
     app.log("1. Select serial port and click 'Connect'")
@@ -985,9 +925,8 @@ def main():
     app.log("4. Select trajectory patterns to track")
     app.log("")
     app.log("LQR Tuning Tips:")
-    app.log("- Position smoothing: α=0.95 (95% new, 5% old)")
     app.log("- Increase Q_pos for tighter position control")
-    app.log("- Increase Q_vel for more damping")
+    app.log("- Q_vel has no effect (velocity = 0)")
     app.log("- Decrease R for more aggressive control")
     app.log("- Watch console for debug output every 0.5s")
     app.log("- Click 'Show Gain Matrix' to see computed gains")

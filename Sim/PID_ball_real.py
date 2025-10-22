@@ -6,7 +6,6 @@ Features:
 - 100Hz dedicated control thread
 - Pixy2 camera integration
 - Modular GUI with scrollable columns
-- Ball position EMA filtering
 - Garbage collection optimization
 - Optimized baud rates (USB 200k, Maestro 250k)
 - Windows thread priority
@@ -25,7 +24,7 @@ import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from core.control_core import BallPositionFilter, clip_tilt_vector
+from core.control_core import clip_tilt_vector
 from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
 from gui.gui_builder import create_standard_layout
 
@@ -119,8 +118,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.port_var = tk.StringVar()
         config = HardwareControllerConfig()
 
-        self.ball_filter = BallPositionFilter(alpha=0.7)
-
         super().__init__(root, config)
 
         self.root.title("Stewart Platform - Real Hardware Control (100Hz)")
@@ -170,7 +167,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
         self.log("Hardware controller initialized (100Hz mode)")
-        self.log("Optimizations: EMA filter, GC optimization, optimized baud rates, thread priority, timer resolution")
 
     def _create_controller_param_widgets(self):
         """Override to use hardware-specific defaults."""
@@ -194,7 +190,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
-            {'type': 'ball_filter', 'args': {'ball_filter': self.ball_filter}},
             {'type': 'serial_connection', 'args': {'port_var': self.port_var}},
             {'type': 'simulation_control'},
             {'type': 'controller',
@@ -302,8 +297,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
 
-        self.ball_filter.reset()
-
         self.log("Disconnected")
 
     def _initialize_controller(self):
@@ -406,15 +399,13 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ball_x_mm = (pixy_x - CAMERA_CENTER_X) * self.pixels_to_mm_x
                 ball_y_mm = ((CAMERA_HEIGHT_PIXELS - pixy_y) - CAMERA_CENTER_Y) * self.pixels_to_mm_y
 
-                ball_x_mm_filtered, ball_y_mm_filtered = self.ball_filter.update(
-                    ball_x_mm, ball_y_mm
-                )
-                self.ball_pos_mm = (ball_x_mm_filtered, ball_y_mm_filtered)
+                # Use raw position
+                self.ball_pos_mm = (ball_x_mm, ball_y_mm)
                 self.ball_detected = ball_data['detected']
 
                 if self.ball_detected:
-                    self.ball_history_x.append(ball_x_mm_filtered)
-                    self.ball_history_y.append(ball_y_mm_filtered)
+                    self.ball_history_x.append(ball_x_mm)
+                    self.ball_history_y.append(ball_y_mm)
                     if len(self.ball_history_x) > self.max_history:
                         self.ball_history_x.pop(0)
                         self.ball_history_y.pop(0)
@@ -516,7 +507,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             elapsed = time.perf_counter() - loop_start
 
             if elapsed > 0.050:
-                self.log(f"WARNING: Loop took {elapsed * 1000:.1f}ms - Windows preemption detected")
+                print(f"WARNING: Loop took {elapsed * 1000:.1f}ms - Windows preemption detected")
                 timing_breakpoints['sleep'].append(0.0)
             else:
                 sleep_time = loop_interval - elapsed
@@ -653,7 +644,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if hasattr(self, 'timing_breakpoints') and self.timing_breakpoints:
             breakpoint_names = {
                 'ball_read': 'Ball Data Read (Queue)',
-                'ball_process': 'Ball Processing (Filter/History)',
+                'ball_process': 'Ball Processing (Transform/History)',
                 'pattern_calc': 'Pattern Calculation',
                 'pid_update': 'PID Controller Update',
                 'ik_total': 'IK Total (Cache+Calc)',
@@ -714,7 +705,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         stats_msg += f"  Cache Size: {len(self.ik_cache.cache)}/{self.ik_cache.max_size}\n\n"
 
         stats_msg += "Optimizations Active:\n"
-        stats_msg += f"  EMA Filter (α={self.ball_filter.get_alpha():.2f})\n"
         stats_msg += f"  GC Disabled during control\n"
         stats_msg += f"  USB 200k, Maestro 250k baud\n"
         stats_msg += f"  Thread Priority TIME_CRITICAL\n"
@@ -758,7 +748,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         if enabled:
             self.controller.reset()
-            self.ball_filter.reset()
             self.reset_pattern()
             self.log("PID control ENABLED")
 
@@ -828,19 +817,12 @@ def main():
     app.log("Hardware Controller - Ready")
     app.log("=" * 50)
     app.log("")
-    app.log("Optimizations Active:")
-    app.log("   EMA Ball Filter")
-    app.log("   GC Optimization")
-    app.log("   Optimized Baud Rates")
-    app.log("   Windows Thread Priority")
-    app.log("   Windows Timer + Pre-allocated Arrays")
     app.log("")
     app.log("Quick Start:")
     app.log("1. Select serial port and click 'Connect'")
-    app.log("2. Tune ball filter with EMA slider")
-    app.log("3. Enable PID Control for automatic balancing")
-    app.log("4. Click 'Start' to begin 100Hz control loop")
-    app.log("5. Select trajectory patterns to track")
+    app.log("2. Enable PID Control for automatic balancing")
+    app.log("3. Click 'Start' to begin 100Hz control loop")
+    app.log("4. Select trajectory patterns to track")
     app.log("")
 
     root.mainloop()

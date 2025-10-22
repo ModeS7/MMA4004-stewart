@@ -62,8 +62,6 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
         layout['columns'][0]['modules'] = [
             {'type': 'simulation_control'},
-            {'type': 'ball_filter', 'args': {'ball_filter': self.ball_filter}},
-
             {'type': 'trajectory_pattern',
              'args': {'pattern_var': self.pattern_type}},
             {'type': 'ball_control'},

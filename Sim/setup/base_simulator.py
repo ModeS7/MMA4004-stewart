@@ -16,7 +16,7 @@ from matplotlib.patches import Rectangle, Circle
 from abc import ABC, abstractmethod
 
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
-from core.control_core import clip_tilt_vector, BallPositionFilter
+from core.control_core import clip_tilt_vector
 from core.utils import (
     MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM,
     SimulationConfig, format_vector_2d, format_time, format_error_context
@@ -160,9 +160,6 @@ class BaseStewartSimulator:
             sample_rate_hz=19.3
         )
         self.camera_enabled = True
-
-        # Ball position filter for camera noise
-        self.ball_filter = BallPositionFilter(alpha=0.3)
 
         self.controller = None
         self.controller_enabled = tk.BooleanVar(value=False)
@@ -615,8 +612,6 @@ class BaseStewartSimulator:
         if self.controller_enabled.get():
             self.controller.reset()
 
-        self.ball_filter.reset()
-
     def reset_ball(self):
         """Reset ball to center."""
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
@@ -789,23 +784,19 @@ class BaseStewartSimulator:
                             self.gui_modules['pixy2_camera'].update(camera_state)
 
                         if not detected:
-                            # Ball not detected - use last known position
+                            # Use last known measurement or true position
                             if self.pixy_camera.cached_measurement[0] is not None:
-                                ball_x_mm_raw = self.pixy_camera.cached_measurement[0]
-                                ball_y_mm_raw = self.pixy_camera.cached_measurement[1]
+                                ball_x_mm = self.pixy_camera.cached_measurement[0]
+                                ball_y_mm = self.pixy_camera.cached_measurement[1]
                             else:
-                                # No previous measurement, skip this control cycle
-                                ball_x_mm_raw = ball_x_mm_true
-                                ball_y_mm_raw = ball_y_mm_true
+                                ball_x_mm = ball_x_mm_true
+                                ball_y_mm = ball_y_mm_true
                         else:
-                            # Use measured position
-                            ball_x_mm_raw = measured_x
-                            ball_y_mm_raw = measured_y
-
-                        # Apply filter to measured position
-                        ball_x_mm, ball_y_mm = self.ball_filter.update(ball_x_mm_raw, ball_y_mm_raw)
+                            # Use raw measured position
+                            ball_x_mm = measured_x
+                            ball_y_mm = measured_y
                     else:
-                        # Camera disabled - use true position (no filtering needed)
+                        # Camera disabled - use true position
                         ball_x_mm = ball_x_mm_true
                         ball_y_mm = ball_y_mm_true
 
@@ -973,5 +964,4 @@ class BaseStewartSimulator:
 
     def on_camera_reset(self):
         """Handle camera reset."""
-        self.ball_filter.reset()
-        self.log("Camera and filter reset")
+        self.log("Camera reset")

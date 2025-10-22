@@ -323,8 +323,8 @@ class StewartControlGUI:
 
         # DOF configuration (min, max, resolution, default, label)
         self.dof_config = {
-            'x': (-30.0, 30.0, 0.1, 0.0, "X Position (mm) - Right+"),
-            'y': (-30.0, 30.0, 0.1, 0.0, "Y Position (mm) - Away+"),
+            'x': (-60.0, 60.0, 0.1, 0.0, "X Position (mm) - Right+"),
+            'y': (-60.0, 60.0, 0.1, 0.0, "Y Position (mm) - Away+"),
             'z': (self.ik.home_height_top_surface - 30,
                   self.ik.home_height_top_surface + 30,
                   0.1,
