@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from dataclasses import dataclass, field
 from typing import Tuple, Optional
+from collections import deque
 
 
 # ============================================================================
@@ -67,10 +68,10 @@ class KalmanConfig:
         accel_noise: Accelerometer measurement noise [m/s²]
         gyro_noise: Gyroscope measurement noise [rad/s]
     """
-    process_noise_angle: float = 1e-5
-    process_noise_bias: float = 1e-7
-    accel_noise: float = 0.1
-    gyro_noise: float = 0.01
+    process_noise_angle: float = 0.1
+    process_noise_bias: float = 0.1
+    accel_noise: float = 0.5
+    gyro_noise: float = 0.33
 
 
 @dataclass
@@ -84,24 +85,127 @@ class SystemIDConfig:
     Transfer Function:
         H(s) = K·exp(-Td·s) / (τ·s + 1)
 
+    Physical Constraints:
+        max_velocity: Maximum servo slew rate [deg/s] (545 deg/s for standard servos)
+
     Attributes:
         mode: Identification mode ('fit' or 'manual')
         K: Steady-state gain [dimensionless]
         tau: Time constant [s]
         delay: Time delay [s]
+        max_velocity: Maximum servo velocity [deg/s]
         initial_*: Initial guesses for curve fitting when mode='fit'
     """
     mode: str = 'manual'
 
     # Manual mode parameters
     K: float = 1.0
-    tau: float = 0.1
-    delay: float = 0.5
+    tau: float = 0.05
+    delay: float = 0.0
+
+    # Physical constraints
+    max_velocity: float = 545.0  # deg/s (standard servo limit)
 
     # Auto-fit mode initial guesses
     initial_K: float = 1.0
-    initial_tau: float = 0.1
-    initial_delay: float = 0.5
+    initial_tau: float = 0.05
+    initial_delay: float = 0.0
+
+
+# ============================================================================
+# SERVO DYNAMICS MODEL
+# ============================================================================
+
+class FirstOrderServo:
+    """First-order servo model with analytical solution and velocity limiting.
+
+    Features:
+        - Unconditionally stable analytical integration
+        - Physical velocity limiting (slew rate)
+        - Command delay queue
+        - No numerical instability for any tau/dt combination
+
+    Dynamics:
+        τ·dθ/dt = K·(θ_target - θ)
+
+    Analytical solution:
+        θ(t) = θ_target + (θ_0 - θ_target)·exp(-K·t/τ)
+
+    Args:
+        K: Servo gain [dimensionless]
+        tau: Time constant [s]
+        delay: Command delay [s]
+        max_velocity: Maximum angular velocity [deg/s]
+    """
+
+    def __init__(self, K=1.0, tau=0.1, delay=0.0, max_velocity=545.0):
+        self.K = K
+        self.tau = tau
+        self.delay = delay
+        self.max_velocity = max_velocity
+        self.current_angle = 0.0
+        self.target_angle = 0.0
+        self.command_queue = deque()
+
+    def send_command(self, angle, current_time):
+        """Queue a servo command with time delay.
+
+        Args:
+            angle: Target angle [deg]
+            current_time: Current simulation time [s]
+        """
+        delivery_time = current_time + self.delay
+        self.command_queue.append((delivery_time, angle))
+
+    def update(self, dt, current_time):
+        """Update servo state using analytical solution with velocity limiting.
+
+        Args:
+            dt: Time step [s]
+            current_time: Current simulation time [s]
+        """
+        # Process any pending commands
+        while self.command_queue and self.command_queue[0][0] <= current_time:
+            _, angle = self.command_queue.popleft()
+            self.target_angle = angle
+
+        # Compute ideal response using analytical solution
+        if self.tau > 1e-6:
+            # Analytical solution: unconditionally stable
+            alpha = np.exp(-self.K * dt / self.tau)
+            ideal_angle = self.target_angle + (self.current_angle - self.target_angle) * alpha
+        else:
+            # Instantaneous response for tau ≈ 0
+            ideal_angle = self.target_angle
+
+        # Apply velocity limiting (slew rate constraint)
+        angle_change = ideal_angle - self.current_angle
+        max_change = self.max_velocity * dt  # Maximum change in this timestep
+
+        # Clip the change to respect velocity limit
+        if abs(angle_change) > max_change:
+            # Servo is slew-rate limited
+            angle_change = np.sign(angle_change) * max_change
+
+        self.current_angle += angle_change
+
+    def get_angle(self):
+        """Get current servo angle.
+
+        Returns:
+            Current angle [deg]
+        """
+        return self.current_angle
+
+    def reset(self, angle=0.0):
+        """Reset servo state.
+
+        Args:
+            angle: Initial angle [deg]
+        """
+        self.current_angle = angle
+        self.target_angle = angle
+        self.command_queue.clear()
 
 
 # ============================================================================
@@ -432,14 +536,17 @@ class StewartPlatformIK:
 # ============================================================================
 
 class FirstOrderSystemID:
-    """First-order transfer function identification.
+    """First-order transfer function identification with velocity limiting.
 
     Model: H(s) = K·exp(-Td·s) / (τ·s + 1)
+
+    Physical constraint: |dθ/dt| ≤ max_velocity
 
     Parameters:
         K: Steady-state gain [dimensionless]
         τ: Time constant [s]
         Td: Time delay [s]
+        max_velocity: Maximum slew rate [deg/s]
     """
 
     def __init__(self, config: SystemIDConfig):
@@ -541,8 +648,60 @@ class FirstOrderSystemID:
             print(f"Parameter fitting failed: {e}")
             return None
 
+    def simulate_servo_response(self, time: np.ndarray, commanded: np.ndarray) -> np.ndarray:
+        """Simulate servo response using FirstOrderServo model with velocity limiting.
+
+        This is more accurate than predict() as it includes:
+        - Analytical integration (unconditionally stable)
+        - Physical velocity limiting (slew rate)
+        - Command delay queue
+
+        Args:
+            time: Time vector [s]
+            commanded: Commanded input signal [deg]
+
+        Returns:
+            Simulated servo response [deg]
+        """
+        if self.params is None:
+            return None
+
+        K, tau, delay = self.params
+
+        # Create servo with identified parameters
+        servo = FirstOrderServo(
+            K=K,
+            tau=tau,
+            delay=delay,
+            max_velocity=self.config.max_velocity
+        )
+
+        # Initialize at first commanded angle
+        servo.reset(commanded[0])
+
+        # Simulate response
+        response = np.zeros_like(commanded)
+        response[0] = commanded[0]
+
+        for i in range(1, len(time)):
+            dt = time[i] - time[i - 1]
+
+            # Send command
+            servo.send_command(commanded[i], time[i])
+
+            # Update servo dynamics
+            servo.update(dt, time[i])
+
+            # Record angle
+            response[i] = servo.get_angle()
+
+        return response
+
     def predict(self, time: np.ndarray, commanded: np.ndarray) -> np.ndarray:
-        """Generate model prediction for given input signal.
+        """Generate simplified model prediction (without velocity limiting).
+
+        Note: For more accurate predictions including velocity limiting,
+        use simulate_servo_response() instead.
 
         Args:
             time: Time vector [s]
@@ -566,11 +725,13 @@ class FirstOrderSystemID:
 # MAIN PROCESSING PIPELINE
 # ============================================================================
 
-def process_experiment(csv_file: str):
+def process_experiment(csv_file: str, use_servo_simulation: bool = True):
     """Execute complete system identification pipeline on experimental data.
 
     Args:
         csv_file: Path to CSV file containing experiment data
+        use_servo_simulation: If True, use FirstOrderServo model for predictions
+                             If False, use simplified analytical response
 
     Pipeline stages:
         1. Load and validate CSV data
@@ -578,7 +739,8 @@ def process_experiment(csv_file: str):
         3. Estimate orientation using Kalman filter
         4. Compute servo angles via inverse kinematics
         5. Identify transfer function parameters
-        6. Generate comparative plots
+        6. Simulate servo response with identified parameters
+        7. Generate comparative plots
     """
 
     print(f"Processing: {csv_file}")
@@ -596,6 +758,8 @@ def process_experiment(csv_file: str):
     sysid = FirstOrderSystemID(sysid_config)
 
     print(f"  System identification mode: {sysid_config.mode}")
+    print(
+        f"  Servo simulation: {'ENABLED (analytical + velocity limiting)' if use_servo_simulation else 'DISABLED (simplified)'}")
 
     # Convert Teensy timestamps to seconds (from microseconds)
     time = (df['timestamp_us'].values - df['timestamp_us'].values[0]) / 1e6
@@ -684,13 +848,21 @@ def process_experiment(csv_file: str):
             print(f"\n  System ID Results (Servo {max_servo}) - Mode: {mode_str.upper()}")
             print(f"    K (Gain):       {fit_result['K']:.4f}")
             print(f"    τ (Time const): {fit_result['tau']:.4f} s")
-            print(f"    Td (Delay):     {fit_result['delay']:.4f} s ({fit_result['delay']*1000:.1f} ms)")
+            print(f"    Td (Delay):     {fit_result['delay']:.4f} s ({fit_result['delay'] * 1000:.1f} ms)")
             print(f"    R²:             {fit_result['r_squared']:.4f}")
+            print(f"    Max velocity:   {sysid_config.max_velocity:.1f} deg/s")
 
             print("  Generating model predictions...")
             theta_model = np.zeros_like(theta_cmd)
+
             for i in range(6):
-                pred = sysid.predict(time, theta_cmd[:, i])
+                if use_servo_simulation:
+                    # Use full servo simulation (analytical + velocity limiting)
+                    pred = sysid.simulate_servo_response(time, theta_cmd[:, i])
+                else:
+                    # Use simplified analytical response
+                    pred = sysid.predict(time, theta_cmd[:, i])
+
                 if pred is not None:
                     theta_model[:, i] = pred
 
@@ -719,11 +891,13 @@ def process_experiment(csv_file: str):
     fig2, axes = plt.subplots(3, 2, figsize=(14, 10))
     axes = axes.flatten()
 
+    model_label = 'Model (Full)' if use_servo_simulation else 'Model (Simplified)'
+
     for i in range(6):
         axes[i].plot(time, theta_cmd[:, i], 'b-', label='Commanded', linewidth=2)
         axes[i].plot(time, theta_est[:, i], 'r--', label='IMU-IK', linewidth=1.5)
         if theta_model is not None:
-            axes[i].plot(time, theta_model[:, i], 'g:', label='Model', linewidth=2)
+            axes[i].plot(time, theta_model[:, i], 'g:', label=model_label, linewidth=2)
         if len(step_indices) > 0:
             axes[i].axvline(x=step_time, color='gray', linestyle='--', alpha=0.5, linewidth=1)
         axes[i].set_ylabel(f'θ{i} [deg]')
@@ -733,7 +907,10 @@ def process_experiment(csv_file: str):
         if i >= 4:
             axes[i].set_xlabel('Time [s]')
 
-    fig2.suptitle('Servo Angles: Commanded vs IMU-IK vs Model', fontsize=14, y=0.995)
+    title = 'Servo Angles: Commanded vs IMU-IK vs Model'
+    if use_servo_simulation:
+        title += ' (with velocity limiting)'
+    fig2.suptitle(title, fontsize=14, y=0.995)
     plt.tight_layout()
     plt.show()
 
@@ -749,10 +926,18 @@ if __name__ == "__main__":
         print("Stewart Platform System Identification Tool")
         print("=" * 70)
         print("\nUsage:")
-        print("  python script.py <experiment_csv_file>")
-        print("\nNew: Uses Teensy-timestamped data for accurate delay measurement")
+        print("  python script.py <experiment_csv_file> [--simplified]")
+        print("\nOptions:")
+        print("  --simplified    Use simplified model (no velocity limiting)")
+        print("\nFeatures:")
+        print("  • Analytical servo integration (unconditionally stable)")
+        print("  • Physical velocity limiting (545 deg/s)")
+        print("  • Command delay modeling")
+        print("  • Teensy-timestamped data for accurate delay measurement")
         print("=" * 70)
         sys.exit(1)
 
     csv_file = sys.argv[1]
-    process_experiment(csv_file)
+    use_servo_sim = '--simplified' not in sys.argv
+
+    process_experiment(csv_file, use_servo_simulation=use_servo_sim)
