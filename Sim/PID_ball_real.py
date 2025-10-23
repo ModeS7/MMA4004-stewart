@@ -38,14 +38,14 @@ THREAD_PRIORITY_TIME_CRITICAL = 15
 
 
 class WindowsTimerManager:
-    """Windows multimedia timer resolution manager. Reduces timer granularity from 15.6ms to 1ms."""
+    """Windows multimedia timer resolution manager."""
 
     def __init__(self):
         self.timer_set = False
         self.is_windows = sys.platform.startswith('win')
 
     def set_high_resolution(self):
-        """Set Windows timer to 1ms resolution."""
+        """Set Windows timer to high resolution."""
         if not self.is_windows:
             return False, "Not Windows - timer not set"
 
@@ -54,7 +54,7 @@ class WindowsTimerManager:
             result = timeBeginPeriod(1)
             if result == 0:
                 self.timer_set = True
-                return True, "Windows timer set to 1ms"
+                return True, "Windows timer resolution set"
             else:
                 return False, f"Timer set failed: {result}"
         except Exception as e:
@@ -72,7 +72,7 @@ class WindowsTimerManager:
 
 
 class ThreadPriorityManager:
-    """Windows thread priority manager. Elevates control thread priority to reduce jitter."""
+    """Windows thread priority manager."""
 
     def __init__(self):
         self.is_windows = sys.platform.startswith('win')
@@ -267,7 +267,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             self.derivative_checkbox_ref = derivative_checkbox
 
-            self.derivative_status = QLabel("ⓘ")
+            self.derivative_status = QLabel("[OFF]")
             self.derivative_status.setStyleSheet(f"color: {self.colors['border']}; font-size: 10pt;")
             derivative_layout.addWidget(self.derivative_status)
             derivative_layout.addStretch()
@@ -426,7 +426,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.log(f"PID derivative: {mode}")
 
         if hasattr(self, 'derivative_status'):
-            self.derivative_status.setText("✓" if enabled else "ⓘ")
+            self.derivative_status.setText("[ON]" if enabled else "[OFF]")
             color = self.colors['success'] if enabled else self.colors['border']
             self.derivative_status.setStyleSheet(f"color: {color}; font-size: 10pt;")
 
@@ -949,19 +949,6 @@ def main():
     """Launch hardware controller."""
     app = QApplication(sys.argv)
     simulator = HardwareStewartSimulator(app)
-
-    simulator.log("=" * 50)
-    simulator.log("Hardware Controller - Ready")
-    simulator.log("=" * 50)
-    simulator.log("")
-    simulator.log("")
-    simulator.log("Quick Start:")
-    simulator.log("1. Select serial port and click 'Connect'")
-    simulator.log("2. Enable PID Control for automatic balancing")
-    simulator.log("3. Click 'Start' to begin 100Hz control loop")
-    simulator.log("4. Select trajectory patterns to track")
-    simulator.log("")
-
     simulator.show()
     sys.exit(app.exec())
 

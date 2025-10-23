@@ -105,8 +105,8 @@ class ControllerModule(GUIModule):
         self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
         enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_label = QLabel("●")
-        font = QFont("Segoe UI", 14)
+        self.status_label = QLabel("[OFF]")
+        font = QFont("Segoe UI", 10)
         self.status_label.setFont(font)
         self.status_label.setStyleSheet(f"color: {self.colors['border']};")
         enable_layout.addWidget(self.status_label)

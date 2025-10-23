@@ -37,14 +37,14 @@ THREAD_PRIORITY_TIME_CRITICAL = 15
 
 
 class WindowsTimerManager:
-    """Windows multimedia timer resolution manager. Reduces timer granularity from 15.6ms to 1ms."""
+    """Windows multimedia timer resolution manager."""
 
     def __init__(self):
         self.timer_set = False
         self.is_windows = sys.platform.startswith('win')
 
     def set_high_resolution(self):
-        """Set Windows timer to 1ms resolution."""
+        """Set Windows timer to high resolution."""
         if not self.is_windows:
             return False, "Not Windows - timer not set"
 
@@ -53,7 +53,7 @@ class WindowsTimerManager:
             result = timeBeginPeriod(1)
             if result == 0:
                 self.timer_set = True
-                return True, "Windows timer set to 1ms"
+                return True, "Windows timer resolution set"
             else:
                 return False, f"Timer set failed: {result}"
         except Exception as e:
@@ -71,7 +71,7 @@ class WindowsTimerManager:
 
 
 class ThreadPriorityManager:
-    """Windows thread priority manager. Elevates control thread priority to reduce jitter."""
+    """Windows thread priority manager."""
 
     def __init__(self):
         self.is_windows = sys.platform.startswith('win')
@@ -149,7 +149,7 @@ class IKCache:
 
 
 class SerialController:
-    """High-performance serial communication with hardware."""
+    """Serial communication with hardware."""
 
     def __init__(self, port, baudrate=200000):
         self.port = port

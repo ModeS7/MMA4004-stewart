@@ -3,7 +3,7 @@
 Stewart Platform Simulator - Modular Base Class
 
 Reusable simulator with pluggable controller support and modular GUI.
-PyQt6 + PyQtGraph implementation for high-performance rendering.
+PyQt6 + PyQtGraph implementation.
 """
 
 from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QGroupBox, QGridLayout, QLabel, QSlider, QComboBox

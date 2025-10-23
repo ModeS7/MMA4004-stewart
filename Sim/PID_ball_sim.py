@@ -133,7 +133,7 @@ class PIDStewartSimulator(BaseStewartSimulator):
             self.kalman_deriv_checkbox.stateChanged.connect(self.on_kalman_derivative_toggle)
             derivative_layout.addWidget(self.kalman_deriv_checkbox)
 
-            self.derivative_status = QLabel("ⓘ")
+            self.derivative_status = QLabel("[OFF]")
             font = QFont('Segoe UI', 10)
             self.derivative_status.setFont(font)
             self.derivative_status.setStyleSheet(f"color: {self.colors['border']};")
@@ -229,7 +229,7 @@ class PIDStewartSimulator(BaseStewartSimulator):
         self.log(f"PID derivative: {mode}")
 
         if hasattr(self, 'derivative_status'):
-            self.derivative_status.setText("✓" if enabled else "ⓘ")
+            self.derivative_status.setText("[ON]" if enabled else "[OFF]")
             self.derivative_status.setStyleSheet(
                 f"color: {self.colors['success'] if enabled else self.colors['border']};"
             )
@@ -327,30 +327,6 @@ def main():
     """Launch PID Stewart Platform Simulator."""
     app = QApplication(sys.argv)
     simulator = PIDStewartSimulator(app)
-
-    simulator.log("=" * 50)
-    simulator.log("PID Ball Balancing Control - Ready")
-    simulator.log("=" * 50)
-    simulator.log("")
-    simulator.log("Quick Start:")
-    simulator.log("1. Click 'Enable PID Control' to activate automatic balancing")
-    simulator.log("2. Click 'Start' to begin simulation")
-    simulator.log("3. Use 'Push Ball' to test disturbance rejection")
-    simulator.log("4. Select different trajectory patterns to track")
-    simulator.log("5. Adjust pattern size/speed with sliders")
-    simulator.log("")
-    simulator.log("Kalman Filter:")
-    simulator.log("- Enable Kalman filter to smooth camera noise")
-    simulator.log("- Optionally use Kalman velocity for PID derivative")
-    simulator.log("- Tune process/measurement noise for best performance")
-    simulator.log("")
-    simulator.log("Tuning Tips:")
-    simulator.log("- Increase Kp for faster position correction")
-    simulator.log("- Increase Kd for more damping (reduce oscillation)")
-    simulator.log("- Increase Ki to eliminate steady-state error")
-    simulator.log("- Start with Ki=0 and tune Kp/Kd first")
-    simulator.log("")
-
     simulator.show()
     sys.exit(app.exec())
 

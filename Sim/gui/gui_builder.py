@@ -3,7 +3,7 @@
 GUI Layout Builder for Stewart Platform Simulators
 
 Builds GUI from declarative configuration with optional scrolling.
-PyQt6 implementation with high-performance rendering.
+PyQt6 implementation.
 """
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
