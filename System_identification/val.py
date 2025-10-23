@@ -21,7 +21,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.core import StewartPlatformIK, SimpleBallPhysics2D, FirstOrderServo
-from core.utils import SimulationConfig
 
 
 class ValidationSimulator:

@@ -8,7 +8,7 @@ Features:
 - Pixy2 camera noise model
 
 Usage:
-    python PID_ball_sim.py
+    python PID_sim.py
 """
 
 import sys
@@ -18,7 +18,7 @@ from PyQt6.QtGui import QFont
 from setup.base_simulator import ControllerConfig, BaseStewartSimulator
 from core.control_core import PIDController, KalmanFilter
 from gui.gui_builder import create_standard_layout
-from core.utils import (ControlLoopConfig, PIDConfig, get_controller_defaults,
+from core.utils import (get_controller_defaults,
                         BallPhysicsConfig, KalmanFilterConfig, ControlLoopConfig)
 
 

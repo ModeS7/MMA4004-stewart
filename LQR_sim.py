@@ -8,7 +8,7 @@ Features:
 - Pixy2 camera noise model
 
 Usage:
-    python LQR_ball_sim.py
+    python LQR_sim.py
 """
 
 import sys
@@ -19,7 +19,7 @@ from PyQt6.QtGui import QFont
 from setup.base_simulator import ControllerConfig, BaseStewartSimulator
 from core.control_core import LQRController, KalmanFilter
 from gui.gui_builder import create_standard_layout
-from core.utils import (ControlLoopConfig, LQRConfig, BallPhysicsConfig, get_controller_defaults,
+from core.utils import (get_controller_defaults,
                         BallPhysicsConfig, KalmanFilterConfig, ControlLoopConfig)
 
 
@@ -270,7 +270,7 @@ class LQRStewartSimulator(BaseStewartSimulator):
         - Without Kalman: velocity = (0.0, 0.0) → position-only control, Q_vel ignored
         - With Kalman: velocity from filter estimates → full state feedback
 
-        This matches the hardware implementation in LQR_ball_real.py line 250-264.
+        This matches the hardware implementation in LQR_real.py line 250-264.
         """
         if self.kalman_enabled:
             # Kalman predict step (using platform angles from FK)

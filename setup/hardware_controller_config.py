@@ -24,8 +24,7 @@ import ctypes
 
 from setup.base_simulator import ControllerConfig
 from core.control_core import PIDController
-from core.utils import ControlLoopConfig, GUIConfig
-
+from core.utils import ControlLoopConfig
 
 THREAD_PRIORITY_IDLE = -15
 THREAD_PRIORITY_LOWEST = -2

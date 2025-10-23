@@ -6,12 +6,12 @@
 pip install -r requirements.txt
 
 # Simulation
-python Sim/PID_ball_sim.py
-python Sim/LQR_ball_sim.py
+python PID_sim.py
+python LQR_sim.py
 
 # Hardware
-python Sim/PID_ball_real.py
-python Sim/LQR_ball_real.py
+python PID_real.py
+python LQR_real.py
 ```
 
 ## Progress

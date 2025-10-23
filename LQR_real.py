@@ -1,122 +1,71 @@
-#!/usr/bin/env python3
 """
-Stewart Platform Real Hardware Controller
+Stewart Platform Real Hardware Controller - LQR
 
 Features:
 - 100Hz dedicated control thread
 - Pixy2 camera integration
+- Full LQR control with position
 - Modular GUI with scrollable columns
 - Garbage collection optimization
 - Optimized baud rates (USB 200k, Maestro 250k)
-- Windows thread priority
-- Windows timer resolution + Pre-allocated NumPy arrays
+- Windows thread priority + timer resolution
 """
 
-import sys
 from PyQt6.QtWidgets import QApplication, QMessageBox
 import numpy as np
 import time
 import threading
-import serial.tools.list_ports
+from queue import Queue, Empty
 import gc
 import sys
-import ctypes
 
-from setup.base_simulator import BaseStewartSimulator
-from setup.hardware_controller_config import HardwareControllerConfig, SerialController, IKCache
-from core.control_core import clip_tilt_vector, PIDController, KalmanFilter
-from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, format_vector_2d
+from setup.base_simulator import BaseStewartSimulator, ControllerConfig
+from setup.hardware_controller_config import SerialController, IKCache, WindowsTimerManager, ThreadPriorityManager
+from core.control_core import clip_tilt_vector, LQRController, KalmanFilter
+from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, format_time
 from gui.gui_builder import create_standard_layout
 
-THREAD_PRIORITY_IDLE = -15
-THREAD_PRIORITY_LOWEST = -2
-THREAD_PRIORITY_BELOW_NORMAL = -1
-THREAD_PRIORITY_NORMAL = 0
-THREAD_PRIORITY_ABOVE_NORMAL = 1
-THREAD_PRIORITY_HIGHEST = 2
 THREAD_PRIORITY_TIME_CRITICAL = 15
 
 
-class WindowsTimerManager:
-    """Windows multimedia timer resolution manager."""
+class LQRHardwareControllerConfig(ControllerConfig):
+    """LQR controller configuration for hardware."""
 
-    def __init__(self):
-        self.timer_set = False
-        self.is_windows = sys.platform.startswith('win')
+    def __init__(self, ball_physics_params):
+        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
+                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+        self.default_weights = {'Q_pos': 1.0, 'Q_vel': 1.0, 'R': 1.0}
+        self.default_scalar_indices = {'Q_pos': 7, 'Q_vel': 6, 'R': 5}
+        self.ball_physics_params = ball_physics_params
+        self.controller_ref = None
 
-    def set_high_resolution(self):
-        """Set Windows timer to high resolution."""
-        if not self.is_windows:
-            return False, "Not Windows - timer not set"
+    def get_controller_name(self) -> str:
+        return "LQR (Hardware)"
 
-        try:
-            timeBeginPeriod = ctypes.windll.winmm.timeBeginPeriod
-            result = timeBeginPeriod(1)
-            if result == 0:
-                self.timer_set = True
-                return True, "Windows timer resolution set"
-            else:
-                return False, f"Timer set failed: {result}"
-        except Exception as e:
-            return False, f"Timer error: {str(e)}"
+    def create_controller(self, **kwargs):
+        return LQRController(
+            Q_pos=kwargs.get('Q_pos', 1.0),
+            Q_vel=kwargs.get('Q_vel', 0.1),
+            R=kwargs.get('R', 0.01),
+            output_limit=kwargs.get('output_limit', 15.0),
+            ball_physics_params=self.ball_physics_params
+        )
 
-    def restore_default(self):
-        """Restore default timer resolution."""
-        if self.timer_set:
-            try:
-                timeEndPeriod = ctypes.windll.winmm.timeEndPeriod
-                timeEndPeriod(1)
-                self.timer_set = False
-            except:
-                pass
-
-
-class ThreadPriorityManager:
-    """Windows thread priority manager."""
-
-    def __init__(self):
-        self.is_windows = sys.platform.startswith('win')
-        self.kernel32 = None
-
-        if self.is_windows:
-            try:
-                self.kernel32 = ctypes.windll.kernel32
-            except (AttributeError, OSError):
-                self.is_windows = False
-
-    def set_thread_priority(self, thread_id, priority=THREAD_PRIORITY_ABOVE_NORMAL):
-        """
-        Set thread priority on Windows.
-
-        Args:
-            thread_id: Thread ID from thread.ident
-            priority: Priority level (1=ABOVE_NORMAL, 2=HIGHEST)
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.is_windows or self.kernel32 is None:
-            return False
-
-        try:
-            handle = self.kernel32.OpenThread(0x0020, False, thread_id)
-            if not handle:
-                return False
-
-            result = self.kernel32.SetThreadPriority(handle, priority)
-            self.kernel32.CloseHandle(handle)
-
-            return bool(result)
-        except Exception:
-            return False
+    def get_scalar_values(self) -> list:
+        return self.scalar_values
 
 
 class HardwareStewartSimulator(BaseStewartSimulator):
-    """Hardware-specific Stewart Platform Simulator with modular GUI."""
+    """Hardware-specific Stewart Platform Simulator with LQR control."""
 
     def __init__(self, app):
         self.port_var = ''
-        config = HardwareControllerConfig()
+
+        # Plot control
+        self.plot_enabled = True
+        self.plot_rate = 10  # 10 Hz default
+        self.plot_divisor = 10  # Update every Nth loop
+        self.plot_drops = 0
 
         ball_physics_params = {
             'radius': 0.02,
@@ -125,6 +74,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'mass_factor': 1.667
         }
 
+        config = LQRHardwareControllerConfig(ball_physics_params)
+
+        # Kalman filter for ball state estimation
         self.kalman_filter = KalmanFilter(
             process_noise_scale=1.0,
             measurement_noise_scale=1.0,
@@ -133,21 +85,20 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         )
         self.kalman_enabled = False
 
-        # PID-specific: Option to use Kalman velocity for derivative
-        self.use_kalman_derivative = False
-
         super().__init__(app, config)
 
-        self.setWindowTitle("Stewart Platform - Real Hardware Control (100Hz)")
+        self.setWindowTitle("Stewart Platform - Real Hardware Control (LQR, 100Hz)")
 
         self.serial_controller = None
         self.connected = False
 
+        # Camera calibration
         self.pixy_width_mm = 350.0
         self.pixy_height_mm = 266.0
         self.pixels_to_mm_x = self.pixy_width_mm / 316.0
         self.pixels_to_mm_y = self.pixy_height_mm / 208.0
 
+        # Ball state
         self.ball_pos_mm = (0.0, 0.0)
         self.ball_detected = False
         self.last_ball_update = 0
@@ -155,20 +106,24 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.ball_history_y = []
         self.max_history = 100
 
+        # IK cache for performance
         self.ik_cache = IKCache(max_size=5000)
 
+        # Pre-allocated buffers
         self._translation_buffer = np.zeros(3, dtype=np.float64)
         self._rotation_buffer = np.zeros(3, dtype=np.float64)
 
+        # Control thread
         self.control_thread = None
         self.last_sent_angles = None
         self.angle_change_threshold = 0.2
 
+        # Windows optimization
         self.priority_manager = ThreadPriorityManager()
         self.control_thread_id = None
-
         self.timer_manager = WindowsTimerManager()
 
+        # Performance monitoring
         self.actual_fps = 0.0
         self.timing_stats = {
             'ik_time': [],
@@ -178,20 +133,32 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.timing_breakpoints = {}
         self.ik_timeout_count = 0
 
+        # Debug logging
+        self.debug_counter = 0
+        self.debug_interval = 50  # Log every 50 loops (0.5s at 100Hz)
+
+        # GUI update timing
         self.last_gui_update = time.time()
         self.gui_update_count = 0
 
+        # Thread-safe queue for GUI updates (non-blocking control thread)
+        self.gui_state_queue = Queue(maxsize=1)
+        self.plot_state_queue = Queue(maxsize=1)
+
+        # Disable Start button until connected
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.setEnabled(False)
 
-        self.log("Hardware controller initialized (100Hz mode)")
+        self.log("LQR Hardware controller initialized (100Hz mode)")
+        self.log("Debug: Control values logged to console every 0.5s")
+        self.log("Optimizations: GC optimization, optimized baud rates")
 
     def _create_controller_param_widgets(self):
-        """Override to use hardware-specific defaults."""
+        """Override to use LQR-specific defaults."""
         self.param_definitions = [
-            ('kp', 'P (Proportional)', 1.0, 6),
-            ('ki', 'I (Integral)', 1.0, 6),
-            ('kd', 'D (Derivative)', 4.0, 5)
+            ('Q_pos', 'Q Position Weight', 1.0, 7),
+            ('Q_vel', 'Q Velocity Weight', 1.0, 5),
+            ('R', 'R Control Weight', 1.0, 5)
         ]
 
         self.controller_widgets = {
@@ -215,6 +182,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             {'type': 'configuration', 'args': {'use_offset_var': self.use_top_surface_offset}},
             {'type': 'kalman_filter',
              'args': {'kalman_filter': self.kalman_filter}},
+            {'type': 'plot_control',
+             'args': {'plot_enabled_var': self.plot_enabled,
+                      'plot_rate_var': self.plot_rate}},
         ]
 
         layout['columns'][1]['modules'] = [
@@ -223,7 +193,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                       'controller_widgets': self.controller_widgets}},
             {'type': 'servo_angles', 'args': {'show_actual': False}},
             {'type': 'platform_pose'},
-            {'type': 'controller_output', 'args': {'controller_name': 'PID (Hardware)'}},
+            {'type': 'controller_output', 'args': {'controller_name': 'LQR (Hardware)'}},
             {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
             {'type': 'debug_log', 'args': {'height': 8}},
         ]
@@ -241,38 +211,79 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'kalman_enable_change': self.on_kalman_enable_change,
             'kalman_param_change': self.on_kalman_param_change,
             'kalman_reset': self.on_kalman_reset,
+            'plot_enable_change': self.on_plot_enable_change,
+            'plot_rate_change': self.on_plot_rate_change,
         })
 
         return callbacks
 
     def _build_modular_gui(self):
-        """Override to add PID Kalman derivative option."""
+        """Override to add gain matrix button after GUI is built."""
         super()._build_modular_gui()
 
         if 'controller' in self.gui_modules:
-            from PyQt6.QtWidgets import QWidget, QHBoxLayout, QCheckBox, QLabel
-            from PyQt6.QtCore import Qt
+            from PyQt6.QtWidgets import QWidget, QHBoxLayout, QPushButton
 
             controller_frame = self.gui_modules['controller'].widget
             controller_layout = controller_frame.layout()
 
-            derivative_widget = QWidget()
-            derivative_layout = QHBoxLayout(derivative_widget)
-            derivative_layout.setContentsMargins(0, 10, 0, 0)
+            info_widget = QWidget()
+            info_layout = QHBoxLayout(info_widget)
+            info_layout.setContentsMargins(0, 10, 0, 0)
 
-            derivative_checkbox = QCheckBox("Use Kalman Velocity for Derivative")
-            derivative_checkbox.setChecked(self.use_kalman_derivative)
-            derivative_checkbox.stateChanged.connect(self._on_kalman_derivative_toggle)
-            derivative_layout.addWidget(derivative_checkbox)
+            gain_matrix_btn = QPushButton("Show Gain Matrix")
+            gain_matrix_btn.clicked.connect(self.show_gain_matrix)
+            gain_matrix_btn.setFixedWidth(150)
+            info_layout.addWidget(gain_matrix_btn)
+            info_layout.addStretch()
 
-            self.derivative_checkbox_ref = derivative_checkbox
+            controller_layout.addWidget(info_widget)
 
-            self.derivative_status = QLabel("[OFF]")
-            self.derivative_status.setStyleSheet(f"color: {self.colors['border']}; font-size: 10pt;")
-            derivative_layout.addWidget(self.derivative_status)
-            derivative_layout.addStretch()
+    def show_gain_matrix(self):
+        """Display LQR gain matrix in popup."""
+        if self.controller is None or not hasattr(self.controller, 'get_gain_matrix'):
+            QMessageBox.critical(self, "Error", "Controller not initialized")
+            return
 
-            controller_layout.addWidget(derivative_widget)
+        K = self.controller.get_gain_matrix()
+        if K is None:
+            QMessageBox.critical(self, "Error", "LQR gain matrix not computed")
+            return
+
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit
+
+        popup = QDialog(self)
+        popup.setWindowTitle("LQR Gain Matrix")
+        popup.setGeometry(100, 100, 500, 300)
+
+        layout = QVBoxLayout(popup)
+
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['fg']};
+                font-family: 'Consolas', monospace;
+                font-size: 9pt;
+            }}
+        """)
+
+        content = "LQR Gain Matrix K (2x4):\n"
+        content += "State: [x(m), y(m), vx(m/s), vy(m/s)]\n"
+        content += "Control: [ry(deg), rx(deg)]\n\n"
+        content += "K = [ry/state]\n"
+        content += f"    {K[0, :]}\n\n"
+        content += "K = [rx/state]\n"
+        content += f"    {K[1, :]}\n\n"
+        content += "Interpretation:\n"
+        content += f"- Position gain: {K[0, 0]:.4f} deg/(m error)\n"
+        content += f"- Velocity gain: {K[0, 2]:.4f} deg/(m/s)\n"
+
+        text_edit.setText(content)
+        layout.addWidget(text_edit)
+
+        popup.exec()
 
     def refresh_ports(self):
         """Refresh available serial ports."""
@@ -352,19 +363,20 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.log("Disconnected")
 
     def _initialize_controller(self):
-        """Initialize hardware PID controller."""
+        """Initialize LQR controller with parameters from widgets."""
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
-        ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
-        kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
+        Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+        Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+        R = self.controller_config.get_scaled_param('R', sliders, scalar_vars)
 
         self.controller = self.controller_config.create_controller(
-            kp=kp, ki=ki, kd=kd, output_limit=15.0
+            Q_pos=Q_pos, Q_vel=Q_vel, R=R, output_limit=15.0
         )
 
-        self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
+        self.controller_config.controller_ref = self.controller
+        self.log(f"LQR initialized: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
     def on_controller_param_change(self):
         """Update controller when parameters change."""
@@ -374,27 +386,20 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
-        ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
-        kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
+        Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+        Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+        R = self.controller_config.get_scaled_param('R', sliders, scalar_vars)
 
-        self.controller.set_gains(kp, ki, kd)
+        self.controller.set_weights(Q_pos=Q_pos, Q_vel=Q_vel, R=R)
 
         if self.controller_enabled:
-            self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
+            self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
     def on_kalman_enable_change(self, enabled):
         """Handle Kalman filter enable/disable."""
         self.kalman_enabled = enabled
         if enabled:
             self.kalman_filter.reset(self.ball_pos_mm)
-        else:
-            # Disable Kalman derivative if Kalman is disabled
-            if self.use_kalman_derivative:
-                self.use_kalman_derivative = False
-                if hasattr(self, 'derivative_checkbox_ref'):
-                    self.derivative_checkbox_ref.setChecked(False)
-                self._on_kalman_derivative_toggle()
         self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
 
     def on_kalman_param_change(self, param_name, value):
@@ -411,24 +416,12 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.kalman_filter.reset(self.ball_pos_mm)
         self.log("Kalman filter reset")
 
-    def _on_kalman_derivative_toggle(self):
-        """Handle PID derivative mode toggle."""
-        enabled = self.derivative_checkbox_ref.isChecked()
-        if enabled and not self.kalman_enabled:
-            # Can't use Kalman derivative without Kalman enabled
-            self.use_kalman_derivative = False
-            self.derivative_checkbox_ref.setChecked(False)
-            self.log("Enable Kalman filter first to use Kalman derivative")
-            return
+    def on_plot_enable_change(self, enabled):
+        self.log(f"Plot updates: {'ENABLED' if enabled else 'DISABLED'}")
 
-        self.use_kalman_derivative = enabled
-        mode = "Kalman velocity" if enabled else "finite difference"
-        self.log(f"PID derivative: {mode}")
-
-        if hasattr(self, 'derivative_status'):
-            self.derivative_status.setText("[ON]" if enabled else "[OFF]")
-            color = self.colors['success'] if enabled else self.colors['border']
-            self.derivative_status.setStyleSheet(f"color: {color}; font-size: 10pt;")
+    def on_plot_rate_change(self, rate):
+        self.plot_divisor = max(1, 100 // rate)  # Convert Hz to divisor
+        self.log(f"Plot rate: {rate} Hz")
 
     def start_simulation(self):
         """Start 100Hz hardware control thread."""
@@ -457,7 +450,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self._gui_update_loop()
 
     def _control_thread_func(self):
-        """Dedicated 100Hz control thread with detailed timing instrumentation."""
+        """Dedicated 100Hz control thread with LQR controller."""
         loop_interval = ControlLoopConfig.INTERVAL_S
         max_ik_time = ControlLoopConfig.IK_TIMEOUT_S
 
@@ -467,7 +460,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'pattern_calc': [],
             'kalman_predict': [],
             'kalman_update': [],
-            'pid_update': [],
+            'lqr_update': [],
             'ik_total': [],
             'serial_send': [],
             'sleep': []
@@ -479,6 +472,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         while self.simulation_running:
             loop_start = time.perf_counter()
 
+            # Read ball data
             t0 = time.perf_counter()
             ball_data = self.serial_controller.get_latest_ball_data()
             ball_read_time = (time.perf_counter() - t0) * 1000
@@ -491,8 +485,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 pixy_x = ball_data['x']
                 pixy_y = ball_data['y']
 
-                # Camera dimensions: 316×208 pixels, origin at top-left
-                # Invert Y so (0,0) moves to bottom-left, then center it
+                # Camera coordinate transformation
                 CAMERA_HEIGHT_PIXELS = 208.0
                 CAMERA_CENTER_X = 158.0
                 CAMERA_CENTER_Y = 104.0
@@ -519,7 +512,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             if self.kalman_enabled:
                 t_kalman_pred = time.perf_counter()
 
-                # Get platform angles from FK
+                # Get platform angles from FK (actual angles, not commanded)
                 if hasattr(self, 'last_fk_rotation'):
                     rx_deg = self.last_fk_rotation[0]
                     ry_deg = self.last_fk_rotation[1]
@@ -535,7 +528,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 timing_breakpoints['kalman_predict'].append(0.0)
 
             if self.controller_enabled and self.ball_detected:
-
                 if self.kalman_enabled:
                     t_kalman_upd = time.perf_counter()
                     self.kalman_filter.update(self.ball_pos_mm, self.simulation_time)
@@ -550,53 +542,38 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 else:
                     timing_breakpoints['kalman_update'].append(0.0)
                     ball_pos_mm = self.ball_pos_mm
-                    ball_vel_mm_s = (0.0, 0.0)
+                    ball_vel_mm_s = (0.0, 0.0)  # No velocity without Kalman
 
-                t2 = time.perf_counter()
+                # Calculate target from pattern
+                t3 = time.perf_counter()
                 pattern_time = self.simulation_time - self.pattern_start_time
                 target_x, target_y = self.current_pattern.get_position(pattern_time)
                 target_pos_mm = (target_x, target_y)
-                pattern_calc_time = (time.perf_counter() - t2) * 1000
+                pattern_calc_time = (time.perf_counter() - t3) * 1000
                 timing_breakpoints['pattern_calc'].append(pattern_calc_time)
 
-                t3 = time.perf_counter()
+                # LQR controller update
+                t4 = time.perf_counter()
+                rx, ry = self.controller.update(
+                    self.ball_pos_mm,
+                    ball_vel_mm_s,
+                    target_pos_mm
+                )
+                lqr_update_time = (time.perf_counter() - t4) * 1000
+                timing_breakpoints['lqr_update'].append(lqr_update_time)
 
-                if self.use_kalman_derivative and self.kalman_enabled:
-                    # Use Kalman velocity for derivative term
-                    error_x = ball_pos_mm[0] - target_pos_mm[0]
-                    error_y = ball_pos_mm[1] - target_pos_mm[1]
-
-                    error_dot_x = ball_vel_mm_s[0]
-                    error_dot_y = ball_vel_mm_s[1]
-
-                    # Manual PID computation
-                    output_x = (self.controller.kp * error_x +
-                                self.controller.ki * self.controller.integral_x +
-                                self.controller.kd * error_dot_x)
-                    output_y = (self.controller.kp * error_y +
-                                self.controller.ki * self.controller.integral_y +
-                                self.controller.kd * error_dot_y)
-
-                    # Update integrals
-                    self.controller.integral_x += error_x * loop_interval
-                    self.controller.integral_y += error_y * loop_interval
-
-                    # Apply limits
-                    output_x = np.clip(output_x, -MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG)
-                    output_y = np.clip(output_y, -MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG)
-
-                    rx = output_y
-                    ry = -output_x
-                else:
-                    # Standard PID (finite difference derivative)
-                    rx, ry = self.controller.update(ball_pos_mm, target_pos_mm, loop_interval)
-
-                pid_update_time = (time.perf_counter() - t3) * 1000
-                timing_breakpoints['pid_update'].append(pid_update_time)
+                # Debug logging (every 0.5s)
+                self.debug_counter += 1
+                if self.debug_counter >= self.debug_interval:
+                    self.debug_counter = 0
+                    print(f"[LQR] Pos:({self.ball_pos_mm[0]:.1f},{self.ball_pos_mm[1]:.1f})mm "
+                          f"Target:({target_pos_mm[0]:.1f},{target_pos_mm[1]:.1f})mm "
+                          f"Control:({rx:.2f},{ry:.2f})°")
 
                 self.dof_values['rx'] = rx
                 self.dof_values['ry'] = ry
 
+                # Inverse kinematics
                 start_ik = time.perf_counter()
 
                 self._translation_buffer[0] = self.dof_values['x']
@@ -636,6 +613,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 ik_total_time = (time.perf_counter() - start_ik) * 1000
                 timing_breakpoints['ik_total'].append(ik_total_time)
 
+                # Send to servos
                 if angles is not None:
                     if (self.last_sent_angles is None or
                             not np.allclose(angles, self.last_sent_angles,
@@ -663,12 +641,77 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             else:
                 timing_breakpoints['pattern_calc'].append(0.0)
                 timing_breakpoints['kalman_update'].append(0.0)
-                timing_breakpoints['pid_update'].append(0.0)
+                timing_breakpoints['lqr_update'].append(0.0)
                 timing_breakpoints['ik_total'].append(0.0)
                 timing_breakpoints['serial_send'].append(0.0)
 
             self.simulation_time += loop_interval
 
+            # Queue GUI state update (non-blocking)
+            if self.gui_update_count % 2 == 0:  # Update every other loop (50Hz)
+                gui_state = {
+                    'simulation_time': self.simulation_time,
+                    'controller_enabled': self.controller_enabled,
+                    'ball_pos': self.ball_pos_mm,
+                    'ball_vel': "Detected" if self.ball_detected else "Not detected",
+                    'dof_values': self.dof_values.copy(),
+                    'connected': self.connected,
+                    'fps': ControlLoopConfig.FREQUENCY_HZ,
+                    'cache_hit_rate': self.ik_cache.get_hit_rate(),
+                    'ik_timeouts': self.ik_timeout_count,
+                }
+
+                if self.controller_enabled:
+                    rx = self.dof_values['rx']
+                    ry = self.dof_values['ry']
+                    magnitude = np.sqrt(rx ** 2 + ry ** 2)
+                    magnitude_percent = (magnitude / 15.0) * 100
+
+                    pattern_time = self.simulation_time - self.pattern_start_time
+                    target_x, target_y = self.current_pattern.get_position(pattern_time)
+                    error_x = target_x - self.ball_pos_mm[0]
+                    error_y = target_y - self.ball_pos_mm[1]
+
+                    gui_state['controller_output'] = (rx, ry)
+                    gui_state['controller_magnitude'] = (magnitude, magnitude_percent)
+                    gui_state['controller_error'] = (error_x, error_y)
+
+                if self.last_sent_angles is not None:
+                    gui_state['cmd_angles'] = self.last_sent_angles
+
+                pattern_configs = {
+                    'static': "Tracking: Center (0, 0)",
+                    'circle': "Tracking: Circle (r=50mm, T=10s)",
+                    'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
+                    'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
+                }
+                gui_state['pattern_info'] = pattern_configs.get(self.pattern_type, "")
+
+                # Non-blocking queue put
+                try:
+                    self.gui_state_queue.put_nowait(gui_state)
+                except:
+                    pass  # Drop frame if GUI can't keep up
+
+            self.gui_update_count += 1
+
+            # Plot updates (controlled by toggle and rate)
+            if self.gui_update_count % self.plot_divisor == 0 and self.plot_enabled:
+                plot_state = {
+                    'ball_pos': self.ball_pos_mm,
+                    'ball_detected': self.ball_detected,
+                    'ball_history_x': list(self.ball_history_x[-20:]) if self.ball_history_x else [],
+                    'ball_history_y': list(self.ball_history_y[-20:]) if self.ball_history_y else [],
+                    'pattern_type': self.pattern_type,
+                    'pattern_time': self.simulation_time - self.pattern_start_time,
+                    'dof_values': (self.dof_values['rx'], self.dof_values['ry']),
+                }
+                try:
+                    self.plot_state_queue.put_nowait(plot_state)
+                except:
+                    self.plot_drops += 1
+
+            # Sleep to maintain 100Hz
             t_sleep = time.perf_counter()
             elapsed = time.perf_counter() - loop_start
 
@@ -682,100 +725,64 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 sleep_actual_time = (time.perf_counter() - t_sleep) * 1000
                 timing_breakpoints['sleep'].append(sleep_actual_time)
 
+            # Limit breakpoint history
             for key in timing_breakpoints:
                 if len(timing_breakpoints[key]) > max_breakpoint_samples:
                     timing_breakpoints[key].pop(0)
 
     def _gui_update_loop(self):
-        """Separate GUI update loop at lower frequency."""
+        """GUI update loop - pulls state from queue (main thread only)."""
         if not self.simulation_running:
             return
 
-        self.update_gui_modules()
+        # Get GUI state from queue
+        try:
+            state = self.gui_state_queue.get_nowait()
+            self.gui_builder.update_modules(state)
 
-        if self.gui_update_count % 2 == 0:
-            self._update_hardware_plot()
+            # Update Kalman filter GUI if enabled
+            if self.kalman_enabled and hasattr(self, 'kalman_filter'):
+                pos, vel, _ = self.kalman_filter.get_state()
+                std_pos = self.kalman_filter.get_position_uncertainty()
+                stats = self.kalman_filter.get_statistics()
 
-        self.gui_update_count += 1
+                kalman_state = {
+                    'kalman_position': pos,
+                    'kalman_velocity': vel,
+                    'kalman_uncertainty': std_pos,
+                    'kalman_stats': stats
+                }
+
+                if 'kalman_filter' in self.gui_modules:
+                    self.gui_modules['kalman_filter'].update(kalman_state)
+
+        except Empty:
+            pass  # No new state, skip update
+
+        # Get plot state from queue
+        try:
+            plot_state = self.plot_state_queue.get_nowait()
+            self._update_hardware_plot_from_state(plot_state)
+        except Empty:
+            pass  # No new plot data
 
         # Schedule next update using QTimer
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
-
-    def update_gui_modules(self):
-        """Override to add hardware-specific state."""
-        status = "Detected" if self.ball_detected else "Not detected"
-
-        state = {
-            'simulation_time': self.simulation_time,
-            'controller_enabled': self.controller_enabled,
-            'ball_pos': self.ball_pos_mm,
-            'ball_vel': status,
-            'dof_values': self.dof_values,
-            'connected': self.connected,
-            'fps': ControlLoopConfig.FREQUENCY_HZ,
-            'cache_hit_rate': self.ik_cache.get_hit_rate(),
-            'ik_timeouts': self.ik_timeout_count,
-        }
-
-        if self.controller_enabled:
-            rx = self.dof_values['rx']
-            ry = self.dof_values['ry']
-            magnitude = np.sqrt(rx ** 2 + ry ** 2)
-            magnitude_percent = (magnitude / 15.0) * 100
-
-            pattern_time = self.simulation_time - self.pattern_start_time
-            target_x, target_y = self.current_pattern.get_position(pattern_time)
-            error_x = target_x - self.ball_pos_mm[0]
-            error_y = target_y - self.ball_pos_mm[1]
-
-            state['controller_output'] = (rx, ry)
-            state['controller_magnitude'] = (magnitude, magnitude_percent)
-            state['controller_error'] = (error_x, error_y)
-
-        if self.last_sent_angles is not None:
-            state['cmd_angles'] = self.last_sent_angles
-
-        pattern_configs = {
-            'static': "Tracking: Center (0, 0)",
-            'circle': "Tracking: Circle (r=50mm, T=10s)",
-            'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
-            'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
-        }
-        state['pattern_info'] = pattern_configs.get(self.pattern_type, "")
-
-        self.gui_builder.update_modules(state)
-
-        if self.kalman_enabled and hasattr(self, 'kalman_filter'):
-            pos, vel, _ = self.kalman_filter.get_state()
-            std_pos = self.kalman_filter.get_position_uncertainty()
-            stats = self.kalman_filter.get_statistics()
-
-            kalman_state = {
-                'kalman_position': pos,
-                'kalman_velocity': vel,
-                'kalman_uncertainty': std_pos,
-                'kalman_stats': stats
-            }
-
-            if 'kalman_filter' in self.gui_modules:
-                self.gui_modules['kalman_filter'].update(kalman_state)
 
     def setup_plot(self):
         """Setup plot for hardware (using PyQtGraph)."""
         super().setup_plot()
         # PyQtGraph plot is set up in base class, no matplotlib needed
 
-    def _update_hardware_plot(self):
-        """Update plot with hardware data (using PyQtGraph)."""
-        # Plot updates are handled by base class update_plot() method
-        # Just call it with current state
+    def _update_hardware_plot_from_state(self, state):
+        """Update plot from queued state (PyQtGraph - simplified)."""
+        # Just call the base class update_plot method which uses PyQtGraph
         self.update_plot()
-
     def show_timing_stats(self):
         """Show performance statistics with detailed breakpoint analysis."""
         print("\n" + "=" * 70)
-        print("DETAILED TIMING BREAKDOWN")
+        print("LQR HARDWARE CONTROL - DETAILED TIMING BREAKDOWN")
         print("=" * 70 + "\n")
 
         if hasattr(self, 'timing_breakpoints') and self.timing_breakpoints:
@@ -783,7 +790,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 'ball_read': 'Ball Data Read (Queue)',
                 'ball_process': 'Ball Processing (Transform/History)',
                 'pattern_calc': 'Pattern Calculation',
-                'pid_update': 'PID Controller Update',
+                'lqr_update': 'LQR Controller Update',
                 'ik_total': 'IK Total (Cache+Calc)',
                 'serial_send': 'Serial Send',
                 'sleep': 'Sleep/Timing'
@@ -815,7 +822,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         print("=" * 70 + "\n")
 
-        stats_msg = "Performance Statistics (100Hz Hardware Mode)\n"
+        stats_msg = "Performance Statistics (LQR Hardware, 100Hz Mode)\n"
         stats_msg += "=" * 60 + "\n\n"
 
         if self.timing_stats['ik_time']:
@@ -886,7 +893,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if enabled:
             self.controller.reset()
             self.reset_pattern()
-            self.log("PID control ENABLED")
+            self.log("LQR control ENABLED")
 
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
@@ -896,7 +903,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 manual_pose.sliders['y'].setEnabled(False)
                 manual_pose.sliders['z'].setEnabled(False)
         else:
-            self.log("PID control DISABLED")
+            self.log("LQR control DISABLED")
 
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
@@ -906,9 +913,18 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 manual_pose.sliders['y'].setEnabled(True)
                 manual_pose.sliders['z'].setEnabled(True)
 
+    def reset_pattern(self):
+        """Reset pattern timing."""
+        self.pattern_start_time = self.simulation_time
+        self.current_pattern.reset()
+        self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
+
+        if self.controller_enabled.get():
+            self.controller.reset()
+
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Hardware controller update (not used - control thread handles it)."""
-        return self.controller.update(ball_pos_mm, target_pos_mm, dt)
+        return self.controller.update(ball_pos_mm, ball_vel_mm_s, target_pos_mm)
 
     def stop_simulation(self):
         """Stop the control thread."""
@@ -946,9 +962,10 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
 
 def main():
-    """Launch hardware controller."""
+    """Launch LQR hardware controller."""
     app = QApplication(sys.argv)
     simulator = HardwareStewartSimulator(app)
+
     simulator.show()
     sys.exit(app.exec())
 

@@ -10,7 +10,7 @@ PyQt6 implementation for high-performance rendering.
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                               QLabel, QPushButton, QSlider, QCheckBox, QComboBox,
                               QGroupBox, QTextEdit, QMessageBox)
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 import serial.tools.list_ports
 
