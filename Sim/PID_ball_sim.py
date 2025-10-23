@@ -11,8 +11,9 @@ Usage:
     python PID_ball_sim.py
 """
 
-import tkinter as tk
-from tkinter import ttk
+import sys
+from PyQt6.QtWidgets import QApplication, QWidget, QHBoxLayout, QCheckBox, QLabel
+from PyQt6.QtGui import QFont
 
 from setup.base_simulator import ControllerConfig, BaseStewartSimulator
 from core.control_core import PIDController, KalmanFilter
@@ -55,7 +56,7 @@ class PIDControllerConfig(ControllerConfig):
 class PIDStewartSimulator(BaseStewartSimulator):
     """PID-specific Stewart Platform Simulator with Kalman filter support."""
 
-    def __init__(self, root):
+    def __init__(self, app):
 
         # Ball physics parameters from centralized config
         ball_physics_params = BallPhysicsConfig.as_dict()
@@ -70,10 +71,10 @@ class PIDStewartSimulator(BaseStewartSimulator):
         self.kalman_enabled = False
 
         # PID-specific: Option to use Kalman velocity for derivative
-        self.use_kalman_derivative = tk.BooleanVar(value=False)
+        self.use_kalman_derivative = False
 
         config = PIDControllerConfig(mode='simulation')
-        super().__init__(root, config)
+        super().__init__(app, config)
 
     def get_layout_config(self):
         """Define GUI layout for PID simulator with Kalman filter."""
@@ -121,25 +122,29 @@ class PIDStewartSimulator(BaseStewartSimulator):
         super()._build_modular_gui()
 
         if 'controller' in self.gui_modules:
-            controller_frame = self.gui_modules['controller'].frame
+            controller_widget = self.gui_modules['controller'].widget
 
-            derivative_frame = ttk.Frame(controller_frame)
-            derivative_frame.pack(fill='x', pady=(10, 0))
+            derivative_widget = QWidget()
+            derivative_layout = QHBoxLayout()
+            derivative_layout.setContentsMargins(0, 10, 0, 0)
 
-            ttk.Checkbutton(
-                derivative_frame,
-                text="Use Kalman Velocity for Derivative",
-                variable=self.use_kalman_derivative,
-                command=self.on_kalman_derivative_toggle
-            ).pack(side='left')
+            self.kalman_deriv_checkbox = QCheckBox("Use Kalman Velocity for Derivative")
+            self.kalman_deriv_checkbox.setChecked(self.use_kalman_derivative)
+            self.kalman_deriv_checkbox.stateChanged.connect(self.on_kalman_derivative_toggle)
+            derivative_layout.addWidget(self.kalman_deriv_checkbox)
 
-            self.derivative_status = ttk.Label(
-                derivative_frame,
-                text="ⓘ",
-                foreground=self.colors['border'],
-                font=('Segoe UI', 10)
-            )
-            self.derivative_status.pack(side='left', padx=(10, 0))
+            self.derivative_status = QLabel("ⓘ")
+            font = QFont('Segoe UI', 10)
+            self.derivative_status.setFont(font)
+            self.derivative_status.setStyleSheet(f"color: {self.colors['border']};")
+            derivative_layout.addWidget(self.derivative_status)
+
+            derivative_layout.addStretch()
+            derivative_widget.setLayout(derivative_layout)
+
+            # Add to controller widget's layout
+            if hasattr(controller_widget, 'layout') and controller_widget.layout() is not None:
+                controller_widget.layout().addWidget(derivative_widget)
 
     def _initialize_controller(self):
         """Initialize PID controller with parameters from widgets."""
@@ -171,7 +176,7 @@ class PIDStewartSimulator(BaseStewartSimulator):
 
         self.controller.set_gains(kp, ki, kd)
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
     def on_kalman_enable_change(self, enabled):
@@ -184,8 +189,10 @@ class PIDStewartSimulator(BaseStewartSimulator):
             self.kalman_filter.reset((ball_x_mm, ball_y_mm))
         else:
             # Disable Kalman derivative if Kalman is disabled
-            if self.use_kalman_derivative.get():
-                self.use_kalman_derivative.set(False)
+            if self.use_kalman_derivative:
+                self.use_kalman_derivative = False
+                if hasattr(self, 'kalman_deriv_checkbox'):
+                    self.kalman_deriv_checkbox.setChecked(False)
                 self.on_kalman_derivative_toggle()
         self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
 
@@ -207,10 +214,14 @@ class PIDStewartSimulator(BaseStewartSimulator):
 
     def on_kalman_derivative_toggle(self):
         """Handle PID derivative mode toggle."""
-        enabled = self.use_kalman_derivative.get()
+        enabled = self.use_kalman_derivative if hasattr(self, 'kalman_deriv_checkbox') else self.kalman_deriv_checkbox.isChecked()
+        self.use_kalman_derivative = enabled
+
         if enabled and not self.kalman_enabled:
             # Can't use Kalman derivative without Kalman enabled
-            self.use_kalman_derivative.set(False)
+            self.use_kalman_derivative = False
+            if hasattr(self, 'kalman_deriv_checkbox'):
+                self.kalman_deriv_checkbox.setChecked(False)
             self.log("Enable Kalman filter first to use Kalman derivative")
             return
 
@@ -218,9 +229,9 @@ class PIDStewartSimulator(BaseStewartSimulator):
         self.log(f"PID derivative: {mode}")
 
         if hasattr(self, 'derivative_status'):
-            self.derivative_status.config(
-                text="✓" if enabled else "ⓘ",
-                foreground=self.colors['success'] if enabled else self.colors['border']
+            self.derivative_status.setText("✓" if enabled else "ⓘ")
+            self.derivative_status.setStyleSheet(
+                f"color: {self.colors['success'] if enabled else self.colors['border']};"
             )
 
     def update_gui_modules(self):
@@ -278,7 +289,7 @@ class PIDStewartSimulator(BaseStewartSimulator):
             filtered_vel = ball_vel_mm_s
 
         # PID control with optional Kalman derivative
-        if self.use_kalman_derivative.get() and self.kalman_enabled:
+        if self.use_kalman_derivative and self.kalman_enabled:
             # Use Kalman velocity for derivative term
             error_x = filtered_pos[0] - target_pos_mm[0]
             error_y = filtered_pos[1] - target_pos_mm[1]
@@ -314,33 +325,34 @@ class PIDStewartSimulator(BaseStewartSimulator):
 
 def main():
     """Launch PID Stewart Platform Simulator."""
-    root = tk.Tk()
-    app = PIDStewartSimulator(root)
+    app = QApplication(sys.argv)
+    simulator = PIDStewartSimulator(app)
 
-    app.log("=" * 50)
-    app.log("PID Ball Balancing Control - Ready")
-    app.log("=" * 50)
-    app.log("")
-    app.log("Quick Start:")
-    app.log("1. Click 'Enable PID Control' to activate automatic balancing")
-    app.log("2. Click 'Start' to begin simulation")
-    app.log("3. Use 'Push Ball' to test disturbance rejection")
-    app.log("4. Select different trajectory patterns to track")
-    app.log("5. Adjust pattern size/speed with sliders")
-    app.log("")
-    app.log("Kalman Filter:")
-    app.log("- Enable Kalman filter to smooth camera noise")
-    app.log("- Optionally use Kalman velocity for PID derivative")
-    app.log("- Tune process/measurement noise for best performance")
-    app.log("")
-    app.log("Tuning Tips:")
-    app.log("- Increase Kp for faster position correction")
-    app.log("- Increase Kd for more damping (reduce oscillation)")
-    app.log("- Increase Ki to eliminate steady-state error")
-    app.log("- Start with Ki=0 and tune Kp/Kd first")
-    app.log("")
+    simulator.log("=" * 50)
+    simulator.log("PID Ball Balancing Control - Ready")
+    simulator.log("=" * 50)
+    simulator.log("")
+    simulator.log("Quick Start:")
+    simulator.log("1. Click 'Enable PID Control' to activate automatic balancing")
+    simulator.log("2. Click 'Start' to begin simulation")
+    simulator.log("3. Use 'Push Ball' to test disturbance rejection")
+    simulator.log("4. Select different trajectory patterns to track")
+    simulator.log("5. Adjust pattern size/speed with sliders")
+    simulator.log("")
+    simulator.log("Kalman Filter:")
+    simulator.log("- Enable Kalman filter to smooth camera noise")
+    simulator.log("- Optionally use Kalman velocity for PID derivative")
+    simulator.log("- Tune process/measurement noise for best performance")
+    simulator.log("")
+    simulator.log("Tuning Tips:")
+    simulator.log("- Increase Kp for faster position correction")
+    simulator.log("- Increase Kd for more damping (reduce oscillation)")
+    simulator.log("- Increase Ki to eliminate steady-state error")
+    simulator.log("- Start with Ki=0 and tune Kp/Kd first")
+    simulator.log("")
 
-    root.mainloop()
+    simulator.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -3,16 +3,16 @@
 Stewart Platform Simulator - Modular Base Class
 
 Reusable simulator with pluggable controller support and modular GUI.
+PyQt6 + PyQtGraph implementation for high-performance rendering.
 """
 
-import tkinter as tk
-from tkinter import ttk
+from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QGroupBox, QGridLayout, QLabel, QSlider, QComboBox
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QFont
+import pyqtgraph as pg
 import numpy as np
 import torch
 import time
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Rectangle, Circle
 from abc import ABC, abstractmethod
 
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
@@ -45,74 +45,74 @@ class ControllerConfig(ABC):
 
     def get_scaled_param(self, param_name, sliders, scalar_vars):
         """Extract and scale a parameter value from widgets."""
-        raw = float(sliders[param_name].get())
-        scalar = self.get_scalar_values()[scalar_vars[param_name].get()]
+        raw = sliders[param_name].value() / 100.0  # QSlider uses integers
+        scalar = self.get_scalar_values()[scalar_vars[param_name]]
         return raw * scalar
 
-    def create_parameter_slider(self, parent, param_name, label, default,
+    def create_parameter_slider(self, parent_layout, param_name, label, default,
                                 sliders, value_labels, scalar_vars,
                                 on_change_callback):
         """Create standard parameter slider with scalar multiplier."""
-        frame = ttk.Frame(parent)
-        frame.pack(fill='x', pady=5)
+        grid = QGridLayout()
 
-        ttk.Label(frame, text=label, font=('Segoe UI', 9)).grid(
-            row=0, column=0, sticky='w', pady=2
-        )
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont('Segoe UI', 9))
+        grid.addWidget(label_widget, 0, 0, Qt.AlignmentFlag.AlignLeft)
 
-        slider = ttk.Scale(frame, from_=0.0, to=10.0, orient='horizontal')
-        slider.grid(row=0, column=1, sticky='ew', padx=10)
-        slider.set(default)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(0)
+        slider.setMaximum(1000)
+        slider.setValue(int(default * 100))
+        grid.addWidget(slider, 0, 1)
         sliders[param_name] = slider
 
-        value_label = ttk.Label(frame, text=f"{default:.2f}",
-                                width=6, font=('Consolas', 9))
-        value_label.grid(row=0, column=2)
+        value_label = QLabel(f"{default:.2f}")
+        value_label.setFont(QFont('Consolas', 9))
+        value_label.setMinimumWidth(60)
+        grid.addWidget(value_label, 0, 2)
         value_labels[param_name] = value_label
 
-        scalar_var = tk.IntVar(value=getattr(self, 'default_scalar_idx', 4))
-        scalar_vars[param_name] = scalar_var
+        scalar_combo = QComboBox()
+        scalar_combo.addItems([f'×{s:.7g}' for s in self.get_scalar_values()])
+        scalar_combo.setCurrentIndex(getattr(self, 'default_scalar_idx', 4))
+        scalar_combo.setMinimumWidth(120)
+        grid.addWidget(scalar_combo, 0, 3)
 
-        scalar_combo = ttk.Combobox(
-            frame, width=12, state='readonly',
-            values=[f'×{s:.7g}' for s in self.get_scalar_values()]
-        )
-        scalar_combo.grid(row=0, column=3, padx=(5, 0))
-        scalar_combo.current(scalar_var.get())
+        scalar_vars[param_name] = scalar_combo.currentIndex()
 
-        slider.config(command=lambda val, p=param_name:
-        self._on_slider_change(p, val, value_labels, on_change_callback))
-        scalar_combo.bind('<<ComboboxSelected>>',
-                          lambda e, c=scalar_combo, v=scalar_var, p=param_name:
-                          self._on_scalar_change(c, v, p, on_change_callback))
+        def on_slider_change(val):
+            value = val / 100.0
+            value_labels[param_name].setText(f"{value:.2f}")
+            on_change_callback()
 
-        frame.columnconfigure(1, weight=1)
+        def on_scalar_change(idx):
+            scalar_vars[param_name] = idx
+            on_change_callback()
 
-    def _on_slider_change(self, param_name, value, value_labels, callback):
-        val = float(value)
-        value_labels[param_name].config(text=f"{val:.2f}")
-        callback()
+        slider.valueChanged.connect(on_slider_change)
+        scalar_combo.currentIndexChanged.connect(on_scalar_change)
 
-    def _on_scalar_change(self, combo, var, param_name, callback):
-        var.set(combo.current())
-        callback()
+        grid.setColumnStretch(1, 1)
+
+        # Add to parent layout (now receives layout directly)
+        parent_layout.addLayout(grid)
 
 
-class BaseStewartSimulator:
+class BaseStewartSimulator(QMainWindow):
     """
     Base Stewart Platform Simulator with modular GUI.
 
     Subclasses define layout via get_layout_config().
     """
 
-    def __init__(self, root, controller_config: ControllerConfig):
-        self.root = root
+    def __init__(self, app, controller_config: ControllerConfig):
+        super().__init__()
+        self.app = app
         self.controller_config = controller_config
 
         controller_name = controller_config.get_controller_name()
-        self.root.title(f"Stewart Platform - {controller_name} Ball Balancing Control")
-        self.root.geometry("1400x900")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.setWindowTitle(f"Stewart Platform - {controller_name} Ball Balancing Control")
+        self.resize(1400, 900)
 
         self.colors = {
             'bg': '#1e1e1e',
@@ -128,7 +128,6 @@ class BaseStewartSimulator:
             'warning': '#ce9178'
         }
 
-        self.root.configure(bg=self.colors['bg'])
         self.setup_dark_theme()
 
         self.platform_params = {
@@ -168,10 +167,10 @@ class BaseStewartSimulator:
         self.camera_enabled = True
 
         self.controller = None
-        self.controller_enabled = tk.BooleanVar(value=False)
+        self.controller_enabled = False
 
         self.current_pattern = PatternFactory.create('static', x=0.0, y=0.0)
-        self.pattern_type = tk.StringVar(value='static')
+        self.pattern_type = 'static'
         self.pattern_start_time = 0.0
         self.pattern_params = {}
 
@@ -183,10 +182,9 @@ class BaseStewartSimulator:
         self.simulation_running = False
         self.simulation_time = 0.0
         self.last_update_time = None
-        self.update_rate_ms = SimulationConfig.UPDATE_RATE_MS
-        self.simulation_loop_id = None
+        self.update_rate_ms = 10  # 100 Hz target (10ms), more reliable than 2ms
 
-        self.use_top_surface_offset = tk.BooleanVar(value=True)
+        self.use_top_surface_offset = True
         self.dof_values = {
             'x': 0.0, 'y': 0.0, 'z': self.ik.home_height_top_surface,
             'rx': 0.0, 'ry': 0.0, 'rz': 0.0
@@ -212,71 +210,140 @@ class BaseStewartSimulator:
         self.last_fk_rotation = np.zeros(3)
 
         self.update_timer = None
+        self.simulation_timer = QTimer()
+        self.simulation_timer.timeout.connect(self.simulation_loop)
+
+        # Create central widget
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
 
         self._create_controller_param_widgets()
         self._build_modular_gui()
         self._initialize_controller()
 
     def setup_dark_theme(self):
-        """Configure ttk widgets for dark mode."""
-        style = ttk.Style()
-        style.theme_use('default')
-
-        style.configure('TFrame', background=self.colors['bg'])
-        style.configure('Card.TFrame', background=self.colors['panel_bg'], relief='flat')
-
-        style.configure('TLabelframe',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['fg'],
-                        borderwidth=1,
-                        relief='solid')
-        style.configure('TLabelframe.Label',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['highlight'],
-                        font=('Segoe UI', 9, 'bold'))
-
-        style.configure('TLabel',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['fg'],
-                        font=('Segoe UI', 9))
-
-        style.configure('TButton',
-                        background=self.colors['button_bg'],
-                        foreground=self.colors['button_fg'],
-                        borderwidth=0,
-                        focuscolor='none',
-                        font=('Segoe UI', 9))
-        style.map('TButton',
-                  background=[('active', self.colors['highlight']),
-                              ('pressed', '#005a9e')])
-
-        style.configure('TScale',
-                        background=self.colors['panel_bg'],
-                        troughcolor=self.colors['widget_bg'],
-                        borderwidth=0)
-
-        style.configure('TCheckbutton',
-                        background=self.colors['panel_bg'],
-                        foreground=self.colors['fg'],
-                        font=('Segoe UI', 9))
-
-        style.configure('TCombobox',
-                        fieldbackground=self.colors['widget_bg'],
-                        background=self.colors['button_bg'],
-                        foreground=self.colors['fg'],
-                        arrowcolor=self.colors['fg'],
-                        selectbackground=self.colors['highlight'],
-                        selectforeground=self.colors['button_fg'])
-        style.map('TCombobox',
-                  fieldbackground=[('readonly', self.colors['widget_bg'])],
-                  selectbackground=[('readonly', self.colors['widget_bg'])],
-                  foreground=[('readonly', self.colors['fg'])])
-
-        self.root.option_add('*TCombobox*Listbox.background', self.colors['widget_bg'])
-        self.root.option_add('*TCombobox*Listbox.foreground', self.colors['fg'])
-        self.root.option_add('*TCombobox*Listbox.selectBackground', self.colors['highlight'])
-        self.root.option_add('*TCombobox*Listbox.selectForeground', self.colors['button_fg'])
-        self.root.option_add('*TCombobox*Listbox.font', ('Segoe UI', 9))
+        """Configure PyQt6 dark theme using QSS."""
+        stylesheet = f"""
+            QMainWindow {{
+                background-color: {self.colors['bg']};
+            }}
+            QWidget {{
+                background-color: {self.colors['bg']};
+                color: {self.colors['fg']};
+            }}
+            QGroupBox {{
+                background-color: {self.colors['panel_bg']};
+                border: 1px solid {self.colors['border']};
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: {self.colors['highlight']};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{
+                color: {self.colors['fg']};
+            }}
+            QPushButton {{
+                background-color: {self.colors['button_bg']};
+                color: {self.colors['button_fg']};
+                border: none;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background-color: {self.colors['highlight']};
+            }}
+            QPushButton:pressed {{
+                background-color: #005a9e;
+            }}
+            QPushButton:disabled {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['border']};
+            }}
+            QSlider::groove:horizontal {{
+                background: {self.colors['widget_bg']};
+                height: 6px;
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {self.colors['highlight']};
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }}
+            QCheckBox {{
+                color: {self.colors['fg']};
+                spacing: 8px;
+                font-size: 10pt;
+            }}
+            QCheckBox::indicator {{
+                width: 20px;
+                height: 20px;
+                border: 2px solid {self.colors['border']};
+                border-radius: 4px;
+                background-color: {self.colors['widget_bg']};
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: {self.colors['highlight']};
+                background-color: {self.colors['panel_bg']};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {self.colors['highlight']};
+                border-color: {self.colors['highlight']};
+            }}
+            QCheckBox::indicator:checked:hover {{
+                background-color: #0088dd;
+                border-color: #0088dd;
+            }}
+            QComboBox {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['fg']};
+                border: 1px solid {self.colors['border']};
+                padding: 3px 5px;
+                border-radius: 3px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {self.colors['fg']};
+                margin-right: 5px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['fg']};
+                selection-background-color: {self.colors['highlight']};
+                selection-color: {self.colors['button_fg']};
+            }}
+            QTextEdit {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['fg']};
+                border: 1px solid {self.colors['border']};
+                border-radius: 3px;
+            }}
+            QScrollBar:vertical {{
+                background: {self.colors['widget_bg']};
+                width: 12px;
+                border-radius: 6px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {self.colors['border']};
+                border-radius: 6px;
+                min-height: 20px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """
+        self.app.setStyleSheet(stylesheet)
 
     def _create_controller_param_widgets(self):
         """Create controller parameter widgets."""
@@ -330,7 +397,7 @@ class BaseStewartSimulator:
         layout_config = self.get_layout_config()
         callbacks = self._create_callbacks()
 
-        self.gui_builder = GUIBuilder(self.root, module_registry)
+        self.gui_builder = GUIBuilder(self.central_widget, module_registry)
         self.gui_modules = self.gui_builder.build(layout_config, self.colors, callbacks)
 
         if 'plot_panel' in self.gui_modules:
@@ -360,7 +427,7 @@ class BaseStewartSimulator:
 
     def on_pattern_param_change(self, param_name, value):
         """Update pattern with new parameters."""
-        pattern_type = self.pattern_type.get()
+        pattern_type = self.pattern_type
 
         self.pattern_params[param_name] = value
 
@@ -397,111 +464,124 @@ class BaseStewartSimulator:
         raise NotImplementedError
 
     def _create_plot(self, parent):
-        """Create matplotlib plot."""
-        plot_frame = ttk.LabelFrame(parent, text="Ball Position (Top View)", padding=10)
-        plot_frame.pack(fill='both', expand=True)
+        """Create PyQtGraph plot."""
+        plot_group = QGroupBox("Ball Position (Top View)")
+        plot_layout = QVBoxLayout()
 
-        plt.style.use('dark_background')
-        self.fig, self.ax = plt.subplots(figsize=(6, 6), facecolor=self.colors['panel_bg'])
-        self.ax.set_facecolor(self.colors['widget_bg'])
+        # Create PyQtGraph plot widget
+        pg.setConfigOptions(antialias=True)
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground(self.colors['widget_bg'])
+        self.plot_widget.setMinimumSize(600, 600)
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
-        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        plot_layout.addWidget(self.plot_widget)
+        plot_group.setLayout(plot_layout)
+
+        # Add to parent layout
+        if hasattr(parent, 'layout') and parent.layout() is not None:
+            parent.layout().addWidget(plot_group)
 
         self.setup_plot()
 
     def setup_plot(self):
-        """Setup matplotlib plot."""
-        self.ax.clear()
-        self.ax.set_xlim(-120, 120)
-        self.ax.set_ylim(-120, 120)
-        self.ax.set_xlabel('X (mm)', color=self.colors['fg'], fontsize=10)
-        self.ax.set_ylabel('Y (mm)', color=self.colors['fg'], fontsize=10)
-        self.ax.set_title('Ball Position (Top View)', color=self.colors['fg'],
-                          fontsize=11, fontweight='bold')
-        self.ax.grid(True, alpha=0.2, linestyle='--', color=self.colors['fg'])
-        self.ax.set_aspect('equal')
-        self.ax.tick_params(colors=self.colors['fg'])
+        """Setup PyQtGraph plot."""
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.setXRange(-120, 120)
+        plot_item.setYRange(-120, 120)
+        plot_item.setLabel('bottom', 'X (mm)', color=self.colors['fg'])
+        plot_item.setLabel('left', 'Y (mm)', color=self.colors['fg'])
+        plot_item.setTitle('Ball Position (Top View)', color=self.colors['fg'])
+        plot_item.showGrid(x=True, y=True, alpha=0.2)
+        plot_item.setAspectLocked(True)
 
-        for spine in self.ax.spines.values():
-            spine.set_color(self.colors['border'])
+        # Platform boundary
+        self.platform_rect = pg.QtWidgets.QGraphicsRectItem(
+            -PLATFORM_HALF_SIZE_MM, -PLATFORM_HALF_SIZE_MM,
+            PLATFORM_HALF_SIZE_MM * 2, PLATFORM_HALF_SIZE_MM * 2
+        )
+        pen = pg.mkPen(color=self.colors['fg'], width=2, style=Qt.PenStyle.DashLine)
+        self.platform_rect.setPen(pen)
+        plot_item.addItem(self.platform_rect)
 
-        platform_square = Rectangle((-PLATFORM_HALF_SIZE_MM, -PLATFORM_HALF_SIZE_MM),
-                                    PLATFORM_HALF_SIZE_MM * 2, PLATFORM_HALF_SIZE_MM * 2,
-                                    fill=False,
-                                    edgecolor=self.colors['fg'],
-                                    linewidth=2,
-                                    linestyle='--',
-                                    label='Platform Edge',
-                                    alpha=0.5)
-        self.ax.add_patch(platform_square)
+        # Trajectory line
+        self.trajectory_line = plot_item.plot([], [], pen=pg.mkPen(color=self.colors['highlight'],
+                                                                     width=1, style=Qt.PenStyle.DashLine))
 
-        self.trajectory_line, = self.ax.plot([], [], '--', color=self.colors['highlight'],
-                                             alpha=0.3, linewidth=1, label='Trajectory')
-        self.target_marker, = self.ax.plot([0], [0], 'x', color=self.colors['success'],
-                                           markersize=10, markeredgewidth=2, label='Target')
+        # Target marker
+        self.target_marker = pg.ScatterPlotItem([0], [0], symbol='x', size=15,
+                                                 pen=pg.mkPen(color=self.colors['success'], width=2))
+        plot_item.addItem(self.target_marker)
 
-        self.ball_circle = Circle((0, 0), 3.0, color='#ff4444', alpha=0.8,
-                                  zorder=10, label='Ball')
-        self.ax.add_patch(self.ball_circle)
+        # Ball
+        self.ball_scatter = pg.ScatterPlotItem([0], [0], symbol='o', size=20,
+                                                pen=pg.mkPen(None),
+                                                brush=pg.mkBrush('#ff4444'))
+        plot_item.addItem(self.ball_scatter)
 
+        # Tilt arrow (will be added dynamically)
         self.tilt_arrow = None
-
-        legend = self.ax.legend(loc='upper right', fontsize=8,
-                                facecolor=self.colors['panel_bg'],
-                                edgecolor=self.colors['border'],
-                                labelcolor=self.colors['fg'])
-        legend.get_frame().set_alpha(0.9)
-
-        self.canvas.draw()
 
     def update_plot(self):
         """Update plot with current state."""
-        ball_x = self.ball_pos[0, 0].item() * 1000
-        ball_y = self.ball_pos[0, 1].item() * 1000
-        self.ball_circle.center = (ball_x, ball_y)
+        # Check if plot items still exist (window might be closing)
+        if not hasattr(self, 'ball_scatter') or self.ball_scatter is None:
+            return
 
-        if self.pattern_type.get() != 'static':
-            pattern_periods = {'circle': 10.0, 'figure8': 12.0, 'star': 15.0}
-            period = pattern_periods.get(self.pattern_type.get(), 10.0)
+        try:
+            ball_x = self.ball_pos[0, 0].item() * 1000
+            ball_y = self.ball_pos[0, 1].item() * 1000
+            self.ball_scatter.setData([ball_x], [ball_y])
+        except RuntimeError:
+            # Plot items have been deleted, stop trying to update
+            return
 
-            t_samples = np.linspace(0, period, 100)
-            path_x, path_y = [], []
-            for t in t_samples:
-                x, y = self.current_pattern.get_position(t)
-                path_x.append(x)
-                path_y.append(y)
+        try:
+            if self.pattern_type != 'static':
+                pattern_periods = {'circle': 10.0, 'figure8': 12.0, 'star': 15.0}
+                period = pattern_periods.get(self.pattern_type, 10.0)
 
-            self.trajectory_line.set_data(path_x, path_y)
+                t_samples = np.linspace(0, period, 100)
+                path_x, path_y = [], []
+                for t in t_samples:
+                    x, y = self.current_pattern.get_position(t)
+                    path_x.append(x)
+                    path_y.append(y)
 
-            pattern_time = self.simulation_time - self.pattern_start_time
-            target_x, target_y = self.current_pattern.get_position(pattern_time)
-            self.target_marker.set_data([target_x], [target_y])
-        else:
-            self.trajectory_line.set_data([], [])
-            self.target_marker.set_data([0], [0])
+                self.trajectory_line.setData(path_x, path_y)
 
-        if self.tilt_arrow is not None:
-            self.tilt_arrow.remove()
-            self.tilt_arrow = None
+                pattern_time = self.simulation_time - self.pattern_start_time
+                target_x, target_y = self.current_pattern.get_position(pattern_time)
+                self.target_marker.setData([target_x], [target_y])
+            else:
+                self.trajectory_line.setData([], [])
+                self.target_marker.setData([0], [0])
 
-        rx = self.dof_values['rx']
-        ry = self.dof_values['ry']
+            # Update tilt arrow
+            if self.tilt_arrow is not None:
+                self.plot_widget.getPlotItem().removeItem(self.tilt_arrow)
+                self.tilt_arrow = None
 
-        if abs(rx) > 0.5 or abs(ry) > 0.5:
-            dx = -np.sin(np.radians(ry))
-            dy = -np.sin(np.radians(rx))
-            magnitude = np.sqrt(dx ** 2 + dy ** 2)
+            rx = self.dof_values['rx']
+            ry = self.dof_values['ry']
 
-            if magnitude > 0:
-                dx = (dx / magnitude) * 30
-                dy = (dy / magnitude) * 30
-                color = self.colors['success'] if self.controller_enabled.get() else self.colors['highlight']
-                self.tilt_arrow = self.ax.arrow(0, 0, dx, dy, head_width=8, head_length=10,
-                                                fc=color, ec=color,
-                                                alpha=0.6, linewidth=2, zorder=5)
+            if abs(rx) > 0.5 or abs(ry) > 0.5:
+                dx = -np.sin(np.radians(ry))
+                dy = -np.sin(np.radians(rx))
+                magnitude = np.sqrt(dx ** 2 + dy ** 2)
 
-        self.canvas.draw_idle()
+                if magnitude > 0:
+                    dx = (dx / magnitude) * 30
+                    dy = (dy / magnitude) * 30
+                    color = self.colors['success'] if self.controller_enabled else self.colors['highlight']
+
+                    self.tilt_arrow = pg.ArrowItem(angle=np.degrees(np.arctan2(dy, dx)),
+                                                    tipAngle=30, headLen=15, tailLen=25,
+                                                    pen=pg.mkPen(color), brush=pg.mkBrush(color))
+                    self.tilt_arrow.setPos(0, 0)
+                    self.plot_widget.getPlotItem().addItem(self.tilt_arrow)
+        except RuntimeError:
+            # Plot items deleted during update, skip
+            pass
 
     def log(self, message):
         """Add message to debug log."""
@@ -517,7 +597,7 @@ class BaseStewartSimulator:
 
         state = {
             'simulation_time': self.simulation_time,
-            'controller_enabled': self.controller_enabled.get(),
+            'controller_enabled': self.controller_enabled,
             'ball_pos': (ball_x_mm, ball_y_mm),
             'ball_vel': (vel_x_mm, vel_y_mm),
             'dof_values': self.dof_values,
@@ -527,7 +607,7 @@ class BaseStewartSimulator:
             'fk_rotation': self.last_fk_rotation,
         }
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
             magnitude = np.sqrt(rx ** 2 + ry ** 2)
@@ -553,13 +633,15 @@ class BaseStewartSimulator:
             'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
             'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
         }
-        state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
+        state['pattern_info'] = pattern_configs.get(self.pattern_type, "")
 
         self.gui_builder.update_modules(state)
 
     def on_controller_toggle(self):
         """Handle controller enable/disable."""
-        enabled = self.controller_enabled.get()
+        # Toggle the state
+        self.controller_enabled = not self.controller_enabled
+        enabled = self.controller_enabled
 
         if enabled:
             self.controller.reset()
@@ -570,8 +652,8 @@ class BaseStewartSimulator:
 
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
-                manual_pose.sliders['rx'].config(state='disabled')
-                manual_pose.sliders['ry'].config(state='disabled')
+                manual_pose.sliders['rx'].setEnabled(False)
+                manual_pose.sliders['ry'].setEnabled(False)
 
             self.dof_values['rx'] = 0.0
             self.dof_values['ry'] = 0.0
@@ -583,12 +665,15 @@ class BaseStewartSimulator:
 
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
-                manual_pose.sliders['rx'].config(state='normal')
-                manual_pose.sliders['ry'].config(state='normal')
+                manual_pose.sliders['rx'].setEnabled(True)
+                manual_pose.sliders['ry'].setEnabled(True)
 
-    def on_pattern_change(self, event=None):
+    def on_pattern_change(self, pattern_type=None):
         """Handle pattern selection change."""
-        pattern_type = self.pattern_type.get()
+        if pattern_type is not None:
+            self.pattern_type = pattern_type
+        else:
+            pattern_type = self.pattern_type
 
         self.pattern_params.clear()
 
@@ -617,19 +702,19 @@ class BaseStewartSimulator:
         self.current_pattern.reset()
         self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.controller.reset()
 
     def reset_ball(self):
         """Reset ball to center."""
-        home_z = self.ik.home_height_top_surface if self.use_top_surface_offset.get() else self.ik.home_height
+        home_z = self.ik.home_height_top_surface if self.use_top_surface_offset else self.ik.home_height
         ball_start_height = (home_z / 1000) + self.ball_physics.radius
 
         self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
         self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
         self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.controller.reset()
 
         self.update_plot()
@@ -644,7 +729,9 @@ class BaseStewartSimulator:
 
     def on_offset_toggle(self):
         """Handle top surface offset toggle."""
-        enabled = self.use_top_surface_offset.get()
+        # Toggle the state
+        self.use_top_surface_offset = not self.use_top_surface_offset
+        enabled = self.use_top_surface_offset
         home_z = self.ik.home_height_top_surface if enabled else self.ik.home_height
 
         if 'manual_pose' in self.gui_modules:
@@ -653,7 +740,10 @@ class BaseStewartSimulator:
             new_config = (home_z - 30, home_z + 30, z_config[2], home_z, z_config[4])
             self.dof_config['z'] = new_config
 
-            manual_pose.sliders['z'].config(from_=home_z - 30, to=home_z + 30)
+            slider = manual_pose.sliders['z']
+            res = z_config[2]
+            slider.setMinimum(int((home_z - 30) / res))
+            slider.setMaximum(int((home_z + 30) / res))
 
         self.dof_values['z'] = home_z
 
@@ -667,8 +757,25 @@ class BaseStewartSimulator:
         self.dof_values[dof] = val
 
         if self.update_timer is not None:
-            self.root.after_cancel(self.update_timer)
-        self.update_timer = self.root.after(50, self.calculate_ik)
+            self.update_timer.stop()
+        self.update_timer = QTimer()
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.calculate_ik)
+        self.update_timer.start(50)
+
+    def on_camera_enable_change(self, enabled):
+        """Handle camera enable/disable."""
+        self.camera_enabled = enabled
+        self.log(f"Camera noise: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_camera_param_change(self, param_name, value):
+        """Handle camera parameter change."""
+        self.log(f"Camera {param_name}: {value}")
+
+    def on_camera_reset(self):
+        """Handle camera reset."""
+        self.pixy_camera.reset()
+        self.log("Camera reset")
 
     def calculate_ik(self):
         """Calculate inverse kinematics for current pose."""
@@ -682,14 +789,14 @@ class BaseStewartSimulator:
             MAX_TILT_ANGLE_DEG
         )
 
-        if tilt_mag > MAX_TILT_ANGLE_DEG and not self.controller_enabled.get():
+        if tilt_mag > MAX_TILT_ANGLE_DEG and not self.controller_enabled:
             self.dof_values['rx'] = rx_limited
             self.dof_values['ry'] = ry_limited
 
         rotation = np.array([rx_limited, ry_limited, self.dof_values['rz']])
 
         angles = self.ik.calculate_servo_angles(translation, rotation,
-                                                self.use_top_surface_offset.get())
+                                                self.use_top_surface_offset)
 
         if angles is not None:
             self.last_cmd_angles = angles
@@ -705,23 +812,20 @@ class BaseStewartSimulator:
 
         if 'simulation_control' in self.gui_modules:
             sim_ctrl = self.gui_modules['simulation_control']
-            sim_ctrl.start_btn.config(state='disabled')
-            sim_ctrl.stop_btn.config(state='normal')
+            sim_ctrl.start_btn.setEnabled(False)
+            sim_ctrl.stop_btn.setEnabled(True)
 
-        self.simulation_loop()
+        self.simulation_timer.start(self.update_rate_ms)
 
     def stop_simulation(self):
         """Stop simulation loop."""
         self.simulation_running = False
-
-        if self.simulation_loop_id is not None:
-            self.root.after_cancel(self.simulation_loop_id)
-            self.simulation_loop_id = None
+        self.simulation_timer.stop()
 
         if 'simulation_control' in self.gui_modules:
             sim_ctrl = self.gui_modules['simulation_control']
-            sim_ctrl.start_btn.config(state='normal')
-            sim_ctrl.stop_btn.config(state='disabled')
+            sim_ctrl.start_btn.setEnabled(True)
+            sim_ctrl.stop_btn.setEnabled(False)
 
         self.log("Simulation stopped")
 
@@ -739,7 +843,7 @@ class BaseStewartSimulator:
 
         for dof, (_, _, _, default, _) in self.dof_config.items():
             if dof == 'z':
-                home_z = (self.ik.home_height_top_surface if self.use_top_surface_offset.get()
+                home_z = (self.ik.home_height_top_surface if self.use_top_surface_offset
                           else self.ik.home_height)
                 self.dof_values[dof] = home_z
             else:
@@ -747,7 +851,7 @@ class BaseStewartSimulator:
 
         self.reset_ball()
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.controller.reset()
 
         self.log("Simulation reset")
@@ -758,15 +862,22 @@ class BaseStewartSimulator:
     def simulation_loop(self):
         """Main simulation update loop."""
         if not self.simulation_running:
-            self.simulation_loop_id = None
+            return
+
+        # Safety check: stop if window is closing
+        if not self.isVisible():
+            self.simulation_running = False
             return
 
         current_time = time.time()
         if self.last_update_time is not None:
-            dt = SimulationConfig.UPDATE_RATE_MS / 1000.0
+            # Use actual elapsed time for real-time simulation
+            dt = current_time - self.last_update_time
+            # Cap dt to prevent huge jumps if timer was delayed
+            dt = min(dt, 0.1)  # Max 100ms per step
             self.simulation_time += dt
 
-            if self.controller_enabled.get():
+            if self.controller_enabled:
                 try:
                     # Get true ball position
                     ball_x_mm_true = self.ball_pos[0, 0].item() * 1000
@@ -835,7 +946,7 @@ class BaseStewartSimulator:
                     rotation = np.array([rx, ry, self.dof_values['rz']])
 
                     angles = self.ik.calculate_servo_angles(translation, rotation,
-                                                            self.use_top_surface_offset.get())
+                                                            self.use_top_surface_offset)
 
                     if angles is not None:
                         self.last_cmd_angles = angles
@@ -854,7 +965,7 @@ class BaseStewartSimulator:
                         str(e)
                     )
                     self.log(f"{controller_name} error:\n{error_msg}")
-                    self.controller_enabled.set(False)
+                    self.controller_enabled = False
                     self.on_controller_toggle()
 
             for servo in self.servos:
@@ -863,7 +974,7 @@ class BaseStewartSimulator:
             actual_angles = np.array([servo.get_angle() for servo in self.servos])
 
             translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
-                actual_angles, use_top_surface_offset=self.use_top_surface_offset.get()
+                actual_angles, use_top_surface_offset=self.use_top_surface_offset
             )
 
             if success:
@@ -915,7 +1026,6 @@ class BaseStewartSimulator:
             self.update_plot()
 
         self.last_update_time = current_time
-        self.simulation_loop_id = self.root.after(self.update_rate_ms, self.simulation_loop)
 
     @abstractmethod
     def _initialize_controller(self):
@@ -931,45 +1041,26 @@ class BaseStewartSimulator:
         """Callback when controller parameters change."""
         pass
 
-    def on_closing(self):
+    def closeEvent(self, event):
         """Clean shutdown when window is closed."""
+        # Stop simulation first
         self.simulation_running = False
 
-        if self.simulation_loop_id is not None:
-            try:
-                self.root.after_cancel(self.simulation_loop_id)
-                self.simulation_loop_id = None
-            except:
-                pass
+        # Stop all timers
+        if hasattr(self, 'simulation_timer'):
+            self.simulation_timer.stop()
 
-        if self.update_timer is not None:
-            try:
-                self.root.after_cancel(self.update_timer)
-            except:
-                pass
+        if hasattr(self, 'update_timer') and self.update_timer is not None:
+            self.update_timer.stop()
 
-        try:
-            self.root.quit()
-            self.root.destroy()
-        except:
-            pass
+        # Clear plot references to prevent access after deletion
+        if hasattr(self, 'ball_scatter'):
+            self.ball_scatter = None
+        if hasattr(self, 'trajectory_line'):
+            self.trajectory_line = None
+        if hasattr(self, 'target_marker'):
+            self.target_marker = None
+        if hasattr(self, 'tilt_arrow'):
+            self.tilt_arrow = None
 
-    def on_camera_enable_change(self, enabled):
-        """Handle camera enable/disable."""
-        self.camera_enabled = enabled
-        self.log(f"Camera noise: {'ENABLED' if enabled else 'DISABLED'}")
-
-    def on_camera_param_change(self, param_name, value):
-        """Handle camera parameter change."""
-        param_labels = {
-            'pixel_size': 'Pixel size',
-            'noise_std': 'Noise std',
-            'detection_rate': 'Detection rate',
-            'sample_rate': 'Sample rate'
-        }
-        label = param_labels.get(param_name, param_name)
-        self.log(f"Camera {label}: {value:.3f}")
-
-    def on_camera_reset(self):
-        """Handle camera reset."""
-        self.log("Camera reset")
+        event.accept()

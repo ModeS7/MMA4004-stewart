@@ -12,8 +12,8 @@ Features:
 - Windows timer resolution + Pre-allocated NumPy arrays
 """
 
-import tkinter as tk
-from tkinter import messagebox, ttk
+import sys
+from PyQt6.QtWidgets import QApplication, QMessageBox
 import numpy as np
 import time
 import threading
@@ -114,8 +114,8 @@ class ThreadPriorityManager:
 class HardwareStewartSimulator(BaseStewartSimulator):
     """Hardware-specific Stewart Platform Simulator with modular GUI."""
 
-    def __init__(self, root):
-        self.port_var = tk.StringVar()
+    def __init__(self, app):
+        self.port_var = ''
         config = HardwareControllerConfig()
 
         ball_physics_params = {
@@ -134,11 +134,11 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.kalman_enabled = False
 
         # PID-specific: Option to use Kalman velocity for derivative
-        self.use_kalman_derivative = tk.BooleanVar(value=False)
+        self.use_kalman_derivative = False
 
-        super().__init__(root, config)
+        super().__init__(app, config)
 
-        self.root.title("Stewart Platform - Real Hardware Control (100Hz)")
+        self.setWindowTitle("Stewart Platform - Real Hardware Control (100Hz)")
 
         self.serial_controller = None
         self.connected = False
@@ -182,7 +182,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.gui_update_count = 0
 
         if 'simulation_control' in self.gui_modules:
-            self.gui_modules['simulation_control'].start_btn.config(state='disabled')
+            self.gui_modules['simulation_control'].start_btn.setEnabled(False)
 
         self.log("Hardware controller initialized (100Hz mode)")
 
@@ -203,28 +203,28 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         }
 
     def get_layout_config(self):
-        """Define hardware-specific GUI layout with scrollable columns."""
+        """Define hardware-specific GUI layout (matches simulation layout)."""
         layout = create_standard_layout(scrollable_columns=False, include_plot=True)
 
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
             {'type': 'serial_connection', 'args': {'port_var': self.port_var}},
             {'type': 'simulation_control'},
-            {'type': 'controller',
-             'args': {'controller_config': self.controller_config,
-                      'controller_widgets': self.controller_widgets}},
             {'type': 'trajectory_pattern', 'args': {'pattern_var': self.pattern_type}},
             {'type': 'ball_state'},
             {'type': 'configuration', 'args': {'use_offset_var': self.use_top_surface_offset}},
+            {'type': 'kalman_filter',
+             'args': {'kalman_filter': self.kalman_filter}},
         ]
 
         layout['columns'][1]['modules'] = [
+            {'type': 'controller',
+             'args': {'controller_config': self.controller_config,
+                      'controller_widgets': self.controller_widgets}},
             {'type': 'servo_angles', 'args': {'show_actual': False}},
             {'type': 'platform_pose'},
             {'type': 'controller_output', 'args': {'controller_name': 'PID (Hardware)'}},
             {'type': 'manual_pose', 'args': {'dof_config': self.dof_config}},
-            {'type': 'kalman_filter',
-             'args': {'kalman_filter': self.kalman_filter}},
             {'type': 'debug_log', 'args': {'height': 8}},
         ]
 
@@ -250,25 +250,29 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         super()._build_modular_gui()
 
         if 'controller' in self.gui_modules:
-            controller_frame = self.gui_modules['controller'].frame
+            from PyQt6.QtWidgets import QWidget, QHBoxLayout, QCheckBox, QLabel
+            from PyQt6.QtCore import Qt
 
-            derivative_frame = ttk.Frame(controller_frame)
-            derivative_frame.pack(fill='x', pady=(10, 0))
+            controller_frame = self.gui_modules['controller'].widget
+            controller_layout = controller_frame.layout()
 
-            ttk.Checkbutton(
-                derivative_frame,
-                text="Use Kalman Velocity for Derivative",
-                variable=self.use_kalman_derivative,
-                command=self.on_kalman_derivative_toggle
-            ).pack(side='left')
+            derivative_widget = QWidget()
+            derivative_layout = QHBoxLayout(derivative_widget)
+            derivative_layout.setContentsMargins(0, 10, 0, 0)
 
-            self.derivative_status = ttk.Label(
-                derivative_frame,
-                text="ⓘ",
-                foreground=self.colors['border'],
-                font=('Segoe UI', 10)
-            )
-            self.derivative_status.pack(side='left', padx=(10, 0))
+            derivative_checkbox = QCheckBox("Use Kalman Velocity for Derivative")
+            derivative_checkbox.setChecked(self.use_kalman_derivative)
+            derivative_checkbox.stateChanged.connect(self._on_kalman_derivative_toggle)
+            derivative_layout.addWidget(derivative_checkbox)
+
+            self.derivative_checkbox_ref = derivative_checkbox
+
+            self.derivative_status = QLabel("ⓘ")
+            self.derivative_status.setStyleSheet(f"color: {self.colors['border']}; font-size: 10pt;")
+            derivative_layout.addWidget(self.derivative_status)
+            derivative_layout.addStretch()
+
+            controller_layout.addWidget(derivative_widget)
 
     def refresh_ports(self):
         """Refresh available serial ports."""
@@ -290,7 +294,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
                 angles = self.ik.calculate_servo_angles(
                     translation, rotation,
-                    self.use_top_surface_offset.get()
+                    self.use_top_surface_offset
                 )
 
                 if angles is not None:
@@ -302,9 +306,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def connect_serial(self):
         """Connect to hardware."""
-        port = self.port_var.get()
+        port = self.port_var
         if not port:
-            messagebox.showerror("Error", "No port selected")
+            QMessageBox.critical(self, "Error", "No port selected")
             return
 
         self.serial_controller = SerialController(port)
@@ -327,9 +331,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.prewarm_ik_cache()
 
             if 'simulation_control' in self.gui_modules:
-                self.gui_modules['simulation_control'].start_btn.config(state='normal')
+                self.gui_modules['simulation_control'].start_btn.setEnabled(True)
         else:
-            messagebox.showerror("Error", message)
+            QMessageBox.critical(self, "Error", message)
             self.log(f"Error: {message}")
 
     def disconnect_serial(self):
@@ -343,7 +347,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.connected = False
 
         if 'simulation_control' in self.gui_modules:
-            self.gui_modules['simulation_control'].start_btn.config(state='disabled')
+            self.gui_modules['simulation_control'].start_btn.setEnabled(False)
 
         self.log("Disconnected")
 
@@ -376,7 +380,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         self.controller.set_gains(kp, ki, kd)
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.log(f"PID gains updated: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
     def on_kalman_enable_change(self, enabled):
@@ -386,9 +390,11 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.kalman_filter.reset(self.ball_pos_mm)
         else:
             # Disable Kalman derivative if Kalman is disabled
-            if self.use_kalman_derivative.get():
-                self.use_kalman_derivative.set(False)
-                self.on_kalman_derivative_toggle()
+            if self.use_kalman_derivative:
+                self.use_kalman_derivative = False
+                if hasattr(self, 'derivative_checkbox_ref'):
+                    self.derivative_checkbox_ref.setChecked(False)
+                self._on_kalman_derivative_toggle()
         self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
 
     def on_kalman_param_change(self, param_name, value):
@@ -405,23 +411,24 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.kalman_filter.reset(self.ball_pos_mm)
         self.log("Kalman filter reset")
 
-    def on_kalman_derivative_toggle(self):
+    def _on_kalman_derivative_toggle(self):
         """Handle PID derivative mode toggle."""
-        enabled = self.use_kalman_derivative.get()
+        enabled = self.derivative_checkbox_ref.isChecked()
         if enabled and not self.kalman_enabled:
             # Can't use Kalman derivative without Kalman enabled
-            self.use_kalman_derivative.set(False)
+            self.use_kalman_derivative = False
+            self.derivative_checkbox_ref.setChecked(False)
             self.log("Enable Kalman filter first to use Kalman derivative")
             return
 
+        self.use_kalman_derivative = enabled
         mode = "Kalman velocity" if enabled else "finite difference"
         self.log(f"PID derivative: {mode}")
 
         if hasattr(self, 'derivative_status'):
-            self.derivative_status.config(
-                text="✓" if enabled else "ⓘ",
-                foreground=self.colors['success'] if enabled else self.colors['border']
-            )
+            self.derivative_status.setText("✓" if enabled else "ⓘ")
+            color = self.colors['success'] if enabled else self.colors['border']
+            self.derivative_status.setStyleSheet(f"color: {color}; font-size: 10pt;")
 
     def start_simulation(self):
         """Start 100Hz hardware control thread."""
@@ -527,7 +534,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             else:
                 timing_breakpoints['kalman_predict'].append(0.0)
 
-            if self.controller_enabled.get() and self.ball_detected:
+            if self.controller_enabled and self.ball_detected:
 
                 if self.kalman_enabled:
                     t_kalman_upd = time.perf_counter()
@@ -554,7 +561,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
                 t3 = time.perf_counter()
 
-                if self.use_kalman_derivative.get() and self.kalman_enabled:
+                if self.use_kalman_derivative and self.kalman_enabled:
                     # Use Kalman velocity for derivative term
                     error_x = ball_pos_mm[0] - target_pos_mm[0]
                     error_y = ball_pos_mm[1] - target_pos_mm[1]
@@ -606,7 +613,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     angles = self.ik.calculate_servo_angles(
                         self._translation_buffer,
                         self._rotation_buffer,
-                        self.use_top_surface_offset.get()
+                        self.use_top_surface_offset
                     )
 
                     ik_time = time.perf_counter() - start_ik
@@ -691,7 +698,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         self.gui_update_count += 1
 
-        self.root.after(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
+        # Schedule next update using QTimer
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
 
     def update_gui_modules(self):
         """Override to add hardware-specific state."""
@@ -699,7 +708,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         state = {
             'simulation_time': self.simulation_time,
-            'controller_enabled': self.controller_enabled.get(),
+            'controller_enabled': self.controller_enabled,
             'ball_pos': self.ball_pos_mm,
             'ball_vel': status,
             'dof_values': self.dof_values,
@@ -709,7 +718,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'ik_timeouts': self.ik_timeout_count,
         }
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             rx = self.dof_values['rx']
             ry = self.dof_values['ry']
             magnitude = np.sqrt(rx ** 2 + ry ** 2)
@@ -733,7 +742,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
             'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
         }
-        state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
+        state['pattern_info'] = pattern_configs.get(self.pattern_type, "")
 
         self.gui_builder.update_modules(state)
 
@@ -753,61 +762,15 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 self.gui_modules['kalman_filter'].update(kalman_state)
 
     def setup_plot(self):
-        """Setup plot for hardware."""
+        """Setup plot for hardware (using PyQtGraph)."""
         super().setup_plot()
-
-        self.ball_trail, = self.ax.plot([], [], 'r-', alpha=0.3, linewidth=1,
-                                        label='Ball Trail')
-
-        legend = self.ax.legend(loc='upper right', fontsize=8,
-                                facecolor=self.colors['panel_bg'],
-                                edgecolor=self.colors['border'],
-                                labelcolor=self.colors['fg'])
-        legend.get_frame().set_alpha(0.9)
-
-        self.canvas.draw()
+        # PyQtGraph plot is set up in base class, no matplotlib needed
 
     def _update_hardware_plot(self):
-        """Update plot with hardware data."""
-        try:
-            if self.ball_detected:
-                self.ball_circle.center = self.ball_pos_mm
-                self.ball_circle.set_alpha(0.8)
-            else:
-                self.ball_circle.set_alpha(0.2)
-
-            if len(self.ball_history_x) > 1:
-                self.ball_trail.set_data(self.ball_history_x, self.ball_history_y)
-
-            if self.pattern_type.get() != 'static':
-                pattern_time = self.simulation_time - self.pattern_start_time
-                target_x, target_y = self.current_pattern.get_position(pattern_time)
-                self.target_marker.set_data([target_x], [target_y])
-
-            if self.tilt_arrow is not None:
-                self.tilt_arrow.remove()
-                self.tilt_arrow = None
-
-            rx = self.dof_values['rx']
-            ry = self.dof_values['ry']
-
-            if abs(rx) > 0.5 or abs(ry) > 0.5:
-                dx = -np.sin(np.radians(ry))
-                dy = -np.sin(np.radians(rx))
-                magnitude = np.sqrt(dx ** 2 + dy ** 2)
-
-                if magnitude > 0:
-                    dx = (dx / magnitude) * 30
-                    dy = (dy / magnitude) * 30
-                    color = self.colors['success']
-                    self.tilt_arrow = self.ax.arrow(0, 0, dx, dy,
-                                                    head_width=8, head_length=10,
-                                                    fc=color, ec=color,
-                                                    alpha=0.6, linewidth=2, zorder=5)
-
-            self.canvas.draw_idle()
-        except:
-            pass
+        """Update plot with hardware data (using PyQtGraph)."""
+        # Plot updates are handled by base class update_plot() method
+        # Just call it with current state
+        self.update_plot()
 
     def show_timing_stats(self):
         """Show performance statistics with detailed breakpoint analysis."""
@@ -887,7 +850,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         stats_msg += "DETAILED BREAKDOWN PRINTED TO CONSOLE"
 
-        messagebox.showinfo("Performance Statistics", stats_msg)
+        QMessageBox.information(self, "Performance Statistics", stats_msg)
 
     def calculate_ik(self):
         """Calculate inverse kinematics and send to hardware."""
@@ -908,7 +871,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         rotation = np.array([rx_limited, ry_limited, self.dof_values['rz']])
 
         angles = self.ik.calculate_servo_angles(translation, rotation,
-                                                self.use_top_surface_offset.get())
+                                                self.use_top_surface_offset)
 
         if angles is not None:
             self.last_cmd_angles = angles
@@ -918,7 +881,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def on_controller_toggle(self):
         """Override to handle manual control disabling for hardware."""
-        enabled = self.controller_enabled.get()
+        enabled = self.controller_enabled
 
         if enabled:
             self.controller.reset()
@@ -927,21 +890,21 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
-                manual_pose.sliders['rx'].config(state='disabled')
-                manual_pose.sliders['ry'].config(state='disabled')
-                manual_pose.sliders['x'].config(state='disabled')
-                manual_pose.sliders['y'].config(state='disabled')
-                manual_pose.sliders['z'].config(state='disabled')
+                manual_pose.sliders['rx'].setEnabled(False)
+                manual_pose.sliders['ry'].setEnabled(False)
+                manual_pose.sliders['x'].setEnabled(False)
+                manual_pose.sliders['y'].setEnabled(False)
+                manual_pose.sliders['z'].setEnabled(False)
         else:
             self.log("PID control DISABLED")
 
             if 'manual_pose' in self.gui_modules:
                 manual_pose = self.gui_modules['manual_pose']
-                manual_pose.sliders['rx'].config(state='normal')
-                manual_pose.sliders['ry'].config(state='normal')
-                manual_pose.sliders['x'].config(state='normal')
-                manual_pose.sliders['y'].config(state='normal')
-                manual_pose.sliders['z'].config(state='normal')
+                manual_pose.sliders['rx'].setEnabled(True)
+                manual_pose.sliders['ry'].setEnabled(True)
+                manual_pose.sliders['x'].setEnabled(True)
+                manual_pose.sliders['y'].setEnabled(True)
+                manual_pose.sliders['z'].setEnabled(True)
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Hardware controller update (not used - control thread handles it)."""
@@ -984,22 +947,23 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
 def main():
     """Launch hardware controller."""
-    root = tk.Tk()
-    app = HardwareStewartSimulator(root)
+    app = QApplication(sys.argv)
+    simulator = HardwareStewartSimulator(app)
 
-    app.log("=" * 50)
-    app.log("Hardware Controller - Ready")
-    app.log("=" * 50)
-    app.log("")
-    app.log("")
-    app.log("Quick Start:")
-    app.log("1. Select serial port and click 'Connect'")
-    app.log("2. Enable PID Control for automatic balancing")
-    app.log("3. Click 'Start' to begin 100Hz control loop")
-    app.log("4. Select trajectory patterns to track")
-    app.log("")
+    simulator.log("=" * 50)
+    simulator.log("Hardware Controller - Ready")
+    simulator.log("=" * 50)
+    simulator.log("")
+    simulator.log("")
+    simulator.log("Quick Start:")
+    simulator.log("1. Select serial port and click 'Connect'")
+    simulator.log("2. Enable PID Control for automatic balancing")
+    simulator.log("3. Click 'Start' to begin 100Hz control loop")
+    simulator.log("4. Select trajectory patterns to track")
+    simulator.log("")
 
-    root.mainloop()
+    simulator.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

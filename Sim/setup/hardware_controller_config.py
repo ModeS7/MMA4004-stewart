@@ -13,8 +13,6 @@ Key differences from simulation:
 - High-speed serial (200000 baud)
 """
 
-import tkinter as tk
-from tkinter import ttk
 import numpy as np
 import time
 import threading

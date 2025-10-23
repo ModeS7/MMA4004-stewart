@@ -11,8 +11,10 @@ Usage:
     python LQR_ball_sim.py
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox
+import sys
+from PyQt6.QtWidgets import (QApplication, QWidget, QPushButton, QVBoxLayout,
+                              QHBoxLayout, QTextEdit, QMessageBox, QDialog)
+from PyQt6.QtGui import QFont
 
 from setup.base_simulator import ControllerConfig, BaseStewartSimulator
 from core.control_core import LQRController, KalmanFilter
@@ -53,7 +55,7 @@ class LQRControllerConfig(ControllerConfig):
 class LQRStewartSimulator(BaseStewartSimulator):
     """LQR-specific Stewart Platform Simulator with Kalman filter support."""
 
-    def __init__(self, root):
+    def __init__(self, app):
 
         # Ball physics parameters from centralized config
         ball_physics_params = BallPhysicsConfig.as_dict()
@@ -68,7 +70,7 @@ class LQRStewartSimulator(BaseStewartSimulator):
         self.kalman_enabled = False
 
         config = LQRControllerConfig(mode='simulation')
-        super().__init__(root, config)
+        super().__init__(app, config)
 
     def get_layout_config(self):
         """Define GUI layout for LQR simulator with Kalman filter."""
@@ -117,50 +119,68 @@ class LQRStewartSimulator(BaseStewartSimulator):
         super()._build_modular_gui()
 
         if 'controller' in self.gui_modules:
-            controller_frame = self.gui_modules['controller'].frame
+            controller_widget = self.gui_modules['controller'].widget
 
-            info_frame = ttk.Frame(controller_frame)
-            info_frame.pack(fill='x', pady=(10, 0))
+            info_widget = QWidget()
+            info_layout = QHBoxLayout()
+            info_layout.setContentsMargins(0, 10, 0, 0)
 
-            ttk.Button(info_frame, text="Show Gain Matrix",
-                       command=self.show_gain_matrix,
-                       width=20).pack(side='left', padx=5)
+            gain_btn = QPushButton("Show Gain Matrix")
+            gain_btn.clicked.connect(self.show_gain_matrix)
+            gain_btn.setMinimumWidth(150)
+            info_layout.addWidget(gain_btn)
+            info_layout.addStretch()
+
+            info_widget.setLayout(info_layout)
+
+            # Add to controller widget's layout
+            if hasattr(controller_widget, 'layout') and controller_widget.layout() is not None:
+                controller_widget.layout().addWidget(info_widget)
 
     def show_gain_matrix(self):
         """Display LQR gain matrix in popup."""
         if self.controller is None or not hasattr(self.controller, 'get_gain_matrix'):
-            messagebox.showerror("Error", "Controller not initialized")
+            QMessageBox.critical(self, "Error", "Controller not initialized")
             return
 
         K = self.controller.get_gain_matrix()
         if K is None:
-            messagebox.showerror("Error", "LQR gain matrix not computed")
+            QMessageBox.critical(self, "Error", "LQR gain matrix not computed")
             return
 
-        popup = tk.Toplevel(self.root)
-        popup.title("LQR Gain Matrix")
-        popup.configure(bg=self.colors['bg'])
-        popup.geometry("500x300")
+        popup = QDialog(self)
+        popup.setWindowTitle("LQR Gain Matrix")
+        popup.resize(500, 300)
 
-        text = tk.Text(popup,
-                       bg=self.colors['widget_bg'],
-                       fg=self.colors['fg'],
-                       font=('Consolas', 9),
-                       wrap='none')
-        text.pack(fill='both', expand=True, padx=10, pady=10)
+        layout = QVBoxLayout()
 
-        text.insert('1.0', "LQR Gain Matrix K (2x4):\n")
-        text.insert('end', "State: [x(m), y(m), vx(m/s), vy(m/s)]\n")
-        text.insert('end', "Control: [ry(deg), rx(deg)]\n\n")
-        text.insert('end', "K = [ry/state]\n")
-        text.insert('end', f"    {K[0, :]}\n\n")
-        text.insert('end', "K = [rx/state]\n")
-        text.insert('end', f"    {K[1, :]}\n\n")
-        text.insert('end', "Interpretation:\n")
-        text.insert('end', f"- Position gain: {K[0, 0]:.4f} deg/(m error)\n")
-        text.insert('end', f"- Velocity gain: {K[0, 2]:.4f} deg/(m/s)\n")
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFont(QFont('Consolas', 9))
+        text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['fg']};
+                border: 1px solid {self.colors['border']};
+            }}
+        """)
 
-        text.config(state='disabled')
+        content = "LQR Gain Matrix K (2x4):\n"
+        content += "State: [x(m), y(m), vx(m/s), vy(m/s)]\n"
+        content += "Control: [ry(deg), rx(deg)]\n\n"
+        content += "K = [ry/state]\n"
+        content += f"    {K[0, :]}\n\n"
+        content += "K = [rx/state]\n"
+        content += f"    {K[1, :]}\n\n"
+        content += "Interpretation:\n"
+        content += f"- Position gain: {K[0, 0]:.4f} deg/(m error)\n"
+        content += f"- Velocity gain: {K[0, 2]:.4f} deg/(m/s)\n"
+
+        text.setPlainText(content)
+        layout.addWidget(text)
+
+        popup.setLayout(layout)
+        popup.exec()
 
     def _initialize_controller(self):
         """Initialize LQR controller with parameters from widgets."""
@@ -192,7 +212,7 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
         self.controller.set_weights(Q_pos=Q_pos, Q_vel=Q_vel, R=R)
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
     def on_kalman_enable_change(self, enabled):
@@ -283,38 +303,39 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
 def main():
     """Launch LQR Stewart Platform Simulator."""
-    root = tk.Tk()
-    app = LQRStewartSimulator(root)
+    app = QApplication(sys.argv)
+    simulator = LQRStewartSimulator(app)
 
-    app.log("=" * 50)
-    app.log("LQR Ball Balancing Control - Ready")
-    app.log("=" * 50)
-    app.log("")
-    app.log("IMPORTANT: LQR Requires Velocity Feedback!")
-    app.log("- WITHOUT Kalman: velocity = 0 → position-only control")
-    app.log("- WITH Kalman: velocity estimated → full state feedback")
-    app.log("- Q_vel weight ONLY affects control when Kalman is enabled")
-    app.log("")
-    app.log("Quick Start:")
-    app.log("1. Enable Kalman Filter for proper LQR operation")
-    app.log("2. Click 'Enable LQR Control' to activate balancing")
-    app.log("3. Click 'Start' to begin simulation")
-    app.log("4. Use 'Push Ball' to test disturbance rejection")
-    app.log("5. Select different trajectory patterns to track")
-    app.log("")
-    app.log("Kalman Filter:")
-    app.log("- Essential for LQR velocity feedback")
-    app.log("- Smooths camera noise and estimates velocity")
-    app.log("- Tune process/measurement noise for best performance")
-    app.log("")
-    app.log("Tuning Tips:")
-    app.log("- Increase Q_pos for tighter position control")
-    app.log("- Increase Q_vel for more damping (needs Kalman enabled!)")
-    app.log("- Decrease R for more aggressive control")
-    app.log("- Click 'Show Gain Matrix' to see computed gains")
-    app.log("")
+    simulator.log("=" * 50)
+    simulator.log("LQR Ball Balancing Control - Ready")
+    simulator.log("=" * 50)
+    simulator.log("")
+    simulator.log("IMPORTANT: LQR Requires Velocity Feedback!")
+    simulator.log("- WITHOUT Kalman: velocity = 0 → position-only control")
+    simulator.log("- WITH Kalman: velocity estimated → full state feedback")
+    simulator.log("- Q_vel weight ONLY affects control when Kalman is enabled")
+    simulator.log("")
+    simulator.log("Quick Start:")
+    simulator.log("1. Enable Kalman Filter for proper LQR operation")
+    simulator.log("2. Click 'Enable LQR Control' to activate balancing")
+    simulator.log("3. Click 'Start' to begin simulation")
+    simulator.log("4. Use 'Push Ball' to test disturbance rejection")
+    simulator.log("5. Select different trajectory patterns to track")
+    simulator.log("")
+    simulator.log("Kalman Filter:")
+    simulator.log("- Essential for LQR velocity feedback")
+    simulator.log("- Smooths camera noise and estimates velocity")
+    simulator.log("- Tune process/measurement noise for best performance")
+    simulator.log("")
+    simulator.log("Tuning Tips:")
+    simulator.log("- Increase Q_pos for tighter position control")
+    simulator.log("- Increase Q_vel for more damping (needs Kalman enabled!)")
+    simulator.log("- Decrease R for more aggressive control")
+    simulator.log("- Click 'Show Gain Matrix' to see computed gains")
+    simulator.log("")
 
-    root.mainloop()
+    simulator.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

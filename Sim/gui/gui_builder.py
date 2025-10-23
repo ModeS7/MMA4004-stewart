@@ -3,77 +3,61 @@
 GUI Layout Builder for Stewart Platform Simulators
 
 Builds GUI from declarative configuration with optional scrolling.
+PyQt6 implementation with high-performance rendering.
 """
 
-import tkinter as tk
-from tkinter import ttk
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
+                              QFrame, QSizePolicy)
+from PyQt6.QtCore import Qt
 
 
 class ScrollableColumn:
-    """Scrollable column container using Canvas."""
+    """Scrollable column container using QScrollArea."""
 
     def __init__(self, parent, width=None, bg_color='#1e1e1e'):
         """
         Args:
             parent: Parent widget
             width: Fixed width in pixels (optional)
-            bg_color: Background color for canvas
+            bg_color: Background color for container
         """
-        self.outer_frame = ttk.Frame(parent)
+        self.outer_widget = QWidget(parent)
+        self.outer_layout = QVBoxLayout(self.outer_widget)
+        self.outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.outer_layout.setSpacing(0)
+
         if width:
-            self.outer_frame.configure(width=width)
-            self.outer_frame.pack_propagate(False)
+            self.outer_widget.setFixedWidth(width)
 
-        self.canvas = tk.Canvas(self.outer_frame, highlightthickness=0, bg=bg_color)
-        self.scrollbar = ttk.Scrollbar(self.outer_frame, orient="vertical",
-                                       command=self.canvas.yview)
+        # Scroll area
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setStyleSheet(f"QScrollArea {{ background-color: {bg_color}; border: none; }}")
 
-        self.inner_frame = ttk.Frame(self.canvas)
-        self.canvas_window = self.canvas.create_window((0, 0),
-                                                       window=self.inner_frame,
-                                                       anchor="nw")
+        # Inner container for modules
+        self.inner_widget = QWidget()
+        self.inner_layout = QVBoxLayout(self.inner_widget)
+        self.inner_layout.setContentsMargins(0, 0, 0, 0)
+        self.inner_layout.setSpacing(10)
+        self.inner_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-
-        self.inner_frame.bind("<Configure>", self._on_frame_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-
-        self._bind_mousewheel()
-
-    def _on_frame_configure(self, event=None):
-        """Update canvas scroll region when content size changes."""
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _on_canvas_configure(self, event):
-        """Update inner frame width to match canvas."""
-        canvas_width = event.width
-        self.canvas.itemconfig(self.canvas_window, width=canvas_width)
-
-    def _bind_mousewheel(self):
-        """Bind mouse wheel for scrolling."""
-
-        def _on_mousewheel(event):
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _on_enter(event):
-            self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        def _on_leave(event):
-            self.canvas.unbind_all("<MouseWheel>")
-
-        self.canvas.bind("<Enter>", _on_enter)
-        self.canvas.bind("<Leave>", _on_leave)
+        self.scroll_area.setWidget(self.inner_widget)
+        self.outer_layout.addWidget(self.scroll_area)
 
     def get_container(self):
-        """Get the frame where modules should be added."""
-        return self.inner_frame
+        """Get the widget where modules should be added."""
+        return self.inner_widget
 
-    def pack(self, **kwargs):
-        """Pack the outer frame."""
-        self.outer_frame.pack(**kwargs)
+    def get_layout(self):
+        """Get the layout where modules should be added."""
+        return self.inner_layout
+
+    def get_widget(self):
+        """Get the outer widget for adding to parent layout."""
+        return self.outer_widget
 
 
 class GUIBuilder:
@@ -98,13 +82,13 @@ class GUIBuilder:
     }
     """
 
-    def __init__(self, root, module_registry):
+    def __init__(self, parent_widget, module_registry):
         """
         Args:
-            root: Root tkinter window
+            parent_widget: Parent QWidget
             module_registry: Dict mapping module type names to module classes
         """
-        self.root = root
+        self.parent_widget = parent_widget
         self.module_registry = module_registry
         self.modules = {}
         self.columns = []
@@ -121,8 +105,9 @@ class GUIBuilder:
         Returns:
             dict: References to created modules by name
         """
-        main_frame = ttk.Frame(self.root, style='TFrame')
-        main_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        main_layout = QHBoxLayout(self.parent_widget)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
 
         column_configs = layout_config.get('columns', [])
 
@@ -131,35 +116,36 @@ class GUIBuilder:
             scrollable = col_config.get('scrollable', False)
 
             if scrollable:
-                column = ScrollableColumn(main_frame, width=width,
+                column = ScrollableColumn(self.parent_widget, width=width,
                                           bg_color=colors.get('bg', '#1e1e1e'))
-                column.pack(side='left', fill='both',
-                            expand=(width is None),
-                            padx=(0 if col_idx == 0 else 5, 5))
-                container = column.get_container()
+                main_layout.addWidget(column.get_widget())
+                container_layout = column.get_layout()
                 self.columns.append(column)
             else:
-                column = ttk.Frame(main_frame, style='TFrame')
+                column_widget = QWidget()
+                column_layout = QVBoxLayout(column_widget)
+                column_layout.setContentsMargins(0, 0, 0, 0)
+                column_layout.setSpacing(10)
+                column_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
                 if width:
-                    column.configure(width=width)
-                    column.pack_propagate(False)
-                column.pack(side='left', fill='both',
-                            expand=(width is None),
-                            padx=(0 if col_idx == 0 else 5, 5))
-                container = column
-                self.columns.append(column)
+                    column_widget.setFixedWidth(width)
+
+                main_layout.addWidget(column_widget)
+                container_layout = column_layout
+                self.columns.append(column_widget)
 
             module_configs = col_config.get('modules', [])
             for mod_config in module_configs:
-                self._create_module(container, mod_config, colors, callbacks)
+                self._create_module(container_layout, mod_config, colors, callbacks)
 
         if layout_config.get('plot', {}).get('enabled', False):
-            self._create_plot_panel(main_frame, layout_config['plot'], colors)
+            self._create_plot_panel(main_layout, layout_config['plot'], colors)
 
         return self.modules
 
-    def _create_module(self, parent, module_config, colors, callbacks):
-        """Create a single module and add to parent."""
+    def _create_module(self, parent_layout, module_config, colors, callbacks):
+        """Create a single module and add to parent layout."""
         module_type = module_config.get('type')
         module_name = module_config.get('name', module_type)
         module_args = module_config.get('args', {})
@@ -169,19 +155,25 @@ class GUIBuilder:
             return
 
         module_class = self.module_registry[module_type]
-        module = module_class(parent, colors, callbacks, **module_args)
+        module = module_class(self.parent_widget, colors, callbacks, **module_args)
 
-        frame = module.create()
-        if frame:
-            pack_config = module_config.get('pack', {'fill': 'x', 'pady': (0, 10)})
-            frame.pack(**pack_config)
+        widget = module.create()
+        if widget:
+            parent_layout.addWidget(widget)
             self.modules[module_name] = module
 
-    def _create_plot_panel(self, parent, plot_config, colors):
+    def _create_plot_panel(self, parent_layout, plot_config, colors):
         """Create plot panel (actual plot created by simulator)."""
-        plot_panel = ttk.Frame(parent, style='TFrame')
-        plot_panel.pack(side='right', fill='both', expand=True, padx=(5, 0))
-        self.modules['plot_panel'] = plot_panel
+        plot_widget = QWidget()
+        plot_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        # Create layout for plot widget so simulator can add plot to it
+        plot_layout = QVBoxLayout()
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_widget.setLayout(plot_layout)
+
+        parent_layout.addWidget(plot_widget)
+        self.modules['plot_panel'] = plot_widget
 
     def update_modules(self, state):
         """

@@ -4,10 +4,14 @@ Modular GUI Components for Stewart Platform Simulators
 
 Each module is a self-contained, reusable widget panel.
 Modules communicate with the main simulator through callbacks.
+PyQt6 implementation for high-performance rendering.
 """
 
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+                              QLabel, QPushButton, QSlider, QCheckBox, QComboBox,
+                              QGroupBox, QTextEdit, QMessageBox)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
 import serial.tools.list_ports
 
 from core.utils import format_time, format_vector_2d, MAX_TILT_ANGLE_DEG
@@ -19,17 +23,17 @@ class GUIModule:
     def __init__(self, parent, colors, callbacks=None):
         """
         Args:
-            parent: Parent tkinter widget
+            parent: Parent QWidget
             colors: Color scheme dict
             callbacks: Dict of callback functions to simulator
         """
         self.parent = parent
         self.colors = colors
         self.callbacks = callbacks or {}
-        self.frame = None
+        self.widget = None
 
     def create(self):
-        """Create and return the module's frame."""
+        """Create and return the module's widget."""
         raise NotImplementedError
 
     def update(self, state):
@@ -41,35 +45,43 @@ class SimulationControlModule(GUIModule):
     """Start/Stop/Reset simulation controls."""
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Simulation Control", padding=10)
+        group = QGroupBox("Simulation Control")
+        layout = QVBoxLayout()
 
-        btn_frame = ttk.Frame(self.frame)
-        btn_frame.pack(fill='x')
+        btn_layout = QHBoxLayout()
 
-        self.start_btn = ttk.Button(btn_frame, text="▶ Start",
-                                    command=self.callbacks.get('start'),
-                                    width=10)
-        self.start_btn.pack(side='left', padx=5)
+        self.start_btn = QPushButton("▶ Start")
+        self.start_btn.clicked.connect(self.callbacks.get('start'))
+        self.start_btn.setMinimumWidth(100)
+        btn_layout.addWidget(self.start_btn)
 
-        self.stop_btn = ttk.Button(btn_frame, text="⏸ Stop",
-                                   command=self.callbacks.get('stop'),
-                                   state='disabled', width=10)
-        self.stop_btn.pack(side='left', padx=5)
+        self.stop_btn = QPushButton("⏸ Stop")
+        self.stop_btn.clicked.connect(self.callbacks.get('stop'))
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setMinimumWidth(100)
+        btn_layout.addWidget(self.stop_btn)
 
-        self.reset_btn = ttk.Button(btn_frame, text="↻ Reset",
-                                    command=self.callbacks.get('reset'),
-                                    width=10)
-        self.reset_btn.pack(side='left', padx=5)
+        self.reset_btn = QPushButton("↻ Reset")
+        self.reset_btn.clicked.connect(self.callbacks.get('reset'))
+        self.reset_btn.setMinimumWidth(100)
+        btn_layout.addWidget(self.reset_btn)
 
-        self.time_label = ttk.Label(self.frame, text="Time: 0.00s",
-                                    font=('Consolas', 10, 'bold'))
-        self.time_label.pack(pady=(10, 0))
+        layout.addLayout(btn_layout)
 
-        return self.frame
+        self.time_label = QLabel("Time: 0.00s")
+        font = QFont("Consolas", 10)
+        font.setBold(True)
+        self.time_label.setFont(font)
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.time_label)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def update(self, state):
         if 'simulation_time' in state:
-            self.time_label.config(text=f"Time: {format_time(state['simulation_time'])}")
+            self.time_label.setText(f"Time: {format_time(state['simulation_time'])}")
 
 
 class ControllerModule(GUIModule):
@@ -83,19 +95,24 @@ class ControllerModule(GUIModule):
 
     def create(self):
         controller_name = self.controller_config.get_controller_name()
-        self.frame = ttk.LabelFrame(self.parent, text=f"{controller_name} Ball Balancing", padding=10)
+        group = QGroupBox(f"{controller_name} Ball Balancing")
+        layout = QVBoxLayout()
 
-        enable_frame = ttk.Frame(self.frame)
-        enable_frame.pack(fill='x', pady=(0, 10))
+        enable_layout = QHBoxLayout()
 
-        ttk.Checkbutton(enable_frame, text=f"Enable {controller_name} Control",
-                        variable=self.controller_enabled,
-                        command=self.callbacks.get('toggle_controller')).pack(side='left')
+        self.enable_checkbox = QCheckBox(f"Enable {controller_name} Control")
+        self.enable_checkbox.setChecked(self.controller_enabled)
+        self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
+        enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_label = ttk.Label(enable_frame, text="●",
-                                      foreground=self.colors['border'],
-                                      font=('Segoe UI', 14))
-        self.status_label.pack(side='left', padx=(10, 0))
+        self.status_label = QLabel("●")
+        font = QFont("Segoe UI", 14)
+        self.status_label.setFont(font)
+        self.status_label.setStyleSheet(f"color: {self.colors['border']};")
+        enable_layout.addWidget(self.status_label)
+        enable_layout.addStretch()
+
+        layout.addLayout(enable_layout)
 
         if 'param_definitions' in self.controller_widgets:
             param_definitions = self.controller_widgets['param_definitions']
@@ -114,20 +131,34 @@ class ControllerModule(GUIModule):
                 self.controller_config.default_scalar_idx = default_scalar_idx
 
                 self.controller_config.create_parameter_slider(
-                    self.frame, param_name, label, default,
+                    layout, param_name, label, default,
                     sliders, value_labels, scalar_vars,
                     self.callbacks.get('param_change')
                 )
 
                 self.controller_config.default_scalar_idx = old_idx
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _on_enable_toggle(self):
+        """Handle enable checkbox toggle - update state then call callback."""
+        self.controller_enabled = self.enable_checkbox.isChecked()
+        if self.callbacks.get('toggle_controller'):
+            self.callbacks['toggle_controller']()
 
     def update(self, state):
-        if 'controller_enabled' in state and state['controller_enabled']:
-            self.status_label.config(foreground=self.colors['success'])
-        else:
-            self.status_label.config(foreground=self.colors['border'])
+        if 'controller_enabled' in state:
+            enabled = state['controller_enabled']
+            # Update checkbox if state changed externally
+            if self.enable_checkbox.isChecked() != enabled:
+                self.enable_checkbox.setChecked(enabled)
+            # Update status indicator
+            if enabled:
+                self.status_label.setStyleSheet(f"color: {self.colors['success']};")
+            else:
+                self.status_label.setStyleSheet(f"color: {self.colors['border']};")
 
 
 class TrajectoryPatternModule(GUIModule):
@@ -137,51 +168,64 @@ class TrajectoryPatternModule(GUIModule):
         super().__init__(parent, colors, callbacks)
         self.pattern_var = pattern_var
         self.param_widgets = {}
+        self.params_layout = None
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Trajectory Pattern", padding=10)
+        group = QGroupBox("Trajectory Pattern")
+        layout = QVBoxLayout()
 
-        selector_frame = ttk.Frame(self.frame)
-        selector_frame.pack(fill='x', pady=(0, 5))
+        selector_layout = QHBoxLayout()
 
-        ttk.Label(selector_frame, text="Pattern:",
-                  font=('Segoe UI', 9)).pack(side='left', padx=(0, 10))
+        selector_layout.addWidget(QLabel("Pattern:"))
 
-        pattern_combo = ttk.Combobox(selector_frame, textvariable=self.pattern_var,
-                                     width=15, state='readonly',
-                                     values=['static', 'circle', 'figure8', 'star'])
-        pattern_combo.pack(side='left', padx=5)
-        pattern_combo.bind('<<ComboboxSelected>>', self._on_pattern_change)
+        self.pattern_combo = QComboBox()
+        self.pattern_combo.addItems(['static', 'circle', 'figure8', 'star'])
+        self.pattern_combo.setCurrentText(self.pattern_var)
+        self.pattern_combo.currentTextChanged.connect(self._on_pattern_change)
+        selector_layout.addWidget(self.pattern_combo)
 
-        ttk.Button(selector_frame, text="Reset",
-                   command=self.callbacks.get('pattern_reset'),
-                   width=8).pack(side='left', padx=5)
+        reset_btn = QPushButton("Reset")
+        reset_btn.clicked.connect(self.callbacks.get('pattern_reset'))
+        reset_btn.setMinimumWidth(80)
+        selector_layout.addWidget(reset_btn)
+        selector_layout.addStretch()
 
-        self.info_label = ttk.Label(self.frame,
-                                    text="Tracking: Center (0, 0)",
-                                    font=('Consolas', 8),
-                                    foreground=self.colors['success'])
-        self.info_label.pack(anchor='w', pady=(5, 0))
+        layout.addLayout(selector_layout)
 
-        self.params_container = ttk.Frame(self.frame)
-        self.params_container.pack(fill='x', pady=(10, 0))
+        self.info_label = QLabel("Tracking: Center (0, 0)")
+        font = QFont("Consolas", 8)
+        self.info_label.setFont(font)
+        self.info_label.setStyleSheet(f"color: {self.colors['success']};")
+        layout.addWidget(self.info_label)
+
+        self.params_widget = QWidget()
+        self.params_layout = QVBoxLayout()
+        self.params_layout.setContentsMargins(0, 10, 0, 0)
+        self.params_widget.setLayout(self.params_layout)
+        layout.addWidget(self.params_widget)
 
         self._update_pattern_params()
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
-    def _on_pattern_change(self, event=None):
+    def _on_pattern_change(self, pattern):
+        self.pattern_var = pattern
         self._update_pattern_params()
         if self.callbacks.get('pattern_change'):
-            self.callbacks['pattern_change']()
+            self.callbacks['pattern_change'](pattern)
 
     def _update_pattern_params(self):
         """Update parameter sliders based on selected pattern."""
-        for widget in self.params_container.winfo_children():
-            widget.destroy()
+        # Clear existing widgets
+        while self.params_layout.count():
+            item = self.params_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self.param_widgets.clear()
 
-        pattern_type = self.pattern_var.get()
+        pattern_type = self.pattern_var if isinstance(self.pattern_var, str) else self.pattern_combo.currentText()
 
         pattern_params = {
             'static': [],
@@ -203,98 +247,113 @@ class TrajectoryPatternModule(GUIModule):
         params = pattern_params.get(pattern_type, [])
 
         if not params:
-            ttk.Label(self.params_container,
-                     text="No adjustable parameters",
-                     font=('Segoe UI', 8, 'italic'),
-                     foreground=self.colors['border']).pack(pady=5)
+            no_params_label = QLabel("No adjustable parameters")
+            font = QFont("Segoe UI", 8)
+            font.setItalic(True)
+            no_params_label.setFont(font)
+            no_params_label.setStyleSheet(f"color: {self.colors['border']};")
+            self.params_layout.addWidget(no_params_label)
             return
 
         for param_name, label, min_val, max_val, default, resolution in params:
             self._create_param_slider(param_name, label, min_val, max_val, default, resolution)
 
     def _create_param_slider(self, param_name, label, min_val, max_val, default, resolution):
-        frame = ttk.Frame(self.params_container)
-        frame.pack(fill='x', pady=3)
+        param_widget = QWidget()
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 3, 0, 3)
 
-        ttk.Label(frame, text=label,
-                  font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', padx=(0, 5))
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont("Segoe UI", 9))
+        grid.addWidget(label_widget, 0, 0)
 
-        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
-        slider.grid(row=0, column=1, sticky='ew', padx=5)
-        slider.set(default)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(int(min_val / resolution))
+        slider.setMaximum(int(max_val / resolution))
+        slider.setValue(int(default / resolution))
+        grid.addWidget(slider, 0, 1)
 
-        value_label = ttk.Label(frame, text=f"{default:.1f}",
-                               width=6, font=('Consolas', 9))
-        value_label.grid(row=0, column=2)
+        value_label = QLabel(f"{default:.1f}")
+        value_label.setFont(QFont("Consolas", 9))
+        value_label.setMinimumWidth(60)
+        grid.addWidget(value_label, 0, 2)
 
         def on_change(val):
-            value = float(val)
-            value_label.config(text=f"{value:.1f}")
+            value = val * resolution
+            value_label.setText(f"{value:.1f}")
             if self.callbacks.get('pattern_param_change'):
                 self.callbacks['pattern_param_change'](param_name, value)
 
-        slider.config(command=on_change)
-        frame.columnconfigure(1, weight=1)
+        slider.valueChanged.connect(on_change)
+        grid.setColumnStretch(1, 1)
+
+        param_widget.setLayout(grid)
+        self.params_layout.addWidget(param_widget)
 
         self.param_widgets[param_name] = {
             'slider': slider,
             'label': value_label,
-            'frame': frame
+            'widget': param_widget,
+            'resolution': resolution
         }
 
     def update(self, state):
         if 'pattern_info' in state:
-            self.info_label.config(text=state['pattern_info'])
+            self.info_label.setText(state['pattern_info'])
 
 
 class BallControlModule(GUIModule):
     """Ball reset and push buttons."""
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Ball Control", padding=10)
+        group = QGroupBox("Ball Control")
+        layout = QHBoxLayout()
 
-        btn_frame = ttk.Frame(self.frame)
-        btn_frame.pack()
+        reset_btn = QPushButton("Reset Ball")
+        reset_btn.clicked.connect(self.callbacks.get('reset_ball'))
+        reset_btn.setMinimumWidth(120)
+        layout.addWidget(reset_btn)
 
-        ttk.Button(btn_frame, text="Reset Ball",
-                   command=self.callbacks.get('reset_ball'),
-                   width=15).pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="Push Ball",
-                   command=self.callbacks.get('push_ball'),
-                   width=15).pack(side='left', padx=5)
+        push_btn = QPushButton("Push Ball")
+        push_btn.clicked.connect(self.callbacks.get('push_ball'))
+        push_btn.setMinimumWidth(120)
+        layout.addWidget(push_btn)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
 
 class BallStateModule(GUIModule):
     """Ball position and velocity display."""
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Ball State", padding=10)
+        group = QGroupBox("Ball State")
+        layout = QVBoxLayout()
 
-        self.pos_label = ttk.Label(self.frame,
-                                   text="Position: (0.0, 0.0) mm",
-                                   font=('Consolas', 9))
-        self.pos_label.pack(anchor='w', pady=2)
+        self.pos_label = QLabel("Position: (0.0, 0.0) mm")
+        self.pos_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.pos_label)
 
-        self.vel_label = ttk.Label(self.frame,
-                                   text="Velocity: (0.0, 0.0) mm/s",
-                                   font=('Consolas', 9))
-        self.vel_label.pack(anchor='w', pady=2)
+        self.vel_label = QLabel("Velocity: (0.0, 0.0) mm/s")
+        self.vel_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.vel_label)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def update(self, state):
         if 'ball_pos' in state:
-            self.pos_label.config(text=f"Position: {format_vector_2d(state['ball_pos'])}")
+            self.pos_label.setText(f"Position: {format_vector_2d(state['ball_pos'])}")
         if 'ball_vel' in state:
             if isinstance(state['ball_vel'], tuple) and len(state['ball_vel']) == 2:
                 if isinstance(state['ball_vel'][0], str):
-                    self.vel_label.config(text=f"Status: {state['ball_vel'][0]}")
+                    self.vel_label.setText(f"Status: {state['ball_vel'][0]}")
                 else:
-                    self.vel_label.config(text=f"Velocity: {format_vector_2d(state['ball_vel'], 'mm/s')}")
+                    self.vel_label.setText(f"Velocity: {format_vector_2d(state['ball_vel'], 'mm/s')}")
             elif isinstance(state['ball_vel'], str):
-                self.vel_label.config(text=f"Status: {state['ball_vel']}")
+                self.vel_label.setText(f"Status: {state['ball_vel']}")
 
 
 class ConfigurationModule(GUIModule):
@@ -305,13 +364,23 @@ class ConfigurationModule(GUIModule):
         self.use_offset_var = use_offset_var
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Configuration", padding=10)
+        group = QGroupBox("Configuration")
+        layout = QVBoxLayout()
 
-        ttk.Checkbutton(self.frame, text="Use Top Surface Offset",
-                        variable=self.use_offset_var,
-                        command=self.callbacks.get('toggle_offset')).pack(anchor='w')
+        self.offset_checkbox = QCheckBox("Use Top Surface Offset")
+        self.offset_checkbox.setChecked(self.use_offset_var)
+        self.offset_checkbox.stateChanged.connect(self._on_offset_toggle)
+        layout.addWidget(self.offset_checkbox)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _on_offset_toggle(self):
+        """Handle offset checkbox toggle."""
+        self.use_offset_var = self.offset_checkbox.isChecked()
+        if self.callbacks.get('toggle_offset'):
+            self.callbacks['toggle_offset']()
 
 
 class ManualPoseControlModule(GUIModule):
@@ -324,52 +393,58 @@ class ManualPoseControlModule(GUIModule):
         self.value_labels = {}
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Manual Pose Control (6 DOF)", padding=10)
+        group = QGroupBox("Manual Pose Control (6 DOF)")
+        grid = QGridLayout()
 
         for idx, (dof, (min_val, max_val, res, default, label)) in enumerate(self.dof_config.items()):
-            ttk.Label(self.frame, text=label,
-                      font=('Segoe UI', 9)).grid(row=idx, column=0, sticky='w', pady=8)
+            label_widget = QLabel(label)
+            label_widget.setFont(QFont("Segoe UI", 9))
+            grid.addWidget(label_widget, idx, 0)
 
-            slider = ttk.Scale(self.frame, from_=min_val, to=max_val,
-                               orient='horizontal',
-                               command=lambda val, d=dof: self._on_slider_change(d, val))
-            slider.grid(row=idx, column=1, sticky='ew', padx=10, pady=8)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setMinimum(int(min_val / res))
+            slider.setMaximum(int(max_val / res))
+            slider.setValue(int(default / res))
+            grid.addWidget(slider, idx, 1)
+
+            value_label = QLabel(f"{default:.2f}")
+            value_label.setFont(QFont("Consolas", 9))
+            value_label.setMinimumWidth(80)
+            grid.addWidget(value_label, idx, 2)
+
+            def on_change(val, d=dof, r=res):
+                value = val * r
+                self.value_labels[d].setText(f"{value:.2f}")
+                if self.callbacks.get('slider_change'):
+                    self.callbacks['slider_change'](d, value)
+
+            slider.valueChanged.connect(on_change)
             self.sliders[dof] = slider
-
-            value_label = ttk.Label(self.frame, text=f"{default:.2f}",
-                                    width=8, font=('Consolas', 9))
-            value_label.grid(row=idx, column=2, pady=8)
             self.value_labels[dof] = value_label
-            slider.set(default)
 
-        self.frame.columnconfigure(1, weight=1)
+        grid.setColumnStretch(1, 1)
 
-        tilt_info_frame = ttk.Frame(self.frame)
-        tilt_info_frame.grid(row=len(self.dof_config), column=0,
-                             columnspan=3, sticky='ew', pady=(10, 5))
+        tilt_layout = QHBoxLayout()
+        tilt_layout.addWidget(QLabel("Tilt Vector:"))
+        self.tilt_magnitude_label = QLabel("0.00° (0.0%)")
+        self.tilt_magnitude_label.setFont(QFont("Consolas", 9))
+        self.tilt_magnitude_label.setStyleSheet(f"color: {self.colors['success']};")
+        tilt_layout.addWidget(self.tilt_magnitude_label)
+        tilt_layout.addStretch()
 
-        ttk.Label(tilt_info_frame, text="Tilt Vector:",
-                  font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 10))
-        self.tilt_magnitude_label = ttk.Label(tilt_info_frame,
-                                              text="0.00° (0.0%)",
-                                              font=('Consolas', 9),
-                                              foreground=self.colors['success'])
-        self.tilt_magnitude_label.pack(side='left')
+        layout = QVBoxLayout()
+        layout.addLayout(grid)
+        layout.addLayout(tilt_layout)
 
-        return self.frame
-
-    def _on_slider_change(self, dof, value):
-        val = float(value)
-        self.value_labels[dof].config(text=f"{val:.2f}")
-
-        if self.callbacks.get('slider_change'):
-            self.callbacks['slider_change'](dof, val)
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def update(self, state):
         if 'dof_values' in state:
             for dof, val in state['dof_values'].items():
                 if dof in self.value_labels:
-                    self.value_labels[dof].config(text=f"{val:.2f}")
+                    self.value_labels[dof].setText(f"{val:.2f}")
 
         if 'tilt_magnitude' in state:
             mag = state['tilt_magnitude']
@@ -382,10 +457,8 @@ class ManualPoseControlModule(GUIModule):
             else:
                 color = self.colors['success']
 
-            self.tilt_magnitude_label.config(
-                text=f"{mag:.2f}° ({percent:.1f}%)",
-                foreground=color
-            )
+            self.tilt_magnitude_label.setText(f"{mag:.2f}° ({percent:.1f}%)")
+            self.tilt_magnitude_label.setStyleSheet(f"color: {color};")
 
 
 class ServoAnglesModule(GUIModule):
@@ -396,70 +469,78 @@ class ServoAnglesModule(GUIModule):
         self.show_actual = show_actual
 
     def create(self):
-        container = ttk.Frame(self.parent)
+        container = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        cmd_frame = ttk.LabelFrame(container, text="Commanded Servo Angles (IK)", padding=10)
-        cmd_frame.pack(fill='x', pady=(0, 10))
+        cmd_group = QGroupBox("Commanded Servo Angles (IK)")
+        cmd_grid = QGridLayout()
 
         self.cmd_labels = []
         for i in range(6):
-            label = ttk.Label(cmd_frame, text=f"S{i + 1}: 0.00°",
-                              font=('Consolas', 9))
-            label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
+            label = QLabel(f"S{i + 1}: 0.00°")
+            label.setFont(QFont("Consolas", 9))
+            cmd_grid.addWidget(label, i // 3, i % 3)
             self.cmd_labels.append(label)
 
+        cmd_group.setLayout(cmd_grid)
+        layout.addWidget(cmd_group)
+
         if self.show_actual:
-            actual_frame = ttk.LabelFrame(container, text="Actual Servo Angles", padding=10)
-            actual_frame.pack(fill='x')
+            actual_group = QGroupBox("Actual Servo Angles")
+            actual_grid = QGridLayout()
 
             self.actual_labels = []
             for i in range(6):
-                label = ttk.Label(actual_frame, text=f"S{i + 1}: 0.00°",
-                                  font=('Consolas', 9))
-                label.grid(row=i // 3, column=i % 3, padx=15, pady=5, sticky='w')
+                label = QLabel(f"S{i + 1}: 0.00°")
+                label.setFont(QFont("Consolas", 9))
+                actual_grid.addWidget(label, i // 3, i % 3)
                 self.actual_labels.append(label)
 
-        self.frame = container
-        return self.frame
+            actual_group.setLayout(actual_grid)
+            layout.addWidget(actual_group)
+
+        container.setLayout(layout)
+        self.widget = container
+        return self.widget
 
     def update(self, state):
         if 'cmd_angles' in state:
             for i, angle in enumerate(state['cmd_angles']):
-                self.cmd_labels[i].config(text=f"S{i + 1}: {angle:6.2f}°")
+                self.cmd_labels[i].setText(f"S{i + 1}: {angle:6.2f}°")
 
         if self.show_actual and 'actual_angles' in state:
             for i, angle in enumerate(state['actual_angles']):
-                self.actual_labels[i].config(text=f"S{i + 1}: {angle:6.2f}°")
+                self.actual_labels[i].setText(f"S{i + 1}: {angle:6.2f}°")
 
 
 class PlatformPoseModule(GUIModule):
     """Display platform pose from forward kinematics."""
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Platform Pose (FK)", padding=10)
+        group = QGroupBox("Platform Pose (FK)")
+        layout = QVBoxLayout()
 
-        self.pos_label = ttk.Label(self.frame, text="X: 0.00  Y: 0.00  Z: 0.00 mm",
-                                   font=('Consolas', 9))
-        self.pos_label.pack(anchor='w', pady=2)
+        self.pos_label = QLabel("X: 0.00  Y: 0.00  Z: 0.00 mm")
+        self.pos_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.pos_label)
 
-        self.rot_label = ttk.Label(self.frame, text="Roll: 0.00  Pitch: 0.00  Yaw: 0.00°",
-                                   font=('Consolas', 9))
-        self.rot_label.pack(anchor='w', pady=2)
+        self.rot_label = QLabel("Roll: 0.00  Pitch: 0.00  Yaw: 0.00°")
+        self.rot_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.rot_label)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def update(self, state):
         if 'fk_translation' in state:
             t = state['fk_translation']
-            self.pos_label.config(
-                text=f"X: {t[0]:6.2f}  Y: {t[1]:6.2f}  Z: {t[2]:6.2f} mm"
-            )
+            self.pos_label.setText(f"X: {t[0]:6.2f}  Y: {t[1]:6.2f}  Z: {t[2]:6.2f} mm")
 
         if 'fk_rotation' in state:
             r = state['fk_rotation']
-            self.rot_label.config(
-                text=f"Roll: {r[0]:6.2f}  Pitch: {r[1]:6.2f}  Yaw: {r[2]:6.2f}°"
-            )
+            self.rot_label.setText(f"Roll: {r[0]:6.2f}  Pitch: {r[1]:6.2f}  Yaw: {r[2]:6.2f}°")
 
 
 class ControllerOutputModule(GUIModule):
@@ -470,37 +551,37 @@ class ControllerOutputModule(GUIModule):
         self.controller_name = controller_name
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text=f"{self.controller_name} Output", padding=10)
+        group = QGroupBox(f"{self.controller_name} Output")
+        layout = QVBoxLayout()
 
-        self.output_label = ttk.Label(self.frame,
-                                      text="Tilt: rx=0.00°  ry=0.00°",
-                                      font=('Consolas', 9))
-        self.output_label.pack(anchor='w', pady=2)
+        self.output_label = QLabel("Tilt: rx=0.00°  ry=0.00°")
+        self.output_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.output_label)
 
-        self.magnitude_label = ttk.Label(self.frame,
-                                         text="Magnitude: 0.00° (0%)",
-                                         font=('Consolas', 9))
-        self.magnitude_label.pack(anchor='w', pady=2)
+        self.magnitude_label = QLabel("Magnitude: 0.00° (0%)")
+        self.magnitude_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.magnitude_label)
 
-        self.error_label = ttk.Label(self.frame,
-                                     text="Error: (0.0, 0.0) mm",
-                                     font=('Consolas', 9))
-        self.error_label.pack(anchor='w', pady=2)
+        self.error_label = QLabel("Error: (0.0, 0.0) mm")
+        self.error_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.error_label)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def update(self, state):
         if 'controller_output' in state:
             rx, ry = state['controller_output']
-            self.output_label.config(text=f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
+            self.output_label.setText(f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
 
         if 'controller_magnitude' in state:
             mag, percent = state['controller_magnitude']
-            self.magnitude_label.config(text=f"Magnitude: {mag:.2f}° ({percent:.1f}%)")
+            self.magnitude_label.setText(f"Magnitude: {mag:.2f}° ({percent:.1f}%)")
 
         if 'controller_error' in state:
             error = state['controller_error']
-            self.error_label.config(text=f"Error: {format_vector_2d(error)}")
+            self.error_label.setText(f"Error: {format_vector_2d(error)}")
 
 
 class DebugLogModule(GUIModule):
@@ -511,31 +592,32 @@ class DebugLogModule(GUIModule):
         self.height = height
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Debug Log", padding=10)
+        group = QGroupBox("Debug Log")
+        layout = QVBoxLayout()
 
-        self.log_text = scrolledtext.ScrolledText(
-            self.frame,
-            height=self.height,
-            font=('Consolas', 8),
-            bg=self.colors['widget_bg'],
-            fg=self.colors['fg'],
-            insertbackground=self.colors['fg'],
-            selectbackground=self.colors['highlight'],
-            selectforeground=self.colors['button_fg'],
-            relief='flat',
-            borderwidth=0
-        )
-        self.log_text.pack(fill='both', expand=True)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 8))
+        self.log_text.setMinimumHeight(self.height * 20)
+        self.log_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {self.colors['widget_bg']};
+                color: {self.colors['fg']};
+                border: none;
+            }}
+        """)
+        layout.addWidget(self.log_text)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def log(self, message, timestamp=None):
         if timestamp is not None:
-            msg = f"[{format_time(timestamp)}] {message}\n"
+            msg = f"[{format_time(timestamp)}] {message}"
         else:
-            msg = f"{message}\n"
-        self.log_text.insert(tk.END, msg)
-        self.log_text.see(tk.END)
+            msg = f"{message}"
+        self.log_text.append(msg)
 
 
 class SerialConnectionModule(GUIModule):
@@ -548,122 +630,128 @@ class SerialConnectionModule(GUIModule):
         self.port_status_label = None
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Serial Connection", padding=10)
+        group = QGroupBox("Serial Connection")
+        layout = QVBoxLayout()
 
-        port_frame = ttk.Frame(self.frame)
-        port_frame.pack(fill='x', pady=(0, 5))
+        port_layout = QHBoxLayout()
+        port_layout.addWidget(QLabel("Port:"))
 
-        ttk.Label(port_frame, text="Port:").pack(side='left', padx=(0, 5))
+        self.port_combo = QComboBox()
+        port_layout.addWidget(self.port_combo)
 
-        self.port_combo = ttk.Combobox(port_frame, textvariable=self.port_var,
-                                       width=15, state='readonly')
-        self.port_combo.pack(side='left', padx=5)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        refresh_btn.setMinimumWidth(80)
+        port_layout.addWidget(refresh_btn)
+        port_layout.addStretch()
 
-        ttk.Button(port_frame, text="Refresh",
-                   command=self._refresh_ports,
-                   width=8).pack(side='left')
+        layout.addLayout(port_layout)
 
-        self.port_status_label = ttk.Label(self.frame, text="",
-                                           font=('Consolas', 8),
-                                           foreground=self.colors['fg'])
-        self.port_status_label.pack(fill='x', pady=(0, 5))
+        self.port_status_label = QLabel("")
+        self.port_status_label.setFont(QFont("Consolas", 8))
+        self.port_status_label.setStyleSheet(f"color: {self.colors['fg']};")
+        layout.addWidget(self.port_status_label)
 
-        btn_frame = ttk.Frame(self.frame)
-        btn_frame.pack(fill='x', pady=(5, 0))
+        btn_layout = QHBoxLayout()
 
-        self.connect_btn = ttk.Button(btn_frame, text="Connect",
-                                      command=self.callbacks.get('connect'),
-                                      width=12)
-        self.connect_btn.pack(side='left', padx=5)
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self.callbacks.get('connect'))
+        self.connect_btn.setMinimumWidth(100)
+        btn_layout.addWidget(self.connect_btn)
 
-        self.disconnect_btn = ttk.Button(btn_frame, text="Disconnect",
-                                         command=self.callbacks.get('disconnect'),
-                                         state='disabled', width=12)
-        self.disconnect_btn.pack(side='left', padx=5)
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.clicked.connect(self.callbacks.get('disconnect'))
+        self.disconnect_btn.setEnabled(False)
+        self.disconnect_btn.setMinimumWidth(100)
+        btn_layout.addWidget(self.disconnect_btn)
 
-        self.status_label = ttk.Label(self.frame, text="Not connected",
-                                      foreground=self.colors['border'])
-        self.status_label.pack(pady=(5, 0))
+        layout.addLayout(btn_layout)
+
+        self.status_label = QLabel("Not connected")
+        self.status_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(self.status_label)
 
         self._refresh_ports()
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def _refresh_ports(self):
         try:
             ports = list(serial.tools.list_ports.comports())
             port_names = [port.device for port in ports]
 
-            self.port_combo['values'] = port_names
+            self.port_combo.clear()
+            self.port_combo.addItems(port_names)
 
             if port_names:
-                self.port_combo.current(0)
-                self.port_status_label.config(
-                    text=f"Found {len(port_names)} port(s)",
-                    foreground=self.colors['success']
-                )
-                self.connect_btn.config(state='normal')
+                self.port_status_label.setText(f"Found {len(port_names)} port(s)")
+                self.port_status_label.setStyleSheet(f"color: {self.colors['success']};")
+                self.connect_btn.setEnabled(True)
             else:
-                self.port_status_label.config(
-                    text="No serial ports found",
-                    foreground=self.colors['warning']
-                )
-                self.connect_btn.config(state='disabled')
+                self.port_status_label.setText("No serial ports found")
+                self.port_status_label.setStyleSheet(f"color: {self.colors['warning']};")
+                self.connect_btn.setEnabled(False)
 
         except Exception as e:
-            self.port_status_label.config(
-                text=f"Error: {str(e)}",
-                foreground=self.colors['warning']
-            )
-            self.connect_btn.config(state='disabled')
+            self.port_status_label.setText(f"Error: {str(e)}")
+            self.port_status_label.setStyleSheet(f"color: {self.colors['warning']};")
+            self.connect_btn.setEnabled(False)
 
     def update(self, state):
         if 'connected' in state:
             if state['connected']:
-                self.status_label.config(text="Connected",
-                                         foreground=self.colors['success'])
-                self.connect_btn.config(state='disabled')
-                self.disconnect_btn.config(state='normal')
+                self.status_label.setText("Connected")
+                self.status_label.setStyleSheet(f"color: {self.colors['success']};")
+                self.connect_btn.setEnabled(False)
+                self.disconnect_btn.setEnabled(True)
             else:
-                self.status_label.config(text="Not connected",
-                                         foreground=self.colors['border'])
-                self.connect_btn.config(state='normal')
-                self.disconnect_btn.config(state='disabled')
+                self.status_label.setText("Not connected")
+                self.status_label.setStyleSheet(f"color: {self.colors['border']};")
+                self.connect_btn.setEnabled(True)
+                self.disconnect_btn.setEnabled(False)
 
 
 class PerformanceStatsModule(GUIModule):
     """Performance statistics for 100Hz hardware mode."""
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="100Hz MODE", padding=10)
+        group = QGroupBox("100Hz MODE")
+        layout = QVBoxLayout()
 
-        self.fps_label = ttk.Label(self.frame, text="Control Loop: 0 Hz",
-                                   font=('Consolas', 10, 'bold'),
-                                   foreground=self.colors['success'])
-        self.fps_label.pack()
+        self.fps_label = QLabel("Control Loop: 0 Hz")
+        font = QFont("Consolas", 10)
+        font.setBold(True)
+        self.fps_label.setFont(font)
+        self.fps_label.setStyleSheet(f"color: {self.colors['success']};")
+        layout.addWidget(self.fps_label)
 
-        self.cache_label = ttk.Label(self.frame, text="IK Cache: 0.0%",
-                                     font=('Consolas', 9))
-        self.cache_label.pack()
+        self.cache_label = QLabel("IK Cache: 0.0%")
+        self.cache_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.cache_label)
 
-        self.timeout_label = ttk.Label(self.frame, text="IK Timeouts: 0",
-                                       font=('Consolas', 9))
-        self.timeout_label.pack()
+        self.timeout_label = QLabel("IK Timeouts: 0")
+        self.timeout_label.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.timeout_label)
 
-        ttk.Button(self.frame, text="Show Statistics",
-                   command=self.callbacks.get('show_stats')).pack(pady=(5, 0))
+        stats_btn = QPushButton("Show Statistics")
+        stats_btn.clicked.connect(self.callbacks.get('show_stats'))
+        layout.addWidget(stats_btn)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def update(self, state):
         if 'fps' in state:
-            self.fps_label.config(text=f"Control: {state['fps']:.1f} Hz")
+            self.fps_label.setText(f"Control: {state['fps']:.1f} Hz")
 
         if 'cache_hit_rate' in state:
-            self.cache_label.config(text=f"IK Cache: {state['cache_hit_rate'] * 100:.1f}%")
+            self.cache_label.setText(f"IK Cache: {state['cache_hit_rate'] * 100:.1f}%")
 
         if 'ik_timeouts' in state:
-            self.timeout_label.config(text=f"IK Timeouts: {state['ik_timeouts']}")
+            self.timeout_label.setText(f"IK Timeouts: {state['ik_timeouts']}")
 
 
 class BallFilterModule(GUIModule):
@@ -674,43 +762,49 @@ class BallFilterModule(GUIModule):
         self.ball_filter = ball_filter
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Ball Position Filter (EMA)", padding=10)
+        group = QGroupBox("Ball Position Filter (EMA)")
+        layout = QVBoxLayout()
 
-        slider_frame = ttk.Frame(self.frame)
-        slider_frame.pack(fill='x')
+        slider_layout = QHBoxLayout()
 
-        ttk.Label(slider_frame, text="α:",
-                  font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(0, 5))
+        label = QLabel("α:")
+        font = QFont("Segoe UI", 9)
+        font.setBold(True)
+        label.setFont(font)
+        slider_layout.addWidget(label)
 
-        self.alpha_slider = ttk.Scale(
-            slider_frame, from_=0.0, to=1.0, orient='horizontal',
-            command=self._on_alpha_change
-        )
-        self.alpha_slider.pack(side='left', fill='x', expand=True, padx=5)
+        self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.alpha_slider.setMinimum(0)
+        self.alpha_slider.setMaximum(100)
+        self.alpha_slider.setValue(int(self.ball_filter.get_alpha() * 100))
+        self.alpha_slider.valueChanged.connect(self._on_alpha_change)
+        slider_layout.addWidget(self.alpha_slider)
 
-        self.alpha_value_label = ttk.Label(
-            slider_frame, text=f"{self.ball_filter.get_alpha():.2f}",
-            width=4, font=('Consolas', 10, 'bold'),
-            foreground=self.colors['highlight']
-        )
-        self.alpha_value_label.pack(side='left', padx=(5, 0))
+        self.alpha_value_label = QLabel(f"{self.ball_filter.get_alpha():.2f}")
+        font = QFont("Consolas", 10)
+        font.setBold(True)
+        self.alpha_value_label.setFont(font)
+        self.alpha_value_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        self.alpha_value_label.setMinimumWidth(40)
+        slider_layout.addWidget(self.alpha_value_label)
 
-        info_label = ttk.Label(
-            self.frame,
-            text="0=Smooth/Lag  →  1=Raw/Responsive",
-            font=('Segoe UI', 7, 'italic'),
-            foreground=self.colors['border']
-        )
-        info_label.pack(anchor='w', pady=(3, 0))
+        layout.addLayout(slider_layout)
 
-        self.alpha_slider.set(self.ball_filter.get_alpha())
+        info_label = QLabel("0=Smooth/Lag  →  1=Raw/Responsive")
+        font = QFont("Segoe UI", 7)
+        font.setItalic(True)
+        info_label.setFont(font)
+        info_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(info_label)
 
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def _on_alpha_change(self, value):
-        alpha = float(value)
+        alpha = value / 100.0
         self.ball_filter.set_alpha(alpha)
-        self.alpha_value_label.config(text=f"{alpha:.2f}")
+        self.alpha_value_label.setText(f"{alpha:.2f}")
 
 
 class Pixy2CameraModule(GUIModule):
@@ -719,191 +813,146 @@ class Pixy2CameraModule(GUIModule):
     def __init__(self, parent, colors, callbacks, camera=None):
         super().__init__(parent, colors, callbacks)
         self.camera = camera
+        self.sliders = {}
+        self.value_labels = {}
+        self.camera_enabled = True
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Pixy2 Camera Model", padding=10)
+        group = QGroupBox("Pixy2 Camera Model")
+        layout = QVBoxLayout()
 
         # Enable/Disable camera noise
-        enable_frame = ttk.Frame(self.frame)
-        enable_frame.pack(fill='x', pady=(0, 10))
+        enable_layout = QHBoxLayout()
 
-        self.camera_enabled = tk.BooleanVar(value=True)
-        ttk.Checkbutton(enable_frame, text="Enable Camera Noise",
-                        variable=self.camera_enabled,
-                        command=self._on_enable_toggle).pack(side='left')
+        self.enable_checkbox = QCheckBox("Enable Camera Noise")
+        self.enable_checkbox.setChecked(True)
+        self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
+        enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = ttk.Label(enable_frame, text="●",
-                                          foreground=self.colors['success'],
-                                          font=('Segoe UI', 14))
-        self.status_indicator.pack(side='left', padx=(10, 0))
+        self.status_indicator = QLabel("●")
+        self.status_indicator.setFont(QFont("Segoe UI", 14))
+        self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
+        enable_layout.addWidget(self.status_indicator)
+        enable_layout.addStretch()
 
-        # Separator
-        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+        layout.addLayout(enable_layout)
 
-        # Pixel size parameter
-        self._create_parameter_row(
-            "Pixel Size:",
-            min_val=0.5,
-            max_val=3.0,
-            default=1.4,
-            resolution=0.1,
-            param_name='pixel_size',
-            unit='mm'
-        )
+        # Parameters
+        self._create_parameter_row(layout, "Pixel Size:", 0.5, 3.0, 1.4, 0.1, 'pixel_size', 'mm')
+        self._create_parameter_row(layout, "Sub-pixel Noise:", 0.0, 1.0, 0.4, 0.01, 'noise_std', 'mm')
+        self._create_parameter_row(layout, "Detection Rate:", 0.90, 1.0, 0.999, 0.001, 'detection_rate', '', "{:.3f}")
+        self._create_parameter_row(layout, "Sample Rate:", 0.0, 60.0, 19.3, 0.1, 'sample_rate', 'Hz', "{:.1f}")
 
-        # Sub-pixel noise parameter
-        self._create_parameter_row(
-            "Sub-pixel Noise:",
-            min_val=0.0,
-            max_val=1.0,
-            default=0.4,
-            resolution=0.01,
-            param_name='noise_std',
-            unit='mm'
-        )
+        info_label = QLabel("(0 Hz = sample every frame)")
+        font = QFont("Segoe UI", 7)
+        font.setItalic(True)
+        info_label.setFont(font)
+        info_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(info_label)
 
-        # Detection rate parameter
-        self._create_parameter_row(
-            "Detection Rate:",
-            min_val=0.90,
-            max_val=1.0,
-            default=0.999,
-            resolution=0.001,
-            param_name='detection_rate',
-            unit='',
-            format_str="{:.3f}"
-        )
+        # Camera statistics
+        stats_layout = QVBoxLayout()
+        stats_label = QLabel("Camera Stats:")
+        font = QFont("Segoe UI", 9)
+        font.setBold(True)
+        stats_label.setFont(font)
+        stats_layout.addWidget(stats_label)
 
-        # Sample rate parameter
-        self._create_parameter_row(
-            "Sample Rate:",
-            min_val=0.0,
-            max_val=60.0,
-            default=19.3,
-            resolution=0.1,
-            param_name='sample_rate',
-            unit='Hz',
-            format_str="{:.1f}"
-        )
+        self.measurement_label = QLabel("Raw: (0.0, 0.0) mm")
+        self.measurement_label.setFont(QFont("Consolas", 8))
+        stats_layout.addWidget(self.measurement_label)
 
-        # Info label for sample rate
-        info_label = ttk.Label(
-            self.frame,
-            text="(0 Hz = sample every frame)",
-            font=('Segoe UI', 7, 'italic'),
-            foreground=self.colors['border']
-        )
-        info_label.pack(anchor='w', pady=(0, 10))
+        self.quantized_label = QLabel("Quantized: (0.0, 0.0) mm")
+        self.quantized_label.setFont(QFont("Consolas", 8))
+        stats_layout.addWidget(self.quantized_label)
 
-        # Separator
-        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+        self.sample_status_label = QLabel("Last sample: never")
+        self.sample_status_label.setFont(QFont("Consolas", 8))
+        stats_layout.addWidget(self.sample_status_label)
 
-        # Camera statistics display
-        stats_frame = ttk.Frame(self.frame)
-        stats_frame.pack(fill='x', pady=(0, 5))
-
-        ttk.Label(stats_frame, text="Camera Stats:",
-                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 5))
-
-        self.measurement_label = ttk.Label(stats_frame,
-                                           text="Raw: (0.0, 0.0) mm",
-                                           font=('Consolas', 8))
-        self.measurement_label.pack(anchor='w', pady=2)
-
-        self.quantized_label = ttk.Label(stats_frame,
-                                         text="Quantized: (0.0, 0.0) mm",
-                                         font=('Consolas', 8))
-        self.quantized_label.pack(anchor='w', pady=2)
-
-        self.sample_status_label = ttk.Label(stats_frame,
-                                             text="Last sample: never",
-                                             font=('Consolas', 8))
-        self.sample_status_label.pack(anchor='w', pady=2)
+        layout.addLayout(stats_layout)
 
         # Control buttons
-        btn_frame = ttk.Frame(self.frame)
-        btn_frame.pack(fill='x', pady=(10, 0))
+        btn_layout = QHBoxLayout()
 
-        ttk.Button(btn_frame, text="Reset Camera",
-                   command=self._on_reset_camera,
-                   width=15).pack(side='left', padx=5)
+        reset_btn = QPushButton("Reset Camera")
+        reset_btn.clicked.connect(self._on_reset_camera)
+        reset_btn.setMinimumWidth(120)
+        btn_layout.addWidget(reset_btn)
 
-        ttk.Button(btn_frame, text="Preset: Real",
-                   command=self._load_real_preset,
-                   width=15).pack(side='left', padx=5)
+        preset_btn = QPushButton("Preset: Real")
+        preset_btn.clicked.connect(self._load_real_preset)
+        preset_btn.setMinimumWidth(120)
+        btn_layout.addWidget(preset_btn)
 
-        # Preset info
-        preset_info = ttk.Label(
-            self.frame,
-            text="Real preset: measured values from actual Pixy2",
-            font=('Segoe UI', 7, 'italic'),
-            foreground=self.colors['border']
-        )
-        preset_info.pack(anchor='w', pady=(5, 0))
+        layout.addLayout(btn_layout)
 
-        return self.frame
+        preset_info = QLabel("Real preset: measured values from actual Pixy2")
+        font = QFont("Segoe UI", 7)
+        font.setItalic(True)
+        preset_info.setFont(font)
+        preset_info.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(preset_info)
 
-    def _create_parameter_row(self, label, min_val, max_val, default,
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _create_parameter_row(self, parent_layout, label, min_val, max_val, default,
                               resolution, param_name, unit='', format_str="{:.2f}"):
-        """Create a parameter control row with slider and value display."""
-        frame = ttk.Frame(self.frame)
-        frame.pack(fill='x', pady=5)
+        grid = QGridLayout()
 
-        ttk.Label(frame, text=label,
-                  font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', padx=(0, 10))
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont("Segoe UI", 9))
+        grid.addWidget(label_widget, 0, 0)
 
-        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
-        slider.grid(row=0, column=1, sticky='ew', padx=5)
-        slider.set(default)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(int(min_val / resolution))
+        slider.setMaximum(int(max_val / resolution))
+        slider.setValue(int(default / resolution))
+        grid.addWidget(slider, 0, 1)
 
         value_text = format_str.format(default) + (f" {unit}" if unit else "")
-        value_label = ttk.Label(frame, text=value_text,
-                                width=10, font=('Consolas', 9),
-                                foreground=self.colors['highlight'])
-        value_label.grid(row=0, column=2)
-
-        # Store references
-        if not hasattr(self, 'sliders'):
-            self.sliders = {}
-            self.value_labels = {}
+        value_label = QLabel(value_text)
+        value_label.setFont(QFont("Consolas", 9))
+        value_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        value_label.setMinimumWidth(80)
+        grid.addWidget(value_label, 0, 2)
 
         self.sliders[param_name] = slider
         self.value_labels[param_name] = value_label
 
-        # Bind slider change
-        def on_change(val):
-            value = float(val)
-            value_text = format_str.format(value) + (f" {unit}" if unit else "")
-            value_label.config(text=value_text)
-            self._on_param_change(param_name, value)
+        def on_change(val, pn=param_name, r=resolution, fs=format_str, u=unit):
+            value = val * r
+            value_text = fs.format(value) + (f" {u}" if u else "")
+            self.value_labels[pn].setText(value_text)
+            self._on_param_change(pn, value)
 
-        slider.config(command=on_change)
-        frame.columnconfigure(1, weight=1)
+        slider.valueChanged.connect(on_change)
+        grid.setColumnStretch(1, 1)
+
+        parent_layout.addLayout(grid)
 
     def _on_enable_toggle(self):
-        """Handle camera enable/disable."""
-        enabled = self.camera_enabled.get()
+        enabled = self.enable_checkbox.isChecked()
+        self.camera_enabled = enabled
 
         if enabled:
-            self.status_indicator.config(foreground=self.colors['success'])
-            # Enable all sliders
+            self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
             for slider in self.sliders.values():
-                slider.config(state='normal')
+                slider.setEnabled(True)
         else:
-            self.status_indicator.config(foreground=self.colors['border'])
-            # Disable all sliders
+            self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
             for slider in self.sliders.values():
-                slider.config(state='disabled')
+                slider.setEnabled(False)
 
         if self.callbacks.get('camera_enable_change'):
             self.callbacks['camera_enable_change'](enabled)
 
     def _on_param_change(self, param_name, value):
-        """Handle parameter change."""
-        if not self.camera or not self.camera_enabled.get():
+        if not self.camera or not self.camera_enabled:
             return
 
-        # Update camera parameters
         if param_name == 'pixel_size':
             self.camera.pixel_size = value
         elif param_name == 'noise_std':
@@ -917,7 +966,6 @@ class Pixy2CameraModule(GUIModule):
             self.callbacks['camera_param_change'](param_name, value)
 
     def _on_reset_camera(self):
-        """Reset camera state."""
         if self.camera:
             self.camera.reset()
 
@@ -925,54 +973,48 @@ class Pixy2CameraModule(GUIModule):
             self.callbacks['camera_reset']()
 
     def _load_real_preset(self):
-        """Load real-world measured parameters."""
-        # Measured values from your noise analysis
         presets = {
             'pixel_size': 1.4,
-            'noise_std': 0.4,  # Tuned to match your X-axis std dev
+            'noise_std': 0.4,
             'detection_rate': 0.999,
             'sample_rate': 19.3
         }
 
         for param_name, value in presets.items():
             if param_name in self.sliders:
-                self.sliders[param_name].set(value)
-                # Trigger update
+                # Get resolution from slider
+                slider = self.sliders[param_name]
+                resolution = (slider.maximum() - slider.minimum()) / 100.0  # Approximate
+                if param_name == 'detection_rate':
+                    resolution = 0.001
+                elif param_name == 'noise_std':
+                    resolution = 0.01
+                elif param_name == 'pixel_size':
+                    resolution = 0.1
+                elif param_name == 'sample_rate':
+                    resolution = 0.1
+
+                slider.setValue(int(value / resolution))
                 self._on_param_change(param_name, value)
 
         if self.callbacks.get('log'):
             self.callbacks['log']("Loaded real Pixy2 camera preset")
 
     def update(self, state):
-        """Update camera statistics display."""
         if 'camera_raw_measurement' in state:
             x, y = state['camera_raw_measurement']
             if x is not None and y is not None:
-                self.measurement_label.config(
-                    text=f"Raw: ({x:.2f}, {y:.2f}) mm"
-                )
+                self.measurement_label.setText(f"Raw: ({x:.2f}, {y:.2f}) mm")
 
         if 'camera_quantized_measurement' in state:
             x, y = state['camera_quantized_measurement']
             if x is not None and y is not None:
-                self.quantized_label.config(
-                    text=f"Quantized: ({x:.2f}, {y:.2f}) mm"
-                )
+                self.quantized_label.setText(f"Quantized: ({x:.2f}, {y:.2f}) mm")
 
         if 'camera_last_sample_time' in state:
             time_val = state['camera_last_sample_time']
             if time_val >= 0:
-                self.sample_status_label.config(
-                    text=f"Last sample: {time_val:.3f}s"
-                )
-
-        if 'camera_is_new_sample' in state and state['camera_is_new_sample']:
-            # Flash the status indicator briefly
-            original_color = self.status_indicator.cget('foreground')
-            self.status_indicator.config(foreground='#ffffff')
-            self.frame.after(50, lambda: self.status_indicator.config(
-                foreground=original_color
-            ))
+                self.sample_status_label.setText(f"Last sample: {time_val:.3f}s")
 
 
 class KalmanFilterModule(GUIModule):
@@ -981,164 +1023,134 @@ class KalmanFilterModule(GUIModule):
     def __init__(self, parent, colors, callbacks, kalman_filter=None):
         super().__init__(parent, colors, callbacks)
         self.kalman_filter = kalman_filter
+        self.sliders = {}
+        self.value_labels = {}
+        self.filter_enabled = False
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Kalman Filter", padding=10)
+        group = QGroupBox("Kalman Filter")
+        layout = QVBoxLayout()
 
         # Enable/Disable control
-        enable_frame = ttk.Frame(self.frame)
-        enable_frame.pack(fill='x', pady=(0, 10))
+        enable_layout = QHBoxLayout()
 
-        self.filter_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(enable_frame, text="Enable Kalman Filter",
-                        variable=self.filter_enabled,
-                        command=self._on_enable_toggle).pack(side='left')
+        self.enable_checkbox = QCheckBox("Enable Kalman Filter")
+        self.enable_checkbox.setChecked(False)
+        self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
+        enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = ttk.Label(enable_frame, text="●",
-                                          foreground=self.colors['border'],
-                                          font=('Segoe UI', 14))
-        self.status_indicator.pack(side='left', padx=(10, 0))
+        self.status_indicator = QLabel("●")
+        self.status_indicator.setFont(QFont("Segoe UI", 14))
+        self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+        enable_layout.addWidget(self.status_indicator)
+        enable_layout.addStretch()
 
-        # Separator
-        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+        layout.addLayout(enable_layout)
 
-        # Process Noise slider
-        self._create_parameter_slider(
-            label="Process Noise (Q):",
-            min_val=0.01,
-            max_val=10.0,
-            default=1.0,
-            param_name='process_noise',
-            tooltip="Model trust: Lower=trust model, Higher=trust measurements"
-        )
-
-        # Measurement Noise slider
-        self._create_parameter_slider(
-            label="Measurement Noise (R):",
-            min_val=0.01,
-            max_val=10.0,
-            default=1.0,
-            param_name='measurement_noise',
-            tooltip="Camera trust: Lower=trust camera, Higher=smooth more"
-        )
-
-        # Separator
-        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(10, 10))
+        # Parameters
+        self._create_parameter_slider(layout, "Process Noise (Q):", 0.01, 10.0, 1.0, 'process_noise')
+        self._create_parameter_slider(layout, "Measurement Noise (R):", 0.01, 10.0, 1.0, 'measurement_noise')
 
         # Filter state display
-        state_frame = ttk.Frame(self.frame)
-        state_frame.pack(fill='x', pady=(0, 5))
+        state_layout = QVBoxLayout()
+        state_label = QLabel("Filter State:")
+        font = QFont("Segoe UI", 9)
+        font.setBold(True)
+        state_label.setFont(font)
+        state_layout.addWidget(state_label)
 
-        ttk.Label(state_frame, text="Filter State:",
-                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 5))
+        self.position_label = QLabel("Position: (0.0, 0.0) mm")
+        self.position_label.setFont(QFont("Consolas", 8))
+        state_layout.addWidget(self.position_label)
 
-        self.position_label = ttk.Label(state_frame,
-                                        text="Position: (0.0, 0.0) mm",
-                                        font=('Consolas', 8))
-        self.position_label.pack(anchor='w', pady=2)
+        self.velocity_label = QLabel("Velocity: (0.0, 0.0) mm/s")
+        self.velocity_label.setFont(QFont("Consolas", 8))
+        state_layout.addWidget(self.velocity_label)
 
-        self.velocity_label = ttk.Label(state_frame,
-                                        text="Velocity: (0.0, 0.0) mm/s",
-                                        font=('Consolas', 8))
-        self.velocity_label.pack(anchor='w', pady=2)
+        self.uncertainty_label = QLabel("Uncertainty: ±0.0 mm")
+        self.uncertainty_label.setFont(QFont("Consolas", 8))
+        state_layout.addWidget(self.uncertainty_label)
 
-        self.uncertainty_label = ttk.Label(state_frame,
-                                           text="Uncertainty: ±0.0 mm",
-                                           font=('Consolas', 8))
-        self.uncertainty_label.pack(anchor='w', pady=2)
+        layout.addLayout(state_layout)
 
-        # Statistics display
-        stats_frame = ttk.Frame(self.frame)
-        stats_frame.pack(fill='x', pady=(5, 5))
-
-        self.stats_label = ttk.Label(stats_frame,
-                                     text="Updates: 0/0 (0.0%)",
-                                     font=('Consolas', 8),
-                                     foreground=self.colors['border'])
-        self.stats_label.pack(anchor='w', pady=2)
+        # Statistics
+        self.stats_label = QLabel("Updates: 0/0 (0.0%)")
+        self.stats_label.setFont(QFont("Consolas", 8))
+        self.stats_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(self.stats_label)
 
         # Control buttons
-        btn_frame = ttk.Frame(self.frame)
-        btn_frame.pack(fill='x', pady=(10, 0))
+        btn_layout = QHBoxLayout()
 
-        ttk.Button(btn_frame, text="Reset Filter",
-                   command=self._on_reset_filter,
-                   width=15).pack(side='left', padx=5)
+        reset_btn = QPushButton("Reset Filter")
+        reset_btn.clicked.connect(self._on_reset_filter)
+        reset_btn.setMinimumWidth(120)
+        btn_layout.addWidget(reset_btn)
 
-        ttk.Button(btn_frame, text="Show Details",
-                   command=self._on_show_details,
-                   width=15).pack(side='left', padx=5)
+        details_btn = QPushButton("Show Details")
+        details_btn.clicked.connect(self._on_show_details)
+        details_btn.setMinimumWidth(120)
+        btn_layout.addWidget(details_btn)
 
-        return self.frame
+        layout.addLayout(btn_layout)
 
-    def _create_parameter_slider(self, label, min_val, max_val, default,
-                                 param_name, tooltip=""):
-        """Create a parameter control row with slider and value display."""
-        frame = ttk.Frame(self.frame)
-        frame.pack(fill='x', pady=5)
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
-        label_widget = ttk.Label(frame, text=label,
-                                 font=('Segoe UI', 9))
-        label_widget.grid(row=0, column=0, sticky='w', padx=(0, 10))
+    def _create_parameter_slider(self, parent_layout, label, min_val, max_val, default, param_name):
+        grid = QGridLayout()
 
-        slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal')
-        slider.grid(row=0, column=1, sticky='ew', padx=5)
-        slider.set(default)
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont("Segoe UI", 9))
+        grid.addWidget(label_widget, 0, 0)
 
-        value_label = ttk.Label(frame, text=f"{default:.2f}",
-                                width=6, font=('Consolas', 9),
-                                foreground=self.colors['highlight'])
-        value_label.grid(row=0, column=2)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(int(min_val * 100))
+        slider.setMaximum(int(max_val * 100))
+        slider.setValue(int(default * 100))
+        slider.setEnabled(False)
+        grid.addWidget(slider, 0, 1)
 
-        # Store references
-        if not hasattr(self, 'sliders'):
-            self.sliders = {}
-            self.value_labels = {}
+        value_label = QLabel(f"{default:.2f}")
+        value_label.setFont(QFont("Consolas", 9))
+        value_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        value_label.setMinimumWidth(60)
+        grid.addWidget(value_label, 0, 2)
 
         self.sliders[param_name] = slider
         self.value_labels[param_name] = value_label
 
-        # Bind slider change
-        def on_change(val):
-            value = float(val)
-            value_label.config(text=f"{value:.2f}")
-            self._on_param_change(param_name, value)
+        def on_change(val, pn=param_name):
+            value = val / 100.0
+            self.value_labels[pn].setText(f"{value:.2f}")
+            self._on_param_change(pn, value)
 
-        slider.config(command=on_change)
-        frame.columnconfigure(1, weight=1)
+        slider.valueChanged.connect(on_change)
+        grid.setColumnStretch(1, 1)
 
-        # Tooltip (optional)
-        if tooltip:
-            info_label = ttk.Label(frame, text="ⓘ",
-                                   font=('Segoe UI', 8),
-                                   foreground=self.colors['border'])
-            info_label.grid(row=0, column=3, padx=(2, 0))
-            # In a real implementation, you'd add a tooltip on hover
+        parent_layout.addLayout(grid)
 
     def _on_enable_toggle(self):
-        """Handle filter enable/disable."""
-        enabled = self.filter_enabled.get()
+        enabled = self.enable_checkbox.isChecked()
+        self.filter_enabled = enabled
 
         if enabled:
-            self.status_indicator.config(foreground=self.colors['success'])
-            # Enable sliders
+            self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
             for slider in self.sliders.values():
-                slider.config(state='normal')
+                slider.setEnabled(True)
         else:
-            self.status_indicator.config(foreground=self.colors['border'])
-            # Disable sliders
+            self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
             for slider in self.sliders.values():
-                slider.config(state='disabled')
+                slider.setEnabled(False)
 
         if self.callbacks.get('kalman_enable_change'):
             self.callbacks['kalman_enable_change'](enabled)
 
     def _on_param_change(self, param_name, value):
-        """Handle parameter change."""
-        if not self.kalman_filter or not self.filter_enabled.get():
+        if not self.kalman_filter or not self.filter_enabled:
             return
 
-        # Update filter parameters
         if param_name == 'process_noise':
             self.kalman_filter.set_process_noise(value)
         elif param_name == 'measurement_noise':
@@ -1148,7 +1160,6 @@ class KalmanFilterModule(GUIModule):
             self.callbacks['kalman_param_change'](param_name, value)
 
     def _on_reset_filter(self):
-        """Reset filter state."""
         if self.kalman_filter:
             self.kalman_filter.reset()
 
@@ -1156,11 +1167,8 @@ class KalmanFilterModule(GUIModule):
             self.callbacks['kalman_reset']()
 
     def _on_show_details(self):
-        """Show detailed filter information."""
         if not self.kalman_filter:
             return
-
-        from tkinter import messagebox
 
         stats = self.kalman_filter.get_statistics()
         pos, vel, _ = self.kalman_filter.get_state()
@@ -1188,34 +1196,30 @@ class KalmanFilterModule(GUIModule):
         details += f"  Process noise scale: {stats['process_noise_scale']:.3f}\n"
         details += f"  Measurement noise scale: {stats['measurement_noise_scale']:.3f}\n"
 
-        messagebox.showinfo("Kalman Filter Details", details)
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("Kalman Filter Details")
+        msg_box.setText(details)
+        msg_box.exec()
 
     def update(self, state):
-        """Update filter state display."""
         if 'kalman_position' in state:
             pos = state['kalman_position']
-            self.position_label.config(
-                text=f"Position: ({pos[0]:.2f}, {pos[1]:.2f}) mm"
-            )
+            self.position_label.setText(f"Position: ({pos[0]:.2f}, {pos[1]:.2f}) mm")
 
         if 'kalman_velocity' in state:
             vel = state['kalman_velocity']
-            self.velocity_label.config(
-                text=f"Velocity: ({vel[0]:.2f}, {vel[1]:.2f}) mm/s"
-            )
+            self.velocity_label.setText(f"Velocity: ({vel[0]:.2f}, {vel[1]:.2f}) mm/s")
 
         if 'kalman_uncertainty' in state:
             std = state['kalman_uncertainty']
             avg_std = (std[0] + std[1]) / 2.0
-            self.uncertainty_label.config(
-                text=f"Uncertainty: ±{avg_std:.3f} mm"
-            )
+            self.uncertainty_label.setText(f"Uncertainty: ±{avg_std:.3f} mm")
 
         if 'kalman_stats' in state:
             stats = state['kalman_stats']
-            self.stats_label.config(
-                text=f"Updates: {stats['updates']}/{stats['predictions']} "
-                     f"({stats['update_ratio'] * 100:.1f}%)"
+            self.stats_label.setText(
+                f"Updates: {stats['updates']}/{stats['predictions']} "
+                f"({stats['update_ratio'] * 100:.1f}%)"
             )
 
 
@@ -1226,79 +1230,86 @@ class PlotControlModule(GUIModule):
         super().__init__(parent, colors, callbacks)
         self.plot_enabled_var = plot_enabled_var
         self.plot_rate_var = plot_rate_var
-        self.rate_label = None  # Initialize to None
 
     def create(self):
-        self.frame = ttk.LabelFrame(self.parent, text="Plot Control", padding=10)
+        group = QGroupBox("Plot Control")
+        layout = QVBoxLayout()
 
         # Enable toggle
-        enable_frame = ttk.Frame(self.frame)
-        enable_frame.pack(fill='x', pady=(0, 10))
+        enable_layout = QHBoxLayout()
 
-        ttk.Checkbutton(enable_frame, text="Enable Live Plot Updates",
-                        variable=self.plot_enabled_var,
-                        command=self._on_enable_toggle).pack(side='left')
+        self.enable_checkbox = QCheckBox("Enable Live Plot Updates")
+        self.enable_checkbox.setChecked(self.plot_enabled_var)
+        self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
+        enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = ttk.Label(enable_frame, text="●",
-                                          foreground=self.colors['success'],
-                                          font=('Segoe UI', 14))
-        self.status_indicator.pack(side='left', padx=(10, 0))
+        self.status_indicator = QLabel("●")
+        self.status_indicator.setFont(QFont("Segoe UI", 14))
+        color = self.colors['success'] if self.plot_enabled_var else self.colors['border']
+        self.status_indicator.setStyleSheet(f"color: {color};")
+        enable_layout.addWidget(self.status_indicator)
+        enable_layout.addStretch()
 
-        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+        layout.addLayout(enable_layout)
 
         # Rate slider
-        rate_frame = ttk.Frame(self.frame)
-        rate_frame.pack(fill='x', pady=5)
+        rate_grid = QGridLayout()
 
-        ttk.Label(rate_frame, text="Plot Refresh Rate:",
-                  font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w')
+        rate_grid.addWidget(QLabel("Plot Refresh Rate:"), 0, 0)
 
-        self.rate_slider = ttk.Scale(rate_frame, from_=1, to=50, orient='horizontal')
-        self.rate_slider.grid(row=0, column=1, sticky='ew', padx=5)
+        self.rate_slider = QSlider(Qt.Orientation.Horizontal)
+        self.rate_slider.setMinimum(1)
+        self.rate_slider.setMaximum(50)
+        self.rate_slider.setValue(self.plot_rate_var)
+        self.rate_slider.valueChanged.connect(self._on_rate_change)
+        rate_grid.addWidget(self.rate_slider, 0, 1)
 
-        self.rate_label = ttk.Label(rate_frame, text=f"{self.plot_rate_var.get()} Hz",
-                                    width=8, font=('Consolas', 9),
-                                    foreground=self.colors['highlight'])
-        self.rate_label.grid(row=0, column=2)
+        self.rate_label = QLabel(f"{self.plot_rate_var} Hz")
+        self.rate_label.setFont(QFont("Consolas", 9))
+        self.rate_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        self.rate_label.setMinimumWidth(70)
+        rate_grid.addWidget(self.rate_label, 0, 2)
 
-        # Set value AFTER creating label
-        self.rate_slider.set(self.plot_rate_var.get())
-        self.rate_slider.config(command=self._on_rate_change)
+        rate_grid.setColumnStretch(1, 1)
+        layout.addLayout(rate_grid)
 
-        rate_frame.columnconfigure(1, weight=1)
+        info_label = QLabel("Lower rate = better control performance")
+        font = QFont("Segoe UI", 7)
+        font.setItalic(True)
+        info_label.setFont(font)
+        info_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(info_label)
 
-        ttk.Label(self.frame, text="Lower rate = better control performance",
-                  font=('Segoe UI', 7, 'italic'),
-                  foreground=self.colors['border']).pack(anchor='w', pady=(5, 0))
+        self.perf_label = QLabel("")
+        self.perf_label.setFont(QFont("Consolas", 8))
+        self.perf_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(self.perf_label)
 
-        self.perf_label = ttk.Label(self.frame, text="",
-                                    font=('Consolas', 8),
-                                    foreground=self.colors['border'])
-        self.perf_label.pack(anchor='w', pady=(5, 0))
-
-        return self.frame
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
 
     def _on_enable_toggle(self):
-        enabled = self.plot_enabled_var.get()
-        self.status_indicator.config(foreground=self.colors['success'] if enabled else self.colors['border'])
-        self.rate_slider.config(state='normal' if enabled else 'disabled')
+        enabled = self.enable_checkbox.isChecked()
+        self.plot_enabled_var = enabled
+        color = self.colors['success'] if enabled else self.colors['border']
+        self.status_indicator.setStyleSheet(f"color: {color};")
+        self.rate_slider.setEnabled(enabled)
         if self.callbacks.get('plot_enable_change'):
             self.callbacks['plot_enable_change'](enabled)
 
     def _on_rate_change(self, value):
-        rate = int(float(value))
-        self.plot_rate_var.set(rate)
-        if self.rate_label:
-            self.rate_label.config(text=f"{rate} Hz")
+        self.plot_rate_var = value
+        self.rate_label.setText(f"{value} Hz")
         if self.callbacks.get('plot_rate_change'):
-            self.callbacks['plot_rate_change'](rate)
+            self.callbacks['plot_rate_change'](value)
 
     def update(self, state):
         if 'plot_drops' in state:
             drops = state['plot_drops']
             if drops > 0:
-                self.perf_label.config(text=f"{drops} frames dropped",
-                                       foreground=self.colors['warning'])
+                self.perf_label.setText(f"{drops} frames dropped")
+                self.perf_label.setStyleSheet(f"color: {self.colors['warning']};")
             else:
-                self.perf_label.config(text="No frame drops",
-                                       foreground=self.colors['success'])
+                self.perf_label.setText("No frame drops")
+                self.perf_label.setStyleSheet(f"color: {self.colors['success']};")
