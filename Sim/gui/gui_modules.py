@@ -1217,3 +1217,88 @@ class KalmanFilterModule(GUIModule):
                 text=f"Updates: {stats['updates']}/{stats['predictions']} "
                      f"({stats['update_ratio'] * 100:.1f}%)"
             )
+
+
+class PlotControlModule(GUIModule):
+    """Control plot updates and refresh rate."""
+
+    def __init__(self, parent, colors, callbacks, plot_enabled_var, plot_rate_var):
+        super().__init__(parent, colors, callbacks)
+        self.plot_enabled_var = plot_enabled_var
+        self.plot_rate_var = plot_rate_var
+        self.rate_label = None  # Initialize to None
+
+    def create(self):
+        self.frame = ttk.LabelFrame(self.parent, text="Plot Control", padding=10)
+
+        # Enable toggle
+        enable_frame = ttk.Frame(self.frame)
+        enable_frame.pack(fill='x', pady=(0, 10))
+
+        ttk.Checkbutton(enable_frame, text="Enable Live Plot Updates",
+                        variable=self.plot_enabled_var,
+                        command=self._on_enable_toggle).pack(side='left')
+
+        self.status_indicator = ttk.Label(enable_frame, text="●",
+                                          foreground=self.colors['success'],
+                                          font=('Segoe UI', 14))
+        self.status_indicator.pack(side='left', padx=(10, 0))
+
+        ttk.Separator(self.frame, orient='horizontal').pack(fill='x', pady=(5, 10))
+
+        # Rate slider
+        rate_frame = ttk.Frame(self.frame)
+        rate_frame.pack(fill='x', pady=5)
+
+        ttk.Label(rate_frame, text="Plot Refresh Rate:",
+                  font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w')
+
+        self.rate_slider = ttk.Scale(rate_frame, from_=1, to=50, orient='horizontal')
+        self.rate_slider.grid(row=0, column=1, sticky='ew', padx=5)
+
+        self.rate_label = ttk.Label(rate_frame, text=f"{self.plot_rate_var.get()} Hz",
+                                    width=8, font=('Consolas', 9),
+                                    foreground=self.colors['highlight'])
+        self.rate_label.grid(row=0, column=2)
+
+        # Set value AFTER creating label
+        self.rate_slider.set(self.plot_rate_var.get())
+        self.rate_slider.config(command=self._on_rate_change)
+
+        rate_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self.frame, text="Lower rate = better control performance",
+                  font=('Segoe UI', 7, 'italic'),
+                  foreground=self.colors['border']).pack(anchor='w', pady=(5, 0))
+
+        self.perf_label = ttk.Label(self.frame, text="",
+                                    font=('Consolas', 8),
+                                    foreground=self.colors['border'])
+        self.perf_label.pack(anchor='w', pady=(5, 0))
+
+        return self.frame
+
+    def _on_enable_toggle(self):
+        enabled = self.plot_enabled_var.get()
+        self.status_indicator.config(foreground=self.colors['success'] if enabled else self.colors['border'])
+        self.rate_slider.config(state='normal' if enabled else 'disabled')
+        if self.callbacks.get('plot_enable_change'):
+            self.callbacks['plot_enable_change'](enabled)
+
+    def _on_rate_change(self, value):
+        rate = int(float(value))
+        self.plot_rate_var.set(rate)
+        if self.rate_label:
+            self.rate_label.config(text=f"{rate} Hz")
+        if self.callbacks.get('plot_rate_change'):
+            self.callbacks['plot_rate_change'](rate)
+
+    def update(self, state):
+        if 'plot_drops' in state:
+            drops = state['plot_drops']
+            if drops > 0:
+                self.perf_label.config(text=f"{drops} frames dropped",
+                                       foreground=self.colors['warning'])
+            else:
+                self.perf_label.config(text="No frame drops",
+                                       foreground=self.colors['success'])

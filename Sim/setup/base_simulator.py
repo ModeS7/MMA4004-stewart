@@ -324,6 +324,7 @@ class BaseStewartSimulator:
             'ball_filter': gm.BallFilterModule,
             'pixy2_camera': gm.Pixy2CameraModule,
             'kalman_filter': gm.KalmanFilterModule,
+            'plot_control': gm.PlotControlModule,
         }
 
         layout_config = self.get_layout_config()

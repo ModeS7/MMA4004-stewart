@@ -16,14 +16,13 @@ from tkinter import messagebox, ttk
 import numpy as np
 import time
 import threading
-import serial.tools.list_ports
+from queue import Queue, Empty
 import gc
 import sys
-import ctypes
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import SerialController, IKCache, WindowsTimerManager, ThreadPriorityManager
-from core.control_core import clip_tilt_vector, LQRController, KalmanFilter  # ADD KalmanFilter
+from core.control_core import clip_tilt_vector, LQRController, KalmanFilter
 from core.utils import ControlLoopConfig, GUIConfig, MAX_TILT_ANGLE_DEG, MAX_SERVO_ANGLE_DEG, format_time, \
     format_vector_2d
 from gui.gui_builder import create_standard_layout
@@ -118,6 +117,12 @@ class HardwareStewartSimulator(BaseStewartSimulator):
     def __init__(self, root):
         self.port_var = tk.StringVar()
 
+        # Plot control
+        self.plot_enabled = tk.BooleanVar(value=True)
+        self.plot_rate = tk.IntVar(value=10)  # 10 Hz default
+        self.plot_divisor = 10  # Update every Nth loop
+        self.plot_drops = 0
+
         ball_physics_params = {
             'radius': 0.02,
             'mass': 0.0027,
@@ -192,6 +197,10 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.last_gui_update = time.time()
         self.gui_update_count = 0
 
+        # Thread-safe queue for GUI updates (non-blocking control thread)
+        self.gui_state_queue = Queue(maxsize=1)
+        self.plot_state_queue = Queue(maxsize=1)
+
         # Disable Start button until connected
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.config(state='disabled')
@@ -230,6 +239,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             {'type': 'trajectory_pattern', 'args': {'pattern_var': self.pattern_type}},
             {'type': 'ball_state'},
             {'type': 'configuration', 'args': {'use_offset_var': self.use_top_surface_offset}},
+            {'type': 'plot_control',
+             'args': {'plot_enabled_var': self.plot_enabled,
+                      'plot_rate_var': self.plot_rate}},
         ]
 
         layout['columns'][1]['modules'] = [
@@ -255,6 +267,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'kalman_enable_change': self.on_kalman_enable_change,
             'kalman_param_change': self.on_kalman_param_change,
             'kalman_reset': self.on_kalman_reset,
+            'plot_enable_change': self.on_plot_enable_change,
+            'plot_rate_change': self.on_plot_rate_change,
         })
 
         return callbacks
@@ -439,6 +453,13 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         """Handle Kalman filter reset."""
         self.kalman_filter.reset(self.ball_pos_mm)
         self.log("Kalman filter reset")
+
+    def on_plot_enable_change(self, enabled):
+        self.log(f"Plot updates: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_plot_rate_change(self, rate):
+        self.plot_divisor = max(1, 100 // rate)  # Convert Hz to divisor
+        self.log(f"Plot rate: {rate} Hz")
 
     def start_simulation(self):
         """Start 100Hz hardware control thread."""
@@ -664,6 +685,70 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             self.simulation_time += loop_interval
 
+            # Queue GUI state update (non-blocking)
+            if self.gui_update_count % 2 == 0:  # Update every other loop (50Hz)
+                gui_state = {
+                    'simulation_time': self.simulation_time,
+                    'controller_enabled': self.controller_enabled.get(),
+                    'ball_pos': self.ball_pos_mm,
+                    'ball_vel': "Detected" if self.ball_detected else "Not detected",
+                    'dof_values': self.dof_values.copy(),
+                    'connected': self.connected,
+                    'fps': ControlLoopConfig.FREQUENCY_HZ,
+                    'cache_hit_rate': self.ik_cache.get_hit_rate(),
+                    'ik_timeouts': self.ik_timeout_count,
+                }
+
+                if self.controller_enabled.get():
+                    rx = self.dof_values['rx']
+                    ry = self.dof_values['ry']
+                    magnitude = np.sqrt(rx ** 2 + ry ** 2)
+                    magnitude_percent = (magnitude / 15.0) * 100
+
+                    pattern_time = self.simulation_time - self.pattern_start_time
+                    target_x, target_y = self.current_pattern.get_position(pattern_time)
+                    error_x = target_x - self.ball_pos_mm[0]
+                    error_y = target_y - self.ball_pos_mm[1]
+
+                    gui_state['controller_output'] = (rx, ry)
+                    gui_state['controller_magnitude'] = (magnitude, magnitude_percent)
+                    gui_state['controller_error'] = (error_x, error_y)
+
+                if self.last_sent_angles is not None:
+                    gui_state['cmd_angles'] = self.last_sent_angles
+
+                pattern_configs = {
+                    'static': "Tracking: Center (0, 0)",
+                    'circle': "Tracking: Circle (r=50mm, T=10s)",
+                    'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
+                    'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
+                }
+                gui_state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
+
+                # Non-blocking queue put
+                try:
+                    self.gui_state_queue.put_nowait(gui_state)
+                except:
+                    pass  # Drop frame if GUI can't keep up
+
+            self.gui_update_count += 1
+
+            # Plot updates (controlled by toggle and rate)
+            if self.gui_update_count % self.plot_divisor == 0 and self.plot_enabled.get():
+                plot_state = {
+                    'ball_pos': self.ball_pos_mm,
+                    'ball_detected': self.ball_detected,
+                    'ball_history_x': list(self.ball_history_x[-20:]) if self.ball_history_x else [],
+                    'ball_history_y': list(self.ball_history_y[-20:]) if self.ball_history_y else [],
+                    'pattern_type': self.pattern_type.get(),
+                    'pattern_time': self.simulation_time - self.pattern_start_time,
+                    'dof_values': (self.dof_values['rx'], self.dof_values['ry']),
+                }
+                try:
+                    self.plot_state_queue.put_nowait(plot_state)
+                except:
+                    self.plot_drops += 1
+
             # Sleep to maintain 100Hz
             t_sleep = time.perf_counter()
             elapsed = time.perf_counter() - loop_start
@@ -684,77 +769,43 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     timing_breakpoints[key].pop(0)
 
     def _gui_update_loop(self):
-        """Separate GUI update loop at lower frequency."""
+        """GUI update loop - pulls state from queue (main thread only)."""
         if not self.simulation_running:
             return
 
-        self.update_gui_modules()
+        # Get GUI state from queue
+        try:
+            state = self.gui_state_queue.get_nowait()
+            self.gui_builder.update_modules(state)
 
-        if self.gui_update_count % 2 == 0:
-            self._update_hardware_plot()
+            # Update Kalman filter GUI if enabled
+            if self.kalman_enabled and hasattr(self, 'kalman_filter'):
+                pos, vel, _ = self.kalman_filter.get_state()
+                std_pos = self.kalman_filter.get_position_uncertainty()
+                stats = self.kalman_filter.get_statistics()
 
-        self.gui_update_count += 1
+                kalman_state = {
+                    'kalman_position': pos,
+                    'kalman_velocity': vel,
+                    'kalman_uncertainty': std_pos,
+                    'kalman_stats': stats
+                }
 
+                if 'kalman_filter' in self.gui_modules:
+                    self.gui_modules['kalman_filter'].update(kalman_state)
+
+        except Empty:
+            pass  # No new state, skip update
+
+        # Get plot state from queue
+        try:
+            plot_state = self.plot_state_queue.get_nowait()
+            self._update_hardware_plot_from_state(plot_state)
+        except Empty:
+            pass  # No new plot data
+
+        # Schedule next update
         self.root.after(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
-
-    def update_gui_modules(self):
-        """Override to add hardware-specific state."""
-        status = "Detected" if self.ball_detected else "Not detected"
-
-        state = {
-            'simulation_time': self.simulation_time,
-            'controller_enabled': self.controller_enabled.get(),
-            'ball_pos': self.ball_pos_mm,
-            'ball_vel': status,
-            'dof_values': self.dof_values,
-            'connected': self.connected,
-            'fps': ControlLoopConfig.FREQUENCY_HZ,
-            'cache_hit_rate': self.ik_cache.get_hit_rate(),
-            'ik_timeouts': self.ik_timeout_count,
-        }
-
-        if self.controller_enabled.get():
-            rx = self.dof_values['rx']
-            ry = self.dof_values['ry']
-            magnitude = np.sqrt(rx ** 2 + ry ** 2)
-            magnitude_percent = (magnitude / 15.0) * 100
-
-            pattern_time = self.simulation_time - self.pattern_start_time
-            target_x, target_y = self.current_pattern.get_position(pattern_time)
-            error_x = target_x - self.ball_pos_mm[0]
-            error_y = target_y - self.ball_pos_mm[1]
-
-            state['controller_output'] = (rx, ry)
-            state['controller_magnitude'] = (magnitude, magnitude_percent)
-            state['controller_error'] = (error_x, error_y)
-
-        if self.last_sent_angles is not None:
-            state['cmd_angles'] = self.last_sent_angles
-
-        pattern_configs = {
-            'static': "Tracking: Center (0, 0)",
-            'circle': "Tracking: Circle (r=50mm, T=10s)",
-            'figure8': "Tracking: Figure-8 (60×40mm, T=12s)",
-            'star': "Tracking: 5-Point Star (r=60mm, T=15s)"
-        }
-        state['pattern_info'] = pattern_configs.get(self.pattern_type.get(), "")
-
-        self.gui_builder.update_modules(state)
-
-        if self.kalman_enabled and hasattr(self, 'kalman_filter'):
-            pos, vel, _ = self.kalman_filter.get_state()
-            std_pos = self.kalman_filter.get_position_uncertainty()
-            stats = self.kalman_filter.get_statistics()
-
-            kalman_state = {
-                'kalman_position': pos,
-                'kalman_velocity': vel,
-                'kalman_uncertainty': std_pos,
-                'kalman_stats': stats
-            }
-
-            if 'kalman_filter' in self.gui_modules:
-                self.gui_modules['kalman_filter'].update(kalman_state)
 
     def setup_plot(self):
         """Setup plot for hardware."""
@@ -771,29 +822,27 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         self.canvas.draw()
 
-    def _update_hardware_plot(self):
-        """Update plot with hardware data."""
+    def _update_hardware_plot_from_state(self, state):
+        """Update plot from queued state (main thread only)."""
         try:
-            if self.ball_detected:
-                self.ball_circle.center = self.ball_pos_mm
+            if state['ball_detected']:
+                self.ball_circle.center = state['ball_pos']
                 self.ball_circle.set_alpha(0.8)
             else:
                 self.ball_circle.set_alpha(0.2)
 
-            if len(self.ball_history_x) > 1:
-                self.ball_trail.set_data(self.ball_history_x, self.ball_history_y)
+            if len(state['ball_history_x']) > 1:
+                self.ball_trail.set_data(state['ball_history_x'], state['ball_history_y'])
 
-            if self.pattern_type.get() != 'static':
-                pattern_time = self.simulation_time - self.pattern_start_time
-                target_x, target_y = self.current_pattern.get_position(pattern_time)
+            if state['pattern_type'] != 'static':
+                target_x, target_y = self.current_pattern.get_position(state['pattern_time'])
                 self.target_marker.set_data([target_x], [target_y])
 
             if self.tilt_arrow is not None:
                 self.tilt_arrow.remove()
                 self.tilt_arrow = None
 
-            rx = self.dof_values['rx']
-            ry = self.dof_values['ry']
+            rx, ry = state['dof_values']  # Now it's a tuple
 
             if abs(rx) > 0.5 or abs(ry) > 0.5:
                 dx = -np.sin(np.radians(ry))
@@ -812,7 +861,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             self.canvas.draw_idle()
         except:
             pass
-
     def show_timing_stats(self):
         """Show performance statistics with detailed breakpoint analysis."""
         print("\n" + "=" * 70)
