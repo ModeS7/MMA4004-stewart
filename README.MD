@@ -1,14 +1,28 @@
+# Stewart Platform Ball Balancer
 
-done - Run step response tests on all 6 servos to extract time constant τ
-done - Measure actual platform geometry (link lengths, joint offsets)
-done - Record test trajectories: commanded angles + IMU data
-done - Implement first-order servo dynamics K = 1, τ = 0.1s, delay = 0.35s
-done - Make a working sim with FK
-done - implement ball dynamics
-- Implement PID controller
-- Implement LQR controller
-- Test on real hardware to establish baseline
-- implement contact dynamics
-- Set up parallel environments
-- Implement RL
-- Test on real hardware to establish baseline
+6-DOF Stewart platform for ball balancing with camera feedback. PyQt6 GUI, 100Hz hardware control.
+
+```bash
+pip install -r requirements.txt
+
+# Simulation
+python Sim/PID_ball_sim.py
+python Sim/LQR_ball_sim.py
+
+# Hardware
+python Sim/PID_ball_real.py
+python Sim/LQR_ball_real.py
+```
+
+## Progress
+
+- [x] System identification (servo τ=0.1s, delay=0.35s)
+- [x] Platform kinematics (IK/FK)
+- [x] Ball physics simulation (RK4)
+- [x] PID controller with Kalman filter
+- [x] LQR controller with Kalman filter
+- [x] Hardware integration (Pixy2 camera + serial)
+- [x] PyQt6 + PyQtGraph GUI (<10ms jitter)
+- [ ] Contact dynamics
+- [ ] Parallel environments for RL
+- [ ] RL controller
