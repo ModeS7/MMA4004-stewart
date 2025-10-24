@@ -985,8 +985,14 @@ class BaseStewartSimulator(QMainWindow):
 
             actual_angles = np.array([servo.get_angle() for servo in self.servos])
 
+            initial_guess = None
+            if self.last_fk_translation is not None and self.last_fk_rotation is not None:
+                initial_guess = (self.last_fk_translation, self.last_fk_rotation)
+
             translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
-                actual_angles, use_top_surface_offset=self.use_top_surface_offset
+                actual_angles,
+                initial_guess=initial_guess,
+                use_top_surface_offset=self.use_top_surface_offset
             )
 
             if success:
