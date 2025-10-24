@@ -2,7 +2,7 @@
 Stewart Platform Real Hardware Controller - LQR
 
 Features:
-- 100Hz dedicated control thread
+- Variable frequency control thread (50-500Hz)
 - Pixy2 camera integration
 - Full LQR control with position
 - Modular GUI with scrollable columns
@@ -11,13 +11,16 @@ Features:
 - Windows thread priority + timer resolution
 """
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox, QWidget, QHBoxLayout, QPushButton, QDialog, QVBoxLayout, QTextEdit
+from PyQt6.QtCore import QTimer, Qt
+import pyqtgraph as pg
 import numpy as np
 import time
 import threading
 from queue import Queue, Empty
 import gc
 import sys
+import torch
 
 from setup.base_simulator import BaseStewartSimulator, ControllerConfig
 from setup.hardware_controller_config import SerialController, IKCache, WindowsTimerManager, ThreadPriorityManager
@@ -35,7 +38,7 @@ class LQRHardwareControllerConfig(ControllerConfig):
         self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
                               0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
         self.default_weights = {'Q_pos': 1.0, 'Q_vel': 1.0, 'R': 1.0}
-        self.default_scalar_indices = {'Q_pos': 7, 'Q_vel': 6, 'R': 5}
+        self.default_scalar_indices = {'Q_pos': 9, 'Q_vel': 5, 'R': 5}
         self.ball_physics_params = ball_physics_params
         self.controller_ref = None
 
@@ -76,18 +79,23 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         config = LQRHardwareControllerConfig(ball_physics_params)
 
+        # Control frequency (variable 50-500Hz) - MUST be set before super().__init__()
+        self.control_frequency = ControlLoopConfig.DEFAULT_FREQUENCY_HZ
+        self.control_interval = 1.0 / self.control_frequency
+        self.actual_frequency = self.control_frequency
+
         # Kalman filter for ball state estimation
         self.kalman_filter = KalmanFilter(
             process_noise_scale=1.0,
             measurement_noise_scale=1.0,
             ball_physics_params=ball_physics_params,
-            dt=ControlLoopConfig.INTERVAL_S
+            dt=self.control_interval
         )
         self.kalman_enabled = False
 
         super().__init__(app, config)
 
-        self.setWindowTitle("Stewart Platform - Real Hardware Control (LQR, 100Hz)")
+        self.setWindowTitle(f"Stewart Platform - Real Hardware Control (LQR, {self.control_frequency}Hz)")
 
         self.serial_controller = None
         self.connected = False
@@ -105,6 +113,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.ball_history_x = []
         self.ball_history_y = []
         self.max_history = 100
+
+        # Ball position for plotting (compatible with base class)
+        self.ball_pos = torch.tensor([[0.0, 0.0, 0.02]], dtype=torch.float32)
 
         # IK cache for performance
         self.ik_cache = IKCache(max_size=5000)
@@ -134,8 +145,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.ik_timeout_count = 0
 
         # Debug logging
-        self.debug_counter = 0
-        self.debug_interval = 50  # Log every 50 loops (0.5s at 100Hz)
+        self.first_ball_data_received = False
 
         # GUI update timing
         self.last_gui_update = time.time()
@@ -149,14 +159,13 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.setEnabled(False)
 
-        self.log("LQR Hardware controller initialized (100Hz mode)")
-        self.log("Debug: Control values logged to console every 0.5s")
+        self.log("LQR Hardware controller initialized")
         self.log("Optimizations: GC optimization, optimized baud rates")
 
     def _create_controller_param_widgets(self):
         """Override to use LQR-specific defaults."""
         self.param_definitions = [
-            ('Q_pos', 'Q Position Weight', 1.0, 7),
+            ('Q_pos', 'Q Position Weight', 1.0, 9),
             ('Q_vel', 'Q Velocity Weight', 1.0, 5),
             ('R', 'R Control Weight', 1.0, 5)
         ]
@@ -171,12 +180,16 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define hardware-specific GUI layout (matches simulation layout)."""
-        layout = create_standard_layout(scrollable_columns=False, include_plot=True)
+        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
         layout['columns'][0]['modules'] = [
             {'type': 'performance_stats'},
             {'type': 'serial_connection', 'args': {'port_var': self.port_var}},
             {'type': 'simulation_control'},
+            {'type': 'control_frequency',
+             'args': {'frequency_var': self.control_frequency,
+                      'min_freq': ControlLoopConfig.MIN_FREQUENCY_HZ,
+                      'max_freq': ControlLoopConfig.MAX_FREQUENCY_HZ}},
             {'type': 'trajectory_pattern', 'args': {'pattern_var': self.pattern_type}},
             {'type': 'ball_state'},
             {'type': 'configuration', 'args': {'use_offset_var': self.use_top_surface_offset}},
@@ -213,6 +226,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             'kalman_reset': self.on_kalman_reset,
             'plot_enable_change': self.on_plot_enable_change,
             'plot_rate_change': self.on_plot_rate_change,
+            'frequency_change': self.on_frequency_change,
         })
 
         return callbacks
@@ -222,8 +236,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         super()._build_modular_gui()
 
         if 'controller' in self.gui_modules:
-            from PyQt6.QtWidgets import QWidget, QHBoxLayout, QPushButton
-
             controller_frame = self.gui_modules['controller'].widget
             controller_layout = controller_frame.layout()
 
@@ -249,8 +261,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if K is None:
             QMessageBox.critical(self, "Error", "LQR gain matrix not computed")
             return
-
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit
 
         popup = QDialog(self)
         popup.setWindowTitle("LQR Gain Matrix")
@@ -317,7 +327,11 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def connect_serial(self):
         """Connect to hardware."""
-        port = self.port_var
+        if 'serial_connection' in self.gui_modules:
+            port = self.gui_modules['serial_connection'].port_combo.currentText()
+        else:
+            port = self.port_var
+
         if not port:
             QMessageBox.critical(self, "Error", "No port selected")
             return
@@ -420,20 +434,36 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.log(f"Plot updates: {'ENABLED' if enabled else 'DISABLED'}")
 
     def on_plot_rate_change(self, rate):
-        self.plot_divisor = max(1, 100 // rate)  # Convert Hz to divisor
-        self.log(f"Plot rate: {rate} Hz")
+        self.plot_divisor = max(1, self.control_frequency // rate)  # Convert Hz to divisor
+
+    def on_frequency_change(self, frequency):
+        """Handle control frequency change."""
+        self.control_frequency = frequency
+        self.control_interval = 1.0 / frequency
+        self.log(f"Control frequency: {frequency} Hz ({self.control_interval*1000:.2f} ms period)")
+        self.setWindowTitle(f"Stewart Platform - Real Hardware Control (LQR, {frequency}Hz)")
+
+        # Update Kalman filter dt and rebuild matrices
+        self.kalman_filter.dt = self.control_interval
+        self.kalman_filter._build_system_matrices()
+
+        # Recalculate plot divisor
+        if hasattr(self, 'plot_rate'):
+            self.plot_divisor = max(1, frequency // self.plot_rate)
 
     def start_simulation(self):
-        """Start 100Hz hardware control thread."""
+        """Start hardware control thread."""
         if not self.connected:
             return
 
         self.simulation_running = True
         self.simulation_time = 0.0
         self.ik_timeout_count = 0
+        self.first_ball_data_received = False
 
         gc.disable()
-        self.log("Control started (100Hz, GC disabled)")
+        self.log(f"Control started ({self.control_frequency}Hz, GC disabled)")
+        self.log("Waiting for ball data from Pixy2 camera...")
 
         self.control_thread = threading.Thread(target=self._control_thread_func, daemon=True)
         self.control_thread.start()
@@ -450,9 +480,12 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self._gui_update_loop()
 
     def _control_thread_func(self):
-        """Dedicated 100Hz control thread with LQR controller."""
-        loop_interval = ControlLoopConfig.INTERVAL_S
+        """Dedicated high-frequency control thread with LQR controller (50-500Hz variable)."""
         max_ik_time = ControlLoopConfig.IK_TIMEOUT_S
+
+        # Frequency tracking
+        loop_count = 0
+        freq_measure_start = time.perf_counter()
 
         timing_breakpoints = {
             'ball_read': [],
@@ -482,6 +515,10 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 t1 = time.perf_counter()
                 self.last_ball_update = self.simulation_time
 
+                if not self.first_ball_data_received:
+                    self.first_ball_data_received = True
+                    print(f"[BALL DATA] First data received at t={self.simulation_time:.2f}s")
+
                 pixy_x = ball_data['x']
                 pixy_y = ball_data['y']
 
@@ -496,6 +533,10 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 # Use raw position
                 self.ball_pos_mm = (ball_x_mm, ball_y_mm)
                 self.ball_detected = ball_data['detected']
+
+                # Update ball_pos for plotting (convert mm to m)
+                self.ball_pos[0, 0] = ball_x_mm / 1000.0
+                self.ball_pos[0, 1] = ball_y_mm / 1000.0
 
                 if self.ball_detected:
                     self.ball_history_x.append(ball_x_mm)
@@ -561,14 +602,6 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 )
                 lqr_update_time = (time.perf_counter() - t4) * 1000
                 timing_breakpoints['lqr_update'].append(lqr_update_time)
-
-                # Debug logging (every 0.5s)
-                self.debug_counter += 1
-                if self.debug_counter >= self.debug_interval:
-                    self.debug_counter = 0
-                    print(f"[LQR] Pos:({self.ball_pos_mm[0]:.1f},{self.ball_pos_mm[1]:.1f})mm "
-                          f"Target:({target_pos_mm[0]:.1f},{target_pos_mm[1]:.1f})mm "
-                          f"Control:({rx:.2f},{ry:.2f})°")
 
                 self.dof_values['rx'] = rx
                 self.dof_values['ry'] = ry
@@ -645,7 +678,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 timing_breakpoints['ik_total'].append(0.0)
                 timing_breakpoints['serial_send'].append(0.0)
 
-            self.simulation_time += loop_interval
+            self.simulation_time += self.control_interval
 
             # Queue GUI state update (non-blocking)
             if self.gui_update_count % 2 == 0:  # Update every other loop (50Hz)
@@ -656,7 +689,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                     'ball_vel': "Detected" if self.ball_detected else "Not detected",
                     'dof_values': self.dof_values.copy(),
                     'connected': self.connected,
-                    'fps': ControlLoopConfig.FREQUENCY_HZ,
+                    'fps': self.control_frequency,
+                    'actual_frequency': self.actual_frequency,
                     'cache_hit_rate': self.ik_cache.get_hit_rate(),
                     'ik_timeouts': self.ik_timeout_count,
                 }
@@ -700,8 +734,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 plot_state = {
                     'ball_pos': self.ball_pos_mm,
                     'ball_detected': self.ball_detected,
-                    'ball_history_x': list(self.ball_history_x[-20:]) if self.ball_history_x else [],
-                    'ball_history_y': list(self.ball_history_y[-20:]) if self.ball_history_y else [],
+                    'ball_history_x': list(self.ball_history_x) if self.ball_history_x else [],
+                    'ball_history_y': list(self.ball_history_y) if self.ball_history_y else [],
                     'pattern_type': self.pattern_type,
                     'pattern_time': self.simulation_time - self.pattern_start_time,
                     'dof_values': (self.dof_values['rx'], self.dof_values['ry']),
@@ -711,19 +745,29 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 except:
                     self.plot_drops += 1
 
-            # Sleep to maintain 100Hz
+            # Sleep to maintain target frequency
             t_sleep = time.perf_counter()
             elapsed = time.perf_counter() - loop_start
 
-            if elapsed > 0.050:
-                print(f"WARNING: Loop took {elapsed * 1000:.1f}ms - Windows preemption detected")
+            # Warn if loop took more than 2× period (severe overrun)
+            if elapsed > self.control_interval * 2:
+                print(f"WARNING: Loop took {elapsed * 1000:.1f}ms (target: {self.control_interval*1000:.1f}ms)")
                 timing_breakpoints['sleep'].append(0.0)
             else:
-                sleep_time = loop_interval - elapsed
+                sleep_time = self.control_interval - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 sleep_actual_time = (time.perf_counter() - t_sleep) * 1000
                 timing_breakpoints['sleep'].append(sleep_actual_time)
+
+            # Measure actual frequency (every 100 loops)
+            loop_count += 1
+            if loop_count >= 100:
+                freq_measure_end = time.perf_counter()
+                elapsed_time = freq_measure_end - freq_measure_start
+                self.actual_frequency = loop_count / elapsed_time
+                loop_count = 0
+                freq_measure_start = freq_measure_end
 
             # Limit breakpoint history
             for key in timing_breakpoints:
@@ -767,18 +811,27 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             pass  # No new plot data
 
         # Schedule next update using QTimer
-        from PyQt6.QtCore import QTimer
         QTimer.singleShot(GUIConfig.UPDATE_INTERVAL_MS, self._gui_update_loop)
 
     def setup_plot(self):
         """Setup plot for hardware (using PyQtGraph)."""
         super().setup_plot()
-        # PyQtGraph plot is set up in base class, no matplotlib needed
+
+        # Add ball trail plot item
+        plot_item = self.plot_widget.getPlotItem()
+        self.ball_trail = plot_item.plot([], [], pen=pg.mkPen(color='#ff8888', width=2, style=Qt.PenStyle.DashLine))
 
     def _update_hardware_plot_from_state(self, state):
-        """Update plot from queued state (PyQtGraph - simplified)."""
-        # Just call the base class update_plot method which uses PyQtGraph
+        """Update plot from queued state with ball trail."""
+        # Update base plot (ball position, trajectory, target)
         self.update_plot()
+
+        # Update ball trail from history
+        if 'ball_history_x' in state and 'ball_history_y' in state:
+            history_x = state['ball_history_x']
+            history_y = state['ball_history_y']
+            if history_x and history_y and len(history_x) > 1:
+                self.ball_trail.setData(history_x, history_y)
     def show_timing_stats(self):
         """Show performance statistics with detailed breakpoint analysis."""
         print("\n" + "=" * 70)
@@ -822,7 +875,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         print("=" * 70 + "\n")
 
-        stats_msg = "Performance Statistics (LQR Hardware, 100Hz Mode)\n"
+        stats_msg = f"Performance Statistics (LQR Hardware, {self.control_frequency}Hz)\n"
         stats_msg += "=" * 60 + "\n\n"
 
         if self.timing_stats['ik_time']:
@@ -871,7 +924,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
             MAX_TILT_ANGLE_DEG
         )
 
-        if tilt_mag > MAX_TILT_ANGLE_DEG and not self.controller_enabled.get():
+        if tilt_mag > MAX_TILT_ANGLE_DEG and not self.controller_enabled:
             self.dof_values['rx'] = rx_limited
             self.dof_values['ry'] = ry_limited
 
@@ -888,6 +941,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
     def on_controller_toggle(self):
         """Override to handle manual control disabling for hardware."""
+        # Toggle the state (call parent implementation)
+        self.controller_enabled = not self.controller_enabled
         enabled = self.controller_enabled
 
         if enabled:
@@ -919,7 +974,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.current_pattern.reset()
         self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
 
-        if self.controller_enabled.get():
+        if self.controller_enabled:
             self.controller.reset()
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):

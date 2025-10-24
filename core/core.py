@@ -18,7 +18,7 @@ from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM
 class FirstOrderServo:
     """First-order servo model with command delay."""
 
-    def __init__(self, K=1.0, tau=0.1, delay=0.0, max_velocity=545.0):
+    def __init__(self, K=1.0, tau=0.05, delay=0.0, max_velocity=545.0):
         self.K = K
         self.tau = tau
         self.delay = delay
@@ -44,9 +44,9 @@ class FirstOrderServo:
             # Instantaneous response for tau ≈ 0
             ideal_angle = self.target_angle
 
-        # Apply velocity limiting (physical constraint: real servos have max speed)
+        # Apply velocity limiting
         angle_change = ideal_angle - self.current_angle
-        max_change = self.max_velocity * dt  # Maximum change in this timestep
+        max_change = self.max_velocity * dt
 
         # Clip the change to respect velocity limit
         if abs(angle_change) > max_change:

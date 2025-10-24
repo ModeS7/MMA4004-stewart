@@ -351,14 +351,14 @@ class BaseStewartSimulator(QMainWindow):
 
         if controller_name == "PID":
             self.param_definitions = [
-                ('kp', 'P (Proportional)', 3.0, 4),
-                ('ki', 'I (Integral)', 1.0, 4),
-                ('kd', 'D (Derivative)', 3.0, 4)
+                ('kp', 'P (Proportional)', 1.0, 6),
+                ('ki', 'I (Integral)', 1.0, 6),
+                ('kd', 'D (Derivative)', 4.0, 5)
             ]
         elif controller_name == "LQR":
             self.param_definitions = [
-                ('Q_pos', 'Q Position Weight', 1.0, 7),
-                ('Q_vel', 'Q Velocity Weight', 1.0, 6),
+                ('Q_pos', 'Q Position Weight', 1.0, 9),
+                ('Q_vel', 'Q Velocity Weight', 1.0, 5),
                 ('R', 'R Control Weight', 1.0, 5)
             ]
         else:
@@ -392,6 +392,7 @@ class BaseStewartSimulator(QMainWindow):
             'pixy2_camera': gm.Pixy2CameraModule,
             'kalman_filter': gm.KalmanFilterModule,
             'plot_control': gm.PlotControlModule,
+            'control_frequency': gm.ControlFrequencyModule,
         }
 
         layout_config = self.get_layout_config()
@@ -431,6 +432,16 @@ class BaseStewartSimulator(QMainWindow):
 
         self.pattern_params[param_name] = value
 
+        # If period is changing, preserve the current phase (position in cycle)
+        if param_name == 'period' and hasattr(self.current_pattern, 'period'):
+            old_period = self.current_pattern.period
+            current_pattern_time = self.simulation_time - self.pattern_start_time
+            # Calculate current phase (0 to 1)
+            current_phase = (current_pattern_time % old_period) / old_period
+            # Adjust start time to maintain phase with new period
+            new_pattern_time = current_phase * value
+            self.pattern_start_time = self.simulation_time - new_pattern_time
+
         if pattern_type == 'circle':
             radius = self.pattern_params.get('radius', 50.0)
             period = self.pattern_params.get('period', 10.0)
@@ -455,7 +466,8 @@ class BaseStewartSimulator(QMainWindow):
                                                          radius=radius,
                                                          period=period)
 
-        self.reset_pattern()
+        # Reset pattern internal state but keep timing to continue on path
+        self.current_pattern.reset()
         self.update_plot()
 
     @abstractmethod
@@ -537,8 +549,8 @@ class BaseStewartSimulator(QMainWindow):
 
         try:
             if self.pattern_type != 'static':
-                pattern_periods = {'circle': 10.0, 'figure8': 12.0, 'star': 15.0}
-                period = pattern_periods.get(self.pattern_type, 10.0)
+                # Use actual period from pattern object instead of hardcoded defaults
+                period = getattr(self.current_pattern, 'period', 10.0)
 
                 t_samples = np.linspace(0, period, 100)
                 path_x, path_y = [], []

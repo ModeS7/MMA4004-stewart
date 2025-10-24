@@ -28,10 +28,13 @@ PLATFORM_HALF_SIZE_MM = 100.0  # Half platform size for boundary checks (mm)
 
 class ControlLoopConfig:
     """Configuration for real-time control loop (hardware mode)."""
-    FREQUENCY_HZ = 100  # Control loop frequency
-    INTERVAL_S = 1.0 / FREQUENCY_HZ  # Control loop period (10ms)
-    IK_TIMEOUT_S = 0.008  # Maximum time allowed for IK calculation (8ms)
-    MAX_LOOP_TIME_S = 0.01  # Maximum acceptable loop time (10ms)
+    DEFAULT_FREQUENCY_HZ = 250  # Default control loop frequency
+    MIN_FREQUENCY_HZ = 50  # Minimum control loop frequency
+    MAX_FREQUENCY_HZ = 500  # Maximum control loop frequency
+    FREQUENCY_HZ = DEFAULT_FREQUENCY_HZ  # Current control loop frequency (configurable)
+    INTERVAL_S = 1.0 / FREQUENCY_HZ  # Control loop period
+    IK_TIMEOUT_S = 0.004  # Maximum time allowed for IK calculation (4ms for 500Hz)
+    MAX_LOOP_TIME_S = 0.002  # Maximum acceptable loop time (2ms for 500Hz)
 
 
 class GUIConfig:
@@ -79,9 +82,9 @@ class PIDConfig:
 
     # Default scalar indices (index into SCALAR_VALUES)
     SIM_SCALAR_INDICES = {
-        'kp': 4,  # 0.001
-        'ki': 4,  # 0.001
-        'kd': 4  # 0.001
+        'kp': 3,  # 0.0001 (matches hardware)
+        'ki': 3,  # 0.0001 (matches hardware)
+        'kd': 3  # 0.0001 (matches hardware)
     }
 
     HW_SCALAR_INDICES = {
@@ -128,13 +131,13 @@ class LQRConfig:
 
     # Default scalar indices
     SIM_SCALAR_INDICES = {
-        'Q_pos': 7,  # 1.0
-        'Q_vel': 6,  # 0.1
+        'Q_pos': 9,  # 100.0
+        'Q_vel': 5,  # 0.01
         'R': 5  # 0.01
     }
 
     HW_SCALAR_INDICES = {
-        'Q_pos': 7,  # 1.0
+        'Q_pos': 9,  # 100.0
         'Q_vel': 5,  # 0.01
         'R': 5  # 0.01
     }

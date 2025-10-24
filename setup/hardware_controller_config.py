@@ -274,31 +274,22 @@ class SerialController:
                 time.sleep(0.1)
 
     def send_servo_angles(self, angles):
-        """Queue servo angles with rate limiting."""
+        """Queue servo angles (no rate limiting for high-frequency control)."""
         if not self.connected:
             return False
 
         try:
-            current_time = time.time()
-            time_since_last = current_time - self.last_command_time
-
-            queue_size = self.command_queue.qsize()
-            if queue_size > 10:
-                min_interval = 0.05
-            elif queue_size > 5:
-                min_interval = 0.02
-            else:
-                min_interval = ControlLoopConfig.INTERVAL_S
-
-            if time_since_last < min_interval:
-                return True
-
             command = ','.join([f'{angle:.2f}' for angle in angles]) + '\n'
 
-            if self.command_queue.qsize() >= 15:
-                return True
+            # Drop oldest commands if queue is full (keep system responsive)
+            if self.command_queue.qsize() >= 20:
+                try:
+                    self.command_queue.get_nowait()  # Remove oldest
+                except:
+                    pass
 
             self.command_queue.put_nowait(command)
+            self.last_command_time = time.time()
             return True
         except Exception as e:
             print(f"Error queueing command: {e}")

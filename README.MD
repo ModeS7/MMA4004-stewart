@@ -16,7 +16,7 @@ python LQR_real.py
 
 ## Progress
 
-- [x] System identification (servo τ=0.1s, delay=0.35s)
+- [x] System identification (servo τ=0.05s, delay=0.0s)
 - [x] Platform kinematics (IK/FK)
 - [x] Ball physics simulation (RK4)
 - [x] PID controller with Kalman filter

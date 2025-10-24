@@ -151,9 +151,11 @@ class ControllerModule(GUIModule):
     def update(self, state):
         if 'controller_enabled' in state:
             enabled = state['controller_enabled']
-            # Update checkbox if state changed externally
+            # Update checkbox if state changed externally (block signals to prevent double-toggle)
             if self.enable_checkbox.isChecked() != enabled:
+                self.enable_checkbox.blockSignals(True)
                 self.enable_checkbox.setChecked(enabled)
+                self.enable_checkbox.blockSignals(False)
             # Update status indicator
             if enabled:
                 self.status_label.setStyleSheet(f"color: {self.colors['success']};")
@@ -1259,7 +1261,7 @@ class PlotControlModule(GUIModule):
 
         self.rate_slider = QSlider(Qt.Orientation.Horizontal)
         self.rate_slider.setMinimum(1)
-        self.rate_slider.setMaximum(50)
+        self.rate_slider.setMaximum(100)
         self.rate_slider.setValue(self.plot_rate_var)
         self.rate_slider.valueChanged.connect(self._on_rate_change)
         rate_grid.addWidget(self.rate_slider, 0, 1)
@@ -1313,3 +1315,79 @@ class PlotControlModule(GUIModule):
             else:
                 self.perf_label.setText("No frame drops")
                 self.perf_label.setStyleSheet(f"color: {self.colors['success']};")
+
+
+class ControlFrequencyModule(GUIModule):
+    """Control loop frequency adjustment (hardware only)."""
+
+    def __init__(self, parent, colors, callbacks, frequency_var, min_freq=50, max_freq=500):
+        super().__init__(parent, colors, callbacks)
+        self.frequency_var = frequency_var
+        self.min_freq = min_freq
+        self.max_freq = max_freq
+
+    def create(self):
+        group = QGroupBox("Control Frequency")
+        layout = QVBoxLayout()
+
+        freq_grid = QGridLayout()
+
+        freq_grid.addWidget(QLabel("Loop Frequency:"), 0, 0)
+
+        self.freq_slider = QSlider(Qt.Orientation.Horizontal)
+        self.freq_slider.setMinimum(self.min_freq)
+        self.freq_slider.setMaximum(self.max_freq)
+        self.freq_slider.setValue(self.frequency_var)
+        self.freq_slider.setTickInterval(50)
+        self.freq_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.freq_slider.valueChanged.connect(self._on_freq_change)
+        freq_grid.addWidget(self.freq_slider, 0, 1)
+
+        self.freq_label = QLabel(f"{self.frequency_var} Hz")
+        self.freq_label.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        self.freq_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        self.freq_label.setMinimumWidth(80)
+        freq_grid.addWidget(self.freq_label, 0, 2)
+
+        freq_grid.setColumnStretch(1, 1)
+        layout.addLayout(freq_grid)
+
+        # Info labels
+        info_layout = QVBoxLayout()
+        self.period_label = QLabel(f"Period: {1000.0/self.frequency_var:.2f} ms")
+        self.period_label.setFont(QFont("Consolas", 8))
+        self.period_label.setStyleSheet(f"color: {self.colors['fg']};")
+        info_layout.addWidget(self.period_label)
+
+        self.camera_ratio_label = QLabel(f"Camera ratio: {self.frequency_var/50:.1f}× (50Hz)")
+        self.camera_ratio_label.setFont(QFont("Consolas", 8))
+        self.camera_ratio_label.setStyleSheet(f"color: {self.colors['fg']};")
+        info_layout.addWidget(self.camera_ratio_label)
+
+        layout.addLayout(info_layout)
+
+        warning_label = QLabel("Higher frequencies increase CPU load")
+        warning_label.setFont(QFont("Segoe UI", 8))
+        warning_label.setStyleSheet(f"color: {self.colors['warning']};")
+        layout.addWidget(warning_label)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _on_freq_change(self, value):
+        self.frequency_var = value
+        self.freq_label.setText(f"{value} Hz")
+        self.period_label.setText(f"Period: {1000.0/value:.2f} ms")
+        self.camera_ratio_label.setText(f"Camera ratio: {value/50:.1f}× (50Hz)")
+
+        if self.callbacks.get('frequency_change'):
+            self.callbacks['frequency_change'](value)
+
+    def update(self, state):
+        if 'actual_frequency' in state:
+            actual = state['actual_frequency']
+            if abs(actual - self.frequency_var) > 5:
+                self.freq_label.setStyleSheet(f"color: {self.colors['warning']};")
+            else:
+                self.freq_label.setStyleSheet(f"color: {self.colors['highlight']};")
