@@ -46,7 +46,9 @@ class IMULogger:
                     line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
                     if line:
                         startup_messages.append(line)
-                        print(f"  Arduino: {line}")
+                        # Only print non-IMU data messages
+                        if not line.startswith("A:") and not line.startswith("G:"):
+                            print(f"  Arduino: {line}")
 
             # Check if sampling started
             if any("Sampling started" in msg for msg in startup_messages):
