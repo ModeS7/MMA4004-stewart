@@ -209,10 +209,10 @@ class LQRController:
             max_real = np.max(np.real(eig_vals))
 
             if max_real >= 0:
-                print(f"Warning: LQR may be unstable (max eigenvalue: {max_real:.4f})")
+                print(f"LQR eigenvalue check: max real part = {max_real:.4f}")
 
         except np.linalg.LinAlgError as e:
-            print(f"Error solving Riccati equation: {e}")
+            print(f"Riccati equation solver failed: {e}")
             self.K = np.array([[1.0, 0.0, 1.0, 0.0],
                                [0.0, 1.0, 0.0, 1.0]])
 
@@ -565,4 +565,375 @@ class KalmanFilter:
             'last_measurement_time': self.last_measurement_time,
             'process_noise_scale': self.process_noise_scale,
             'measurement_noise_scale': self.measurement_noise_scale
+        }
+
+
+class IMUKalmanFilter:
+    """
+    Extended Kalman Filter for IMU orientation estimation.
+
+    State: [rx, ry, bias_gx, bias_gy, bias_gz]
+    - rx, ry: Roll and pitch angles in radians
+    - bias_gx, bias_gy, bias_gz: Gyro biases in rad/s
+
+    Sensors:
+    - Gyroscope: Provides angular velocity (prediction)
+    - Accelerometer: Provides gravity direction (measurement update when quasi-static)
+
+    Features:
+    - Dual-rate processing (gyro ~759 Hz, accel ~1265 Hz)
+    - Automatic rejection of dynamic acceleration
+    - Gyro bias estimation for long-term stability
+    """
+
+    def __init__(self,
+                 accel_noise_std=None,
+                 gyro_noise_std=None,
+                 bias_process_noise=1e-6,
+                 gyro_scale=0.00875,
+                 accel_scale=0.001,
+                 dt_gyro=1.0/759.0,
+                 dynamic_accel_threshold=2.0):
+        """
+        Args:
+            accel_noise_std: (ax, ay, az) noise std in m/s² (from analyze_imu.py)
+            gyro_noise_std: (gx, gy, gz) noise std in rad/s (from analyze_imu.py)
+            bias_process_noise: Gyro bias random walk std (rad/s/sqrt(s))
+            gyro_scale: Gyro scaling factor (deg/s per raw unit), default 0.00875 for L3GD20
+            accel_scale: Accel scaling factor (g per raw unit), default 0.001 for LSM303
+            dt_gyro: Gyro sampling period (seconds)
+            dynamic_accel_threshold: Accel magnitude threshold for quasi-static detection (m/s²)
+        """
+        # State: [rx(rad), ry(rad), bias_gx(rad/s), bias_gy(rad/s), bias_gz(rad/s)]
+        # Initialize with measured gyro biases from analyze_imu.py
+        self.x = np.array([
+            0.0,        # rx (rad)
+            0.0,        # ry (rad)
+            0.065968,   # bias_gx (rad/s) - measured mean
+            0.050949,   # bias_gy (rad/s) - measured mean
+            0.018238    # bias_gz (rad/s) - measured mean
+        ])
+
+        # State covariance (units: rad² for angles, (rad/s)² for biases)
+        self.P = np.diag([0.01, 0.01, 0.001, 0.001, 0.001])  # Lower bias uncertainty since we used measured values
+
+        # Sensor scaling
+        self.gyro_scale = gyro_scale * (np.pi / 180.0)  # Convert to rad/s per raw unit
+        self.accel_scale = accel_scale * 9.81  # Convert to m/s² per raw unit
+
+        # Time step
+        self.dt_gyro = dt_gyro
+
+        # Noise parameters (measured from analyze_imu.py)
+        # Using physical units: accel in m/s², gyro in rad/s
+        if gyro_noise_std is None:
+            # Measured values from IMU characterization
+            gyro_noise_std = [0.017550, 0.017716, 0.004335]  # rad/s
+        if accel_noise_std is None:
+            # Measured values from IMU characterization
+            accel_noise_std = [0.0701, 0.0651, 0.0889]  # m/s²
+
+        self.gyro_noise_std = np.array(gyro_noise_std)
+        self.accel_noise_std = np.array(accel_noise_std)
+
+        self.bias_process_noise = bias_process_noise
+
+        # Dynamic acceleration threshold
+        self.dynamic_threshold = dynamic_accel_threshold
+        self.g = 9.81
+
+        # Build noise matrices
+        self._build_noise_matrices()
+
+        # Statistics
+        self.prediction_count = 0
+        self.update_count = 0
+        self.rejected_update_count = 0
+        self.last_accel_magnitude = 0.0
+
+    def _build_noise_matrices(self):
+        """Build process and measurement noise covariance matrices."""
+        dt = self.dt_gyro
+
+        # Process noise Q: uncertainty in gyro integration + bias random walk
+        # State: [rx, ry, bias_gx, bias_gy, bias_gz]
+        q_angle = (self.gyro_noise_std[0] * dt) ** 2  # Angle uncertainty from gyro noise
+        q_bias = (self.bias_process_noise * dt) ** 2  # Bias random walk (very small to keep biases stable)
+
+        # Use extremely small bias process noise to prevent bias drift
+        # Biases are initialized with measured values and should remain nearly constant
+        self.Q = np.diag([q_angle, q_angle, q_bias * 0.001, q_bias * 0.001, q_bias * 0.001])
+
+        # Measurement noise R: accelerometer noise
+        # Measurement: [rx_meas, ry_meas] from atan2(accel components)
+        # Noise propagates through nonlinear function - approximate with accel noise
+        self.R = np.diag([
+            (self.accel_noise_std[1] / self.g) ** 2,  # rx uncertainty from ay, az noise
+            (self.accel_noise_std[0] / self.g) ** 2   # ry uncertainty from ax, az noise
+        ])
+
+    def predict(self, gyro_raw):
+        """
+        Prediction step using gyroscope measurement.
+
+        Args:
+            gyro_raw: [gx, gy, gz] raw gyro values
+
+        Returns:
+            Predicted state [rx_deg, ry_deg, bias_gx, bias_gy, bias_gz]
+        """
+        gx, gy, gz = gyro_raw
+
+        # Convert raw gyro to rad/s
+        gx_rad_s = gx * self.gyro_scale
+        gy_rad_s = gy * self.gyro_scale
+        gz_rad_s = gz * self.gyro_scale
+
+        # Current state (biases are in rad/s)
+        rx, ry, bias_gx, bias_gy, bias_gz = self.x
+
+        # Saturate biases to reasonable limits (±10°/s = ±0.174 rad/s)
+        max_bias = 0.174  # rad/s
+        bias_gx = np.clip(bias_gx, -max_bias, max_bias)
+        bias_gy = np.clip(bias_gy, -max_bias, max_bias)
+        bias_gz = np.clip(bias_gz, -max_bias, max_bias)
+
+        # Gyro integration (bias-corrected)
+        rx_new = rx + (gy_rad_s - bias_gy) * self.dt_gyro
+        ry_new = ry + (gx_rad_s - bias_gx) * self.dt_gyro
+
+        # Wrap angles to [-pi, +pi] to prevent infinite accumulation
+        rx_new = np.arctan2(np.sin(rx_new), np.cos(rx_new))
+        ry_new = np.arctan2(np.sin(ry_new), np.cos(ry_new))
+
+        # Update state with wrapped angles and saturated biases
+        self.x = np.array([rx_new, ry_new, bias_gx, bias_gy, bias_gz])
+
+        # Jacobian of state transition (F = ∂f/∂x)
+        F = np.array([
+            [1, 0, 0, -self.dt_gyro, 0],
+            [0, 1, -self.dt_gyro, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 1]
+        ])
+
+        # Covariance prediction: P = F*P*F' + Q
+        self.P = F @ self.P @ F.T + self.Q
+
+        # Ensure covariance stays positive definite
+        self.P = 0.5 * (self.P + self.P.T)  # Force symmetry
+        min_var = 1e-8
+        for i in range(5):
+            if self.P[i, i] < min_var:
+                self.P[i, i] = min_var
+
+        self.prediction_count += 1
+
+        # Return orientation in degrees
+        rx_deg = rx_new * (180.0 / np.pi)
+        ry_deg = ry_new * (180.0 / np.pi)
+        return np.array([rx_deg, ry_deg, bias_gx, bias_gy, bias_gz])
+
+    def update(self, accel_raw, force_update=False):
+        """
+        Update step using accelerometer measurement.
+
+        Only updates if acceleration magnitude is close to gravity (quasi-static).
+        Uses accelerometer to measure absolute tilt angles from gravity direction.
+
+        Args:
+            accel_raw: [ax, ay, az] raw accelerometer values
+            force_update: If True, skip dynamic acceleration check
+
+        Returns:
+            (updated, updated_state)
+            - updated: True if measurement was used (quasi-static)
+            - updated_state: Current state [rx_deg, ry_deg, bias_gx, bias_gy, bias_gz]
+        """
+        ax, ay, az = accel_raw
+
+        # Convert to physical units
+        ax_ms2 = ax * self.accel_scale
+        ay_ms2 = ay * self.accel_scale
+        az_ms2 = az * self.accel_scale
+
+        # Check if quasi-static
+        accel_magnitude = np.sqrt(ax_ms2**2 + ay_ms2**2 + az_ms2**2)
+        self.last_accel_magnitude = accel_magnitude
+
+        if not force_update and abs(accel_magnitude - self.g) > self.dynamic_threshold:
+            # Dynamic acceleration detected - skip update
+            self.rejected_update_count += 1
+            rx_deg = self.x[0] * (180.0 / np.pi)
+            ry_deg = self.x[1] * (180.0 / np.pi)
+            return False, np.array([rx_deg, ry_deg, self.x[2], self.x[3], self.x[4]])
+
+        # Measurement model: extract tilt from gravity direction
+        # rx = atan2(-ay, az)  (roll: rotation around X axis)
+        # ry = atan2(ax, az)   (pitch: rotation around Y axis)
+        z_meas = np.array([
+            np.arctan2(-ay_ms2, az_ms2),
+            np.arctan2(ax_ms2, az_ms2)
+        ])
+
+        # Predicted measurement
+        rx, ry = self.x[0], self.x[1]
+        z_pred = np.array([rx, ry])
+
+        # Innovation
+        y = z_meas - z_pred
+
+        # Wrap angles to [-pi, pi]
+        y[0] = np.arctan2(np.sin(y[0]), np.cos(y[0]))
+        y[1] = np.arctan2(np.sin(y[1]), np.cos(y[1]))
+
+        # Measurement Jacobian H = ∂h/∂x
+        # h(x) = [rx, ry] (measurement model is just extracting first two states)
+        # But bias states don't affect measurement
+        H = np.array([
+            [1, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0]
+        ])
+
+        # Innovation covariance: S = H*P*H' + R
+        S = H @ self.P @ H.T + self.R
+
+        # Kalman gain: K = P*H' * inv(S)
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        # State update: x = x + K*y
+        self.x = self.x + K @ y
+
+        # Wrap angles to [-pi, +pi] after update
+        self.x[0] = np.arctan2(np.sin(self.x[0]), np.cos(self.x[0]))
+        self.x[1] = np.arctan2(np.sin(self.x[1]), np.cos(self.x[1]))
+
+        # Saturate biases to reasonable limits (±10°/s = ±0.174 rad/s)
+        max_bias = 0.174  # rad/s
+        self.x[2] = np.clip(self.x[2], -max_bias, max_bias)
+        self.x[3] = np.clip(self.x[3], -max_bias, max_bias)
+        self.x[4] = np.clip(self.x[4], -max_bias, max_bias)
+
+        # Covariance update (Joseph form for numerical stability)
+        I_KH = np.eye(5) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+
+        # Ensure covariance stays positive definite and symmetric
+        self.P = 0.5 * (self.P + self.P.T)  # Force symmetry
+        min_var = 1e-8
+        for i in range(5):
+            if self.P[i, i] < min_var:
+                self.P[i, i] = min_var
+
+        self.update_count += 1
+
+        rx_deg = self.x[0] * (180.0 / np.pi)
+        ry_deg = self.x[1] * (180.0 / np.pi)
+        return True, np.array([rx_deg, ry_deg, self.x[2], self.x[3], self.x[4]])
+
+    def get_orientation_deg(self):
+        """
+        Get current orientation estimate in degrees.
+
+        Returns:
+            (rx, ry): Roll and pitch angles in degrees
+        """
+        rx_deg = self.x[0] * (180.0 / np.pi)
+        ry_deg = self.x[1] * (180.0 / np.pi)
+        return rx_deg, ry_deg
+
+    def get_gyro_biases(self):
+        """
+        Get estimated gyro biases in rad/s.
+
+        Returns:
+            (bias_gx, bias_gy, bias_gz) in rad/s
+        """
+        return self.x[2], self.x[3], self.x[4]
+
+    def get_state(self):
+        """
+        Get full filter state.
+
+        Returns:
+            [rx_deg, ry_deg, bias_gx, bias_gy, bias_gz]
+        """
+        rx_deg = self.x[0] * (180.0 / np.pi)
+        ry_deg = self.x[1] * (180.0 / np.pi)
+        return np.array([rx_deg, ry_deg, self.x[2], self.x[3], self.x[4]])
+
+    def calibrate_biases(self, gyro_samples, duration=5.0):
+        """
+        Calibrate gyro biases from stationary measurements.
+
+        Args:
+            gyro_samples: List of [gx, gy, gz] raw gyro samples
+            duration: Duration of calibration in seconds
+
+        Returns:
+            (bias_gx, bias_gy, bias_gz) estimated biases in rad/s
+        """
+        gyro_array = np.array(gyro_samples)
+
+        # Compute mean in raw units, then convert to rad/s
+        bias_gx_raw = np.mean(gyro_array[:, 0])
+        bias_gy_raw = np.mean(gyro_array[:, 1])
+        bias_gz_raw = np.mean(gyro_array[:, 2])
+
+        # Convert to rad/s (consistent with state units)
+        bias_gx = bias_gx_raw * self.gyro_scale
+        bias_gy = bias_gy_raw * self.gyro_scale
+        bias_gz = bias_gz_raw * self.gyro_scale
+
+        # Update filter state
+        self.x[2] = bias_gx
+        self.x[3] = bias_gy
+        self.x[4] = bias_gz
+
+        # Reduce bias uncertainty after calibration (units: (rad/s)^2)
+        self.P[2, 2] = (0.01 * self.gyro_scale) ** 2
+        self.P[3, 3] = (0.01 * self.gyro_scale) ** 2
+        self.P[4, 4] = (0.01 * self.gyro_scale) ** 2
+
+        return bias_gx, bias_gy, bias_gz
+
+    def reset(self, initial_orientation_deg=None, reset_biases=False):
+        """
+        Reset filter state.
+
+        Args:
+            initial_orientation_deg: Optional (rx, ry) in degrees
+            reset_biases: If True, reset biases to measured defaults
+        """
+        if initial_orientation_deg is not None:
+            rx_rad = initial_orientation_deg[0] * (np.pi / 180.0)
+            ry_rad = initial_orientation_deg[1] * (np.pi / 180.0)
+            self.x[0] = rx_rad
+            self.x[1] = ry_rad
+        else:
+            self.x[0] = 0.0
+            self.x[1] = 0.0
+
+        # Reset biases to measured defaults if requested
+        if reset_biases:
+            self.x[2] = 0.065968  # bias_gx (rad/s)
+            self.x[3] = 0.050949  # bias_gy (rad/s)
+            self.x[4] = 0.018238  # bias_gz (rad/s)
+
+        self.P = np.diag([0.01, 0.01, 0.001, 0.001, 0.001])
+        self.prediction_count = 0
+        self.update_count = 0
+        self.rejected_update_count = 0
+
+    def get_statistics(self):
+        """Get filter statistics for monitoring."""
+        total_updates = self.update_count + self.rejected_update_count
+        return {
+            'predictions': self.prediction_count,
+            'updates': self.update_count,
+            'rejected_updates': self.rejected_update_count,
+            'update_rate': self.update_count / max(1, total_updates),
+            'last_accel_mag': self.last_accel_magnitude,
+            'gyro_biases': self.get_gyro_biases()
         }
