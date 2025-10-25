@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
 from core.control_core import clip_tilt_vector
 from core.utils import (
-    MAX_TILT_ANGLE_DEG, PLATFORM_HALF_SIZE_MM,
+    MAX_TILT_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM,
     SimulationConfig, format_time, format_error_context
 )
 from gui.gui_builder import GUIBuilder
@@ -131,12 +131,12 @@ class BaseStewartSimulator(QMainWindow):
         self.setup_dark_theme()
 
         self.platform_params = {
-            "horn_length": 31.75,
-            "rod_length": 145.0,
-            "base": 73.025,
-            "base_anchors": 36.8893,
-            "platform": 67.775,
-            "platform_anchors": 12.7,
+            "horn_length": 45.3722,             #31.75
+            "rod_length": 205.0,                #145.0
+            "base": 86.6025 + 18.75 + 11,       #73.025
+            "base_anchors": 64.75 - 45.3722,    #36.8893
+            "platform": 84.0759,                #67.775
+            "platform_anchors": 12.5,           #12.7
             "top_surface_offset": 26.0
         }
         self.ik = StewartPlatformIK(**self.platform_params)
@@ -498,22 +498,22 @@ class BaseStewartSimulator(QMainWindow):
     def setup_plot(self):
         """Setup PyQtGraph plot."""
         plot_item = self.plot_widget.getPlotItem()
-        plot_item.setXRange(-120, 120)
-        plot_item.setYRange(-120, 120)
+        plot_item.setXRange(-180, 180)
+        plot_item.setYRange(-180, 180)
         plot_item.setLabel('bottom', 'X (mm)', color=self.colors['fg'])
         plot_item.setLabel('left', 'Y (mm)', color=self.colors['fg'])
         plot_item.setTitle('Ball Position (Top View)', color=self.colors['fg'])
         plot_item.showGrid(x=True, y=True, alpha=0.2)
         plot_item.setAspectLocked(True)
 
-        # Platform boundary
-        self.platform_rect = pg.QtWidgets.QGraphicsRectItem(
-            -PLATFORM_HALF_SIZE_MM, -PLATFORM_HALF_SIZE_MM,
-            PLATFORM_HALF_SIZE_MM * 2, PLATFORM_HALF_SIZE_MM * 2
+        # Platform boundary (circular)
+        self.platform_circle = pg.QtWidgets.QGraphicsEllipseItem(
+            -PLATFORM_RADIUS_MM, -PLATFORM_RADIUS_MM,
+            PLATFORM_RADIUS_MM * 2, PLATFORM_RADIUS_MM * 2
         )
         pen = pg.mkPen(color=self.colors['fg'], width=2, style=Qt.PenStyle.DashLine)
-        self.platform_rect.setPen(pen)
-        plot_item.addItem(self.platform_rect)
+        self.platform_circle.setPen(pen)
+        plot_item.addItem(self.platform_circle)
 
         # Trajectory line
         self.trajectory_line = plot_item.plot([], [], pen=pg.mkPen(color=self.colors['highlight'],
@@ -989,11 +989,24 @@ class BaseStewartSimulator(QMainWindow):
             if self.last_fk_translation is not None and self.last_fk_rotation is not None:
                 initial_guess = (self.last_fk_translation, self.last_fk_rotation)
 
-            translation, rotation, success, _ = self.ik.calculate_forward_kinematics(
+            translation, rotation, success, iterations = self.ik.calculate_forward_kinematics(
                 actual_angles,
                 initial_guess=initial_guess,
                 use_top_surface_offset=self.use_top_surface_offset
             )
+
+            # Fallback: if FK fails with initial guess, retry from home position
+            if not success and initial_guess is not None:
+                translation, rotation, success, iterations = self.ik.calculate_forward_kinematics(
+                    actual_angles,
+                    initial_guess=None,
+                    use_top_surface_offset=self.use_top_surface_offset
+                )
+                if success:
+                    self.log(f"FK recovered using home position guess")
+
+            if not success:
+                self.log(f"FK FAILED after retry, angles={actual_angles}")
 
             if success:
                 self.last_fk_translation = translation

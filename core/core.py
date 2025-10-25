@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from collections import deque
 
-from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM
+from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM
 
 
 class FirstOrderServo:
@@ -348,8 +348,10 @@ class SimpleBallPhysics2D:
             platform_angular_accel
         )
 
-        max_xy = PLATFORM_HALF_SIZE_MM / 1000.0
-        fell_off = (torch.abs(new_xy_pos[:, 0]) > max_xy) | (torch.abs(new_xy_pos[:, 1]) > max_xy)
+        # Check if ball fell off circular platform
+        max_radius = PLATFORM_RADIUS_MM / 1000.0
+        distance_from_center = torch.norm(new_xy_pos, dim=1)
+        fell_off = distance_from_center > max_radius
 
         contact_info = {'fell_off': False}
 
