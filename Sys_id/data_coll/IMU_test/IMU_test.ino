@@ -6,9 +6,12 @@
 #define L3GD20_ADDR       0x6B
 
 // Register addresses
-#define LSM303_OUT_X_L_A  0x28
-#define LSM303_OUT_X_H_M  0x03
-#define L3GD20_OUT_X_L    0x28
+#define LSM303_STATUS_REG_A 0x27
+#define LSM303_OUT_X_L_A    0x28
+#define LSM303_SR_REG_M     0x09
+#define LSM303_OUT_X_H_M    0x03
+#define L3GD20_STATUS_REG   0x27
+#define L3GD20_OUT_X_L      0x28
 
 // Raw data buffers
 int16_t accelData[3];
@@ -19,9 +22,6 @@ int16_t magData[3];
 unsigned long accelCount = 0;
 unsigned long gyroCount = 0;
 unsigned long magCount = 0;
-unsigned long lastAccelTime = 0;
-unsigned long lastGyroTime = 0;
-unsigned long lastMagTime = 0;
 unsigned long accelStartTime = 0;
 unsigned long gyroStartTime = 0;
 unsigned long magStartTime = 0;
@@ -60,30 +60,66 @@ void setup() {
   lastRateReport = micros();
 }
 
+bool isAccelReady() {
+  Wire.beginTransmission(LSM303_ACCEL_ADDR);
+  Wire.write(LSM303_STATUS_REG_A);
+  Wire.endTransmission();
+
+  Wire.requestFrom(LSM303_ACCEL_ADDR, 1);
+  if (Wire.available()) {
+    uint8_t status = Wire.read();
+    return (status & 0x08) != 0; // Check bit 3 (ZYXDA - new data available)
+  }
+  return false;
+}
+
+bool isGyroReady() {
+  Wire.beginTransmission(L3GD20_ADDR);
+  Wire.write(L3GD20_STATUS_REG);
+  Wire.endTransmission();
+
+  Wire.requestFrom(L3GD20_ADDR, 1);
+  if (Wire.available()) {
+    uint8_t status = Wire.read();
+    return (status & 0x08) != 0; // Check bit 3 (ZYXDA - new data available)
+  }
+  return false;
+}
+
+bool isMagReady() {
+  Wire.beginTransmission(LSM303_MAG_ADDR);
+  Wire.write(LSM303_SR_REG_M);
+  Wire.endTransmission();
+
+  Wire.requestFrom(LSM303_MAG_ADDR, 1);
+  if (Wire.available()) {
+    uint8_t status = Wire.read();
+    return (status & 0x01) != 0; // Check bit 0 (DRDY - data ready)
+  }
+  return false;
+}
+
 void loop() {
   unsigned long now = micros();
 
-  // Read accelerometer every 744us (1344Hz target)
-  if (now - lastAccelTime >= 744) {
+  // Check accelerometer DRDY flag (bit 3 of STATUS_REG_A)
+  if (isAccelReady()) {
     readAccel();
     printAccel();
-    lastAccelTime = now;
     accelCount++;
   }
 
-  // Read gyroscope every 1250us (800Hz target)
-  if (now - lastGyroTime >= 1250) {
+  // Check gyroscope DRDY flag (bit 3 of STATUS_REG)
+  if (isGyroReady()) {
     readGyro();
     printGyro();
-    lastGyroTime = now;
     gyroCount++;
   }
 
-  // Read magnetometer every 4545us (220Hz target)
-  if (now - lastMagTime >= 4545) {
+  // Check magnetometer DRDY flag (bit 0 of SR_REG_M)
+  if (isMagReady()) {
     readMag();
     printMag();
-    lastMagTime = now;
     magCount++;
   }
 
