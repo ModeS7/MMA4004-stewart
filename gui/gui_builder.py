@@ -151,7 +151,7 @@ class GUIBuilder:
         module_args = module_config.get('args', {})
 
         if module_type not in self.module_registry:
-            print(f"Warning: Unknown module type '{module_type}'")
+            print(f"Module type not found: '{module_type}'")
             return
 
         module_class = self.module_registry[module_type]

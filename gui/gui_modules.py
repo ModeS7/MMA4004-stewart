@@ -50,18 +50,18 @@ class SimulationControlModule(GUIModule):
 
         btn_layout = QHBoxLayout()
 
-        self.start_btn = QPushButton("▶ Start")
+        self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self.callbacks.get('start'))
         self.start_btn.setMinimumWidth(100)
         btn_layout.addWidget(self.start_btn)
 
-        self.stop_btn = QPushButton("⏸ Stop")
+        self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.callbacks.get('stop'))
         self.stop_btn.setEnabled(False)
         self.stop_btn.setMinimumWidth(100)
         btn_layout.addWidget(self.stop_btn)
 
-        self.reset_btn = QPushButton("↻ Reset")
+        self.reset_btn = QPushButton("Reset")
         self.reset_btn.clicked.connect(self.callbacks.get('reset'))
         self.reset_btn.setMinimumWidth(100)
         btn_layout.addWidget(self.reset_btn)
@@ -831,8 +831,8 @@ class Pixy2CameraModule(GUIModule):
         self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
         enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = QLabel("●")
-        self.status_indicator.setFont(QFont("Segoe UI", 14))
+        self.status_indicator = QLabel("[ON]")
+        self.status_indicator.setFont(QFont("Segoe UI", 10))
         self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -940,10 +940,12 @@ class Pixy2CameraModule(GUIModule):
         self.camera_enabled = enabled
 
         if enabled:
+            self.status_indicator.setText("[ON]")
             self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
             for slider in self.sliders.values():
                 slider.setEnabled(True)
         else:
+            self.status_indicator.setText("[OFF]")
             self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
             for slider in self.sliders.values():
                 slider.setEnabled(False)
@@ -1041,8 +1043,8 @@ class KalmanFilterModule(GUIModule):
         self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
         enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = QLabel("●")
-        self.status_indicator.setFont(QFont("Segoe UI", 14))
+        self.status_indicator = QLabel("[OFF]")
+        self.status_indicator.setFont(QFont("Segoe UI", 10))
         self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -1138,10 +1140,12 @@ class KalmanFilterModule(GUIModule):
         self.filter_enabled = enabled
 
         if enabled:
+            self.status_indicator.setText("[ON]")
             self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
             for slider in self.sliders.values():
                 slider.setEnabled(True)
         else:
+            self.status_indicator.setText("[OFF]")
             self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
             for slider in self.sliders.values():
                 slider.setEnabled(False)
@@ -1245,9 +1249,10 @@ class PlotControlModule(GUIModule):
         self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
         enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = QLabel("●")
-        self.status_indicator.setFont(QFont("Segoe UI", 14))
+        status_text = "[ON]" if self.plot_enabled_var else "[OFF]"
         color = self.colors['success'] if self.plot_enabled_var else self.colors['border']
+        self.status_indicator = QLabel(status_text)
+        self.status_indicator.setFont(QFont("Segoe UI", 10))
         self.status_indicator.setStyleSheet(f"color: {color};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -1294,7 +1299,9 @@ class PlotControlModule(GUIModule):
     def _on_enable_toggle(self):
         enabled = self.enable_checkbox.isChecked()
         self.plot_enabled_var = enabled
+        status_text = "[ON]" if enabled else "[OFF]"
         color = self.colors['success'] if enabled else self.colors['border']
+        self.status_indicator.setText(status_text)
         self.status_indicator.setStyleSheet(f"color: {color};")
         self.rate_slider.setEnabled(enabled)
         if self.callbacks.get('plot_enable_change'):

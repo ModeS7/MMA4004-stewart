@@ -238,7 +238,7 @@ class SerialController:
 
             except Exception as e:
                 if self.running:
-                    print(f"Serial read error: {e}")
+                    print(f"Serial read failed: {e}")
                 time.sleep(0.1)
 
     def _write_loop(self):
@@ -292,7 +292,7 @@ class SerialController:
             self.last_command_time = time.time()
             return True
         except Exception as e:
-            print(f"Error queueing command: {e}")
+            print(f"Command queue failed: {e}")
             return False
 
     def send_command(self, cmd):
@@ -349,8 +349,8 @@ class HardwareControllerConfig(ControllerConfig):
 
 def main():
     """Launch hardware controller."""
-    print("Hardware controller configuration loaded (200000 baud).")
-    print("Use HardwareStewartSimulator to run with real hardware.")
+    print("Hardware controller configuration loaded")
+    print("Serial baud rate: 200000")
 
 
 if __name__ == "__main__":
