@@ -2,14 +2,13 @@
 """
 IMU Data Logger for Kalman Filter Tuning
 
-Connects to Arduino running IMU_test.ino and logs IMU data to CSV.
-Data includes accelerometer, gyroscope, and magnetometer (LSM303 + L3GD20) readings for Kalman filter tuning.
+Connects to Arduino running IMU.ino and logs IMU data to separate CSV files.
+Data includes accelerometer and gyroscope (LSM303 + L3GD20) readings for Kalman filter tuning.
 
-IMU_test.ino output format:
+IMU.ino output format:
 - Accelerometer: "A:ax,ay,az"
 - Gyroscope: "G:gx,gy,gz"
-- Magnetometer: "M:mx,my,mz"
-- Rate reports: "RATE - Accel: xx.xx Hz | Gyro: xx.xx Hz | Mag: xx.xx Hz"
+- Rate reports: "RATE - Accel: xx.xx Hz | Gyro: xx.xx Hz"
 """
 
 import serial
@@ -27,14 +26,13 @@ class IMULogger:
         self.baudrate = baudrate
         self.serial_conn = None
         self.is_connected = False
-        self.csv_writer = None
-        self.csv_file = None
-        self.last_accel = [0, 0, 0]
-        self.last_gyro = [0, 0, 0]
-        self.last_mag = [0, 0, 0]
+        self.accel_csv_file = None
+        self.accel_csv_writer = None
+        self.gyro_csv_file = None
+        self.gyro_csv_writer = None
 
     def connect(self):
-        """Connect to Arduino running IMU_test.ino"""
+        """Connect to Arduino running IMU.ino"""
         try:
             print(f"Connecting to {self.port} at {self.baudrate} baud...")
             self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=1.0)
@@ -58,9 +56,8 @@ class IMULogger:
 
             self.is_connected = True
             print("Connection established")
-            print("Accelerometer: LSM303 (~1344 Hz)")
-            print("Gyroscope: L3GD20 (~800 Hz)")
-            print("Magnetometer: LSM303 (~220 Hz)\n")
+            print("Accelerometer: LSM303 (~1265 Hz)")
+            print("Gyroscope: L3GD20 (~759 Hz)\n")
             return True
 
         except Exception as e:
@@ -73,36 +70,52 @@ class IMULogger:
             self.serial_conn.close()
         self.is_connected = False
 
-    def start_logging(self, output_file, duration=None):
-        """Start logging IMU data to CSV file"""
+    def start_logging(self, output_prefix, duration=None):
+        """Start logging IMU data to separate CSV files"""
         if not self.is_connected:
             print("ERROR: Not connected to Arduino")
             return
 
         # Create output directory if needed
-        output_path = Path(output_file)
+        output_path = Path(output_prefix)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Generate output filenames
+        accel_file = f"{output_prefix}_accel.csv"
+        gyro_file = f"{output_prefix}_gyro.csv"
+
         try:
-            # Open CSV file
-            self.csv_file = open(output_file, 'w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
+            # Open accelerometer CSV file
+            self.accel_csv_file = open(accel_file, 'w', newline='')
+            self.accel_csv_writer = csv.writer(self.accel_csv_file)
 
-            # Write header with metadata
-            self.csv_writer.writerow(['# IMU Data Log - LSM303 + L3GD20'])
-            self.csv_writer.writerow([f'# Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'])
-            self.csv_writer.writerow([f'# Port: {self.port}'])
-            self.csv_writer.writerow([f'# Baud: {self.baudrate}'])
-            self.csv_writer.writerow([f'# Duration: {duration}s' if duration else '# Duration: Manual stop'])
-            self.csv_writer.writerow(['# Accelerometer: LSM303 (12-bit, ~1344 Hz)'])
-            self.csv_writer.writerow(['# Gyroscope: L3GD20 (16-bit, ~800 Hz)'])
-            self.csv_writer.writerow(['# Magnetometer: LSM303 (16-bit, ~220 Hz)'])
-            self.csv_writer.writerow([])
+            # Write accelerometer header
+            self.accel_csv_writer.writerow(['# Accelerometer Data - LSM303'])
+            self.accel_csv_writer.writerow([f'# Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'])
+            self.accel_csv_writer.writerow([f'# Port: {self.port}'])
+            self.accel_csv_writer.writerow([f'# Baud: {self.baudrate}'])
+            self.accel_csv_writer.writerow([f'# Duration: {duration}s' if duration else '# Duration: Manual stop'])
+            self.accel_csv_writer.writerow(['# Sensor: LSM303 (12-bit, ~1265 Hz)'])
+            self.accel_csv_writer.writerow([])
+            self.accel_csv_writer.writerow(['timestamp_pc', 'ax', 'ay', 'az'])
 
-            # Write column headers
-            self.csv_writer.writerow(['timestamp_pc', 'ax', 'ay', 'az', 'gx', 'gy', 'gz', 'mx', 'my', 'mz'])
+            # Open gyroscope CSV file
+            self.gyro_csv_file = open(gyro_file, 'w', newline='')
+            self.gyro_csv_writer = csv.writer(self.gyro_csv_file)
 
-            print(f"Logging to: {output_file}")
+            # Write gyroscope header
+            self.gyro_csv_writer.writerow(['# Gyroscope Data - L3GD20'])
+            self.gyro_csv_writer.writerow([f'# Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'])
+            self.gyro_csv_writer.writerow([f'# Port: {self.port}'])
+            self.gyro_csv_writer.writerow([f'# Baud: {self.baudrate}'])
+            self.gyro_csv_writer.writerow([f'# Duration: {duration}s' if duration else '# Duration: Manual stop'])
+            self.gyro_csv_writer.writerow(['# Sensor: L3GD20 (16-bit, ~759 Hz)'])
+            self.gyro_csv_writer.writerow([])
+            self.gyro_csv_writer.writerow(['timestamp_pc', 'gx', 'gy', 'gz'])
+
+            print(f"Logging to:")
+            print(f"  Accel: {accel_file}")
+            print(f"  Gyro:  {gyro_file}")
             if duration:
                 print(f"Duration: {duration} seconds")
             else:
@@ -113,10 +126,8 @@ class IMULogger:
 
             # Start logging
             start_time = time.time()
-            sample_count = 0
             accel_count = 0
             gyro_count = 0
-            mag_count = 0
             last_status_time = start_time
 
             while True:
@@ -134,17 +145,10 @@ class IMULogger:
                         if len(parts) == 3:
                             try:
                                 timestamp_pc = time.time()
-                                self.last_accel = [int(parts[0]), int(parts[1]), int(parts[2])]
+                                ax, ay, az = int(parts[0]), int(parts[1]), int(parts[2])
 
-                                # Write combined row
-                                self.csv_writer.writerow([
-                                    timestamp_pc,
-                                    self.last_accel[0], self.last_accel[1], self.last_accel[2],
-                                    self.last_gyro[0], self.last_gyro[1], self.last_gyro[2],
-                                    self.last_mag[0], self.last_mag[1], self.last_mag[2]
-                                ])
-
-                                sample_count += 1
+                                # Write accelerometer row
+                                self.accel_csv_writer.writerow([timestamp_pc, ax, ay, az])
                                 accel_count += 1
 
                             except ValueError:
@@ -155,22 +159,17 @@ class IMULogger:
                         parts = line[2:].split(',')
                         if len(parts) == 3:
                             try:
-                                self.last_gyro = [int(parts[0]), int(parts[1]), int(parts[2])]
+                                timestamp_pc = time.time()
+                                gx, gy, gz = int(parts[0]), int(parts[1]), int(parts[2])
+
+                                # Write gyroscope row
+                                self.gyro_csv_writer.writerow([timestamp_pc, gx, gy, gz])
                                 gyro_count += 1
+
                             except ValueError:
                                 pass
 
-                    elif line.startswith("M:"):
-                        # Parse magnetometer: M:mx,my,mz
-                        parts = line[2:].split(',')
-                        if len(parts) == 3:
-                            try:
-                                self.last_mag = [int(parts[0]), int(parts[1]), int(parts[2])]
-                                mag_count += 1
-                            except ValueError:
-                                pass
-
-                    elif line.startswith("RATE"):
+                    elif line.startswith("RATE") or line.startswith("Accel:"):
                         # Rate report from Arduino
                         print(f"  {line}")
 
@@ -179,39 +178,40 @@ class IMULogger:
                     elapsed = time.time() - start_time
                     accel_rate = accel_count / elapsed if elapsed > 0 else 0
                     gyro_rate = gyro_count / elapsed if elapsed > 0 else 0
-                    mag_rate = mag_count / elapsed if elapsed > 0 else 0
-                    print(f"  Samples: {sample_count:6d} | "
+                    total_samples = accel_count + gyro_count
+                    print(f"  Total: {total_samples:6d} | "
                           f"Elapsed: {elapsed:6.1f}s | "
                           f"Accel: {accel_rate:6.1f} Hz | "
-                          f"Gyro: {gyro_rate:6.1f} Hz | "
-                          f"Mag: {mag_rate:6.1f} Hz", end='\r')
+                          f"Gyro: {gyro_rate:6.1f} Hz", end='\r')
                     last_status_time = time.time()
 
             # Final summary
             elapsed = time.time() - start_time
             accel_rate = accel_count / elapsed if elapsed > 0 else 0
             gyro_rate = gyro_count / elapsed if elapsed > 0 else 0
-            mag_rate = mag_count / elapsed if elapsed > 0 else 0
+            total_samples = accel_count + gyro_count
             print(f"\n\nLogging complete:")
-            print(f"  Total samples: {sample_count}")
+            print(f"  Total samples: {total_samples}")
             print(f"  Accelerometer: {accel_count} samples ({accel_rate:.2f} Hz)")
             print(f"  Gyroscope: {gyro_count} samples ({gyro_rate:.2f} Hz)")
-            print(f"  Magnetometer: {mag_count} samples ({mag_rate:.2f} Hz)")
             print(f"  Duration: {elapsed:.2f} seconds")
-            print(f"  Saved to: {output_file}")
+            print(f"  Saved to:")
+            print(f"    Accel: {accel_file}")
+            print(f"    Gyro:  {gyro_file}")
 
         except KeyboardInterrupt:
             elapsed = time.time() - start_time
             accel_rate = accel_count / elapsed if elapsed > 0 else 0
             gyro_rate = gyro_count / elapsed if elapsed > 0 else 0
-            mag_rate = mag_count / elapsed if elapsed > 0 else 0
+            total_samples = accel_count + gyro_count
             print(f"\n\nLogging stopped by user:")
-            print(f"  Total samples: {sample_count}")
+            print(f"  Total samples: {total_samples}")
             print(f"  Accelerometer: {accel_count} samples ({accel_rate:.2f} Hz)")
             print(f"  Gyroscope: {gyro_count} samples ({gyro_rate:.2f} Hz)")
-            print(f"  Magnetometer: {mag_count} samples ({mag_rate:.2f} Hz)")
             print(f"  Duration: {elapsed:.2f} seconds")
-            print(f"  Saved to: {output_file}")
+            print(f"  Saved to:")
+            print(f"    Accel: {accel_file}")
+            print(f"    Gyro:  {gyro_file}")
 
         except Exception as e:
             print(f"\nERROR during logging: {e}")
@@ -219,13 +219,17 @@ class IMULogger:
             traceback.print_exc()
 
         finally:
-            if self.csv_file:
-                self.csv_file.close()
+            if self.accel_csv_file:
+                self.accel_csv_file.close()
+            if self.gyro_csv_file:
+                self.gyro_csv_file.close()
 
     def cleanup(self):
         """Clean up resources"""
-        if self.csv_file:
-            self.csv_file.close()
+        if self.accel_csv_file:
+            self.accel_csv_file.close()
+        if self.gyro_csv_file:
+            self.gyro_csv_file.close()
         self.disconnect()
 
 
@@ -243,17 +247,18 @@ def list_ports():
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Log IMU data from Arduino (IMU_test.ino) to CSV for Kalman filter tuning',
+        description='Log IMU data from Arduino (IMU.ino) to separate CSV files for Kalman filter tuning',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python imu_logger.py --list
   python imu_logger.py --port COM3 --duration 60
   python imu_logger.py --port /dev/ttyACM0 --duration 30
-  python imu_logger.py --port COM3 --output my_data.csv
+  python imu_logger.py --port COM3 --output my_data
 
-Note: IMU_test.ino must be uploaded to Arduino first.
+Note: IMU.ino must be uploaded to Arduino first.
       Uses 2000000 baud rate (2 Mbps).
+      Creates two files: <output>_accel.csv and <output>_gyro.csv
         """
     )
 
@@ -264,7 +269,7 @@ Note: IMU_test.ino must be uploaded to Arduino first.
     parser.add_argument('--duration', type=float,
                         help='Logging duration in seconds (default: manual stop with Ctrl+C)')
     parser.add_argument('--output', type=str,
-                        help='Output CSV file (default: auto-generated with timestamp)')
+                        help='Output file prefix (default: auto-generated with timestamp)')
 
     args = parser.parse_args()
 
@@ -280,12 +285,12 @@ Note: IMU_test.ino must be uploaded to Arduino first.
         list_ports()
         return
 
-    # Generate output filename if not specified
+    # Generate output filename prefix if not specified
     if not args.output:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = f"imu_data_{timestamp}.csv"
+        args.output = f"imu_data_{timestamp}"
 
-    # Create logger and connect (fixed 2 Mbaud for IMU_test.ino)
+    # Create logger and connect (fixed 2 Mbaud for IMU.ino)
     logger = IMULogger(args.port, baudrate=2000000)
 
     try:
