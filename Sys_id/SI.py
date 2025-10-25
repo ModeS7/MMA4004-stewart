@@ -42,7 +42,7 @@ class IMUConfig:
     # Axis orientation: [X, Y, Z] multipliers (+1 or -1)
     # Default: Z-axis inverted based on physical mounting
     accel_axis_flip: np.ndarray = field(default_factory=lambda: np.array([-1, 1, -1]))
-    gyro_axis_flip: np.ndarray = field(default_factory=lambda: np.array([-1, 1, 1]))
+    gyro_axis_flip: np.ndarray = field(default_factory=lambda: np.array([-1, 1, -1]))
 
     # Frame alignment: 3x3 rotation matrices for 90°/180° corrections
     # Set to None if no rotation needed
@@ -68,10 +68,10 @@ class KalmanConfig:
         accel_noise: Accelerometer measurement noise [m/s²]
         gyro_noise: Gyroscope measurement noise [rad/s]
     """
-    process_noise_angle: float = 0.1
-    process_noise_bias: float = 0.1
-    accel_noise: float = 0.5
-    gyro_noise: float = 0.33
+    process_noise_angle: float = 0.0
+    process_noise_bias: float = 0.0
+    accel_noise: float = 1.0
+    gyro_noise: float = 1.0
 
 
 @dataclass
