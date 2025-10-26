@@ -9,8 +9,8 @@ Platform follows IMU orientation and reacts to movements:
   * Naturally drifts back to center (0,0,0)
 
 Usage:
-    python imu/imu_mirror_demo.py --port COM3
-    python imu/imu_mirror_demo.py --port COM3 --invert-imu --remap-gyro
+    python imu/mirror_demo.py --port COM3
+    python imu/mirror_demo.py --port COM3 --invert-imu --remap-gyro
 """
 
 import sys
@@ -998,10 +998,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python imu_mirror_demo.py --list
-  python imu_mirror_demo.py --port COM3
-  python imu_mirror_demo.py --port COM3 --invert-imu
-  python imu_mirror_demo.py --port COM3 --no-calibrate
+  python mirror_demo.py --list
+  python mirror_demo.py --port COM3
+  python mirror_demo.py --port COM3 --invert-imu
+  python mirror_demo.py --port COM3 --no-calibrate
 
 Note: Upload IMU_control.ino to Teensy first.
       Automatic calibration runs at startup (10 seconds, keep IMU still).
