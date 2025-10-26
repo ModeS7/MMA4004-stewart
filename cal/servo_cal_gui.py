@@ -332,6 +332,7 @@ class ServoCalibrationGUI(QMainWindow):
         self.all_servos_slider.setTickInterval(500)
         self.all_servos_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.all_servos_slider.valueChanged.connect(self.on_all_servos_slider_change)
+        self.all_servos_slider.sliderReleased.connect(self.on_all_servos_slider_released)
         slider_layout.addWidget(self.all_servos_slider)
 
         self.all_servos_value_label = QLabel("0.00°")
@@ -481,10 +482,24 @@ class ServoCalibrationGUI(QMainWindow):
             for i in range(6):
                 self.servo_angles[i] = angle
                 self.servo_sliders[i].setValue(value)
-        else:
+        # In offset mode, wait for slider release to apply offset
+
+    def on_all_servos_slider_released(self):
+        """Handle all servos slider release (for offset mode)."""
+        if self.all_servos_mode == "offset":
+            value = self.all_servos_slider.value()
+            offset_angle = value / 100.0
+
             # Apply offset to all servos
-            # Only apply when slider is released or use a button
-            pass
+            for i in range(6):
+                new_angle = self.servo_angles[i] + offset_angle
+                new_angle = max(-45.0, min(45.0, new_angle))
+                self.servo_angles[i] = new_angle
+                self.servo_sliders[i].setValue(int(new_angle * 100))
+
+            # Reset slider to 0 after applying offset
+            self.all_servos_slider.setValue(0)
+            self.send_servo_angles()
 
     def on_all_servos_manual_input(self):
         """Handle all servos manual input."""
