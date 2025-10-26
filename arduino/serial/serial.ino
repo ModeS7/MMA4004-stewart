@@ -14,25 +14,34 @@
 MicroMaestro maestro(maestroSerial);
 
 // CONSTANTS
-float abs_0 = 4000;
-float abs_90 = 8000;
+// PWM range in quarter-microseconds (Maestro units)
+// Full 180° servo range: 500-2500 µs
+float abs_0 = 2000;   // 500 µs (0°)
+float abs_90 = 10000;  // 2500 µs (180°)
 
-// Servo ranges (CCW direction)
+// Servo ranges (CCW direction) - full 180° range
 float range[6][2] = {
-  {-45, 45}, {45, -45},
-  {-45, 45}, {45, -45},
-  {-45, 45}, {45, -45}
+  {-90, 90}, {90, -90},
+  {-90, 90}, {90, -90},
+  {-90, 90}, {90, -90}
 };
 
+// Safety limit for angle validation
+const float MAX_ANGLE_LIMIT = 80.0;  // Safety margin (servos can do ±90°)
+
 // Servo offsets (calibration)
-float offset[6] = {-0.5, 7, -2, 4, -2.5, 5.5};
+//float offset[6] = {-0.5, 7, -2, 4, -2.5, 5.5};
+float offset[6] = {-5.07, 1.66, -7.22, -1.79, -6.83, 1.61};
+
+// Global offset adjustment (added to all servos)
+float global_offset = 8.47;  // Change this value to shift all servos
 
 float theta[6] = {0, 0, 0, 0, 0, 0};
 int servoSpeed = 20;        // 0 = unlimited (fastest)
 int servoAcceleration = 20; // 0 = unlimited (fastest)
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(2000000);
   maestroSerial.begin(250000);
 
   Serial.println("Stewart Platform Servo Controller");
@@ -69,7 +78,7 @@ void loop() {
     int angleIndex = 0;
     int startIndex = 0;
 
-    for (int i = 0; i <= input.length(); i++) {
+    for (unsigned int i = 0; i <= input.length(); i++) {
       if (i == input.length() || input.charAt(i) == ',') {
         if (angleIndex < 6) {
           angles[angleIndex] = input.substring(startIndex, i).toFloat();
@@ -84,10 +93,12 @@ void loop() {
       // Validate angles
       bool valid = true;
       for (int i = 0; i < 6; i++) {
-        if (abs(angles[i]) > 40) {
+        if (abs(angles[i]) > MAX_ANGLE_LIMIT) {
           Serial.print("ERROR: Angle ");
           Serial.print(i);
-          Serial.print(" exceeds limit: ");
+          Serial.print(" exceeds limit (±");
+          Serial.print(MAX_ANGLE_LIMIT);
+          Serial.print("°): ");
           Serial.println(angles[i]);
           valid = false;
           break;
@@ -121,7 +132,7 @@ void loop() {
 
 void moveServos(int spd, int acc) {
   for (int i = 0; i < 6; i++) {
-    float pos = theta[i] + offset[i];
+    float pos = theta[i] + offset[i] + global_offset;
     pos = map(pos, range[i][0], range[i][1], abs_0, abs_90);
     maestro.setSpeed(i, spd);
     maestro.setAcceleration(i, acc);

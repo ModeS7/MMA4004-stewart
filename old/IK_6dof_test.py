@@ -15,9 +15,9 @@ import time
 class StewartPlatformIK:
     """Inverse kinematics using Robert Eisele's method."""
 
-    def __init__(self, horn_length=31.75, rod_length=145.0, base=73.025,
-                 base_anchors=36.8893, platform=67.775, platform_anchors=12.7,
-                 top_surface_offset=26.0):
+    def __init__(self, horn_length=45.4960, rod_length=205.0, base=86.6025+18.75+11,
+                 base_anchors=64.75, platform=84.0759, platform_anchors=12.5,
+                 top_surface_offset=38.0):
         # Physical dimensions (mm)
         self.horn_length = horn_length
         self.rod_length = rod_length
@@ -154,7 +154,7 @@ class StewartPlatformIK:
             alpha_k = np.arcsin(ratio) - np.arctan2(f_k, e_k)
             angles[k] = np.degrees(alpha_k)
 
-            if abs(angles[k]) > 40:
+            if abs(angles[k]) > 70:
                 return None
 
         return -angles
@@ -253,12 +253,12 @@ class PlatformParametersDialog:
     def on_reset(self):
         """Reset all values to defaults."""
         defaults = {
-            "horn_length": 31.75,
-            "rod_length": 145.0,
-            "base": 73.025,
-            "base_anchors": 36.8893,
-            "platform": 67.775,
-            "platform_anchors": 12.7,
+            "horn_length": 45.4960,
+            "rod_length": 205.0,
+            "base": 86.6025+18.75+11,
+            "base_anchors": 64.75,
+            "platform": 84.0759,
+            "platform_anchors": 12.5,
         }
 
         for param_name, entry in self.entries.items():
@@ -299,13 +299,13 @@ class StewartControlGUI:
 
         # Initialize with default parameters
         self.platform_params = {
-            "horn_length": 31.75,
-            "rod_length": 145.0,
-            "base": 73.025,
-            "base_anchors": 36.8893,
-            "platform": 67.775,
-            "platform_anchors": 12.7,
-            "top_surface_offset": 26.0
+            "horn_length": 45.4960,
+            "rod_length": 205.0,
+            "base": 86.6025+18.75+11,
+            "base_anchors": 64.75,
+            "platform": 84.0759,
+            "platform_anchors": 12.5,
+            "top_surface_offset": 38.0
         }
 
         self.ik = StewartPlatformIK(**self.platform_params)
@@ -323,16 +323,16 @@ class StewartControlGUI:
 
         # DOF configuration (min, max, resolution, default, label)
         self.dof_config = {
-            'x': (-60.0, 60.0, 0.1, 0.0, "X Position (mm) - Right+"),
-            'y': (-60.0, 60.0, 0.1, 0.0, "Y Position (mm) - Away+"),
-            'z': (self.ik.home_height_top_surface - 30,
-                  self.ik.home_height_top_surface + 30,
+            'x': (-100.0, 100.0, 0.1, 0.0, "X Position (mm) - Right+"),
+            'y': (-100.0, 100.0, 0.1, 0.0, "Y Position (mm) - Away+"),
+            'z': (self.ik.home_height_top_surface - 50,
+                  self.ik.home_height_top_surface + 50,
                   0.1,
                   self.ik.home_height_top_surface,
                   f"Z Height (mm) - Top Surface [Home: {self.ik.home_height_top_surface:.1f}]"),
-            'rx': (-15.0, 15.0, 0.1, 0.0, "Rotation X (°) - Roll"),
-            'ry': (-15.0, 15.0, 0.1, 0.0, "Rotation Y (°) - Pitch"),
-            'rz': (-15.0, 15.0, 0.1, 0.0, "Rotation Z (°) - Yaw")
+            'rx': (-50.0, 50.0, 0.1, 0.0, "Rotation X (°) - Roll"),
+            'ry': (-50.0, 50.0, 0.1, 0.0, "Rotation Y (°) - Pitch"),
+            'rz': (-90.0, 90.0, 0.1, 0.0, "Rotation Z (°) - Yaw")
         }
 
         self.sliders = {}

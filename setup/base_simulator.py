@@ -137,7 +137,7 @@ class BaseStewartSimulator(QMainWindow):
             "base_anchors": 64.75 - 45.3722,    #36.8893
             "platform": 84.0759,                #67.775
             "platform_anchors": 12.5,           #12.7
-            "top_surface_offset": 26.0
+            "top_surface_offset": 38.0
         }
         self.ik = StewartPlatformIK(**self.platform_params)
         self.servos = [

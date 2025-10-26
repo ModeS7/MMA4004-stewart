@@ -150,8 +150,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         self.serial_controller = None
         self.connected = False
 
-        self.pixy_width_mm = 350.0
-        self.pixy_height_mm = 266.0
+        self.pixy_width_mm = 558.0  # Updated for new camera distance (was 350.0)
+        self.pixy_height_mm = 424.0  # Updated for new camera distance (was 266.0)
         self.pixels_to_mm_x = self.pixy_width_mm / 316.0
         self.pixels_to_mm_y = self.pixy_height_mm / 208.0
 
@@ -530,8 +530,8 @@ class HardwareStewartSimulator(BaseStewartSimulator):
                 # Camera dimensions: 316×208 pixels, origin at top-left
                 # Invert Y so (0,0) moves to bottom-left, then center it
                 CAMERA_HEIGHT_PIXELS = 208.0
-                CAMERA_CENTER_X = 158.0
-                CAMERA_CENTER_Y = 104.0
+                CAMERA_CENTER_X = 145.0
+                CAMERA_CENTER_Y = 102.0
 
                 ball_x_mm = (pixy_x - CAMERA_CENTER_X) * self.pixels_to_mm_x
                 ball_y_mm = ((CAMERA_HEIGHT_PIXELS - pixy_y) - CAMERA_CENTER_Y) * self.pixels_to_mm_y

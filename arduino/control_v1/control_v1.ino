@@ -19,20 +19,31 @@ Pixy2SPI_SS pixy;
 MicroMaestro maestro(MAESTRO_SERIAL);
 
 // ===== PIXY2 CONSTANTS =====
-const float ORIGIN_X = 158.0;
-const float ORIGIN_Y = 104.0;
+const float ORIGIN_X = 145.0;
+const float ORIGIN_Y = 102.0;
 
 // ===== SERVO CONTROL CONSTANTS =====
-const float abs_0 = 4000;
-const float abs_90 = 8000;
+// PWM range in quarter-microseconds (Maestro units)
+// Full 180° servo range: 500-2500 µs
+const float abs_0 = 2000;   // 500 µs (0°)
+const float abs_90 = 10000;  // 2500 µs (180°)
 
+// Servo ranges (CCW direction) - full 180° range
 float range[6][2] = {
-  {-45, 45}, {45, -45},
-  {-45, 45}, {45, -45},
-  {-45, 45}, {45, -45}
+  {-90, 90}, {90, -90},
+  {-90, 90}, {90, -90},
+  {-90, 90}, {90, -90}
 };
 
-float offset[6] = {-0.5, 7, -2, 4, -2.5, 5.5};
+// Safety limit for angle validation
+const float MAX_ANGLE_LIMIT = 80.0;  // Safety margin (servos can do ±90°)
+
+// Servo offsets (calibration)
+float offset[6] = {-5.07, 1.66, -7.22, -1.79, -6.83, 1.61};
+
+// Global offset adjustment (added to all servos)
+float global_offset = 8.47;  // Change this value to shift all servos
+
 float theta[6] = {0, 0, 0, 0, 0, 0};
 
 // **SPEED SETTINGS**
@@ -274,7 +285,7 @@ void parseAndExecuteAngles(char* cmd) {
 
   // Check limits
   for (int i = 0; i < 6; i++) {
-    if (abs(angles[i]) > 40 || isnan(angles[i])) {
+    if (abs(angles[i]) > MAX_ANGLE_LIMIT || isnan(angles[i])) {
       USB_SERIAL.print("ERROR:Invalid angle[");
       USB_SERIAL.print(i);
       USB_SERIAL.print("]=");
@@ -298,9 +309,9 @@ void parseAndExecuteAngles(char* cmd) {
 // ===== SERVO MOVEMENT =====
 void moveServos() {
   for (int i = 0; i < 6; i++) {
-    float pos = theta[i] + offset[i];
+    float pos = theta[i] + offset[i] + global_offset;
     pos = map_float(pos, range[i][0], range[i][1], abs_0, abs_90);
-    pos = constrain(pos, 3000, 9000);
+    pos = constrain(pos, abs_0, abs_90);
 
     maestro.setSpeed(i, servoSpeed);
     maestro.setAcceleration(i, servoAcceleration);
