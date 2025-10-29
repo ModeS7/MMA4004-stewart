@@ -3,13 +3,11 @@
 Plot IMU data from logged CSV files
 
 Displays accelerometer and gyroscope data over time with physical unit conversion.
-Optionally processes through Kalman filter to estimate orientation (like SI.py).
+Processes through Kalman filter to estimate orientation.
 """
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button, TextBox
 import argparse
 from pathlib import Path
 from typing import Tuple
@@ -17,21 +15,29 @@ from collections import deque
 import glob
 import sys
 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QSlider, QPushButton, QLabel, QLineEdit, QCheckBox, QFileDialog,
+                             QGridLayout, QGroupBox)
+from PyQt6.QtCore import Qt, QTimer
+import pyqtgraph as pg
+
 # Add parent directory to path to import core modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.core import StewartPlatformIK, FirstOrderServo
 from core.utils import SimulationConfig
 
-# Set dark theme
-plt.style.use('dark_background')
+# PyQtGraph dark theme configuration
+pg.setConfigOption('background', '#1e1e1e')
+pg.setConfigOption('foreground', 'w')
+pg.setConfigOption('antialias', True)
 
 
 # ============================================================================
-# ORIENTATION KALMAN FILTER (from SI.py)
+# ORIENTATION KALMAN FILTER
 # ============================================================================
 
 class OrientationKalmanFilter:
-    """Extended Kalman Filter for roll and pitch estimation from IMU (like SI.py).
+    """Extended Kalman Filter for roll and pitch estimation from IMU.
 
     State vector: [roll, pitch, gyro_bias_x, gyro_bias_y]
 
@@ -41,9 +47,11 @@ class OrientationKalmanFilter:
         - Removes initial gravity offset to make orientation relative
     """
 
-    def __init__(self, accel_noise=1.0, gyro_noise=1.0, process_noise_angle=0.0, process_noise_bias=0.0):
+    def __init__(self, accel_noise=1.0, gyro_noise=1.0, process_noise_angle=0.0, process_noise_bias=0.0,
+                 accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None,
+                 initial_bias_x=0.0, initial_bias_y=0.0):
         # State: [roll, pitch, gyro_bias_x, gyro_bias_y]
-        self.state = np.zeros(4)
+        self.state = np.array([0.0, 0.0, initial_bias_x, initial_bias_y])
         self.P = np.eye(4) * 0.1
 
         # Process noise covariance
@@ -67,6 +75,12 @@ class OrientationKalmanFilter:
         self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
         self.gyro_scale = 0.00875 * np.pi / 180  # L3GD20: 8.75 mdps/LSB -> rad/s
 
+        # Axis transformations
+        self.accel_axis_flip = accel_axis_flip if accel_axis_flip is not None else np.array([1, 1, 1])
+        self.gyro_axis_flip = gyro_axis_flip if gyro_axis_flip is not None else np.array([1, 1, 1])
+        self.accel_rotation = accel_rotation
+        self.gyro_rotation = gyro_rotation
+
     def initialize(self, accel_raw):
         """Initialize filter state from first accelerometer reading (raw LSB).
 
@@ -74,9 +88,16 @@ class OrientationKalmanFilter:
             accel_raw: Initial acceleration measurement [LSB]
         """
         if not self.initialized:
-            # Convert to m/s²
-            accel = accel_raw * self.accel_scale
+            # Apply transformations and convert to m/s²
+            accel = apply_imu_transforms(accel_raw, self.accel_axis_flip, self.accel_rotation, self.accel_scale)
             ax, ay, az = accel
+
+            # Validate gravity magnitude
+            gravity_mag = np.linalg.norm(accel)
+            expected_gravity = GRAVITY_MAGNITUDE
+            gravity_error = abs(gravity_mag - expected_gravity)
+            if gravity_error > 1.0:  # More than 1 m/s² error
+                print(f"WARNING: Measured gravity magnitude {gravity_mag:.2f} differs from expected {expected_gravity:.2f} by {gravity_error:.2f} m/s²")
 
             roll0 = np.arctan2(ay, az)
             pitch0 = np.arctan2(-ax, np.sqrt(ay ** 2 + az ** 2))
@@ -93,8 +114,8 @@ class OrientationKalmanFilter:
             gyro_raw: Angular velocity measurement [LSB]
             dt: Time step [s]
         """
-        # Convert to rad/s
-        gyro = gyro_raw * self.gyro_scale
+        # Apply transformations and convert to rad/s
+        gyro = apply_imu_transforms(gyro_raw, self.gyro_axis_flip, self.gyro_rotation, self.gyro_scale)
         gx, gy = gyro[0], gyro[1]
 
         # Bias-corrected angular velocity
@@ -122,8 +143,8 @@ class OrientationKalmanFilter:
         Args:
             accel_raw: Acceleration measurement [LSB]
         """
-        # Convert to m/s²
-        accel = accel_raw * self.accel_scale
+        # Apply transformations and convert to m/s²
+        accel = apply_imu_transforms(accel_raw, self.accel_axis_flip, self.accel_rotation, self.accel_scale)
         ax, ay, az = accel
 
         # Tilt angles from accelerometer
@@ -172,14 +193,75 @@ ACCEL_SCALE = 0.001 * 9.81  # 1 mg/LSB → m/s²
 GYRO_SENSITIVITY = 1.0 / 0.00875  # LSB/(°/s) = 114.29
 GYRO_SCALE = 0.00875 * np.pi / 180  # 8.75 mdps/LSB → rad/s
 
-# Kalman Filter Configuration (tuned with measured IMU noise)
-ACCEL_NOISE = 0.0872   # sqrt(0.007602) - measured from analyze_imu.py
-GYRO_NOISE = 0.0174    # sqrt(0.00030214) - measured from analyze_imu.py
-PROCESS_NOISE_ANGLE = 0.001  # Allow small gyro drift
-PROCESS_NOISE_BIAS = 1e-6    # Slow bias adaptation
+# Kalman Filter Configuration (measured from stationary IMU data)
+# Accelerometer noise (m/s²): X=0.0686, Y=0.0672, Z=0.0924
+# Using RMS of X,Y for tilt measurement: sqrt((0.0686² + 0.0672²)/2) ≈ 0.0679
+ACCEL_NOISE = 0.0679  # m/s² - RMS of X,Y accelerometer noise
+
+# Gyroscope noise (rad/s): X=0.021750, Y=0.023157, Z=0.006303
+# Using RMS of X,Y for roll/pitch rates: sqrt((0.021750² + 0.023157²)/2) ≈ 0.0224
+GYRO_NOISE = 0.0224  # rad/s - RMS of X,Y gyroscope noise
+
+PROCESS_NOISE_ANGLE = 0.0  # Allow small gyro drift
+PROCESS_NOISE_BIAS = 0.0    # Slow bias adaptation
+
+# Measured gyroscope biases (rad/s) - from stationary data
+GYRO_BIAS_X = 0.112679  # rad/s
+GYRO_BIAS_Y = 0.031500  # rad/s
+
+# Measured gravity vector (m/s²) - from stationary data
+GRAVITY_VECTOR = np.array([-0.2725, -0.1496, -9.8283])
+GRAVITY_MAGNITUDE = np.linalg.norm(GRAVITY_VECTOR)  # 9.8332 m/s² (slightly above nominal 9.81)
+
+# IMU Axis Transformation Configuration
+ACCEL_AXIS_FLIP = np.array([-1, 1, -1])  # Axis orientation correction
+GYRO_AXIS_FLIP = np.array([-1, 1, -1])
+
+# Frame alignment: 3x3 rotation matrices for 90°/180° corrections
+# Set to None if no rotation needed
+ACCEL_ROTATION = np.array([
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1]
+])
+GYRO_ROTATION = np.array([
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1]
+])
 
 
-# Note: Using IMUKalmanFilter from core.control_core (imported above)
+# ============================================================================
+# IMU DATA TRANSFORMATION
+# ============================================================================
+
+def apply_imu_transforms(raw_data, axis_flip, rotation_matrix, scale):
+    """Apply axis flip, rotation, and scaling to raw IMU data.
+
+    Args:
+        raw_data: Raw sensor values [LSB] (can be single sample or array)
+        axis_flip: Axis orientation multipliers [±1, ±1, ±1]
+        rotation_matrix: 3x3 rotation matrix or None
+        scale: Scaling factor to convert to physical units
+
+    Returns:
+        Transformed data in physical units
+    """
+    # Handle both single samples and arrays
+    is_single = (raw_data.ndim == 1)
+    data = raw_data.reshape(1, -1) if is_single else raw_data
+
+    # Apply scaling
+    scaled = data * scale
+
+    # Apply axis flip
+    scaled = scaled * axis_flip
+
+    # Apply rotation if provided
+    if rotation_matrix is not None:
+        scaled = scaled @ rotation_matrix.T
+
+    return scaled[0] if is_single else scaled
 
 
 # ============================================================================
@@ -265,8 +347,9 @@ def print_statistics(df):
     print(f"  Z-axis: mean={gyro_df['gz_rads'].mean():8.6f}, std={gyro_df['gz_rads'].std():8.6f}")
 
 
-def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc_noise_angle, proc_noise_bias):
-    """Run Kalman filter with given parameters (using SI.py approach)
+def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc_noise_angle, proc_noise_bias,
+                      accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None):
+    """Run Kalman filter with given parameters
 
     Args:
         accel_df: Accelerometer dataframe
@@ -276,16 +359,26 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
         gyro_noise: Gyroscope measurement noise (rad/s)
         proc_noise_angle: Process noise for angle states
         proc_noise_bias: Process noise for bias states
+        accel_axis_flip: Axis flip for accelerometer
+        gyro_axis_flip: Axis flip for gyroscope
+        accel_rotation: Rotation matrix for accelerometer
+        gyro_rotation: Rotation matrix for gyroscope
 
     Returns:
         Tuple of (rx_est, ry_est, bias_x, bias_y, time, platform_rx, platform_ry)
     """
-    # Create OrientationKalmanFilter (from SI.py) with custom noise parameters
+    # Create OrientationKalmanFilter with custom noise parameters and transformations
     kalman = OrientationKalmanFilter(
         accel_noise=accel_noise,
         gyro_noise=gyro_noise,
         process_noise_angle=proc_noise_angle,
-        process_noise_bias=proc_noise_bias
+        process_noise_bias=proc_noise_bias,
+        accel_axis_flip=accel_axis_flip,
+        gyro_axis_flip=gyro_axis_flip,
+        accel_rotation=accel_rotation,
+        gyro_rotation=gyro_rotation,
+        initial_bias_x=GYRO_BIAS_X,
+        initial_bias_y=GYRO_BIAS_Y
     )
 
     # Initialize from first accelerometer reading
@@ -294,6 +387,8 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
         accel_raw = np.array([first_accel['x'], first_accel['y'], first_accel['z']])
         kalman.initialize(accel_raw)
         print(f"Kalman initialized from gravity: rx={np.degrees(kalman.state[0]):.2f}°, ry={np.degrees(kalman.state[1]):.2f}°")
+        print(f"  Initial gyro biases: X={kalman.state[2]:.6f} rad/s, Y={kalman.state[3]:.6f} rad/s")
+        print(f"  Measured gravity vector: [{GRAVITY_VECTOR[0]:.4f}, {GRAVITY_VECTOR[1]:.4f}, {GRAVITY_VECTOR[2]:.4f}] m/s² (mag={GRAVITY_MAGNITUDE:.4f})")
 
     # Process through Kalman filter
     rx_est = np.zeros(len(accel_df))
@@ -509,6 +604,571 @@ def compute_servo_dynamics_fk(df, stewart_ik):
     return servo_x, servo_y, servo_z, servo_rx, servo_ry, servo_rz
 
 
+class IMUPlotWindow(QMainWindow):
+    """PyQt6 window for interactive IMU data visualization"""
+
+    def __init__(self, df, stewart_ik):
+        super().__init__()
+        self.setWindowTitle("IMU Platform State Comparison")
+        self.resize(1800, 1000)
+
+        # Initialize data
+        self.stewart_ik = stewart_ik
+        self.load_data(df)
+
+        # Debounce timer
+        self.update_timer = QTimer()
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.update_plots)
+
+        # Setup UI
+        self.setup_ui()
+
+        # Update initial rotation status
+        self.accel_rotation_label.setText(self._describe_rotation_matrix(self.accel_rotation))
+        self.gyro_rotation_label.setText(self._describe_rotation_matrix(self.gyro_rotation))
+
+        # Initial plot
+        self.update_plots()
+
+    def load_data(self, df):
+        """Load and process IMU data"""
+        # Separate and sort accel and gyro data by timestamp
+        self.accel_df = df[df['type'] == 'A'].copy().sort_values('timestamp_arduino_us').reset_index(drop=True)
+        self.gyro_df = df[df['type'] == 'G'].copy().sort_values('timestamp_arduino_us').reset_index(drop=True)
+
+        print(f"\nAccelerometer samples: {len(self.accel_df)}")
+        print(f"Gyroscope samples: {len(self.gyro_df)}")
+
+        # Compute FK from commanded servo angles
+        print("\nComputing forward kinematics from commanded servo angles...")
+        self.cmd_fk_x, self.cmd_fk_y, self.cmd_fk_z, self.cmd_fk_rx, self.cmd_fk_ry, self.cmd_fk_rz = \
+            compute_fk_from_servos(df, self.stewart_ik)
+
+        # Compute FK from servo angles with dynamics
+        print("\nComputing forward kinematics with servo dynamics...")
+        self.servo_fk_x, self.servo_fk_y, self.servo_fk_z, self.servo_fk_rx, self.servo_fk_ry, self.servo_fk_rz = \
+            compute_servo_dynamics_fk(df, self.stewart_ik)
+        print("FK computation complete")
+
+        # Interleave accel and gyro based on timestamps
+        print("\nInterleaving sensor data...")
+        self.all_data = []
+        accel_idx = 0
+        gyro_idx = 0
+
+        while accel_idx < len(self.accel_df) or gyro_idx < len(self.gyro_df):
+            if accel_idx >= len(self.accel_df):
+                row = self.gyro_df.iloc[gyro_idx]
+                self.all_data.append(('G', gyro_idx, row))
+                gyro_idx += 1
+            elif gyro_idx >= len(self.gyro_df):
+                row = self.accel_df.iloc[accel_idx]
+                self.all_data.append(('A', accel_idx, row))
+                accel_idx += 1
+            else:
+                accel_time = self.accel_df.iloc[accel_idx]['timestamp_arduino_us']
+                gyro_time = self.gyro_df.iloc[gyro_idx]['timestamp_arduino_us']
+
+                if accel_time <= gyro_time:
+                    row = self.accel_df.iloc[accel_idx]
+                    self.all_data.append(('A', accel_idx, row))
+                    accel_idx += 1
+                else:
+                    row = self.gyro_df.iloc[gyro_idx]
+                    self.all_data.append(('G', gyro_idx, row))
+                    gyro_idx += 1
+
+        # IMU transformation state
+        self.accel_axis_flip = ACCEL_AXIS_FLIP.copy()
+        self.gyro_axis_flip = GYRO_AXIS_FLIP.copy()
+        self.accel_rotation = ACCEL_ROTATION.copy() if ACCEL_ROTATION is not None else None
+        self.gyro_rotation = GYRO_ROTATION.copy() if GYRO_ROTATION is not None else None
+
+    def setup_ui(self):
+        """Setup the user interface"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # Create plot grid (3x2 for 6 DOF)
+        plot_widget = pg.GraphicsLayoutWidget()
+        main_layout.addWidget(plot_widget, stretch=8)
+
+        # Create plots
+        self.plot_x = plot_widget.addPlot(row=0, col=0, title="Position X (Commanded)")
+        self.plot_x.setLabel('left', 'X Position', units='mm')
+        self.plot_x.setLabel('bottom', 'Time', units='s')
+        self.plot_x.addLegend()
+
+        self.plot_y = plot_widget.addPlot(row=0, col=1, title="Position Y (Commanded)")
+        self.plot_y.setLabel('left', 'Y Position', units='mm')
+        self.plot_y.setLabel('bottom', 'Time', units='s')
+        self.plot_y.addLegend()
+
+        self.plot_z = plot_widget.addPlot(row=1, col=0, title="Position Z (Commanded)")
+        self.plot_z.setLabel('left', 'Z Position', units='mm')
+        self.plot_z.setLabel('bottom', 'Time', units='s')
+        self.plot_z.addLegend()
+
+        self.plot_rx = plot_widget.addPlot(row=1, col=1, title="Orientation RX (Roll)")
+        self.plot_rx.setLabel('left', 'Roll', units='deg')
+        self.plot_rx.setLabel('bottom', 'Time', units='s')
+        self.plot_rx.addLegend()
+
+        self.plot_ry = plot_widget.addPlot(row=2, col=0, title="Orientation RY (Pitch)")
+        self.plot_ry.setLabel('left', 'Pitch', units='deg')
+        self.plot_ry.setLabel('bottom', 'Time', units='s')
+        self.plot_ry.addLegend()
+
+        self.plot_rz = plot_widget.addPlot(row=2, col=1, title="Orientation RZ (Yaw)")
+        self.plot_rz.setLabel('left', 'Yaw', units='deg')
+        self.plot_rz.setLabel('bottom', 'Time', units='s')
+        self.plot_rz.addLegend()
+
+        # Controls layout
+        controls_layout = QHBoxLayout()
+        main_layout.addLayout(controls_layout, stretch=1)
+
+        # File controls
+        file_group = QGroupBox("File")
+        file_layout = QHBoxLayout()
+        file_group.setLayout(file_layout)
+
+        self.file_edit = QLineEdit(str(Path.cwd() / 'csv' / '*.csv'))
+        file_layout.addWidget(QLabel("Path:"))
+        file_layout.addWidget(self.file_edit, stretch=3)
+
+        browse_btn = QPushButton("Browse")
+        browse_btn.clicked.connect(self.browse_file)
+        file_layout.addWidget(browse_btn)
+
+        load_btn = QPushButton("Load")
+        load_btn.clicked.connect(self.load_file)
+        file_layout.addWidget(load_btn)
+
+        controls_layout.addWidget(file_group, stretch=2)
+
+        # Kalman filter parameters
+        params_group = QGroupBox("Kalman Filter Parameters")
+        params_layout = QGridLayout()
+        params_group.setLayout(params_layout)
+
+        # Accel noise slider
+        params_layout.addWidget(QLabel("Accel Noise [m/s²]:"), 0, 0)
+        self.accel_noise_slider = QSlider(Qt.Orientation.Horizontal)
+        self.accel_noise_slider.setMinimum(1)
+        self.accel_noise_slider.setMaximum(5000)
+        self.accel_noise_slider.setValue(int(ACCEL_NOISE * 1000))
+        self.accel_noise_slider.valueChanged.connect(self.schedule_update)
+        params_layout.addWidget(self.accel_noise_slider, 0, 1)
+        self.accel_noise_label = QLabel(f"{ACCEL_NOISE:.4f}")
+        params_layout.addWidget(self.accel_noise_label, 0, 2)
+
+        # Gyro noise slider
+        params_layout.addWidget(QLabel("Gyro Noise [rad/s]:"), 1, 0)
+        self.gyro_noise_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gyro_noise_slider.setMinimum(1)
+        self.gyro_noise_slider.setMaximum(1000)
+        self.gyro_noise_slider.setValue(int(GYRO_NOISE * 1000))
+        self.gyro_noise_slider.valueChanged.connect(self.schedule_update)
+        params_layout.addWidget(self.gyro_noise_slider, 1, 1)
+        self.gyro_noise_label = QLabel(f"{GYRO_NOISE:.6f}")
+        params_layout.addWidget(self.gyro_noise_label, 1, 2)
+
+        # Process noise angle slider
+        params_layout.addWidget(QLabel("Proc Noise Angle [rad²]:"), 2, 0)
+        self.proc_angle_slider = QSlider(Qt.Orientation.Horizontal)
+        self.proc_angle_slider.setMinimum(0)
+        self.proc_angle_slider.setMaximum(1000)
+        self.proc_angle_slider.setValue(int(PROCESS_NOISE_ANGLE * 10000))
+        self.proc_angle_slider.valueChanged.connect(self.schedule_update)
+        params_layout.addWidget(self.proc_angle_slider, 2, 1)
+        self.proc_angle_label = QLabel(f"{PROCESS_NOISE_ANGLE:.6f}")
+        params_layout.addWidget(self.proc_angle_label, 2, 2)
+
+        # Process noise bias slider
+        params_layout.addWidget(QLabel("Proc Noise Bias [(rad/s)²]:"), 3, 0)
+        self.proc_bias_slider = QSlider(Qt.Orientation.Horizontal)
+        self.proc_bias_slider.setMinimum(0)
+        self.proc_bias_slider.setMaximum(10000)
+        self.proc_bias_slider.setValue(int(PROCESS_NOISE_BIAS * 10000000))
+        self.proc_bias_slider.valueChanged.connect(self.schedule_update)
+        params_layout.addWidget(self.proc_bias_slider, 3, 1)
+        self.proc_bias_label = QLabel(f"{PROCESS_NOISE_BIAS:.8f}")
+        params_layout.addWidget(self.proc_bias_label, 3, 2)
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.clicked.connect(self.reset_sliders)
+        params_layout.addWidget(reset_btn, 4, 0, 1, 3)
+
+        controls_layout.addWidget(params_group, stretch=3)
+
+        # Axis flip and rotation controls
+        transform_group = QGroupBox("IMU Transformations")
+        transform_layout = QVBoxLayout()
+        transform_group.setLayout(transform_layout)
+
+        # Axis flips section
+        flip_layout = QHBoxLayout()
+
+        accel_flip_layout = QVBoxLayout()
+        accel_flip_layout.addWidget(QLabel("Accelerometer Flips:"))
+        self.accel_flip_x = QCheckBox("Flip X")
+        self.accel_flip_x.setChecked(self.accel_axis_flip[0] < 0)
+        self.accel_flip_x.stateChanged.connect(lambda: self.toggle_accel_flip(0))
+        accel_flip_layout.addWidget(self.accel_flip_x)
+        self.accel_flip_y = QCheckBox("Flip Y")
+        self.accel_flip_y.setChecked(self.accel_axis_flip[1] < 0)
+        self.accel_flip_y.stateChanged.connect(lambda: self.toggle_accel_flip(1))
+        accel_flip_layout.addWidget(self.accel_flip_y)
+        self.accel_flip_z = QCheckBox("Flip Z")
+        self.accel_flip_z.setChecked(self.accel_axis_flip[2] < 0)
+        self.accel_flip_z.stateChanged.connect(lambda: self.toggle_accel_flip(2))
+        accel_flip_layout.addWidget(self.accel_flip_z)
+        flip_layout.addLayout(accel_flip_layout)
+
+        gyro_flip_layout = QVBoxLayout()
+        gyro_flip_layout.addWidget(QLabel("Gyroscope Flips:"))
+        self.gyro_flip_x = QCheckBox("Flip X")
+        self.gyro_flip_x.setChecked(self.gyro_axis_flip[0] < 0)
+        self.gyro_flip_x.stateChanged.connect(lambda: self.toggle_gyro_flip(0))
+        gyro_flip_layout.addWidget(self.gyro_flip_x)
+        self.gyro_flip_y = QCheckBox("Flip Y")
+        self.gyro_flip_y.setChecked(self.gyro_axis_flip[1] < 0)
+        self.gyro_flip_y.stateChanged.connect(lambda: self.toggle_gyro_flip(1))
+        gyro_flip_layout.addWidget(self.gyro_flip_y)
+        self.gyro_flip_z = QCheckBox("Flip Z")
+        self.gyro_flip_z.setChecked(self.gyro_axis_flip[2] < 0)
+        self.gyro_flip_z.stateChanged.connect(lambda: self.toggle_gyro_flip(2))
+        gyro_flip_layout.addWidget(self.gyro_flip_z)
+        flip_layout.addLayout(gyro_flip_layout)
+
+        transform_layout.addLayout(flip_layout)
+
+        # Rotation controls section
+        rotation_layout = QGridLayout()
+        rotation_layout.addWidget(QLabel("Accelerometer Rotations:"), 0, 0, 1, 3)
+
+        # Accel rotation buttons
+        accel_rot_x_neg = QPushButton("X -90°")
+        accel_rot_x_neg.clicked.connect(lambda: self.rotate_accel('x', -90))
+        rotation_layout.addWidget(accel_rot_x_neg, 1, 0)
+        accel_rot_x_pos = QPushButton("X +90°")
+        accel_rot_x_pos.clicked.connect(lambda: self.rotate_accel('x', 90))
+        rotation_layout.addWidget(accel_rot_x_pos, 1, 1)
+
+        accel_rot_y_neg = QPushButton("Y -90°")
+        accel_rot_y_neg.clicked.connect(lambda: self.rotate_accel('y', -90))
+        rotation_layout.addWidget(accel_rot_y_neg, 2, 0)
+        accel_rot_y_pos = QPushButton("Y +90°")
+        accel_rot_y_pos.clicked.connect(lambda: self.rotate_accel('y', 90))
+        rotation_layout.addWidget(accel_rot_y_pos, 2, 1)
+
+        accel_rot_z_neg = QPushButton("Z -90°")
+        accel_rot_z_neg.clicked.connect(lambda: self.rotate_accel('z', -90))
+        rotation_layout.addWidget(accel_rot_z_neg, 3, 0)
+        accel_rot_z_pos = QPushButton("Z +90°")
+        accel_rot_z_pos.clicked.connect(lambda: self.rotate_accel('z', 90))
+        rotation_layout.addWidget(accel_rot_z_pos, 3, 1)
+
+        accel_reset_btn = QPushButton("Reset")
+        accel_reset_btn.clicked.connect(lambda: self.reset_accel_rotation())
+        rotation_layout.addWidget(accel_reset_btn, 1, 2, 3, 1)
+
+        rotation_layout.addWidget(QLabel("Gyroscope Rotations:"), 0, 3, 1, 3)
+
+        # Gyro rotation buttons
+        gyro_rot_x_neg = QPushButton("X -90°")
+        gyro_rot_x_neg.clicked.connect(lambda: self.rotate_gyro('x', -90))
+        rotation_layout.addWidget(gyro_rot_x_neg, 1, 3)
+        gyro_rot_x_pos = QPushButton("X +90°")
+        gyro_rot_x_pos.clicked.connect(lambda: self.rotate_gyro('x', 90))
+        rotation_layout.addWidget(gyro_rot_x_pos, 1, 4)
+
+        gyro_rot_y_neg = QPushButton("Y -90°")
+        gyro_rot_y_neg.clicked.connect(lambda: self.rotate_gyro('y', -90))
+        rotation_layout.addWidget(gyro_rot_y_neg, 2, 3)
+        gyro_rot_y_pos = QPushButton("Y +90°")
+        gyro_rot_y_pos.clicked.connect(lambda: self.rotate_gyro('y', 90))
+        rotation_layout.addWidget(gyro_rot_y_pos, 2, 4)
+
+        gyro_rot_z_neg = QPushButton("Z -90°")
+        gyro_rot_z_neg.clicked.connect(lambda: self.rotate_gyro('z', -90))
+        rotation_layout.addWidget(gyro_rot_z_neg, 3, 3)
+        gyro_rot_z_pos = QPushButton("Z +90°")
+        gyro_rot_z_pos.clicked.connect(lambda: self.rotate_gyro('z', 90))
+        rotation_layout.addWidget(gyro_rot_z_pos, 3, 4)
+
+        gyro_reset_btn = QPushButton("Reset")
+        gyro_reset_btn.clicked.connect(lambda: self.reset_gyro_rotation())
+        rotation_layout.addWidget(gyro_reset_btn, 1, 5, 3, 1)
+
+        transform_layout.addLayout(rotation_layout)
+
+        # Rotation status displays
+        status_layout = QHBoxLayout()
+
+        # Accel rotation status
+        accel_status_layout = QVBoxLayout()
+        accel_status_layout.addWidget(QLabel("Accelerometer Rotation Status:"))
+        self.accel_rotation_label = QLabel("Identity (no rotation)")
+        self.accel_rotation_label.setStyleSheet("font-family: monospace; font-size: 9pt;")
+        accel_status_layout.addWidget(self.accel_rotation_label)
+        status_layout.addLayout(accel_status_layout)
+
+        # Gyro rotation status
+        gyro_status_layout = QVBoxLayout()
+        gyro_status_layout.addWidget(QLabel("Gyroscope Rotation Status:"))
+        self.gyro_rotation_label = QLabel("Identity (no rotation)")
+        self.gyro_rotation_label.setStyleSheet("font-family: monospace; font-size: 9pt;")
+        gyro_status_layout.addWidget(self.gyro_rotation_label)
+        status_layout.addLayout(gyro_status_layout)
+
+        transform_layout.addLayout(status_layout)
+
+        controls_layout.addWidget(transform_group, stretch=2)
+
+    def schedule_update(self):
+        """Schedule plot update with debouncing"""
+        self.update_timer.stop()
+        self.update_timer.start(300)  # 300ms delay
+
+        # Update slider labels immediately
+        self.accel_noise_label.setText(f"{self.accel_noise_slider.value() / 1000:.4f}")
+        self.gyro_noise_label.setText(f"{self.gyro_noise_slider.value() / 1000:.6f}")
+        self.proc_angle_label.setText(f"{self.proc_angle_slider.value() / 10000:.6f}")
+        self.proc_bias_label.setText(f"{self.proc_bias_slider.value() / 10000000:.8f}")
+
+    def update_plots(self):
+        """Update plots with current Kalman filter parameters"""
+        # Get slider values
+        accel_noise = self.accel_noise_slider.value() / 1000
+        gyro_noise = self.gyro_noise_slider.value() / 1000
+        proc_noise_angle = self.proc_angle_slider.value() / 10000
+        proc_noise_bias = self.proc_bias_slider.value() / 10000000
+
+        # Run Kalman filter
+        rx_est, ry_est, bias_x, bias_y, time, platform_rx, platform_ry = run_kalman_filter(
+            self.accel_df, self.gyro_df, self.all_data, accel_noise, gyro_noise,
+            proc_noise_angle, proc_noise_bias,
+            self.accel_axis_flip, self.gyro_axis_flip,
+            self.accel_rotation, self.gyro_rotation
+        )
+
+        # Clear and update plots
+        self.plot_x.clear()
+        self.plot_x.plot(time, self.cmd_fk_x, pen=pg.mkPen('#c77dff', width=1.5, style=Qt.PenStyle.DotLine), name='Commanded')
+        self.plot_x.plot(time, self.servo_fk_x, pen=pg.mkPen('#4ecdc4', width=2), name='Servo FK')
+
+        self.plot_y.clear()
+        self.plot_y.plot(time, self.cmd_fk_y, pen=pg.mkPen('#c77dff', width=1.5, style=Qt.PenStyle.DotLine), name='Commanded')
+        self.plot_y.plot(time, self.servo_fk_y, pen=pg.mkPen('#4ecdc4', width=2), name='Servo FK')
+
+        self.plot_z.clear()
+        self.plot_z.plot(time, self.cmd_fk_z, pen=pg.mkPen('#c77dff', width=1.5, style=Qt.PenStyle.DotLine), name='Commanded')
+        self.plot_z.plot(time, self.servo_fk_z, pen=pg.mkPen('#4ecdc4', width=2), name='Servo FK')
+
+        self.plot_rx.clear()
+        self.plot_rx.plot(time, np.degrees(self.cmd_fk_rx), pen=pg.mkPen('#c77dff', width=1.5, style=Qt.PenStyle.DotLine), name='Commanded FK')
+        self.plot_rx.plot(time, np.degrees(self.servo_fk_rx), pen=pg.mkPen('#4ecdc4', width=2), name='Servo FK')
+        self.plot_rx.plot(time, np.degrees(rx_est), pen=pg.mkPen('#ff6b6b', width=2, style=Qt.PenStyle.DashLine), name='Kalman (IMU)')
+
+        self.plot_ry.clear()
+        self.plot_ry.plot(time, np.degrees(self.cmd_fk_ry), pen=pg.mkPen('#c77dff', width=1.5, style=Qt.PenStyle.DotLine), name='Commanded FK')
+        self.plot_ry.plot(time, np.degrees(self.servo_fk_ry), pen=pg.mkPen('#4ecdc4', width=2), name='Servo FK')
+        self.plot_ry.plot(time, np.degrees(ry_est), pen=pg.mkPen('#ff6b6b', width=2, style=Qt.PenStyle.DashLine), name='Kalman (IMU)')
+
+        self.plot_rz.clear()
+        self.plot_rz.plot(time, np.degrees(self.cmd_fk_rz), pen=pg.mkPen('#c77dff', width=1.5, style=Qt.PenStyle.DotLine), name='Commanded FK')
+        self.plot_rz.plot(time, np.degrees(self.servo_fk_rz), pen=pg.mkPen('#4ecdc4', width=2), name='Servo FK')
+
+    def toggle_accel_flip(self, axis):
+        """Toggle accelerometer axis flip"""
+        self.accel_axis_flip[axis] *= -1
+        self.update_plots()
+
+    def toggle_gyro_flip(self, axis):
+        """Toggle gyroscope axis flip"""
+        self.gyro_axis_flip[axis] *= -1
+        self.update_plots()
+
+    def _describe_rotation_matrix(self, R):
+        """Analyze rotation matrix and return human-readable description"""
+        # Check if identity
+        if np.allclose(R, np.eye(3), atol=1e-6):
+            return "Identity (no rotation)"
+
+        # Format matrix display
+        matrix_str = "Matrix:\n"
+        for i in range(3):
+            row = " ".join([f"{R[i,j]:6.3f}" for j in range(3)])
+            matrix_str += f"  [{row}]\n"
+
+        # Try to decompose into simple 90° rotations
+        # Check for single-axis 90° rotations
+        descriptions = []
+
+        # Check X-axis rotations
+        if np.allclose(R[0,:], [1, 0, 0], atol=1e-6):
+            if np.allclose(R[1,:], [0, 0, -1], atol=1e-6) and np.allclose(R[2,:], [0, 1, 0], atol=1e-6):
+                descriptions.append("X +90°")
+            elif np.allclose(R[1,:], [0, 0, 1], atol=1e-6) and np.allclose(R[2,:], [0, -1, 0], atol=1e-6):
+                descriptions.append("X -90°")
+            elif np.allclose(R[1,:], [0, -1, 0], atol=1e-6) and np.allclose(R[2,:], [0, 0, -1], atol=1e-6):
+                descriptions.append("X 180°")
+
+        # Check Y-axis rotations
+        if np.allclose(R[1,:], [0, 1, 0], atol=1e-6):
+            if np.allclose(R[0,:], [0, 0, 1], atol=1e-6) and np.allclose(R[2,:], [-1, 0, 0], atol=1e-6):
+                descriptions.append("Y +90°")
+            elif np.allclose(R[0,:], [0, 0, -1], atol=1e-6) and np.allclose(R[2,:], [1, 0, 0], atol=1e-6):
+                descriptions.append("Y -90°")
+            elif np.allclose(R[0,:], [-1, 0, 0], atol=1e-6) and np.allclose(R[2,:], [0, 0, -1], atol=1e-6):
+                descriptions.append("Y 180°")
+
+        # Check Z-axis rotations
+        if np.allclose(R[2,:], [0, 0, 1], atol=1e-6):
+            if np.allclose(R[0,:], [0, -1, 0], atol=1e-6) and np.allclose(R[1,:], [1, 0, 0], atol=1e-6):
+                descriptions.append("Z +90°")
+            elif np.allclose(R[0,:], [0, 1, 0], atol=1e-6) and np.allclose(R[1,:], [-1, 0, 0], atol=1e-6):
+                descriptions.append("Z -90°")
+            elif np.allclose(R[0,:], [-1, 0, 0], atol=1e-6) and np.allclose(R[1,:], [0, -1, 0], atol=1e-6):
+                descriptions.append("Z 180°")
+
+        if descriptions:
+            return f"Rotation: {', '.join(descriptions)}\n" + matrix_str.rstrip()
+        else:
+            return f"Complex rotation\n" + matrix_str.rstrip()
+
+    def _get_rotation_matrix(self, axis, angle_deg):
+        """Generate rotation matrix for given axis and angle"""
+        angle = np.radians(angle_deg)
+        c = np.cos(angle)
+        s = np.sin(angle)
+
+        if axis == 'x':
+            return np.array([
+                [1, 0, 0],
+                [0, c, -s],
+                [0, s, c]
+            ])
+        elif axis == 'y':
+            return np.array([
+                [c, 0, s],
+                [0, 1, 0],
+                [-s, 0, c]
+            ])
+        elif axis == 'z':
+            return np.array([
+                [c, -s, 0],
+                [s, c, 0],
+                [0, 0, 1]
+            ])
+
+    def rotate_accel(self, axis, angle_deg):
+        """Apply rotation to accelerometer rotation matrix"""
+        rot = self._get_rotation_matrix(axis, angle_deg)
+        if self.accel_rotation is not None:
+            self.accel_rotation = rot @ self.accel_rotation
+        else:
+            self.accel_rotation = rot
+
+        # Update status display
+        status = self._describe_rotation_matrix(self.accel_rotation)
+        self.accel_rotation_label.setText(status)
+
+        print(f"Accel rotated {angle_deg}° around {axis.upper()}-axis")
+        print(f"Current accel rotation:\n{status}")
+        self.update_plots()
+
+    def rotate_gyro(self, axis, angle_deg):
+        """Apply rotation to gyroscope rotation matrix"""
+        rot = self._get_rotation_matrix(axis, angle_deg)
+        if self.gyro_rotation is not None:
+            self.gyro_rotation = rot @ self.gyro_rotation
+        else:
+            self.gyro_rotation = rot
+
+        # Update status display
+        status = self._describe_rotation_matrix(self.gyro_rotation)
+        self.gyro_rotation_label.setText(status)
+
+        print(f"Gyro rotated {angle_deg}° around {axis.upper()}-axis")
+        print(f"Current gyro rotation:\n{status}")
+        self.update_plots()
+
+    def reset_accel_rotation(self):
+        """Reset accelerometer rotation to identity"""
+        self.accel_rotation = np.eye(3)
+
+        # Update status display
+        self.accel_rotation_label.setText("Identity (no rotation)")
+
+        print("Accel rotation reset to identity")
+        self.update_plots()
+
+    def reset_gyro_rotation(self):
+        """Reset gyroscope rotation to identity"""
+        self.gyro_rotation = np.eye(3)
+
+        # Update status display
+        self.gyro_rotation_label.setText("Identity (no rotation)")
+
+        print("Gyro rotation reset to identity")
+        self.update_plots()
+
+    def reset_sliders(self):
+        """Reset sliders to default values"""
+        self.accel_noise_slider.setValue(int(ACCEL_NOISE * 1000))
+        self.gyro_noise_slider.setValue(int(GYRO_NOISE * 1000))
+        self.proc_angle_slider.setValue(int(PROCESS_NOISE_ANGLE * 10000))
+        self.proc_bias_slider.setValue(int(PROCESS_NOISE_BIAS * 10000000))
+
+    def browse_file(self):
+        """Open file dialog to select CSV file"""
+        csv_dir = Path.cwd() / 'csv'
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select IMU CSV file',
+            str(csv_dir),
+            'CSV files (*.csv);;All files (*.*)'
+        )
+        if filename:
+            self.file_edit.setText(filename)
+
+    def load_file(self):
+        """Load new CSV file and update plots"""
+        file_pattern = self.file_edit.text().strip()
+
+        # Support glob patterns
+        matching_files = sorted(glob.glob(file_pattern))
+        if not matching_files:
+            print(f"ERROR: No files found matching: {file_pattern}")
+            return
+
+        csv_file = matching_files[-1]
+        print(f"\nLoading file: {csv_file}")
+
+        try:
+            # Load and process data
+            df = load_imu_data(csv_file)
+            df = convert_to_physical_units(df)
+
+            # Reload data
+            self.load_data(df)
+
+            # Update plots
+            self.update_plots()
+
+            print("File loaded successfully")
+
+        except Exception as e:
+            print(f"ERROR loading file: {e}")
+            import traceback
+            traceback.print_exc()
+
+
 def process_kalman_filter(df, output_file=None):
     """Interactive platform state comparison: Commanded FK vs Servo FK vs Kalman
 
@@ -519,549 +1179,81 @@ def process_kalman_filter(df, output_file=None):
 
     Args:
         df: DataFrame with IMU data
-        output_file: Optional path to save plot
+        output_file: Optional path to save plot (not used in PyQtGraph version)
     """
     print("\n" + "="*60)
     print("PLATFORM STATE COMPARISON: COMMANDED vs SERVO vs KALMAN")
     print("="*60)
-
-    # Initialize Stewart platform IK with same parameters as base_simulator
-    platform_params = {
-        "horn_length": 45.3722,
-        "rod_length": 205.0,
-        "base": 86.6025 + 18.75 + 11,
-        "base_anchors": 64.75 - 45.3722,
-        "platform": 84.0759,
-        "platform_anchors": 12.5,
-        "top_surface_offset": 38.0
-    }
-    stewart_ik = StewartPlatformIK(**platform_params)
-    print(f"Using platform parameters from base_simulator:")
-
-    # Separate and sort accel and gyro data by timestamp
-    accel_df = df[df['type'] == 'A'].copy().sort_values('timestamp_arduino_us').reset_index(drop=True)
-    gyro_df = df[df['type'] == 'G'].copy().sort_values('timestamp_arduino_us').reset_index(drop=True)
-
-    print(f"\nAccelerometer samples: {len(accel_df)}")
-    print(f"Gyroscope samples: {len(gyro_df)}")
-
-    # Compute FK from commanded servo angles (no dynamics)
-    print("\nComputing forward kinematics from commanded servo angles...")
-    cmd_fk_x, cmd_fk_y, cmd_fk_z, cmd_fk_rx, cmd_fk_ry, cmd_fk_rz = compute_fk_from_servos(df, stewart_ik)
-
-    # Compute FK from servo angles with first-order dynamics
-    print("\nComputing forward kinematics with servo dynamics...")
-    servo_fk_x, servo_fk_y, servo_fk_z, servo_fk_rx, servo_fk_ry, servo_fk_rz = compute_servo_dynamics_fk(df, stewart_ik)
-    print("FK computation complete")
-
-    # Interleave accel and gyro based on timestamps
-    print("\nInterleaving sensor data...")
-    all_data = []
-    accel_idx = 0
-    gyro_idx = 0
-
-    while accel_idx < len(accel_df) or gyro_idx < len(gyro_df):
-        if accel_idx >= len(accel_df):
-            row = gyro_df.iloc[gyro_idx]
-            all_data.append(('G', gyro_idx, row))
-            gyro_idx += 1
-        elif gyro_idx >= len(gyro_df):
-            row = accel_df.iloc[accel_idx]
-            all_data.append(('A', accel_idx, row))
-            accel_idx += 1
-        else:
-            accel_time = accel_df.iloc[accel_idx]['timestamp_arduino_us']
-            gyro_time = gyro_df.iloc[gyro_idx]['timestamp_arduino_us']
-
-            if accel_time <= gyro_time:
-                row = accel_df.iloc[accel_idx]
-                all_data.append(('A', accel_idx, row))
-                accel_idx += 1
-            else:
-                row = gyro_df.iloc[gyro_idx]
-                all_data.append(('G', gyro_idx, row))
-                gyro_idx += 1
 
     print(f"\nInitial Filter Configuration:")
     print(f"  Accel noise: {ACCEL_NOISE:.4f} m/s²")
     print(f"  Gyro noise: {GYRO_NOISE:.6f} rad/s")
     print(f"  Process noise (angle): {PROCESS_NOISE_ANGLE:.6f} rad²")
     print(f"  Process noise (bias): {PROCESS_NOISE_BIAS:.8f} (rad/s)²")
-    print(f"\nAdjust sliders to tune filter parameters...")
+    print(f"  Initial gyro biases: X={GYRO_BIAS_X:.6f} rad/s, Y={GYRO_BIAS_Y:.6f} rad/s")
+    print(f"  Gravity vector: [{GRAVITY_VECTOR[0]:.4f}, {GRAVITY_VECTOR[1]:.4f}, {GRAVITY_VECTOR[2]:.4f}] m/s² (mag={GRAVITY_MAGNITUDE:.4f})")
+    print(f"\nUse sliders to tune filter parameters...")
 
-    # Create figure with 6 subplots for 6 DOF
-    fig = plt.figure(figsize=(18, 12), facecolor='#1e1e1e')
-
-    # Create 3x2 grid for 6 DOF plots - use figure fractions to avoid overlap
-    gs = fig.add_gridspec(3, 2, left=0.08, right=0.96, bottom=0.22, top=0.96, hspace=0.35, wspace=0.25)
-
-    ax_x = fig.add_subplot(gs[0, 0], facecolor='#1e1e1e')
-    ax_y = fig.add_subplot(gs[0, 1], facecolor='#1e1e1e')
-    ax_z = fig.add_subplot(gs[1, 0], facecolor='#1e1e1e')
-    ax_rx = fig.add_subplot(gs[1, 1], facecolor='#1e1e1e')
-    ax_ry = fig.add_subplot(gs[2, 0], facecolor='#1e1e1e')
-    ax_rz = fig.add_subplot(gs[2, 1], facecolor='#1e1e1e')
-
-    axes_list = [ax_x, ax_y, ax_z, ax_rx, ax_ry, ax_rz]
-
-    # Create sliders with dark theme styling at bottom
-    ax_accel = plt.axes([0.15, 0.12, 0.35, 0.018], facecolor='#2e2e2e')
-    slider_accel = Slider(
-        ax=ax_accel,
-        label='Accel Noise [m/s²]',
-        valmin=0.001,
-        valmax=0.5,
-        valinit=ACCEL_NOISE,
-        valstep=0.001,
-        color='#4ecdc4',
-        track_color='#2e2e2e'
-    )
-    slider_accel.label.set_color('white')
-    slider_accel.valtext.set_color('white')
-
-    ax_gyro = plt.axes([0.55, 0.12, 0.35, 0.018], facecolor='#2e2e2e')
-    slider_gyro = Slider(
-        ax=ax_gyro,
-        label='Gyro Noise [rad/s]',
-        valmin=0.001,
-        valmax=0.1,
-        valinit=GYRO_NOISE,
-        valstep=0.0001,
-        color='#4ecdc4',
-        track_color='#2e2e2e'
-    )
-    slider_gyro.label.set_color('white')
-    slider_gyro.valtext.set_color('white')
-
-    ax_proc_angle = plt.axes([0.15, 0.08, 0.35, 0.018], facecolor='#2e2e2e')
-    slider_proc_angle = Slider(
-        ax=ax_proc_angle,
-        label='Proc Noise Angle [rad²]',
-        valmin=0.0,
-        valmax=0.01,
-        valinit=PROCESS_NOISE_ANGLE,
-        valstep=0.0001,
-        color='#4ecdc4',
-        track_color='#2e2e2e'
-    )
-    slider_proc_angle.label.set_color('white')
-    slider_proc_angle.valtext.set_color('white')
-
-    ax_proc_bias = plt.axes([0.55, 0.08, 0.35, 0.018], facecolor='#2e2e2e')
-    slider_proc_bias = Slider(
-        ax=ax_proc_bias,
-        label='Proc Noise Bias [(rad/s)²]',
-        valmin=0.0,
-        valmax=1e-4,
-        valinit=PROCESS_NOISE_BIAS,
-        valstep=1e-7,
-        color='#4ecdc4',
-        track_color='#2e2e2e'
-    )
-    slider_proc_bias.label.set_color('white')
-    slider_proc_bias.valtext.set_color('white')
-
-    # File loading controls and reset button at bottom
-    file_textbox_ax = plt.axes([0.05, 0.03, 0.42, 0.022], facecolor='#2e2e2e')
-    file_browse_ax = plt.axes([0.48, 0.03, 0.08, 0.022], facecolor='#2e2e2e')
-    file_load_ax = plt.axes([0.57, 0.03, 0.08, 0.022], facecolor='#2e2e2e')
-    reset_ax = plt.axes([0.66, 0.03, 0.08, 0.022], facecolor='#2e2e2e')
-
-    # Get directory of current CSV file for default pattern
-    csv_dir = Path.cwd() / 'csv'
-    file_textbox = TextBox(file_textbox_ax, 'File:', initial=str(csv_dir / '*.csv'), color='#2e2e2e', hovercolor='#3e3e3e')
-    file_textbox.label.set_color('white')
-    file_textbox.text_disp.set_color('white')
-
-    button_browse = Button(file_browse_ax, 'Browse', color='#2e2e2e', hovercolor='#4ecdc4')
-    button_browse.label.set_color('white')
-
-    button_load = Button(file_load_ax, 'Load', color='#2e2e2e', hovercolor='#4ecdc4')
-    button_load.label.set_color('white')
-
-    button_reset = Button(reset_ax, 'Reset', color='#2e2e2e', hovercolor='#4ecdc4')
-    button_reset.label.set_color('white')
-
-    # Store plot lines and data for updating
-    lines = {}
-    data_store = {
-        'accel_df': accel_df,
-        'gyro_df': gyro_df,
-        'all_data': all_data,
-        'cmd_fk_x': cmd_fk_x,
-        'cmd_fk_y': cmd_fk_y,
-        'cmd_fk_z': cmd_fk_z,
-        'cmd_fk_rx': cmd_fk_rx,
-        'cmd_fk_ry': cmd_fk_ry,
-        'cmd_fk_rz': cmd_fk_rz,
-        'servo_fk_x': servo_fk_x,
-        'servo_fk_y': servo_fk_y,
-        'servo_fk_z': servo_fk_z,
-        'servo_fk_rx': servo_fk_rx,
-        'servo_fk_ry': servo_fk_ry,
-        'servo_fk_rz': servo_fk_rz,
-        'stewart_ik': stewart_ik
+    # Initialize Stewart platform IK with same parameters as data_logger
+    platform_params = {
+        "horn_length": 45.3722,
+        "rod_length": 205.0,
+        "base": 86.6025 + 18.75 + 11,
+        "base_anchors": 64.75,
+        "platform": 84.0759,
+        "platform_anchors": 12.5,
+        "top_surface_offset": 38.0
     }
+    stewart_ik = StewartPlatformIK(**platform_params)
+    print(f"Using platform parameters from data_logger:")
 
-    def browse_file(event):
-        """Open file dialog to select CSV file"""
-        import tkinter as tk
-        from tkinter import filedialog
+    # Create and show PyQt6 window
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
 
-        # Create hidden tkinter root window
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
+    window = IMUPlotWindow(df, stewart_ik)
+    window.show()
 
-        # Open file dialog
-        csv_dir = Path.cwd() / 'csv'
-        filename = filedialog.askopenfilename(
-            title='Select IMU CSV file',
-            initialdir=csv_dir,
-            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
-        )
-
-        if filename:
-            file_textbox.set_val(filename)
-
-        root.destroy()
-
-    def load_file(text):
-        """Load new CSV file and update all plots"""
-        file_pattern = file_textbox.text.strip()
-
-        # Support glob patterns - use most recent file if pattern
-        matching_files = sorted(glob.glob(file_pattern))
-        if not matching_files:
-            print(f"ERROR: No files found matching: {file_pattern}")
-            return
-
-        csv_file = matching_files[-1]  # Use most recent
-        print(f"\nLoading file: {csv_file}")
-
-        try:
-            # Load and process data
-            new_df = load_imu_data(csv_file)
-            new_df = convert_to_physical_units(new_df)
-
-            # Separate and sort by timestamp
-            new_accel_df = new_df[new_df['type'] == 'A'].copy().sort_values('timestamp_arduino_us').reset_index(drop=True)
-            new_gyro_df = new_df[new_df['type'] == 'G'].copy().sort_values('timestamp_arduino_us').reset_index(drop=True)
-
-            print(f"Loaded {len(new_accel_df)} accel samples, {len(new_gyro_df)} gyro samples")
-
-            # Interleave accel and gyro based on timestamps
-            new_all_data = []
-            accel_idx = 0
-            gyro_idx = 0
-
-            while accel_idx < len(new_accel_df) or gyro_idx < len(new_gyro_df):
-                if accel_idx >= len(new_accel_df):
-                    row = new_gyro_df.iloc[gyro_idx]
-                    new_all_data.append(('G', gyro_idx, row))
-                    gyro_idx += 1
-                elif gyro_idx >= len(new_gyro_df):
-                    row = new_accel_df.iloc[accel_idx]
-                    new_all_data.append(('A', accel_idx, row))
-                    accel_idx += 1
-                else:
-                    accel_time = new_accel_df.iloc[accel_idx]['timestamp_arduino_us']
-                    gyro_time = new_gyro_df.iloc[gyro_idx]['timestamp_arduino_us']
-
-                    if accel_time <= gyro_time:
-                        row = new_accel_df.iloc[accel_idx]
-                        new_all_data.append(('A', accel_idx, row))
-                        accel_idx += 1
-                    else:
-                        row = new_gyro_df.iloc[gyro_idx]
-                        new_all_data.append(('G', gyro_idx, row))
-                        gyro_idx += 1
-
-            # Compute FK for new data (both commanded and servo dynamics)
-            print("Computing forward kinematics...")
-            stewart_ik = data_store['stewart_ik']
-            new_cmd_fk_x, new_cmd_fk_y, new_cmd_fk_z, new_cmd_fk_rx, new_cmd_fk_ry, new_cmd_fk_rz = compute_fk_from_servos(new_df, stewart_ik)
-            new_servo_fk_x, new_servo_fk_y, new_servo_fk_z, new_servo_fk_rx, new_servo_fk_ry, new_servo_fk_rz = compute_servo_dynamics_fk(new_df, stewart_ik)
-
-            # Update data store
-            data_store['accel_df'] = new_accel_df
-            data_store['gyro_df'] = new_gyro_df
-            data_store['all_data'] = new_all_data
-            data_store['cmd_fk_x'] = new_cmd_fk_x
-            data_store['cmd_fk_y'] = new_cmd_fk_y
-            data_store['cmd_fk_z'] = new_cmd_fk_z
-            data_store['cmd_fk_rx'] = new_cmd_fk_rx
-            data_store['cmd_fk_ry'] = new_cmd_fk_ry
-            data_store['cmd_fk_rz'] = new_cmd_fk_rz
-            data_store['servo_fk_x'] = new_servo_fk_x
-            data_store['servo_fk_y'] = new_servo_fk_y
-            data_store['servo_fk_z'] = new_servo_fk_z
-            data_store['servo_fk_rx'] = new_servo_fk_rx
-            data_store['servo_fk_ry'] = new_servo_fk_ry
-            data_store['servo_fk_rz'] = new_servo_fk_rz
-
-            # Clear existing plot lines to force redraw
-            lines.clear()
-
-            # Update plots with new data
-            update_plot(None)
-
-            print("File loaded successfully")
-
-        except Exception as e:
-            print(f"ERROR loading file: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def update_plot(val):
-        """Update plot with new Kalman filter parameters"""
-        # Get current slider values
-        accel_noise = slider_accel.val
-        gyro_noise = slider_gyro.val
-        proc_noise_angle = slider_proc_angle.val
-        proc_noise_bias = slider_proc_bias.val
-
-        # Get data from store (allows file reloading)
-        accel_df = data_store['accel_df']
-        gyro_df = data_store['gyro_df']
-        all_data = data_store['all_data']
-        cmd_fk_x = data_store['cmd_fk_x']
-        cmd_fk_y = data_store['cmd_fk_y']
-        cmd_fk_z = data_store['cmd_fk_z']
-        cmd_fk_rx = data_store['cmd_fk_rx']
-        cmd_fk_ry = data_store['cmd_fk_ry']
-        cmd_fk_rz = data_store['cmd_fk_rz']
-        servo_fk_x = data_store['servo_fk_x']
-        servo_fk_y = data_store['servo_fk_y']
-        servo_fk_z = data_store['servo_fk_z']
-        servo_fk_rx = data_store['servo_fk_rx']
-        servo_fk_ry = data_store['servo_fk_ry']
-        servo_fk_rz = data_store['servo_fk_rz']
-
-        # Run Kalman filter (only for orientation)
-        rx_est, ry_est, bias_x, bias_y, time, platform_rx, platform_ry = run_kalman_filter(
-            accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc_noise_angle, proc_noise_bias
-        )
-
-        # Update plots
-        if 'cmd_fk_x' in lines:
-            # Update existing plot data for all 6 DOF
-            lines['cmd_fk_x'].set_data(time, cmd_fk_x)
-            lines['servo_fk_x'].set_data(time, servo_fk_x)
-            lines['cmd_fk_y'].set_data(time, cmd_fk_y)
-            lines['servo_fk_y'].set_data(time, servo_fk_y)
-            lines['cmd_fk_z'].set_data(time, cmd_fk_z)
-            lines['servo_fk_z'].set_data(time, servo_fk_z)
-
-            lines['cmd_fk_rx'].set_data(time, np.degrees(cmd_fk_rx))
-            lines['servo_fk_rx'].set_data(time, np.degrees(servo_fk_rx))
-            lines['kalman_rx'].set_data(time, np.degrees(rx_est))
-
-            lines['cmd_fk_ry'].set_data(time, np.degrees(cmd_fk_ry))
-            lines['servo_fk_ry'].set_data(time, np.degrees(servo_fk_ry))
-            lines['kalman_ry'].set_data(time, np.degrees(ry_est))
-
-            lines['cmd_fk_rz'].set_data(time, np.degrees(cmd_fk_rz))
-            lines['servo_fk_rz'].set_data(time, np.degrees(servo_fk_rz))
-
-            # Rescale all axes
-            for ax in axes_list:
-                ax.relim()
-                ax.autoscale_view()
-        else:
-            # Initial plot or after clearing - clear all axes and redraw
-            for ax in axes_list:
-                ax.clear()
-                ax.set_facecolor('#1e1e1e')
-
-            # Plot Position X - Commanded translation (same for both since position is commanded, not from FK)
-            lines['cmd_fk_x'], = ax_x.plot(time, cmd_fk_x, '#c77dff', label='Commanded', linewidth=1.5, alpha=0.7, linestyle=':')
-            lines['servo_fk_x'], = ax_x.plot(time, servo_fk_x, '#4ecdc4', label='Commanded', linewidth=2, alpha=0.9)
-            ax_x.set_ylabel('X Position [mm]', color='white')
-            ax_x.set_title('Position X (Commanded)', color='white', fontsize=11)
-            ax_x.legend(loc='best', facecolor='#2e2e2e', edgecolor='#555', fontsize=9)
-            ax_x.grid(True, alpha=0.2, color='#555')
-
-            # Plot Position Y
-            lines['cmd_fk_y'], = ax_y.plot(time, cmd_fk_y, '#c77dff', label='Commanded', linewidth=1.5, alpha=0.7, linestyle=':')
-            lines['servo_fk_y'], = ax_y.plot(time, servo_fk_y, '#4ecdc4', label='Commanded', linewidth=2, alpha=0.9)
-            ax_y.set_ylabel('Y Position [mm]', color='white')
-            ax_y.set_title('Position Y (Commanded)', color='white', fontsize=11)
-            ax_y.legend(loc='best', facecolor='#2e2e2e', edgecolor='#555', fontsize=9)
-            ax_y.grid(True, alpha=0.2, color='#555')
-
-            # Plot Position Z
-            lines['cmd_fk_z'], = ax_z.plot(time, cmd_fk_z, '#c77dff', label='Commanded', linewidth=1.5, alpha=0.7, linestyle=':')
-            lines['servo_fk_z'], = ax_z.plot(time, servo_fk_z, '#4ecdc4', label='Commanded', linewidth=2, alpha=0.9)
-            ax_z.set_ylabel('Z Position [mm]', color='white')
-            ax_z.set_xlabel('Time [s]', color='white')
-            ax_z.set_title('Position Z (Commanded)', color='white', fontsize=11)
-            ax_z.legend(loc='best', facecolor='#2e2e2e', edgecolor='#555', fontsize=9)
-            ax_z.grid(True, alpha=0.2, color='#555')
-
-            # Plot Orientation RX (Roll) - Commanded vs Servo vs Kalman
-            lines['cmd_fk_rx'], = ax_rx.plot(time, np.degrees(cmd_fk_rx), '#c77dff', label='Commanded FK', linewidth=1.5, alpha=0.7, linestyle=':')
-            lines['servo_fk_rx'], = ax_rx.plot(time, np.degrees(servo_fk_rx), '#4ecdc4', label='Servo FK', linewidth=2, alpha=0.9)
-            lines['kalman_rx'], = ax_rx.plot(time, np.degrees(rx_est), '#ff6b6b', label='Kalman (IMU)', linewidth=2, linestyle='--', alpha=0.9)
-            ax_rx.set_ylabel('Roll [deg]', color='white')
-            ax_rx.set_xlabel('Time [s]', color='white')
-            ax_rx.set_title('Orientation RX (Roll)', color='white', fontsize=11)
-            ax_rx.legend(loc='best', facecolor='#2e2e2e', edgecolor='#555', fontsize=8)
-            ax_rx.grid(True, alpha=0.2, color='#555')
-
-            # Plot Orientation RY (Pitch) - Commanded vs Servo vs Kalman
-            lines['cmd_fk_ry'], = ax_ry.plot(time, np.degrees(cmd_fk_ry), '#c77dff', label='Commanded FK', linewidth=1.5, alpha=0.7, linestyle=':')
-            lines['servo_fk_ry'], = ax_ry.plot(time, np.degrees(servo_fk_ry), '#4ecdc4', label='Servo FK', linewidth=2, alpha=0.9)
-            lines['kalman_ry'], = ax_ry.plot(time, np.degrees(ry_est), '#ff6b6b', label='Kalman (IMU)', linewidth=2, linestyle='--', alpha=0.9)
-            ax_ry.set_ylabel('Pitch [deg]', color='white')
-            ax_ry.set_xlabel('Time [s]', color='white')
-            ax_ry.set_title('Orientation RY (Pitch)', color='white', fontsize=11)
-            ax_ry.legend(loc='best', facecolor='#2e2e2e', edgecolor='#555', fontsize=8)
-            ax_ry.grid(True, alpha=0.2, color='#555')
-
-            # Plot Orientation RZ (Yaw) - Commanded vs Servo (no Kalman - no magnetometer)
-            lines['cmd_fk_rz'], = ax_rz.plot(time, np.degrees(cmd_fk_rz), '#c77dff', label='Commanded FK', linewidth=1.5, alpha=0.7, linestyle=':')
-            lines['servo_fk_rz'], = ax_rz.plot(time, np.degrees(servo_fk_rz), '#4ecdc4', label='Servo FK', linewidth=2, alpha=0.9)
-            ax_rz.set_ylabel('Yaw [deg]', color='white')
-            ax_rz.set_xlabel('Time [s]', color='white')
-            ax_rz.set_title('Orientation RZ (Yaw)', color='white', fontsize=11)
-            ax_rz.legend(loc='best', facecolor='#2e2e2e', edgecolor='#555', fontsize=9)
-            ax_rz.grid(True, alpha=0.2, color='#555')
-
-        fig.canvas.draw_idle()
-
-    def reset(event):
-        """Reset sliders to default values"""
-        slider_accel.reset()
-        slider_gyro.reset()
-        slider_proc_angle.reset()
-        slider_proc_bias.reset()
-
-    # Connect sliders to update function
-    slider_accel.on_changed(update_plot)
-    slider_gyro.on_changed(update_plot)
-    slider_proc_angle.on_changed(update_plot)
-    slider_proc_bias.on_changed(update_plot)
-    button_reset.on_clicked(reset)
-    button_browse.on_clicked(browse_file)
-    button_load.on_clicked(load_file)
-
-    # Initial plot
-    update_plot(None)
-
-    plt.tight_layout()
-    plt.show()
+    app.exec()
 
 
 def plot_gui_selector():
-    """Interactive GUI for selecting file and plot type"""
-    from matplotlib.widgets import RadioButtons
-    import tkinter as tk
-    from tkinter import filedialog
-
-    fig = plt.figure(figsize=(12, 8), facecolor='#1e1e1e')
-    ax_main = plt.subplot2grid((3, 2), (0, 0), rowspan=3, colspan=1, facecolor='#1e1e1e')
-    ax_controls = plt.subplot2grid((3, 2), (0, 1), rowspan=3, facecolor='#1e1e1e')
-
-    ax_main.text(0.5, 0.5, 'Load CSV file to view\n6-DOF Platform State Comparison\n(Commanded FK vs Servo FK vs Kalman)',
-                ha='center', va='center', fontsize=13, color='#4ecdc4', transform=ax_main.transAxes)
-    ax_main.axis('off')
-
-    # File loading controls with dark theme
-    ax_controls.axis('off')
-    file_textbox_ax = plt.axes([0.55, 0.85, 0.35, 0.04], facecolor='#2e2e2e')
-    file_browse_ax = plt.axes([0.91, 0.85, 0.08, 0.04], facecolor='#2e2e2e')
-    file_load_ax = plt.axes([0.55, 0.78, 0.15, 0.05], facecolor='#2e2e2e')
+    """Show file dialog to select IMU CSV file"""
+    # Create temporary QApplication for file dialog
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
 
     csv_dir = Path.cwd() / 'csv'
-    file_textbox = TextBox(file_textbox_ax, 'File:', initial=str(csv_dir / '*.csv'),
-                          color='#2e2e2e', hovercolor='#3e3e3e')
-    file_textbox.label.set_color('white')
-    file_textbox.text_disp.set_color('white')
+    filename, _ = QFileDialog.getOpenFileName(
+        None,
+        'Select IMU CSV file',
+        str(csv_dir),
+        'CSV files (*.csv);;All files (*.*)'
+    )
 
-    button_browse = Button(file_browse_ax, 'Browse', color='#2e2e2e', hovercolor='#4ecdc4')
-    button_browse.label.set_color('white')
+    if not filename:
+        print("No file selected")
+        return
 
-    button_load = Button(file_load_ax, 'Load File', color='#2e2e2e', hovercolor='#4ecdc4')
-    button_load.label.set_color('white')
+    print(f"\nLoading file: {filename}")
 
-    state = {'df': None, 'csv_file': None}
+    try:
+        # Load and process data
+        df = load_imu_data(filename)
+        df = convert_to_physical_units(df)
 
-    def browse_file(event):
-        """Open file dialog to select CSV file"""
-        # Create hidden tkinter root window
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
+        print(f"Loaded {len(df)} samples")
+        print_statistics(df)
 
-        # Open file dialog
-        csv_dir = Path.cwd() / 'csv'
-        filename = filedialog.askopenfilename(
-            title='Select IMU CSV file',
-            initialdir=csv_dir,
-            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
-        )
+        # Show comparison plot
+        process_kalman_filter(df)
 
-        if filename:
-            file_textbox.set_val(filename)
-
-        root.destroy()
-
-    def load_and_plot(event):
-        """Load file and show selected plot"""
-        file_pattern = file_textbox.text.strip()
-
-        # Check if it's a specific file or a glob pattern
-        if Path(file_pattern).exists() and Path(file_pattern).is_file():
-            csv_file = file_pattern
-        else:
-            # Support glob patterns
-            matching_files = sorted(glob.glob(file_pattern))
-            if not matching_files:
-                print(f"ERROR: No files found matching: {file_pattern}")
-                ax_main.clear()
-                ax_main.set_facecolor('#1e1e1e')
-                ax_main.text(0.5, 0.5, f'No files found:\n{file_pattern}',
-                            ha='center', va='center', fontsize=12, color='#ff6b6b',
-                            transform=ax_main.transAxes)
-                ax_main.axis('off')
-                fig.canvas.draw_idle()
-                return
-            csv_file = matching_files[-1]
-
-        state['csv_file'] = csv_file
-
-        print(f"\nLoading data from: {csv_file}")
-
-        try:
-            df = load_imu_data(csv_file)
-            df = convert_to_physical_units(df)
-            state['df'] = df
-
-            print(f"Loaded {len(df)} samples")
-            print_statistics(df)
-
-            # Close this window and open the comprehensive comparison plot
-            plt.close(fig)
-            process_kalman_filter(df)
-
-        except Exception as e:
-            print(f"ERROR loading file: {e}")
-            import traceback
-            traceback.print_exc()
-            ax_main.clear()
-            ax_main.set_facecolor('#1e1e1e')
-            ax_main.text(0.5, 0.5, f'Error loading file:\n{str(e)}',
-                        ha='center', va='center', fontsize=12, color='#ff6b6b',
-                        transform=ax_main.transAxes)
-            ax_main.axis('off')
-            fig.canvas.draw_idle()
-
-    button_browse.on_clicked(browse_file)
-    button_load.on_clicked(load_and_plot)
-
-    plt.tight_layout()
-    plt.show()
+    except Exception as e:
+        print(f"ERROR loading file: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def main():
@@ -1073,7 +1265,6 @@ Examples:
   python plot_data.py                              (open GUI file selector)
   python plot_data.py data.csv                     (6-subplot comparison view)
   python plot_data.py csv/imu_*.csv                (load latest matching file)
-  python plot_data.py data.csv --save              (save plot to file)
   python plot_data.py data.csv --stats             (statistics only)
 
 Comparison shows:
@@ -1085,8 +1276,6 @@ Comparison shows:
 
     parser.add_argument('csv_file', type=str, nargs='?',
                         help='Input CSV file from IMU logger (optional - opens GUI if not provided)')
-    parser.add_argument('--save', action='store_true',
-                        help='Save plot to file instead of displaying')
     parser.add_argument('--stats', action='store_true',
                         help='Print statistics only (no plots)')
 
@@ -1116,9 +1305,8 @@ Comparison shows:
     if args.stats:
         return
 
-    # Show comprehensive 6-subplot comparison (Commanded vs FK vs Kalman)
-    output_file = args.csv_file.replace('.csv', '_comparison.png') if args.save else None
-    process_kalman_filter(df, output_file)
+    # Show comparison plot
+    process_kalman_filter(df)
 
 
 if __name__ == "__main__":
