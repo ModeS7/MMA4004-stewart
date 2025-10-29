@@ -357,6 +357,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
             if 'simulation_control' in self.gui_modules:
                 self.gui_modules['simulation_control'].start_btn.setEnabled(True)
+
+            if 'serial_connection' in self.gui_modules:
+                self.gui_modules['serial_connection'].update({'connected': True})
         else:
             QMessageBox.critical(self, "Error", message)
             self.log(f"Error: {message}")
@@ -373,6 +376,9 @@ class HardwareStewartSimulator(BaseStewartSimulator):
 
         if 'simulation_control' in self.gui_modules:
             self.gui_modules['simulation_control'].start_btn.setEnabled(False)
+
+        if 'serial_connection' in self.gui_modules:
+            self.gui_modules['serial_connection'].update({'connected': False})
 
         self.log("Disconnected")
 
@@ -936,7 +942,7 @@ class HardwareStewartSimulator(BaseStewartSimulator):
         if angles is not None:
             self.last_cmd_angles = angles
 
-            if self.connected and not self.simulation_running:
+            if self.connected and not self.controller_enabled:
                 self.serial_controller.send_servo_angles(angles)
 
     def on_controller_toggle(self):
