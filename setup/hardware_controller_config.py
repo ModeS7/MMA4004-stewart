@@ -347,6 +347,30 @@ class HardwareControllerConfig(ControllerConfig):
         return self.scalar_values
 
 
+class LQRControllerConfig(ControllerConfig):
+    """LQR controller configuration."""
+
+    def __init__(self):
+        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
+                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+        self.default_scalar_idx = 5
+
+    def get_controller_name(self) -> str:
+        return "LQR"
+
+    def create_controller(self, **kwargs):
+        from core.control_core import LQRController
+        return LQRController(
+            Q_position=kwargs.get('Q_pos', 0.01),
+            Q_velocity=kwargs.get('Q_vel', 0.01),
+            R_control=kwargs.get('R', 0.01),
+            output_limit=kwargs.get('output_limit', 15.0)
+        )
+
+    def get_scalar_values(self) -> list:
+        return self.scalar_values
+
+
 def main():
     """Launch hardware controller."""
     print("Hardware controller configuration loaded")
