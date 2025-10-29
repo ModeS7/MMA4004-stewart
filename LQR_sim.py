@@ -74,7 +74,7 @@ class LQRStewartSimulator(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Define GUI layout for LQR simulator with Kalman filter."""
-        layout = create_standard_layout(scrollable_columns=False, include_plot=True)
+        layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
         layout['columns'][0]['modules'] = [
             {'type': 'simulation_control'},
@@ -273,7 +273,11 @@ class LQRStewartSimulator(BaseStewartSimulator):
         This matches the hardware implementation in LQR_real.py line 250-264.
         """
         if self.kalman_enabled:
-            # Kalman predict step (using platform angles from FK)
+            # Update Kalman dt to match actual simulation timestep
+            self.kalman_filter.set_dt(dt)
+
+            # Kalman predict step (using actual platform angles from previous timestep)
+            # Ball motion was caused by actual servo angles, not commanded angles
             if hasattr(self, 'last_fk_rotation'):
                 rx_deg = self.last_fk_rotation[0]
                 ry_deg = self.last_fk_rotation[1]

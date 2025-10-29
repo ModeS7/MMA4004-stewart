@@ -264,7 +264,11 @@ class PIDStewartSimulator(BaseStewartSimulator):
         import numpy as np
 
         if self.kalman_enabled:
-            # Kalman predict step (using platform angles from FK)
+            # Update Kalman dt to match actual simulation timestep
+            self.kalman_filter.set_dt(dt)
+
+            # Kalman predict step (using actual platform angles from previous timestep)
+            # Ball motion was caused by actual servo angles, not commanded angles
             if hasattr(self, 'last_fk_rotation'):
                 rx_deg = self.last_fk_rotation[0]
                 ry_deg = self.last_fk_rotation[1]
