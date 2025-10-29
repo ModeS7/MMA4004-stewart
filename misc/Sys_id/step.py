@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Hardware Step Response Data Collector
+Hardware Step Response Data Collector - Continuous Logging
 
-Sends step inputs to the Stewart platform and records:
-- Ball position from camera
-- Commanded servo angles
-- Platform angles (rx, ry)
+Sends step inputs to the Stewart platform and records ball position data.
+Teensy continuously prints BALL: data, Python continuously logs to CSV.
 
 Usage:
-    python collect_step_response.py <serial_port>
+    python step.py <serial_port>
 
 Example:
-    python collect_step_response.py COM3
+    python step.py COM3
 """
 
 import sys
@@ -20,17 +18,19 @@ import csv
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+from queue import Queue, Empty
+import threading
+import serial
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from setup.hardware_controller_config import SerialController
 from core.core import StewartPlatformIK
 
 
 class StepResponseCollector:
-    """Collect step response data from hardware."""
+    """Collect step response data from hardware with continuous logging."""
 
     def __init__(self, serial_port, output_file=None):
-        self.serial_port = serial_port
+        self.serial_port_name = serial_port
 
         if output_file is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -40,44 +40,114 @@ class StepResponseCollector:
 
         # Initialize IK
         self.ik = StewartPlatformIK(
-            horn_length=31.75,
-            rod_length=145.0,
-            base=73.025,
-            base_anchors=36.8893,
-            platform=67.775,
-            platform_anchors=12.7,
-            top_surface_offset=26.0
+            horn_length=45.3722,
+            rod_length=205.0,
+            base=86.6025 + 18.75 + 11,
+            base_anchors=64.75,
+            platform=84.0759,
+            platform_anchors=12.5,
+            top_surface_offset=38.0
         )
 
-        # Camera parameters
-        self.pixy_width_mm = 350.0
-        self.pixy_height_mm = 266.0
-        self.pixels_to_mm_x = self.pixy_width_mm / 316.0
-        self.pixels_to_mm_y = self.pixy_height_mm / 208.0
+        # Camera parameters (for reference only - Teensy sends pixels)
+        self.pixy_width_mm = 350.0  # Field of view width
+        self.pixy_height_mm = 266.0  # Field of view height
+        self.pixy_width_px = 316.0  # Pixy2 resolution
+        self.pixy_height_px = 208.0
 
-        # Data storage
-        self.data_records = []
+        # Serial connection
+        self.serial = None
+        self.running = False
+        self.read_thread = None
+
+        # Data queue for continuous data capture
+        self.ball_data_queue = Queue(maxsize=5000)
+
+        # Current platform state
+        self.current_rx = 0.0
+        self.current_ry = 0.0
+        self.current_angles = np.zeros(6)
+
+        # CSV logging
+        self.csv_file = None
+        self.csv_writer = None
+        self.samples_written = 0
 
         print(f"Output file: {self.output_file}")
 
     def connect(self):
-        """Connect to hardware."""
-        print(f"\nConnecting to {self.serial_port}...")
-        self.serial = SerialController(self.serial_port)
-        success, message = self.serial.connect()
+        """Connect to hardware and start background read thread."""
+        print(f"\nConnecting to {self.serial_port_name}...")
 
-        if not success:
-            raise RuntimeError(f"Connection failed: {message}")
+        try:
+            self.serial = serial.Serial(self.serial_port_name, baudrate=200000, timeout=0.1)
+            time.sleep(2.0)
 
-        print("Connected successfully")
+            # Clear startup messages
+            self.serial.reset_input_buffer()
 
-        # Configure servos for fast response
-        time.sleep(0.5)
-        self.serial.set_servo_speed(0)  # Unlimited speed
-        time.sleep(0.1)
-        self.serial.set_servo_acceleration(0)  # No ramping
-        time.sleep(0.2)
-        print("Servos configured: Speed=0 (unlimited), Accel=0")
+            print("Connected successfully")
+
+            # Start background read thread
+            self.running = True
+            self.read_thread = threading.Thread(target=self._serial_read_loop, daemon=True)
+            self.read_thread.start()
+            print("Background read thread started")
+
+            # Set servo speed to unlimited
+            time.sleep(0.5)
+            self.serial.write(b"SPD:0\n")
+            time.sleep(0.1)
+            print("Servos configured: Speed=0 (unlimited)")
+
+        except Exception as e:
+            raise RuntimeError(f"Connection failed: {e}")
+
+    def _serial_read_loop(self):
+        """Background thread to continuously read serial data."""
+        buffer = ""
+
+        while self.running and self.serial and self.serial.is_open:
+            try:
+                if self.serial.in_waiting > 0:
+                    chunk = self.serial.read(self.serial.in_waiting).decode('utf-8', errors='ignore')
+                    buffer += chunk
+
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+
+                        if line.startswith("BALL:"):
+                            # Parse: BALL:timestamp_s,x_px,y_px,detected,error_x_px,error_y_px
+                            try:
+                                parts = line[5:].split(',')
+                                if len(parts) == 6:
+                                    ball_data = {
+                                        'timestamp': float(parts[0]),
+                                        'x': float(parts[1]),
+                                        'y': float(parts[2]),
+                                        'detected': bool(int(parts[3])),
+                                        'error_x': float(parts[4]),
+                                        'error_y': float(parts[5])
+                                    }
+
+                                    # Add current platform state
+                                    ball_data['rx'] = self.current_rx
+                                    ball_data['ry'] = self.current_ry
+                                    ball_data['servo_angles'] = self.current_angles.copy()
+                                    ball_data['pc_time'] = time.time()
+
+                                    if not self.ball_data_queue.full():
+                                        self.ball_data_queue.put(ball_data)
+                            except (ValueError, IndexError):
+                                pass
+
+                time.sleep(0.0005)
+
+            except Exception as e:
+                if self.running:
+                    print(f"Serial read error: {e}")
+                time.sleep(0.1)
 
     def calculate_angles(self, rx, ry):
         """Calculate servo angles for given tilt."""
@@ -91,150 +161,173 @@ class StepResponseCollector:
 
         return angles
 
-    def send_angles_and_wait(self, angles, settle_time=0.5):
-        """Send angles to hardware and wait for settling."""
-        success = self.serial.send_servo_angles(angles)
-        if not success:
-            print("Warning: Failed to send angles")
-        time.sleep(settle_time)
+    def send_angles(self, angles):
+        """Send angles to hardware."""
+        if not self.serial or not self.serial.is_open:
+            print("Warning: Serial not connected")
+            return False
 
-    def get_ball_position(self):
-        """Get current ball position from camera."""
-        # Clear old data
-        while not self.serial.ball_data_queue.empty():
-            self.serial.ball_data_queue.get_nowait()
+        command = ",".join([f"{angle:.3f}" for angle in angles]) + "\n"
 
-        # Wait for fresh data
-        time.sleep(0.05)
+        try:
+            self.serial.write(command.encode('utf-8'))
+            self.serial.flush()
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to send angles: {e}")
+            return False
 
-        ball_data = self.serial.get_latest_ball_data()
+    def set_position(self, rx, ry):
+        """Calculate and send position, update internal state."""
+        angles = self.calculate_angles(rx, ry)
+        success = self.send_angles(angles)
 
-        if ball_data is None:
-            return None, None, False
+        if success:
+            self.current_rx = rx
+            self.current_ry = ry
+            self.current_angles = angles
 
-        # Convert to mm with Y-axis inversion
-        CAMERA_HEIGHT_PIXELS = 208.0
-        CAMERA_CENTER_X = 158.0
-        CAMERA_CENTER_Y = 104.0
+        return success
 
-        ball_x_mm = (ball_data['x'] - CAMERA_CENTER_X) * self.pixels_to_mm_x
-        ball_y_mm = ((CAMERA_HEIGHT_PIXELS - ball_data['y']) - CAMERA_CENTER_Y) * self.pixels_to_mm_y
+    def start_logging(self):
+        """Open CSV file and start logging."""
+        print(f"\nOpening CSV file: {self.output_file}")
 
-        return ball_x_mm, ball_y_mm, ball_data['detected']
+        self.csv_file = open(self.output_file, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
 
-    def record_data_point(self, timestamp, rx, ry, angles, ball_x, ball_y, detected):
-        """Record a single data point."""
-        record = {
-            'time': timestamp,
-            'rx_deg': rx,
-            'ry_deg': ry,
-            'ball_x_mm': ball_x if detected else np.nan,
-            'ball_y_mm': ball_y if detected else np.nan,
-            'ball_detected': detected,
-            's0': angles[0],
-            's1': angles[1],
-            's2': angles[2],
-            's3': angles[3],
-            's4': angles[4],
-            's5': angles[5],
-        }
-        self.data_records.append(record)
+        # Write header
+        self.csv_writer.writerow([
+            'pc_time', 'teensy_time_s',
+            'ball_x_px', 'ball_y_px', 'ball_detected',
+            'ball_error_x_px', 'ball_error_y_px',
+            'rx_deg', 'ry_deg',
+            's0', 's1', 's2', 's3', 's4', 's5'
+        ])
 
-    def run_step_test(self, rx_step, ry_step, duration=5.0, sample_rate=50.0):
+        self.samples_written = 0
+        print("CSV logging started")
+
+    def stop_logging(self):
+        """Close CSV file."""
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+            print(f"\nCSV logging stopped. Total samples: {self.samples_written}")
+
+    def process_data_queue(self):
+        """Process queued ball data and write to CSV."""
+        samples_processed = 0
+
+        while not self.ball_data_queue.empty():
+            try:
+                data = self.ball_data_queue.get_nowait()
+
+                if self.csv_writer:
+                    # Write row: pc_time, teensy_time_s, ball x/y/detected/errors (pixels), platform rx/ry, servo angles
+                    self.csv_writer.writerow([
+                        data['pc_time'],
+                        data['timestamp'],
+                        data['x'],
+                        data['y'],
+                        int(data['detected']),
+                        data['error_x'],
+                        data['error_y'],
+                        data['rx'],
+                        data['ry'],
+                        data['servo_angles'][0],
+                        data['servo_angles'][1],
+                        data['servo_angles'][2],
+                        data['servo_angles'][3],
+                        data['servo_angles'][4],
+                        data['servo_angles'][5]
+                    ])
+                    self.samples_written += 1
+                    samples_processed += 1
+
+            except Empty:
+                break
+
+        return samples_processed
+
+    def run_step_test(self, rx_step, ry_step, baseline_duration=1.0, step_duration=5.0):
         """
-        Run a step response test.
+        Run a step response test with continuous data logging.
 
         Args:
             rx_step: Step size in rx direction (degrees)
             ry_step: Step size in ry direction (degrees)
-            duration: Test duration AFTER step (seconds)
-            sample_rate: Data collection rate (Hz)
+            baseline_duration: Duration at neutral before step (seconds)
+            step_duration: Duration after step (seconds)
         """
         print(f"\n{'=' * 60}")
         print(f"Step Test: rx={rx_step}°, ry={ry_step}°")
-        print(f"Pre-step: 1s, Post-step: {duration}s, Sample rate: {sample_rate}Hz")
+        print(f"Baseline: {baseline_duration}s, Step: {step_duration}s")
         print(f"{'=' * 60}")
 
-        # Calculate angles for step and neutral
-        step_angles = self.calculate_angles(rx_step, ry_step)
-        neutral_angles = self.calculate_angles(0.0, 0.0)
+        # Clear queue
+        while not self.ball_data_queue.empty():
+            try:
+                self.ball_data_queue.get_nowait()
+            except Empty:
+                break
 
-        print(f"Step servo angles: {step_angles}")
+        # Move to neutral
+        print("Moving to neutral position...")
+        self.set_position(0.0, 0.0)
+        time.sleep(1.0)
 
-        # Ensure we're at neutral
-        print("Setting neutral position...")
-        self.send_angles_and_wait(neutral_angles, settle_time=0.5)
+        # Start logging
+        self.start_logging()
 
-        # Record 1 second of baseline at neutral
-        print("Recording baseline (1s at neutral)...")
+        print(f"\nRecording {baseline_duration}s baseline at neutral...")
         start_time = time.time()
-        sample_interval = 1.0 / sample_rate
-        next_sample = start_time + sample_interval
-        samples_collected = 0
+        step_time = start_time + baseline_duration
         step_applied = False
-        step_time = start_time + 1.0  # Apply step after 1 second
 
-        total_duration = 1.0 + duration  # 1s pre + duration post
+        total_duration = baseline_duration + step_duration
+        last_report_time = start_time
+        report_interval = 0.5
 
         while time.time() - start_time < total_duration:
             current_time = time.time()
 
-            # Apply step input at t=1.0s
+            # Apply step at baseline_duration
             if not step_applied and current_time >= step_time:
-                print("Applying step input NOW!")
-                success = self.serial.send_servo_angles(step_angles)
-                if not success:
-                    print("Warning: Failed to send step angles")
+                print(f"\nApplying step input: rx={rx_step}°, ry={ry_step}°")
+                self.set_position(rx_step, ry_step)
                 step_applied = True
 
-            if current_time >= next_sample:
-                timestamp = current_time - start_time
+            # Process and log data
+            samples = self.process_data_queue()
 
-                # Get ball position
-                ball_x, ball_y, detected = self.get_ball_position()
+            # Progress report
+            if current_time - last_report_time >= report_interval:
+                elapsed = current_time - start_time
+                phase = "BASELINE" if not step_applied else "STEP"
+                queue_size = self.ball_data_queue.qsize()
+                print(f"  [{phase}] t={elapsed:.1f}s | Samples: {self.samples_written} | Queue: {queue_size}")
+                last_report_time = current_time
 
-                # Record with current platform state (neutral before step, step after)
-                if step_applied:
-                    self.record_data_point(timestamp, rx_step, ry_step, step_angles, ball_x, ball_y, detected)
-                else:
-                    self.record_data_point(timestamp, 0.0, 0.0, neutral_angles, ball_x, ball_y, detected)
+            time.sleep(0.01)
 
-                samples_collected += 1
-                if samples_collected % 10 == 0:
-                    status = "detected" if detected else "NOT detected"
-                    phase = "PRE-STEP" if not step_applied else "POST-STEP"
-                    print(f"  [{phase}] t={timestamp:.2f}s: ball {status}")
+        # Process remaining queued data
+        print("\nProcessing remaining data...")
+        time.sleep(0.5)
+        final_samples = self.process_data_queue()
 
-                next_sample += sample_interval
+        print(f"\nTest complete! Total samples: {self.samples_written}")
 
-            time.sleep(0.001)  # Small sleep to prevent busy waiting
-
-        print(f"Collected {samples_collected} samples (baseline + step response)")
+        # Stop logging
+        self.stop_logging()
 
     def return_to_neutral(self):
         """Return platform to neutral position."""
         print("\nReturning to neutral...")
-        neutral_angles = self.calculate_angles(0.0, 0.0)
-        self.send_angles_and_wait(neutral_angles, settle_time=1.0)
+        self.set_position(0.0, 0.0)
+        time.sleep(1.0)
         print("Neutral position reached")
-
-    def save_data(self):
-        """Save collected data to CSV."""
-        if not self.data_records:
-            print("No data to save")
-            return
-
-        print(f"\nSaving {len(self.data_records)} records to {self.output_file}...")
-
-        fieldnames = ['time', 'rx_deg', 'ry_deg', 'ball_x_mm', 'ball_y_mm', 'ball_detected',
-                      's0', 's1', 's2', 's3', 's4', 's5']
-
-        with open(self.output_file, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(self.data_records)
-
-        print(f"Data saved successfully to {self.output_file}")
 
     def run_interactive_tests(self):
         """Run tests interactively with manual ball resets."""
@@ -244,7 +337,7 @@ class StepResponseCollector:
         print("\nOptions:")
         print("  - Enter rx and ry angles (e.g., '15 0' for +15° rx)")
         print("  - Type '0' to return to neutral")
-        print("  - Type 'q' to save and quit")
+        print("  - Type 'q' to quit")
 
         while True:
             print("\n" + "-" * 60)
@@ -267,13 +360,11 @@ class StepResponseCollector:
                 rx = float(parts[0])
                 ry = float(parts[1])
 
-                if abs(rx) > 15 or abs(ry) > 15:
-                    print("Error: Angles must be within ±15°")
+                if abs(rx) > 20 or abs(ry) > 20:
+                    print("Error: Angles must be within ±20°")
                     continue
 
-                description = f"rx={rx}°, ry={ry}°"
-
-                print(f"\n>>> Test: {description}")
+                print(f"\n>>> Test: rx={rx}°, ry={ry}°")
                 print(">>> PLACE BALL AT CENTER <<<")
                 input("Press ENTER when ball is ready...")
 
@@ -282,12 +373,7 @@ class StepResponseCollector:
                     print(f"  {i}...")
                     time.sleep(1.0)
 
-                print("\nTest sequence:")
-                print("  1. Record 1s baseline at neutral (0°, 0°)")
-                print(f"  2. Apply step to ({rx}°, {ry}°)")
-                print("  3. Record 5s response")
-
-                self.run_step_test(rx, ry, duration=50.0, sample_rate=50.0)
+                self.run_step_test(rx, ry, baseline_duration=1.0, step_duration=5.0)
 
                 print("\nTest complete!")
                 self.return_to_neutral()
@@ -300,19 +386,32 @@ class StepResponseCollector:
         print("=" * 60)
 
     def disconnect(self):
-        """Disconnect from hardware."""
-        if hasattr(self, 'serial'):
-            self.serial.disconnect()
-            print("\nDisconnected from hardware")
+        """Disconnect from hardware and stop threads."""
+        print("\nDisconnecting...")
+
+        # Stop read thread
+        self.running = False
+        if self.read_thread:
+            self.read_thread.join(timeout=1.0)
+
+        # Close CSV if open
+        if self.csv_file:
+            self.stop_logging()
+
+        # Close serial
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+
+        print("Disconnected")
 
 
 def main():
     """Main entry point."""
     if len(sys.argv) < 2:
-        print("Usage: python collect_step_response.py <serial_port>")
+        print("Usage: python step.py <serial_port>")
         print("\nExample:")
-        print("  python collect_step_response.py COM3")
-        print("  python collect_step_response.py /dev/ttyACM0")
+        print("  python step.py COM3")
+        print("  python step.py /dev/ttyACM0")
         sys.exit(1)
 
     serial_port = sys.argv[1]
@@ -322,12 +421,10 @@ def main():
     try:
         collector.connect()
         collector.run_interactive_tests()
-        collector.save_data()
 
     except KeyboardInterrupt:
         print("\n\nTest interrupted by user")
         collector.return_to_neutral()
-        collector.save_data()
 
     except Exception as e:
         print(f"\nError: {e}")
