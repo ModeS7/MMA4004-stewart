@@ -9,16 +9,23 @@ Inherits from BaseStewartSimulator and adds:
 - Conditional GUI module loading based on mode and controller
 """
 
-from PyQt6.QtWidgets import QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton
-from PyQt6.QtGui import QFont
+import sys
+import gc
 import time
+import numpy as np
+from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
+                              QPushButton, QApplication, QWidget, QHBoxLayout, QCheckBox)
+from PyQt6.QtGui import QFont
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import (SerialController, IKCache, WindowsTimerManager,
                                                ThreadPriorityManager, HardwareControllerConfig,
                                                LQRControllerConfig as HardwareLQRConfig)
+from LQR_sim import LQRControllerConfig as SimLQRConfig
 from gui import gui_modules as gm
+from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.utils import ControlLoopConfig
+from core.control_core import PIDController, LQRController
 
 # Control configurations
 DEFAULT_HW_FREQUENCY_HZ = 250
@@ -42,6 +49,17 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.control_frequency = DEFAULT_HW_FREQUENCY_HZ
         self.use_kalman_derivative = False  # PID-specific
 
+        # Performance tracking for hardware mode
+        self.performance_data = {
+            'loop_times': [],
+            'ik_times': [],
+            'serial_times': []
+        }
+
+        # Plot control settings
+        self.plot_enabled = True
+        self.plot_rate_hz = 10
+
         # Create controller config based on mode and controller type
         controller_config = self._create_controller_config()
 
@@ -63,11 +81,75 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             if self.operation_mode == 'real':
                 return HardwareLQRConfig()
             else:
-                from setup.base_simulator import LQRControllerConfig as SimLQRConfig
-                return SimLQRConfig()
+                return SimLQRConfig(mode='simulation')
         else:  # Manual
             # For Manual mode, use a dummy config (won't be used)
             return HardwareControllerConfig()
+
+    def _initialize_controller(self):
+        """Initialize controller based on current type."""
+        if self.controller_type_selection == 'Manual':
+            self.controller = None
+            return
+
+        sliders = self.controller_widgets['sliders']
+        scalar_vars = self.controller_widgets['scalar_vars']
+
+        # Check if sliders exist (GUI might not be built yet)
+        controller_name = self.controller_config.get_controller_name()
+        if "PID" in controller_name and 'kp' not in sliders:
+            self.controller = None
+            return
+        if "LQR" in controller_name and 'Q_pos' not in sliders:
+            self.controller = None
+            return
+
+        if "PID" in controller_name:
+            kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
+            ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
+            kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
+
+            self.controller = PIDController(
+                kp=kp, ki=ki, kd=kd,
+                output_limit=15.0,
+                derivative_filter_alpha=0.1
+            )
+            self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
+
+        elif "LQR" in controller_name:
+            Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+            Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+            R = self.controller_config.get_scaled_param('R', sliders, scalar_vars)
+
+            try:
+                self.controller = LQRController(
+                    Q_pos=Q_pos,
+                    Q_vel=Q_vel,
+                    R=R,
+                    output_limit=15.0
+                )
+                self.log(f"LQR initialized: Q_pos={Q_pos:.2e}, Q_vel={Q_vel:.2e}, R={R:.2e}")
+            except Exception as e:
+                self.log(f"LQR initialization failed: {str(e)}")
+                self.log("Try adjusting Q/R parameters")
+                self.controller = None
+
+    def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
+        """Update controller and return control output."""
+        if self.controller is None:
+            return None
+
+        controller_name = self.controller_config.get_controller_name()
+        if "PID" in controller_name:
+            # PID uses position error and dt
+            rx, ry = self.controller.update(ball_pos_mm, target_pos_mm, dt)
+        elif "LQR" in controller_name:
+            # LQR uses position, velocity, and target
+            rx, ry = self.controller.update(ball_pos_mm, ball_vel_mm_s, target_pos_mm)
+        else:
+            return None
+
+        return rx, ry
 
     def _create_callbacks(self):
         """Create callback dictionary with all features."""
@@ -77,6 +159,12 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         callbacks.update({
             'mode_change': self.on_mode_change,
             'controller_type_change': self.on_controller_type_change,
+        })
+
+        # Add plot control callbacks
+        callbacks.update({
+            'plot_enable_change': self.on_plot_enable_change,
+            'plot_rate_change': self.on_plot_rate_change,
         })
 
         # Add hardware callbacks
@@ -100,8 +188,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
     def get_layout_config(self):
         """Return layout configuration based on mode and controller."""
-        from gui.gui_builder import create_standard_layout
-
         # Always scrollable columns
         layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
@@ -145,6 +231,11 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         left_modules.append({'type': 'configuration',
                            'args': {'use_offset_var': self.use_top_surface_offset}})
 
+        # Plot control
+        left_modules.append({'type': 'plot_control',
+                           'args': {'plot_enabled_var': self.plot_enabled,
+                                   'plot_rate_var': self.plot_rate_hz}})
+
         # Ball state
         left_modules.append({'type': 'ball_state'})
 
@@ -185,8 +276,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
     def _build_modular_gui(self):
         """Override to add mode/controller selector modules and build GUI."""
-        from gui.gui_builder import GUIBuilder
-
         # Create extended module registry with our new modules
         module_registry = {
             'mode_selector': gm.ModeSelectionModule,
@@ -207,6 +296,7 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             'pixy2_camera': gm.Pixy2CameraModule,
             'kalman_filter': gm.KalmanFilterModule,
             'control_frequency': gm.ControlFrequencyModule,
+            'plot_control': gm.PlotControlModule,
         }
 
         layout_config = self.get_layout_config()
@@ -225,8 +315,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         """Add controller-specific widgets (PID Kalman derivative, LQR gain matrix)."""
         if self.controller_type_selection == 'PID' and 'controller' in self.gui_modules:
             # Add "Use Kalman Velocity for Derivative" checkbox
-            from PyQt6.QtWidgets import QWidget, QHBoxLayout, QCheckBox, QLabel
-
             controller_frame = self.gui_modules['controller'].widget
             controller_layout = controller_frame.layout()
 
@@ -248,8 +336,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
         elif self.controller_type_selection == 'LQR' and 'controller' in self.gui_modules:
             # Add "Show Gain Matrix" button
-            from PyQt6.QtWidgets import QWidget, QHBoxLayout, QPushButton
-
             controller_frame = self.gui_modules['controller'].widget
             controller_layout = controller_frame.layout()
 
@@ -332,8 +418,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             self.ik_cache = IKCache(max_size=5000)
 
         self.log("Pre-warming IK cache...")
-        import numpy as np
-
         tilts = np.arange(-15, 16, 2)
         count = 0
         for rx in tilts:
@@ -360,6 +444,17 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}] @ {frequency}Hz")
         self.log(f"Control frequency: {frequency}Hz")
 
+    def on_plot_enable_change(self, enabled):
+        """Handle plot enable/disable."""
+        self.plot_enabled = enabled
+        status = "ENABLED" if enabled else "DISABLED"
+        self.log(f"Plot updates: {status}")
+
+    def on_plot_rate_change(self, rate):
+        """Handle plot refresh rate change."""
+        self.plot_rate_hz = rate
+        self.log(f"Plot refresh rate: {rate} Hz")
+
     def show_timing_stats(self):
         """Show performance timing statistics."""
         if not hasattr(self, 'performance_data') or not self.performance_data:
@@ -367,8 +462,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             return
 
         # Calculate statistics
-        import numpy as np
-
         loop_times = self.performance_data.get('loop_times', [])
         ik_times = self.performance_data.get('ik_times', [])
         serial_times = self.performance_data.get('serial_times', [])
@@ -451,7 +544,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             QMessageBox.warning(self, "Gain Matrix", "Controller not initialized")
             return
 
-        from core.control_core import LQRController
         if not isinstance(self.controller, LQRController):
             QMessageBox.warning(self, "Gain Matrix", "Not an LQR controller")
             return
@@ -504,6 +596,10 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         if self.simulation_running:
             self.stop_simulation()
 
+        # Disable controller if enabled
+        if self.controller_enabled:
+            self.controller_enabled = False
+
         # Clean up hardware resources
         if self.operation_mode == 'real' and self.connected:
             self.disconnect_serial()
@@ -532,10 +628,16 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         # Update controller config
         self.controller_config = self._create_controller_config()
 
+        # Recreate controller parameter widgets for new controller type
+        self._create_controller_param_widgets()
+
         # Rebuild GUI dynamically
         self._rebuild_gui()
 
-        # Reinitialize controller
+        # Process events to ensure GUI is fully built
+        QApplication.processEvents()
+
+        # Reinitialize controller (after GUI is built)
         self._initialize_controller()
 
         # Update window title
@@ -543,9 +645,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
     def _rebuild_gui(self):
         """Rebuild entire GUI with new mode/controller configuration."""
-        import gc
-        from PyQt6.QtWidgets import QWidget
-
         # Clear old GUI modules
         if hasattr(self, 'gui_modules'):
             for module in self.gui_modules.values():
@@ -568,14 +667,11 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self._build_modular_gui()
 
         # Process events to ensure GUI is updated
-        from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
 
 def main():
     """Launch comprehensive controller."""
-    from PyQt6.QtWidgets import QApplication
-    import sys
 
     app = QApplication(sys.argv)
     controller = ComprehensiveStewartController(app)

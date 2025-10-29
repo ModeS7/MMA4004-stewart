@@ -349,13 +349,14 @@ class BaseStewartSimulator(QMainWindow):
         """Create controller parameter widgets."""
         controller_name = self.controller_config.get_controller_name()
 
-        if controller_name == "PID":
+        # Check if controller is PID (handles both "PID" and "PID (Hardware)")
+        if "PID" in controller_name:
             self.param_definitions = [
                 ('kp', 'P (Proportional)', 1.0, 6),
                 ('ki', 'I (Integral)', 1.0, 6),
                 ('kd', 'D (Derivative)', 4.0, 5)
             ]
-        elif controller_name == "LQR":
+        elif "LQR" in controller_name:
             self.param_definitions = [
                 ('Q_pos', 'Q Position Weight', 1.0, 9),
                 ('Q_vel', 'Q Velocity Weight', 1.0, 5),
@@ -364,13 +365,21 @@ class BaseStewartSimulator(QMainWindow):
         else:
             self.param_definitions = []
 
-        self.controller_widgets = {
-            'sliders': {},
-            'value_labels': {},
-            'scalar_vars': {},
-            'update_fn': lambda: None,
-            'param_definitions': self.param_definitions
-        }
+        # Update existing dict instead of creating new one (to preserve GUI module references)
+        if not hasattr(self, 'controller_widgets'):
+            self.controller_widgets = {
+                'sliders': {},
+                'value_labels': {},
+                'scalar_vars': {},
+                'update_fn': lambda: None,
+                'param_definitions': self.param_definitions
+            }
+        else:
+            # Clear and update existing dict
+            self.controller_widgets['sliders'].clear()
+            self.controller_widgets['value_labels'].clear()
+            self.controller_widgets['scalar_vars'].clear()
+            self.controller_widgets['param_definitions'] = self.param_definitions
 
     def _build_modular_gui(self):
         """Build GUI using modular system."""
@@ -652,6 +661,11 @@ class BaseStewartSimulator(QMainWindow):
 
     def on_controller_toggle(self):
         """Handle controller enable/disable."""
+        # Check if controller exists
+        if self.controller is None:
+            self.log("Controller not initialized - cannot enable")
+            return
+
         # Toggle the state
         self.controller_enabled = not self.controller_enabled
         enabled = self.controller_enabled
@@ -715,7 +729,7 @@ class BaseStewartSimulator(QMainWindow):
         self.current_pattern.reset()
         self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
 
-        if self.controller_enabled:
+        if self.controller_enabled and self.controller is not None:
             self.controller.reset()
 
     def reset_ball(self):
@@ -727,7 +741,7 @@ class BaseStewartSimulator(QMainWindow):
         self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
         self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
 
-        if self.controller_enabled:
+        if self.controller_enabled and self.controller is not None:
             self.controller.reset()
 
         self.update_plot()
@@ -897,7 +911,7 @@ class BaseStewartSimulator(QMainWindow):
 
         self.reset_ball()
 
-        if self.controller_enabled:
+        if self.controller_enabled and self.controller is not None:
             self.controller.reset()
 
         self.log("Simulation reset")
@@ -969,38 +983,43 @@ class BaseStewartSimulator(QMainWindow):
                     target_x, target_y = self.current_pattern.get_position(pattern_time)
                     target_pos_mm = (target_x, target_y)
 
-                    rx_raw, ry_raw = self._update_controller(
+                    controller_output = self._update_controller(
                         (ball_x_mm, ball_y_mm),  # Use filtered position
                         (ball_vx_mm_s, ball_vy_mm_s),
                         target_pos_mm,
                         dt
                     )
 
-                    rx, ry, tilt_mag = clip_tilt_vector(rx_raw, ry_raw, MAX_TILT_ANGLE_DEG)
-
-                    if tilt_mag > MAX_TILT_ANGLE_DEG:
-                        controller_name = self.controller_config.get_controller_name()
-                        self.log(f"{controller_name} output clipped: "
-                                 f"({rx_raw:.2f}, {ry_raw:.2f}) → ({rx:.2f}, {ry:.2f})")
-
-                    self.dof_values['rx'] = rx
-                    self.dof_values['ry'] = ry
-
-                    translation = np.array([self.dof_values['x'],
-                                            self.dof_values['y'],
-                                            self.dof_values['z']])
-                    rotation = np.array([rx, ry, self.dof_values['rz']])
-
-                    angles = self.ik.calculate_servo_angles(translation, rotation,
-                                                            self.use_top_surface_offset)
-
-                    if angles is not None:
-                        self.last_cmd_angles = angles
-                        for i in range(6):
-                            self.servos[i].send_command(angles[i], self.simulation_time)
+                    if controller_output is None:
+                        self.log("Controller returned None - disabling controller")
+                        self.controller_enabled = False
                     else:
-                        controller_name = self.controller_config.get_controller_name()
-                        self.log(f"{controller_name}: IK solution out of range")
+                        rx_raw, ry_raw = controller_output
+                        rx, ry, tilt_mag = clip_tilt_vector(rx_raw, ry_raw, MAX_TILT_ANGLE_DEG)
+
+                        if tilt_mag > MAX_TILT_ANGLE_DEG:
+                            controller_name = self.controller_config.get_controller_name()
+                            self.log(f"{controller_name} output clipped: "
+                                     f"({rx_raw:.2f}, {ry_raw:.2f}) → ({rx:.2f}, {ry:.2f})")
+
+                        self.dof_values['rx'] = rx
+                        self.dof_values['ry'] = ry
+
+                        translation = np.array([self.dof_values['x'],
+                                                self.dof_values['y'],
+                                                self.dof_values['z']])
+                        rotation = np.array([rx, ry, self.dof_values['rz']])
+
+                        angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                                self.use_top_surface_offset)
+
+                        if angles is not None:
+                            self.last_cmd_angles = angles
+                            for i in range(6):
+                                self.servos[i].send_command(angles[i], self.simulation_time)
+                        else:
+                            controller_name = self.controller_config.get_controller_name()
+                            self.log(f"{controller_name}: IK solution out of range")
 
                 except Exception as e:
                     controller_name = self.controller_config.get_controller_name()
