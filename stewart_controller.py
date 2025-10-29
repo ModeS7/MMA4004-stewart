@@ -21,10 +21,9 @@ from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import (SerialController, IKCache, WindowsTimerManager,
                                                ThreadPriorityManager, HardwareControllerConfig,
                                                LQRControllerConfig as HardwareLQRConfig)
-from LQR_sim import LQRControllerConfig as SimLQRConfig
+from misc.old.LQR_sim import LQRControllerConfig as SimLQRConfig
 from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
-from core.utils import ControlLoopConfig
 from core.control_core import PIDController, LQRController
 
 # Control configurations
