@@ -134,7 +134,7 @@ class BaseStewartSimulator(QMainWindow):
             "horn_length": 45.3722,             #31.75
             "rod_length": 205.0,                #145.0
             "base": 86.6025 + 18.75 + 11,       #73.025
-            "base_anchors": 64.75 - 45.3722,    #36.8893
+            "base_anchors": 64.75,              #36.8893
             "platform": 84.0759,                #67.775
             "platform_anchors": 12.5,           #12.7
             "top_surface_offset": 38.0
@@ -154,7 +154,7 @@ class BaseStewartSimulator(QMainWindow):
             ball_radius=0.02,
             ball_mass=0.0027,
             gravity=9.81,
-            rolling_friction=0.0225,
+            rolling_friction=0.01,
             sphere_type='hollow'
         )
 
@@ -420,6 +420,7 @@ class BaseStewartSimulator(QMainWindow):
             'push_ball': self.push_ball,
             'toggle_offset': self.on_offset_toggle,
             'slider_change': self.on_slider_change,
+            'go_home': self.go_home,
             'camera_enable_change': self.on_camera_enable_change,
             'camera_param_change': self.on_camera_param_change,
             'camera_reset': self.on_camera_reset,
@@ -774,6 +775,39 @@ class BaseStewartSimulator(QMainWindow):
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self.calculate_ik)
         self.update_timer.start(50)
+
+    def go_home(self):
+        """Return platform to home position."""
+        if self.controller_enabled:
+            self.log("Disable controller to use manual control")
+            return
+
+        # Set all DOF values to home position
+        home_z = (self.ik.home_height_top_surface if self.use_top_surface_offset
+                  else self.ik.home_height)
+
+        self.dof_values['x'] = 0.0
+        self.dof_values['y'] = 0.0
+        self.dof_values['z'] = home_z
+        self.dof_values['rx'] = 0.0
+        self.dof_values['ry'] = 0.0
+        self.dof_values['rz'] = 0.0
+
+        # Update sliders to reflect home position
+        if 'manual_pose' in self.gui_modules:
+            manual_pose = self.gui_modules['manual_pose']
+            for dof, value in self.dof_values.items():
+                if dof in manual_pose.sliders:
+                    res = self.dof_config[dof][2]
+                    manual_pose.sliders[dof].blockSignals(True)
+                    manual_pose.sliders[dof].setValue(int(value / res))
+                    manual_pose.sliders[dof].blockSignals(False)
+                    manual_pose.value_labels[dof].setText(f"{value:.2f}")
+
+        # Calculate and send IK to hardware/simulation
+        self.calculate_ik()
+        self.update_plot()
+        self.log("Platform moved to home position")
 
     def on_camera_enable_change(self, enabled):
         """Handle camera enable/disable."""
