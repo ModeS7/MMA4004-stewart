@@ -114,6 +114,22 @@ class ControllerModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
+        # Create a container for parameter sliders (so they can be rebuilt independently)
+        self.params_container = QWidget()
+        self.params_layout = QVBoxLayout()
+        self.params_layout.setContentsMargins(0, 0, 0, 0)
+        self.params_container.setLayout(self.params_layout)
+        layout.addWidget(self.params_container)
+
+        # Add initial parameter sliders to the container
+        self._build_param_sliders()
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _build_param_sliders(self):
+        """Build parameter sliders in the params_container."""
         if 'param_definitions' in self.controller_widgets:
             param_definitions = self.controller_widgets['param_definitions']
             sliders = self.controller_widgets['sliders']
@@ -131,22 +147,50 @@ class ControllerModule(GUIModule):
                 self.controller_config.default_scalar_idx = default_scalar_idx
 
                 self.controller_config.create_parameter_slider(
-                    layout, param_name, label, default,
+                    self.params_layout, param_name, label, default,
                     sliders, value_labels, scalar_vars,
                     self.callbacks.get('param_change')
                 )
 
                 self.controller_config.default_scalar_idx = old_idx
 
-        group.setLayout(layout)
-        self.widget = group
-        return self.widget
-
     def _on_enable_toggle(self):
         """Handle enable checkbox toggle - update state then call callback."""
         self.controller_enabled = self.enable_checkbox.isChecked()
         if self.callbacks.get('toggle_controller'):
             self.callbacks['toggle_controller']()
+
+    def rebuild_params(self, param_definitions, controller_config):
+        """Rebuild parameter sliders for new controller type."""
+        self.controller_config = controller_config
+        self.controller_widgets['param_definitions'] = param_definitions
+
+        # Update group box title
+        controller_name = self.controller_config.get_controller_name()
+        if hasattr(self.widget, 'setTitle'):
+            self.widget.setTitle(f"{controller_name} Ball Balancing")
+
+        # Update enable checkbox label
+        self.enable_checkbox.setText(f"Enable {controller_name} Control")
+
+        # Clear the params_layout (remove all parameter sliders)
+        while self.params_layout.count():
+            item = self.params_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    child = item.layout().takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+
+        # Clear slider references
+        self.controller_widgets['sliders'].clear()
+        self.controller_widgets['value_labels'].clear()
+        self.controller_widgets['scalar_vars'].clear()
+
+        # Rebuild parameter sliders
+        self._build_param_sliders()
 
     def update(self, state):
         if 'controller_enabled' in state:
@@ -396,6 +440,18 @@ class ManualPoseControlModule(GUIModule):
 
     def create(self):
         group = QGroupBox("Manual Pose Control (6 DOF)")
+        main_layout = QVBoxLayout()
+
+        # Home button at the top
+        home_btn_layout = QHBoxLayout()
+        home_btn = QPushButton("Home Position")
+        home_btn.clicked.connect(self.callbacks.get('go_home'))
+        home_btn.setMinimumWidth(120)
+        home_btn_layout.addWidget(home_btn)
+        home_btn_layout.addStretch()
+        main_layout.addLayout(home_btn_layout)
+
+        # DOF sliders
         grid = QGridLayout()
 
         for idx, (dof, (min_val, max_val, res, default, label)) in enumerate(self.dof_config.items()):
@@ -426,6 +482,7 @@ class ManualPoseControlModule(GUIModule):
 
         grid.setColumnStretch(1, 1)
 
+        # Tilt vector indicator
         tilt_layout = QHBoxLayout()
         tilt_layout.addWidget(QLabel("Tilt Vector:"))
         self.tilt_magnitude_label = QLabel("0.00° (0.0%)")
@@ -434,11 +491,10 @@ class ManualPoseControlModule(GUIModule):
         tilt_layout.addWidget(self.tilt_magnitude_label)
         tilt_layout.addStretch()
 
-        layout = QVBoxLayout()
-        layout.addLayout(grid)
-        layout.addLayout(tilt_layout)
+        main_layout.addLayout(grid)
+        main_layout.addLayout(tilt_layout)
 
-        group.setLayout(layout)
+        group.setLayout(main_layout)
         self.widget = group
         return self.widget
 
@@ -571,6 +627,12 @@ class ControllerOutputModule(GUIModule):
         group.setLayout(layout)
         self.widget = group
         return self.widget
+
+    def set_controller_name(self, new_name):
+        """Update controller name in the group box title."""
+        self.controller_name = new_name
+        if hasattr(self.widget, 'setTitle'):
+            self.widget.setTitle(f"{new_name} Output")
 
     def update(self, state):
         if 'controller_output' in state:
@@ -1322,6 +1384,122 @@ class PlotControlModule(GUIModule):
             else:
                 self.perf_label.setText("No frame drops")
                 self.perf_label.setStyleSheet(f"color: {self.colors['success']};")
+
+
+class ModeSelectionModule(GUIModule):
+    """Real/Simulation mode toggle selector."""
+
+    def __init__(self, parent, colors, callbacks, current_mode='sim'):
+        super().__init__(parent, colors, callbacks)
+        self.current_mode = current_mode
+
+    def create(self):
+        group = QGroupBox("Operation Mode")
+        layout = QHBoxLayout()
+
+        self.sim_btn = QPushButton("Simulation")
+        self.sim_btn.setCheckable(True)
+        self.sim_btn.setMinimumWidth(120)
+        self.sim_btn.setMinimumHeight(40)
+        self.sim_btn.clicked.connect(lambda: self._on_mode_select('sim'))
+        layout.addWidget(self.sim_btn)
+
+        self.real_btn = QPushButton("Real Hardware")
+        self.real_btn.setCheckable(True)
+        self.real_btn.setMinimumWidth(120)
+        self.real_btn.setMinimumHeight(40)
+        self.real_btn.clicked.connect(lambda: self._on_mode_select('real'))
+        layout.addWidget(self.real_btn)
+
+        # Set initial state
+        if self.current_mode == 'sim':
+            self.sim_btn.setChecked(True)
+        else:
+            self.real_btn.setChecked(True)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _on_mode_select(self, mode):
+        if mode == self.current_mode:
+            return
+
+        self.current_mode = mode
+
+        # Update button states
+        self.sim_btn.setChecked(mode == 'sim')
+        self.real_btn.setChecked(mode == 'real')
+
+        if self.callbacks.get('mode_change'):
+            self.callbacks['mode_change'](mode)
+
+
+class ControllerSelectionModule(GUIModule):
+    """PID/LQR/Manual controller toggle selector."""
+
+    def __init__(self, parent, colors, callbacks, current_controller='PID'):
+        super().__init__(parent, colors, callbacks)
+        self.current_controller = current_controller
+
+    def create(self):
+        container = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Controller selector buttons
+        btn_layout = QHBoxLayout()
+
+        self.pid_btn = QPushButton("PID")
+        self.pid_btn.setCheckable(True)
+        self.pid_btn.setMinimumWidth(90)
+        self.pid_btn.setMinimumHeight(35)
+        self.pid_btn.clicked.connect(lambda: self._on_controller_select('PID'))
+        btn_layout.addWidget(self.pid_btn)
+
+        self.lqr_btn = QPushButton("LQR")
+        self.lqr_btn.setCheckable(True)
+        self.lqr_btn.setMinimumWidth(90)
+        self.lqr_btn.setMinimumHeight(35)
+        self.lqr_btn.clicked.connect(lambda: self._on_controller_select('LQR'))
+        btn_layout.addWidget(self.lqr_btn)
+
+        self.manual_btn = QPushButton("Manual")
+        self.manual_btn.setCheckable(True)
+        self.manual_btn.setMinimumWidth(90)
+        self.manual_btn.setMinimumHeight(35)
+        self.manual_btn.clicked.connect(lambda: self._on_controller_select('Manual'))
+        btn_layout.addWidget(self.manual_btn)
+
+        btn_layout.addStretch()
+
+        layout.addLayout(btn_layout)
+
+        # Set initial state
+        if self.current_controller == 'PID':
+            self.pid_btn.setChecked(True)
+        elif self.current_controller == 'LQR':
+            self.lqr_btn.setChecked(True)
+        else:
+            self.manual_btn.setChecked(True)
+
+        container.setLayout(layout)
+        self.widget = container
+        return self.widget
+
+    def _on_controller_select(self, controller):
+        if controller == self.current_controller:
+            return
+
+        self.current_controller = controller
+
+        # Update button states
+        self.pid_btn.setChecked(controller == 'PID')
+        self.lqr_btn.setChecked(controller == 'LQR')
+        self.manual_btn.setChecked(controller == 'Manual')
+
+        if self.callbacks.get('controller_type_change'):
+            self.callbacks['controller_type_change'](controller)
 
 
 class ControlFrequencyModule(GUIModule):
