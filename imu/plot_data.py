@@ -49,9 +49,33 @@ class OrientationKalmanFilter:
 
     def __init__(self, accel_noise=1.0, gyro_noise=1.0, process_noise_angle=0.0, process_noise_bias=0.0,
                  accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None,
-                 initial_bias_x=0.0, initial_bias_y=0.0):
+                 initial_bias_x=0.0, initial_bias_y=0.0, gyro_scale_multiplier=1.0):
+        # IMU scaling
+        self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
+        self.gyro_scale = 0.00875 * np.pi / 180 * gyro_scale_multiplier  # L3GD20: 8.75 mdps/LSB -> rad/s (with calibration multiplier)
+
+        # Axis transformations
+        self.accel_axis_flip = accel_axis_flip if accel_axis_flip is not None else np.array([1, 1, 1])
+        self.gyro_axis_flip = gyro_axis_flip if gyro_axis_flip is not None else np.array([1, 1, 1])
+        self.accel_rotation = accel_rotation
+        self.gyro_rotation = gyro_rotation
+
+        # Transform initial bias from raw sensor frame to transformed frame
+        # 1. Scale by gyro_scale_multiplier (since bias was measured with wrong scale)
+        # 2. Apply axis flips and rotation
+        bias_vec = np.array([initial_bias_x * gyro_scale_multiplier,
+                            initial_bias_y * gyro_scale_multiplier,
+                            0.0])
+
+        # Apply axis flip
+        bias_vec = bias_vec * self.gyro_axis_flip
+
+        # Apply rotation if provided
+        if self.gyro_rotation is not None:
+            bias_vec = bias_vec @ self.gyro_rotation.T
+
         # State: [roll, pitch, gyro_bias_x, gyro_bias_y]
-        self.state = np.array([0.0, 0.0, initial_bias_x, initial_bias_y])
+        self.state = np.array([0.0, 0.0, bias_vec[0], bias_vec[1]])
         self.P = np.eye(4) * 0.1
 
         # Process noise covariance
@@ -70,16 +94,6 @@ class OrientationKalmanFilter:
 
         self.initialized = False
         self.initial_accel = None
-
-        # IMU scaling
-        self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
-        self.gyro_scale = 0.00875 * np.pi / 180  # L3GD20: 8.75 mdps/LSB -> rad/s
-
-        # Axis transformations
-        self.accel_axis_flip = accel_axis_flip if accel_axis_flip is not None else np.array([1, 1, 1])
-        self.gyro_axis_flip = gyro_axis_flip if gyro_axis_flip is not None else np.array([1, 1, 1])
-        self.accel_rotation = accel_rotation
-        self.gyro_rotation = gyro_rotation
 
     def initialize(self, accel_raw):
         """Initialize filter state from first accelerometer reading (raw LSB).
@@ -189,25 +203,29 @@ class OrientationKalmanFilter:
 ACCEL_SENSITIVITY = 1000.0  # LSB/g (1 mg/LSB)
 ACCEL_SCALE = 0.001 * 9.81  # 1 mg/LSB → m/s²
 
-# L3GD20 Gyroscope: ±250°/s range
-GYRO_SENSITIVITY = 1.0 / 0.00875  # LSB/(°/s) = 114.29
-GYRO_SCALE = 0.00875 * np.pi / 180  # 8.75 mdps/LSB → rad/s
+# L3GD20H Gyroscope configuration
+# Base sensitivity: 8.75 mdps/LSB (±245 dps range)
+# If configured for ±2000 dps: 70 mdps/LSB (use 8x multiplier)
+GYRO_SENSITIVITY = 1.0 / 0.00875  # LSB/(°/s) = 114.29 (±245 dps)
+GYRO_SCALE = 0.00875 * np.pi / 180  # 8.75 mdps/LSB → rad/s (multiply by 8 for ±2000 dps)
 
 # Kalman Filter Configuration (measured from stationary IMU data)
 # Accelerometer noise (m/s²): X=0.0686, Y=0.0672, Z=0.0924
 # Using RMS of X,Y for tilt measurement: sqrt((0.0686² + 0.0672²)/2) ≈ 0.0679
 ACCEL_NOISE = 0.0679  # m/s² - RMS of X,Y accelerometer noise
 
-# Gyroscope noise (rad/s): X=0.021750, Y=0.023157, Z=0.006303
+# Gyroscope noise (rad/s) - base measurement (will be scaled by gyro_scale_multiplier)
+# Raw measurements: X=0.021750, Y=0.023157, Z=0.006303
 # Using RMS of X,Y for roll/pitch rates: sqrt((0.021750² + 0.023157²)/2) ≈ 0.0224
-GYRO_NOISE = 0.0224  # rad/s - RMS of X,Y gyroscope noise
+GYRO_NOISE = 0.0224  # rad/s - RMS of X,Y gyroscope noise (base, gets scaled by multiplier)
 
 PROCESS_NOISE_ANGLE = 0.0  # Allow small gyro drift
 PROCESS_NOISE_BIAS = 0.0    # Slow bias adaptation
 
-# Measured gyroscope biases (rad/s) - from stationary data
-GYRO_BIAS_X = 0.112679  # rad/s
-GYRO_BIAS_Y = 0.031500  # rad/s
+# Measured gyroscope biases (rad/s) - from stationary data (RAW sensor frame)
+# These values are automatically scaled by gyro_scale_multiplier and transformed by axis flips/rotations
+GYRO_BIAS_X = 0.112679  # rad/s (X-axis mean from stationary data, base value)
+GYRO_BIAS_Y = 0.031500  # rad/s (Y-axis mean from stationary data, base value)
 
 # Measured gravity vector (m/s²) - from stationary data
 GRAVITY_VECTOR = np.array([-0.2725, -0.1496, -9.8283])
@@ -348,7 +366,8 @@ def print_statistics(df):
 
 
 def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc_noise_angle, proc_noise_bias,
-                      accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None):
+                      accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None,
+                      enable_accel_updates=True, enable_gyro_predictions=True, gyro_scale_multiplier=1.0):
     """Run Kalman filter with given parameters
 
     Args:
@@ -363,6 +382,9 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
         gyro_axis_flip: Axis flip for gyroscope
         accel_rotation: Rotation matrix for accelerometer
         gyro_rotation: Rotation matrix for gyroscope
+        enable_accel_updates: If False, skip accelerometer updates (pure gyro integration)
+        enable_gyro_predictions: If False, skip gyro predictions (pure accel tilt)
+        gyro_scale_multiplier: Multiplier for gyroscope scale calibration
 
     Returns:
         Tuple of (rx_est, ry_est, bias_x, bias_y, time, platform_rx, platform_ry)
@@ -378,7 +400,8 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
         accel_rotation=accel_rotation,
         gyro_rotation=gyro_rotation,
         initial_bias_x=GYRO_BIAS_X,
-        initial_bias_y=GYRO_BIAS_Y
+        initial_bias_y=GYRO_BIAS_Y,
+        gyro_scale_multiplier=gyro_scale_multiplier
     )
 
     # Initialize from first accelerometer reading
@@ -405,9 +428,10 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
         dt = max(dt, 0.0001)  # Prevent zero dt
 
         if sensor_type == 'A':
-            # Accelerometer update
+            # Accelerometer update (skip if disabled)
             accel_raw = np.array([row['x'], row['y'], row['z']])
-            kalman.update(accel_raw)
+            if enable_accel_updates:
+                kalman.update(accel_raw)
 
             # Store estimate (state is [rx, ry, bias_gx, bias_gy] in radians/rad/s)
             rx_est[accel_est_idx] = kalman.state[0]
@@ -417,9 +441,10 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
             accel_est_idx += 1
 
         else:
-            # Gyroscope prediction
-            gyro_raw = np.array([row['x'], row['y'], row['z']])
-            kalman.predict(gyro_raw, dt)
+            # Gyroscope prediction (skip if disabled)
+            if enable_gyro_predictions:
+                gyro_raw = np.array([row['x'], row['y'], row['z']])
+                kalman.predict(gyro_raw, dt)
 
         prev_time = current_time
 
@@ -754,53 +779,91 @@ class IMUPlotWindow(QMainWindow):
         params_layout = QGridLayout()
         params_group.setLayout(params_layout)
 
-        # Accel noise slider
+        # Accel noise slider (0-1 normalized with scalar)
         params_layout.addWidget(QLabel("Accel Noise [m/s²]:"), 0, 0)
+        self.accel_noise_scalar = QLineEdit(f"{ACCEL_NOISE:.6f}")
+        self.accel_noise_scalar.setFixedWidth(80)
+        self.accel_noise_scalar.editingFinished.connect(self.schedule_update)
+        params_layout.addWidget(self.accel_noise_scalar, 0, 1)
         self.accel_noise_slider = QSlider(Qt.Orientation.Horizontal)
-        self.accel_noise_slider.setMinimum(1)
-        self.accel_noise_slider.setMaximum(5000)
-        self.accel_noise_slider.setValue(int(ACCEL_NOISE * 1000))
+        self.accel_noise_slider.setMinimum(0)
+        self.accel_noise_slider.setMaximum(1000)
+        self.accel_noise_slider.setValue(1000)  # 1.0 default
         self.accel_noise_slider.valueChanged.connect(self.schedule_update)
-        params_layout.addWidget(self.accel_noise_slider, 0, 1)
-        self.accel_noise_label = QLabel(f"{ACCEL_NOISE:.4f}")
-        params_layout.addWidget(self.accel_noise_label, 0, 2)
+        params_layout.addWidget(self.accel_noise_slider, 0, 2)
+        self.accel_noise_label = QLabel(f"{ACCEL_NOISE:.6f}")
+        params_layout.addWidget(self.accel_noise_label, 0, 3)
 
-        # Gyro noise slider
+        # Gyro noise slider (0-1 normalized with scalar)
         params_layout.addWidget(QLabel("Gyro Noise [rad/s]:"), 1, 0)
+        self.gyro_noise_scalar = QLineEdit(f"{GYRO_NOISE:.6f}")
+        self.gyro_noise_scalar.setFixedWidth(80)
+        self.gyro_noise_scalar.editingFinished.connect(self.schedule_update)
+        params_layout.addWidget(self.gyro_noise_scalar, 1, 1)
         self.gyro_noise_slider = QSlider(Qt.Orientation.Horizontal)
-        self.gyro_noise_slider.setMinimum(1)
+        self.gyro_noise_slider.setMinimum(0)
         self.gyro_noise_slider.setMaximum(1000)
-        self.gyro_noise_slider.setValue(int(GYRO_NOISE * 1000))
+        self.gyro_noise_slider.setValue(1000)  # 1.0 default
         self.gyro_noise_slider.valueChanged.connect(self.schedule_update)
-        params_layout.addWidget(self.gyro_noise_slider, 1, 1)
+        params_layout.addWidget(self.gyro_noise_slider, 1, 2)
         self.gyro_noise_label = QLabel(f"{GYRO_NOISE:.6f}")
-        params_layout.addWidget(self.gyro_noise_label, 1, 2)
+        params_layout.addWidget(self.gyro_noise_label, 1, 3)
 
-        # Process noise angle slider
-        params_layout.addWidget(QLabel("Proc Noise Angle [rad²]:"), 2, 0)
+        # Gyro scale multiplier slider (for calibration)
+        params_layout.addWidget(QLabel("Gyro Scale Multiplier:"), 2, 0)
+        self.gyro_scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gyro_scale_slider.setMinimum(1)
+        self.gyro_scale_slider.setMaximum(10000)
+        self.gyro_scale_slider.setValue(8000)  # 8.0x default
+        self.gyro_scale_slider.valueChanged.connect(self.schedule_update)
+        params_layout.addWidget(self.gyro_scale_slider, 2, 2)
+        self.gyro_scale_label = QLabel("8.000x")
+        params_layout.addWidget(self.gyro_scale_label, 2, 3)
+
+        # Process noise angle slider (0-1 normalized with scalar)
+        params_layout.addWidget(QLabel("Proc Noise Angle [rad²]:"), 3, 0)
+        self.proc_angle_scalar = QLineEdit("0.001")
+        self.proc_angle_scalar.setFixedWidth(80)
+        self.proc_angle_scalar.editingFinished.connect(self.schedule_update)
+        params_layout.addWidget(self.proc_angle_scalar, 3, 1)
         self.proc_angle_slider = QSlider(Qt.Orientation.Horizontal)
         self.proc_angle_slider.setMinimum(0)
         self.proc_angle_slider.setMaximum(1000)
-        self.proc_angle_slider.setValue(int(PROCESS_NOISE_ANGLE * 10000))
+        self.proc_angle_slider.setValue(0)  # 0.0 default
         self.proc_angle_slider.valueChanged.connect(self.schedule_update)
-        params_layout.addWidget(self.proc_angle_slider, 2, 1)
+        params_layout.addWidget(self.proc_angle_slider, 3, 2)
         self.proc_angle_label = QLabel(f"{PROCESS_NOISE_ANGLE:.6f}")
-        params_layout.addWidget(self.proc_angle_label, 2, 2)
+        params_layout.addWidget(self.proc_angle_label, 3, 3)
 
-        # Process noise bias slider
-        params_layout.addWidget(QLabel("Proc Noise Bias [(rad/s)²]:"), 3, 0)
+        # Process noise bias slider (0-1 normalized with scalar)
+        params_layout.addWidget(QLabel("Proc Noise Bias [(rad/s)²]:"), 4, 0)
+        self.proc_bias_scalar = QLineEdit("0.0001")
+        self.proc_bias_scalar.setFixedWidth(80)
+        self.proc_bias_scalar.editingFinished.connect(self.schedule_update)
+        params_layout.addWidget(self.proc_bias_scalar, 4, 1)
         self.proc_bias_slider = QSlider(Qt.Orientation.Horizontal)
         self.proc_bias_slider.setMinimum(0)
-        self.proc_bias_slider.setMaximum(10000)
-        self.proc_bias_slider.setValue(int(PROCESS_NOISE_BIAS * 10000000))
+        self.proc_bias_slider.setMaximum(1000)
+        self.proc_bias_slider.setValue(0)  # 0.0 default
         self.proc_bias_slider.valueChanged.connect(self.schedule_update)
-        params_layout.addWidget(self.proc_bias_slider, 3, 1)
+        params_layout.addWidget(self.proc_bias_slider, 4, 2)
         self.proc_bias_label = QLabel(f"{PROCESS_NOISE_BIAS:.8f}")
-        params_layout.addWidget(self.proc_bias_label, 3, 2)
+        params_layout.addWidget(self.proc_bias_label, 4, 3)
+
+        # Enable/Disable sensor checkboxes
+        self.enable_accel_checkbox = QCheckBox("Enable Accelerometer Updates")
+        self.enable_accel_checkbox.setChecked(True)
+        self.enable_accel_checkbox.stateChanged.connect(self.update_plots)
+        params_layout.addWidget(self.enable_accel_checkbox, 5, 0, 1, 2)
+
+        self.enable_gyro_checkbox = QCheckBox("Enable Gyroscope Predictions")
+        self.enable_gyro_checkbox.setChecked(True)
+        self.enable_gyro_checkbox.stateChanged.connect(self.update_plots)
+        params_layout.addWidget(self.enable_gyro_checkbox, 5, 2, 1, 1)
 
         reset_btn = QPushButton("Reset")
         reset_btn.clicked.connect(self.reset_sliders)
-        params_layout.addWidget(reset_btn, 4, 0, 1, 3)
+        params_layout.addWidget(reset_btn, 6, 0, 1, 3)
 
         controls_layout.addWidget(params_group, stretch=3)
 
@@ -815,15 +878,15 @@ class IMUPlotWindow(QMainWindow):
         accel_flip_layout = QVBoxLayout()
         accel_flip_layout.addWidget(QLabel("Accelerometer Flips:"))
         self.accel_flip_x = QCheckBox("Flip X")
-        self.accel_flip_x.setChecked(self.accel_axis_flip[0] < 0)
+        self.accel_flip_x.setChecked(bool(self.accel_axis_flip[0] < 0))
         self.accel_flip_x.stateChanged.connect(lambda: self.toggle_accel_flip(0))
         accel_flip_layout.addWidget(self.accel_flip_x)
         self.accel_flip_y = QCheckBox("Flip Y")
-        self.accel_flip_y.setChecked(self.accel_axis_flip[1] < 0)
+        self.accel_flip_y.setChecked(bool(self.accel_axis_flip[1] < 0))
         self.accel_flip_y.stateChanged.connect(lambda: self.toggle_accel_flip(1))
         accel_flip_layout.addWidget(self.accel_flip_y)
         self.accel_flip_z = QCheckBox("Flip Z")
-        self.accel_flip_z.setChecked(self.accel_axis_flip[2] < 0)
+        self.accel_flip_z.setChecked(bool(self.accel_axis_flip[2] < 0))
         self.accel_flip_z.stateChanged.connect(lambda: self.toggle_accel_flip(2))
         accel_flip_layout.addWidget(self.accel_flip_z)
         flip_layout.addLayout(accel_flip_layout)
@@ -831,15 +894,15 @@ class IMUPlotWindow(QMainWindow):
         gyro_flip_layout = QVBoxLayout()
         gyro_flip_layout.addWidget(QLabel("Gyroscope Flips:"))
         self.gyro_flip_x = QCheckBox("Flip X")
-        self.gyro_flip_x.setChecked(self.gyro_axis_flip[0] < 0)
+        self.gyro_flip_x.setChecked(bool(self.gyro_axis_flip[0] < 0))
         self.gyro_flip_x.stateChanged.connect(lambda: self.toggle_gyro_flip(0))
         gyro_flip_layout.addWidget(self.gyro_flip_x)
         self.gyro_flip_y = QCheckBox("Flip Y")
-        self.gyro_flip_y.setChecked(self.gyro_axis_flip[1] < 0)
+        self.gyro_flip_y.setChecked(bool(self.gyro_axis_flip[1] < 0))
         self.gyro_flip_y.stateChanged.connect(lambda: self.toggle_gyro_flip(1))
         gyro_flip_layout.addWidget(self.gyro_flip_y)
         self.gyro_flip_z = QCheckBox("Flip Z")
-        self.gyro_flip_z.setChecked(self.gyro_axis_flip[2] < 0)
+        self.gyro_flip_z.setChecked(bool(self.gyro_axis_flip[2] < 0))
         self.gyro_flip_z.stateChanged.connect(lambda: self.toggle_gyro_flip(2))
         gyro_flip_layout.addWidget(self.gyro_flip_z)
         flip_layout.addLayout(gyro_flip_layout)
@@ -934,26 +997,80 @@ class IMUPlotWindow(QMainWindow):
         self.update_timer.stop()
         self.update_timer.start(300)  # 300ms delay
 
-        # Update slider labels immediately
-        self.accel_noise_label.setText(f"{self.accel_noise_slider.value() / 1000:.4f}")
-        self.gyro_noise_label.setText(f"{self.gyro_noise_slider.value() / 1000:.6f}")
-        self.proc_angle_label.setText(f"{self.proc_angle_slider.value() / 10000:.6f}")
-        self.proc_bias_label.setText(f"{self.proc_bias_slider.value() / 10000000:.8f}")
+        # Update slider labels immediately (scalar × slider_value)
+        try:
+            accel_scalar = float(self.accel_noise_scalar.text())
+            accel_val = accel_scalar * (self.accel_noise_slider.value() / 1000)
+            self.accel_noise_label.setText(f"{accel_val:.6f}")
+        except ValueError:
+            self.accel_noise_label.setText("Invalid")
+
+        try:
+            gyro_scalar = float(self.gyro_noise_scalar.text())
+            gyro_val = gyro_scalar * (self.gyro_noise_slider.value() / 1000)
+            self.gyro_noise_label.setText(f"{gyro_val:.6f}")
+        except ValueError:
+            self.gyro_noise_label.setText("Invalid")
+
+        self.gyro_scale_label.setText(f"{self.gyro_scale_slider.value() / 1000:.3f}x")
+
+        try:
+            angle_scalar = float(self.proc_angle_scalar.text())
+            angle_val = angle_scalar * (self.proc_angle_slider.value() / 1000)
+            self.proc_angle_label.setText(f"{angle_val:.6f}")
+        except ValueError:
+            self.proc_angle_label.setText("Invalid")
+
+        try:
+            bias_scalar = float(self.proc_bias_scalar.text())
+            bias_val = bias_scalar * (self.proc_bias_slider.value() / 1000)
+            self.proc_bias_label.setText(f"{bias_val:.8f}")
+        except ValueError:
+            self.proc_bias_label.setText("Invalid")
 
     def update_plots(self):
         """Update plots with current Kalman filter parameters"""
-        # Get slider values
-        accel_noise = self.accel_noise_slider.value() / 1000
-        gyro_noise = self.gyro_noise_slider.value() / 1000
-        proc_noise_angle = self.proc_angle_slider.value() / 10000
-        proc_noise_bias = self.proc_bias_slider.value() / 10000000
+        # Get slider values (scalar × normalized slider value)
+        try:
+            accel_scalar = float(self.accel_noise_scalar.text())
+            accel_noise = accel_scalar * (self.accel_noise_slider.value() / 1000)
+        except ValueError:
+            accel_noise = ACCEL_NOISE
+
+        try:
+            gyro_scalar = float(self.gyro_noise_scalar.text())
+            gyro_noise = gyro_scalar * (self.gyro_noise_slider.value() / 1000)
+        except ValueError:
+            gyro_noise = GYRO_NOISE
+
+        gyro_scale_mult = self.gyro_scale_slider.value() / 1000
+
+        try:
+            angle_scalar = float(self.proc_angle_scalar.text())
+            proc_noise_angle = angle_scalar * (self.proc_angle_slider.value() / 1000)
+        except ValueError:
+            proc_noise_angle = PROCESS_NOISE_ANGLE
+
+        try:
+            bias_scalar = float(self.proc_bias_scalar.text())
+            proc_noise_bias = bias_scalar * (self.proc_bias_slider.value() / 1000)
+        except ValueError:
+            proc_noise_bias = PROCESS_NOISE_BIAS
+
+        # Scale gyro noise by the scale multiplier (same factor that affects measurements)
+        gyro_noise_scaled = gyro_noise * gyro_scale_mult
+
+        # Get checkbox states
+        enable_accel = self.enable_accel_checkbox.isChecked()
+        enable_gyro = self.enable_gyro_checkbox.isChecked()
 
         # Run Kalman filter
         rx_est, ry_est, bias_x, bias_y, time, platform_rx, platform_ry = run_kalman_filter(
-            self.accel_df, self.gyro_df, self.all_data, accel_noise, gyro_noise,
+            self.accel_df, self.gyro_df, self.all_data, accel_noise, gyro_noise_scaled,
             proc_noise_angle, proc_noise_bias,
             self.accel_axis_flip, self.gyro_axis_flip,
-            self.accel_rotation, self.gyro_rotation
+            self.accel_rotation, self.gyro_rotation,
+            enable_accel, enable_gyro, gyro_scale_mult
         )
 
         # Clear and update plots
@@ -1120,10 +1237,18 @@ class IMUPlotWindow(QMainWindow):
 
     def reset_sliders(self):
         """Reset sliders to default values"""
-        self.accel_noise_slider.setValue(int(ACCEL_NOISE * 1000))
-        self.gyro_noise_slider.setValue(int(GYRO_NOISE * 1000))
-        self.proc_angle_slider.setValue(int(PROCESS_NOISE_ANGLE * 10000))
-        self.proc_bias_slider.setValue(int(PROCESS_NOISE_BIAS * 10000000))
+        # Reset scalars
+        self.accel_noise_scalar.setText(f"{ACCEL_NOISE:.6f}")
+        self.gyro_noise_scalar.setText(f"{GYRO_NOISE:.6f}")
+        self.proc_angle_scalar.setText("0.001")
+        self.proc_bias_scalar.setText("0.0001")
+
+        # Reset sliders to 1.0 (fully scaled)
+        self.accel_noise_slider.setValue(1000)
+        self.gyro_noise_slider.setValue(1000)
+        self.gyro_scale_slider.setValue(8000)  # 8.0x
+        self.proc_angle_slider.setValue(0)
+        self.proc_bias_slider.setValue(0)
 
     def browse_file(self):
         """Open file dialog to select CSV file"""
