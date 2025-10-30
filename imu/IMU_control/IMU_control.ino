@@ -4,6 +4,7 @@
 
   Reads IMU sensors at native rates:
   - LSM303 Accelerometer: ~1265 Hz
+  - LSM303 Magnetometer: ~220 Hz
   - L3GD20 Gyroscope: ~759 Hz
 
   USB (Teensy ↔ PC): Native USB speed (no baud limit)
@@ -15,10 +16,12 @@
 
 // ===== I2C ADDRESSES =====
 #define LSM303_ACCEL_ADDR 0x19
+#define LSM303_MAG_ADDR   0x1E
 #define L3GD20_ADDR       0x6B
 
 // ===== REGISTER ADDRESSES =====
 #define LSM303_OUT_X_L_A  0x28
+#define LSM303_OUT_X_H_M  0x03
 #define L3GD20_OUT_X_L    0x28
 
 // ===== HARDWARE INTERFACES =====
@@ -30,18 +33,23 @@ MicroMaestro maestro(MAESTRO_SERIAL);
 // ===== IMU DATA BUFFERS =====
 int16_t accelData[3];
 int16_t gyroData[3];
+int16_t magData[3];
 
 // ===== IMU TIMING =====
 unsigned long lastAccelTime = 0;
 unsigned long lastGyroTime = 0;
+unsigned long lastMagTime = 0;
 unsigned long accelCount = 0;
 unsigned long gyroCount = 0;
+unsigned long magCount = 0;
 unsigned long accelStartTime = 0;
 unsigned long gyroStartTime = 0;
+unsigned long magStartTime = 0;
 
 // Target intervals for native rates
 const unsigned long ACCEL_INTERVAL_US = 744;   // ~1344 Hz target
 const unsigned long GYRO_INTERVAL_US = 1250;   // ~800 Hz target
+const unsigned long MAG_INTERVAL_US = 4545;    // ~220 Hz target
 
 // Rate reporting
 unsigned long lastRateReport = 0;
@@ -114,6 +122,10 @@ void setup() {
   // Configure accelerometer: 1344 Hz
   writeRegister(LSM303_ACCEL_ADDR, 0x20, 0x97);
 
+  // Configure magnetometer: 220 Hz, continuous mode
+  writeRegister(LSM303_MAG_ADDR, 0x00, 0x1C);  // CRA_REG_M: 220 Hz
+  writeRegister(LSM303_MAG_ADDR, 0x02, 0x00);  // MR_REG_M: Continuous conversion
+
   // Configure gyroscope: 800 Hz
   writeRegister(L3GD20_ADDR, 0x20, 0xFF);
 
@@ -128,10 +140,12 @@ void setup() {
   USB_SERIAL.println("READY:IMU + Servo control online");
   USB_SERIAL.println("FORMAT:A:timestamp_us,ax,ay,az");
   USB_SERIAL.println("FORMAT:G:timestamp_us,gx,gy,gz");
+  USB_SERIAL.println("FORMAT:M:timestamp_us,mx,my,mz");
 
   startTime = millis();
   accelStartTime = micros();
   gyroStartTime = micros();
+  magStartTime = micros();
   lastRateReport = micros();
 
   // Clear buffers
@@ -162,18 +176,30 @@ void loop() {
     gyroCount++;
   }
 
+  // Read magnetometer at ~220 Hz
+  if (now - lastMagTime >= MAG_INTERVAL_US) {
+    readMag();
+    sendMag(now);
+    lastMagTime = now;
+    magCount++;
+  }
+
   // Report sampling rates every 2 seconds
   if (now - lastRateReport >= RATE_REPORT_INTERVAL) {
     unsigned long accelElapsed = now - accelStartTime;
     unsigned long gyroElapsed = now - gyroStartTime;
+    unsigned long magElapsed = now - magStartTime;
 
     float accelHz = (accelCount * 1000000.0) / accelElapsed;
     float gyroHz = (gyroCount * 1000000.0) / gyroElapsed;
+    float magHz = (magCount * 1000000.0) / magElapsed;
 
     USB_SERIAL.print("RATE:Accel=");
     USB_SERIAL.print(accelHz, 2);
     USB_SERIAL.print(",Gyro=");
     USB_SERIAL.print(gyroHz, 2);
+    USB_SERIAL.print(",Mag=");
+    USB_SERIAL.print(magHz, 2);
     USB_SERIAL.println(" Hz");
 
     lastRateReport = now;
@@ -264,6 +290,37 @@ void sendGyro(unsigned long timestamp_us) {
   USB_SERIAL.print(gyroData[1]);
   USB_SERIAL.print(",");
   USB_SERIAL.println(gyroData[2]);
+}
+
+void readMag() {
+  Wire.beginTransmission(LSM303_MAG_ADDR);
+  Wire.write(LSM303_OUT_X_H_M); // Start at X high byte (no auto-increment needed for mag)
+  Wire.endTransmission();
+
+  Wire.requestFrom(LSM303_MAG_ADDR, 6);
+
+  // Magnetometer stores data as big-endian (MSB first)
+  uint8_t xhi = Wire.read();
+  uint8_t xlo = Wire.read();
+  uint8_t zhi = Wire.read();  // Note: Z comes before Y in LSM303
+  uint8_t zlo = Wire.read();
+  uint8_t yhi = Wire.read();
+  uint8_t ylo = Wire.read();
+
+  magData[0] = (int16_t)(xhi << 8 | xlo);
+  magData[1] = (int16_t)(yhi << 8 | ylo);
+  magData[2] = (int16_t)(zhi << 8 | zlo);
+}
+
+void sendMag(unsigned long timestamp_us) {
+  USB_SERIAL.print("M:");
+  USB_SERIAL.print(timestamp_us);
+  USB_SERIAL.print(",");
+  USB_SERIAL.print(magData[0]);
+  USB_SERIAL.print(",");
+  USB_SERIAL.print(magData[1]);
+  USB_SERIAL.print(",");
+  USB_SERIAL.println(magData[2]);
 }
 
 // ===== NON-BLOCKING SERIAL COMMAND PROCESSING =====
@@ -402,6 +459,7 @@ void sendPerformanceStats() {
 
   float accelHz = (accelCount * 1000000.0) / (now - accelStartTime);
   float gyroHz = (gyroCount * 1000000.0) / (now - gyroStartTime);
+  float magHz = (magCount * 1000000.0) / (now - magStartTime);
 
   USB_SERIAL.println();
   USB_SERIAL.println("======== IMU PERFORMANCE STATS ========");
@@ -419,6 +477,12 @@ void sendPerformanceStats() {
   USB_SERIAL.print(gyroCount);
   USB_SERIAL.print(" (");
   USB_SERIAL.print(gyroHz, 2);
+  USB_SERIAL.println(" Hz)");
+
+  USB_SERIAL.print("Mag samples: ");
+  USB_SERIAL.print(magCount);
+  USB_SERIAL.print(" (");
+  USB_SERIAL.print(magHz, 2);
   USB_SERIAL.println(" Hz)");
 
   USB_SERIAL.print("Servo cmds: ");
