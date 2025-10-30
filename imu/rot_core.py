@@ -3,14 +3,15 @@
 Real-time IMU Orientation Tracking
 
 Live version of plot_data.py - streams IMU data and shows orientation estimates
-in real-time with interactive parameter tuning and active platform compensation.
+in real-time with interactive parameter tuning and optional active platform compensation.
 
 Features:
 - 10-second startup calibration phase to measure gyroscope bias and gravity vector
 - Real-time Kalman filter for roll (RX) and pitch (RY) estimation
-- Active compensation: sends servo commands to cancel platform rotations
+- Optional active compensation: sends servo commands to cancel platform rotations
 - Live parameter tuning sliders
 - Axis transformation controls
+- Toggleable servo control for testing at home without platform
 
 Calibration Phase:
 - Collects 10 seconds of stationary IMU data at startup
@@ -18,8 +19,15 @@ Calibration Phase:
 - Establishes gravity vector from mean accelerometer readings
 - Initializes Kalman filter with measured values for drift compensation
 
+Compatible Arduino sketches:
+- IMU_control.ino (with servo control)
+- IMU_standalone.ino (without servos, for home testing)
+
 Usage:
     python rot_core.py --port COM4
+
+    Enable "Send Servo Commands" checkbox to actually control platform.
+    Leave unchecked for visualization-only mode (no servos needed).
 """
 
 import sys
@@ -52,14 +60,14 @@ pg.setConfigOption('antialias', True)
 # Default parameters
 ACCEL_NOISE = 1.0
 GYRO_NOISE = 0.0224
-PROCESS_NOISE_ANGLE = 0.0
-PROCESS_NOISE_BIAS = 0.0
+PROCESS_NOISE_ANGLE = 0.001
+PROCESS_NOISE_BIAS = 0.00001
 GYRO_BIAS_X = 0.112679
 GYRO_BIAS_Y = 0.031500
 
 # Axis transformations (default: no inversions)
-ACCEL_AXIS_FLIP = np.array([1, 1, 1])
-GYRO_AXIS_FLIP = np.array([1, 1, 1])
+ACCEL_AXIS_FLIP = np.array([1, 1, -1])
+GYRO_AXIS_FLIP = np.array([1, 1, -1])
 ACCEL_ROTATION = np.eye(3)
 GYRO_ROTATION = np.eye(3)
 
@@ -117,13 +125,14 @@ class RealtimeOrientationWindow(QMainWindow):
         self.servo_interval = 1.0 / 100.0  # 100 Hz
         self.compensation_gain = 1.0  # Full compensation
 
-        # Calibration phase
-        self.calibrating = True
+        # Initialization and calibration phases
+        self.initializing = True
+        self.initialization_duration = 3.0  # 3 seconds to let sensors stabilize
+        self.initialization_start_time = None
+        self.calibrating = False  # Will start after initialization
         self.calibration_duration = 10.0  # 10 seconds calibration
         self.calibration_start_time = None
-        self.calibration_accel_samples = []
-        self.calibration_gyro_samples = []
-        self.calibration_mag_samples = []
+        self.calibration_samples = []  # Store all samples with timestamps and type
         self.calibrated_gravity_vector = None
         self.calibrated_gyro_bias = None
         self.calibrated_mag_offset = None
@@ -232,7 +241,7 @@ class RealtimeOrientationWindow(QMainWindow):
         self.proc_angle_slider = QSlider(Qt.Orientation.Horizontal)
         self.proc_angle_slider.setMinimum(0)
         self.proc_angle_slider.setMaximum(1000)
-        self.proc_angle_slider.setValue(0)
+        self.proc_angle_slider.setValue(1000)
         self.proc_angle_slider.valueChanged.connect(self.schedule_param_update)
         params_layout.addWidget(self.proc_angle_slider, 3, 2)
         self.proc_angle_label = QLabel("0.000")
@@ -247,7 +256,7 @@ class RealtimeOrientationWindow(QMainWindow):
         self.proc_bias_slider = QSlider(Qt.Orientation.Horizontal)
         self.proc_bias_slider.setMinimum(0)
         self.proc_bias_slider.setMaximum(1000)
-        self.proc_bias_slider.setValue(0)
+        self.proc_bias_slider.setValue(1000)
         self.proc_bias_slider.valueChanged.connect(self.schedule_param_update)
         params_layout.addWidget(self.proc_bias_slider, 4, 2)
         self.proc_bias_label = QLabel("0.000")
@@ -261,6 +270,11 @@ class RealtimeOrientationWindow(QMainWindow):
         self.enable_gyro_checkbox = QCheckBox("Enable Gyro Predictions")
         self.enable_gyro_checkbox.setChecked(True)
         params_layout.addWidget(self.enable_gyro_checkbox, 5, 2, 1, 2)
+
+        # Enable servo commands
+        self.enable_servo_checkbox = QCheckBox("Send Servo Commands")
+        self.enable_servo_checkbox.setChecked(False)  # Default OFF for safety
+        params_layout.addWidget(self.enable_servo_checkbox, 6, 0, 1, 4)
 
         controls_layout.addWidget(params_group)
 
@@ -473,8 +487,26 @@ class RealtimeOrientationWindow(QMainWindow):
         update_hz = self.update_count / uptime if uptime > 0 else 0
         servo_hz = self.servo_command_count / uptime if uptime > 0 else 0
 
+        # Check if still initializing
+        if self.initializing:
+            if self.initialization_start_time is None:
+                self.initialization_start_time = time.time()
+            initialization_remaining = self.initialization_duration - (time.time() - self.initialization_start_time)
+
+            if initialization_remaining <= 0:
+                # Initialization complete - start calibration
+                self.initializing = False
+                self.calibrating = True
+                self.calibration_start_time = time.time()
+                print("\nInitialization complete - Starting calibration...")
+            else:
+                # Show initialization progress
+                self.status_label.setText(
+                    f"INITIALIZING... {initialization_remaining:.1f}s remaining (sensors stabilizing)"
+                )
+
         # Check if still calibrating
-        if self.calibrating:
+        elif self.calibrating:
             if self.calibration_start_time is None:
                 self.calibration_start_time = time.time()
             calibration_remaining = self.calibration_duration - (time.time() - self.calibration_start_time)
@@ -483,21 +515,24 @@ class RealtimeOrientationWindow(QMainWindow):
                 # Calibration complete - process data
                 self.process_calibration_data()
                 self.calibrating = False
-                print("\nCalibration complete - Starting active compensation")
+                print("\nCalibration complete")
             else:
                 # Show calibration progress
-                accel_samples = len(self.calibration_accel_samples)
-                gyro_samples = len(self.calibration_gyro_samples)
-                mag_samples = len(self.calibration_mag_samples)
+                # Count sample types
+                accel_samples = sum(1 for s in self.calibration_samples if s[0] == 'A')
+                gyro_samples = sum(1 for s in self.calibration_samples if s[0] == 'G')
+                mag_samples = sum(1 for s in self.calibration_samples if s[0] == 'M')
                 self.status_label.setText(
                     f"CALIBRATING... {calibration_remaining:.1f}s remaining | "
                     f"Samples: Accel={accel_samples} Gyro={gyro_samples} Mag={mag_samples}"
                 )
         else:
+            servo_status = "[ON]" if self.enable_servo_checkbox.isChecked() else "[OFF]"
             self.status_label.setText(
                 f"IMU: rx={self.current_rx_imu:+6.2f}° ry={self.current_ry_imu:+6.2f}° | "
                 f"Comp: rx={self.current_rx_cmd:+6.2f}° ry={self.current_ry_cmd:+6.2f}° | "
-                f"Gyro:{gyro_hz:.0f}Hz Accel:{accel_hz:.0f}Hz Mag:{mag_hz:.0f}Hz Servo:{servo_hz:.0f}Hz"
+                f"Servos:{servo_status} | "
+                f"Gyro:{gyro_hz:.0f}Hz Accel:{accel_hz:.0f}Hz Mag:{mag_hz:.0f}Hz"
             )
 
         # Update plots
@@ -516,24 +551,30 @@ class RealtimeOrientationWindow(QMainWindow):
             self.curve_mag_z.setData(time_relative, np.array(self.mag_z_history))
 
     def connect(self):
-        """Connect to Teensy"""
+        """Connect to Arduino/Teensy"""
         try:
-            print(f"Connecting to {self.port} at {self.baudrate} baud...")
+            print(f"Connecting to {self.port}...")
             self.serial = serial.Serial(self.port, self.baudrate, timeout=0.1)
             time.sleep(2.5)
 
-            # Read startup
+            # Clear startup messages (don't print them)
             start_wait = time.time()
+            init_found = False
             while time.time() - start_wait < 2.0:
                 if self.serial.in_waiting:
                     try:
                         line = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                        if line and not line.startswith("A:") and not line.startswith("G:"):
-                            print(f"  Teensy: {line}")
+                        # Only check if we got READY or INIT message
+                        if line.startswith("READY:") or line.startswith("INIT:"):
+                            init_found = True
                     except:
                         pass
 
-            print("Connected successfully\n")
+            if init_found:
+                print("Connected successfully")
+            else:
+                print("Connected (no startup message received)")
+
             return True
 
         except Exception as e:
@@ -621,34 +662,49 @@ class RealtimeOrientationWindow(QMainWindow):
         """Process IMU data through filter"""
         latest_accel = None
         latest_mag = None
-        enable_accel = self.enable_accel_checkbox.isChecked()
-        enable_gyro = self.enable_gyro_checkbox.isChecked()
 
         while self.running:
             try:
-                # During calibration: collect ALL samples from all queues independently
+                # During initialization: drain queues but don't save (let sensors stabilize)
+                if self.initializing:
+                    # Drain all queues without saving
+                    while not self.accel_queue.empty():
+                        self.accel_queue.get_nowait()
+                    while not self.gyro_queue.empty():
+                        self.gyro_queue.get_nowait()
+                    while not self.mag_queue.empty():
+                        self.mag_queue.get_nowait()
+
+                    time.sleep(0.001)
+                    continue  # Skip filter processing during initialization
+
+                # During calibration: collect ALL samples with timestamps
                 if self.calibrating:
                     # Collect all accelerometer samples
                     while not self.accel_queue.empty():
-                        _, accel_raw = self.accel_queue.get_nowait()
-                        self.calibration_accel_samples.append(accel_raw.copy())
+                        timestamp_us, accel_raw = self.accel_queue.get_nowait()
+                        self.calibration_samples.append(('A', timestamp_us, accel_raw.copy()))
                         latest_accel = accel_raw
 
                     # Collect all gyroscope samples
                     while not self.gyro_queue.empty():
-                        _, gyro_raw = self.gyro_queue.get_nowait()
-                        self.calibration_gyro_samples.append(gyro_raw.copy())
+                        timestamp_us, gyro_raw = self.gyro_queue.get_nowait()
+                        self.calibration_samples.append(('G', timestamp_us, gyro_raw.copy()))
 
                     # Collect all magnetometer samples
                     while not self.mag_queue.empty():
-                        _, mag_raw = self.mag_queue.get_nowait()
-                        self.calibration_mag_samples.append(mag_raw.copy())
+                        timestamp_us, mag_raw = self.mag_queue.get_nowait()
+                        self.calibration_samples.append(('M', timestamp_us, mag_raw.copy()))
                         self.current_mag_x = mag_raw[0]
                         self.current_mag_y = mag_raw[1]
                         self.current_mag_z = mag_raw[2]
 
                     time.sleep(0.001)
                     continue  # Skip filter processing during calibration
+
+                # Get checkbox states
+                enable_accel = self.enable_accel_checkbox.isChecked()
+                enable_gyro = self.enable_gyro_checkbox.isChecked()
 
                 # Normal operation: Process magnetometer queue (for display only)
                 while not self.mag_queue.empty():
@@ -658,16 +714,15 @@ class RealtimeOrientationWindow(QMainWindow):
                     self.current_mag_y = mag_raw[1]
                     self.current_mag_z = mag_raw[2]
 
-                # Process gyro
+                # Process accel queue (get latest accel for each gyro sample)
+                while not self.accel_queue.empty():
+                    _, latest_accel = self.accel_queue.get_nowait()
+
+                # Process gyro - this drives the filter updates
                 while not self.gyro_queue.empty():
                     timestamp_us, gyro_raw = self.gyro_queue.get_nowait()
 
-                    # Get latest accel
-                    while not self.accel_queue.empty():
-                        _, latest_accel = self.accel_queue.get_nowait()
-
                     if latest_accel is not None:
-
                         # Calculate dt
                         current_time = time.time()
                         if self.last_update_time is not None:
@@ -727,17 +782,37 @@ class RealtimeOrientationWindow(QMainWindow):
         # Start plot timer
         self.plot_timer.start()
 
-        print("Real-time orientation tracking started")
+        print("IMU tracking started - Initializing sensors (3s) then calibrating (10s)...")
 
     def process_calibration_data(self):
         """Process collected calibration data to extract biases and gravity vector"""
-        if len(self.calibration_accel_samples) == 0 or len(self.calibration_gyro_samples) == 0:
+        if len(self.calibration_samples) == 0:
             print("WARNING: No calibration data collected!")
             return
 
-        # Convert lists to arrays
-        accel_samples = np.array(self.calibration_accel_samples)
-        gyro_samples = np.array(self.calibration_gyro_samples)
+        # Sort all samples by timestamp (like data_logger.py)
+        self.calibration_samples.sort(key=lambda x: x[1])
+
+        # Separate by sensor type
+        accel_samples = []
+        gyro_samples = []
+        mag_samples = []
+
+        for sample_type, timestamp_us, data in self.calibration_samples:
+            if sample_type == 'A':
+                accel_samples.append(data)
+            elif sample_type == 'G':
+                gyro_samples.append(data)
+            elif sample_type == 'M':
+                mag_samples.append(data)
+
+        if len(accel_samples) == 0 or len(gyro_samples) == 0:
+            print("WARNING: Missing accel or gyro data!")
+            return
+
+        # Convert to arrays
+        accel_samples = np.array(accel_samples)
+        gyro_samples = np.array(gyro_samples)
 
         # Calculate mean raw values
         accel_mean_raw = np.mean(accel_samples, axis=0)
@@ -745,7 +820,8 @@ class RealtimeOrientationWindow(QMainWindow):
 
         # Convert to physical units (same scaling as in OrientationKalmanFilter)
         accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
-        gyro_scale = 0.00875 * np.pi / 180 * 6.6  # L3GD20: 8.75 mdps/LSB * 6.6x -> rad/s
+        gyro_scale_mult = self.gyro_scale_slider.value() / 1000
+        gyro_scale = 0.00875 * np.pi / 180 * gyro_scale_mult  # L3GD20: 8.75 mdps/LSB -> rad/s
 
         # Apply axis transformations
         from core.control_core import apply_imu_transforms
@@ -759,9 +835,9 @@ class RealtimeOrientationWindow(QMainWindow):
         self.calibrated_gyro_bias = gyro_mean_transformed
 
         # Process magnetometer data if available
-        if len(self.calibration_mag_samples) > 0:
-            mag_samples = np.array(self.calibration_mag_samples)
-            mag_mean_raw = np.mean(mag_samples, axis=0)
+        if len(mag_samples) > 0:
+            mag_samples_array = np.array(mag_samples)
+            mag_mean_raw = np.mean(mag_samples_array, axis=0)
             self.calibrated_mag_offset = mag_mean_raw
 
         # Print calibration results
@@ -769,8 +845,8 @@ class RealtimeOrientationWindow(QMainWindow):
         print("CALIBRATION RESULTS")
         print("="*60)
         print(f"Samples collected: Accel={len(accel_samples)}, Gyro={len(gyro_samples)}", end="")
-        if len(self.calibration_mag_samples) > 0:
-            print(f", Mag={len(self.calibration_mag_samples)}")
+        if len(mag_samples) > 0:
+            print(f", Mag={len(mag_samples)}")
         else:
             print()
 
@@ -821,7 +897,7 @@ class RealtimeOrientationWindow(QMainWindow):
             print(f"Error reinitializing filter: {e}")
 
     def send_compensation(self):
-        """Send compensating servo commands to cancel rotation"""
+        """Calculate and optionally send compensating servo commands to cancel rotation"""
         # Don't send commands during calibration
         if self.calibrating:
             return
@@ -836,23 +912,25 @@ class RealtimeOrientationWindow(QMainWindow):
             rx_compensate = np.clip(rx_compensate, -max_angle, max_angle)
             ry_compensate = np.clip(ry_compensate, -max_angle, max_angle)
 
-            # Store commanded angles for plotting
+            # Store commanded angles for plotting (always calculate, even if not sending)
             self.current_rx_cmd = rx_compensate
             self.current_ry_cmd = ry_compensate
 
-            # Compute IK with NO translation (x=0, y=0, z=0)
-            translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
-            rotation = np.array([rx_compensate, ry_compensate, 0.0])
+            # Only compute IK and send if servo commands are enabled
+            if self.enable_servo_checkbox.isChecked():
+                # Compute IK with NO translation (x=0, y=0, z=0)
+                translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
+                rotation = np.array([rx_compensate, ry_compensate, 0.0])
 
-            servo_angles = self.ik.calculate_servo_angles(translation, rotation, use_top_surface_offset=True)
+                servo_angles = self.ik.calculate_servo_angles(translation, rotation, use_top_surface_offset=True)
 
-            if servo_angles is not None:
-                # Send command
-                cmd = ','.join([f"{angle:.2f}" for angle in servo_angles]) + '\n'
+                if servo_angles is not None:
+                    # Send command
+                    cmd = ','.join([f"{angle:.2f}" for angle in servo_angles]) + '\n'
 
-                if self.serial and self.serial.is_open:
-                    self.serial.write(cmd.encode('utf-8'))
-                    self.servo_command_count += 1
+                    if self.serial and self.serial.is_open:
+                        self.serial.write(cmd.encode('utf-8'))
+                        self.servo_command_count += 1
 
         except Exception as e:
             print(f"Compensation error: {e}")
