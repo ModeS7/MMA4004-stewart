@@ -25,6 +25,7 @@ import pyqtgraph as pg
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.core import StewartPlatformIK, FirstOrderServo
 from core.utils import SimulationConfig
+from core.control_core import OrientationKalmanFilter, apply_imu_transforms, GRAVITY_VECTOR, GRAVITY_MAGNITUDE
 
 # PyQtGraph dark theme configuration
 pg.setConfigOption('background', '#1e1e1e')
@@ -33,186 +34,24 @@ pg.setConfigOption('antialias', True)
 
 
 # ============================================================================
-# ORIENTATION KALMAN FILTER
+# IMU SENSOR PARAMETERS
 # ============================================================================
-
-class OrientationKalmanFilter:
-    """Extended Kalman Filter for roll and pitch estimation from IMU.
-
-    State vector: [roll, pitch, gyro_bias_x, gyro_bias_y]
-
-    Features:
-        - Automatic gravity vector zeroing at initialization
-        - Gyroscope bias estimation
-        - Removes initial gravity offset to make orientation relative
-    """
-
-    def __init__(self, accel_noise=1.0, gyro_noise=1.0, process_noise_angle=0.0, process_noise_bias=0.0,
-                 accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None,
-                 initial_bias_x=0.0, initial_bias_y=0.0, gyro_scale_multiplier=1.0):
-        # IMU scaling
-        self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
-        self.gyro_scale = 0.00875 * np.pi / 180 * gyro_scale_multiplier  # L3GD20: 8.75 mdps/LSB -> rad/s (with calibration multiplier)
-
-        # Axis transformations
-        self.accel_axis_flip = accel_axis_flip if accel_axis_flip is not None else np.array([1, 1, 1])
-        self.gyro_axis_flip = gyro_axis_flip if gyro_axis_flip is not None else np.array([1, 1, 1])
-        self.accel_rotation = accel_rotation
-        self.gyro_rotation = gyro_rotation
-
-        # Transform initial bias from raw sensor frame to transformed frame
-        # 1. Scale by gyro_scale_multiplier (since bias was measured with wrong scale)
-        # 2. Apply axis flips and rotation
-        bias_vec = np.array([initial_bias_x * gyro_scale_multiplier,
-                            initial_bias_y * gyro_scale_multiplier,
-                            0.0])
-
-        # Apply axis flip
-        bias_vec = bias_vec * self.gyro_axis_flip
-
-        # Apply rotation if provided
-        if self.gyro_rotation is not None:
-            bias_vec = bias_vec @ self.gyro_rotation.T
-
-        # State: [roll, pitch, gyro_bias_x, gyro_bias_y]
-        self.state = np.array([0.0, 0.0, bias_vec[0], bias_vec[1]])
-        self.P = np.eye(4) * 0.1
-
-        # Process noise covariance
-        self.Q = np.diag([
-            process_noise_angle,
-            process_noise_angle,
-            process_noise_bias,
-            process_noise_bias
-        ])
-
-        # Measurement noise covariance
-        self.R = np.diag([
-            accel_noise ** 2,
-            accel_noise ** 2
-        ])
-
-        self.initialized = False
-        self.initial_accel = None
-
-    def initialize(self, accel_raw):
-        """Initialize filter state from first accelerometer reading (raw LSB).
-
-        Args:
-            accel_raw: Initial acceleration measurement [LSB]
-        """
-        if not self.initialized:
-            # Apply transformations and convert to m/s²
-            accel = apply_imu_transforms(accel_raw, self.accel_axis_flip, self.accel_rotation, self.accel_scale)
-            ax, ay, az = accel
-
-            # Validate gravity magnitude
-            gravity_mag = np.linalg.norm(accel)
-            expected_gravity = GRAVITY_MAGNITUDE
-            gravity_error = abs(gravity_mag - expected_gravity)
-            if gravity_error > 1.0:  # More than 1 m/s² error
-                print(f"WARNING: Measured gravity magnitude {gravity_mag:.2f} differs from expected {expected_gravity:.2f} by {gravity_error:.2f} m/s²")
-
-            roll0 = np.arctan2(ay, az)
-            pitch0 = np.arctan2(-ax, np.sqrt(ay ** 2 + az ** 2))
-
-            self.state[0] = roll0
-            self.state[1] = pitch0
-            self.initial_accel = accel.copy()
-            self.initialized = True
-
-    def predict(self, gyro_raw, dt):
-        """Prediction step using gyroscope measurements (raw LSB).
-
-        Args:
-            gyro_raw: Angular velocity measurement [LSB]
-            dt: Time step [s]
-        """
-        # Apply transformations and convert to rad/s
-        gyro = apply_imu_transforms(gyro_raw, self.gyro_axis_flip, self.gyro_rotation, self.gyro_scale)
-        gx, gy = gyro[0], gyro[1]
-
-        # Bias-corrected angular velocity
-        gx_corrected = gx - self.state[2]
-        gy_corrected = gy - self.state[3]
-
-        # State propagation
-        self.state[0] += gx_corrected * dt
-        self.state[1] += gy_corrected * dt
-
-        # Jacobian of state transition
-        F = np.array([
-            [1, 0, -dt, 0],
-            [0, 1, 0, -dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
-
-        # Covariance propagation
-        self.P = F @ self.P @ F.T + self.Q
-
-    def update(self, accel_raw):
-        """Update step using accelerometer measurements (raw LSB).
-
-        Args:
-            accel_raw: Acceleration measurement [LSB]
-        """
-        # Apply transformations and convert to m/s²
-        accel = apply_imu_transforms(accel_raw, self.accel_axis_flip, self.accel_rotation, self.accel_scale)
-        ax, ay, az = accel
-
-        # Tilt angles from accelerometer
-        roll_meas = np.arctan2(ay, az)
-        pitch_meas = np.arctan2(-ax, np.sqrt(ay ** 2 + az ** 2))
-
-        # Remove initial gravity offset (KEY: makes orientation relative to start)
-        if self.initial_accel is not None:
-            roll_init = np.arctan2(self.initial_accel[1], self.initial_accel[2])
-            pitch_init = np.arctan2(-self.initial_accel[0],
-                                    np.sqrt(self.initial_accel[1] ** 2 + self.initial_accel[2] ** 2))
-            roll_meas -= roll_init
-            pitch_meas -= pitch_init
-
-        z = np.array([roll_meas, pitch_meas])
-
-        # Measurement matrix
-        H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ])
-
-        # Innovation
-        y = z - H @ self.state
-        S = H @ self.P @ H.T + self.R
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        # State and covariance update
-        self.state = self.state + K @ y
-        self.P = (np.eye(4) - K @ H) @ self.P
-
-    def get_orientation(self):
-        """Return current orientation estimate.
-
-        Returns:
-            Tuple of (roll, pitch) in radians
-        """
-        return self.state[0], self.state[1]
-
 
 # LSM303DLHC Accelerometer: ±2g range, 12-bit resolution
 ACCEL_SENSITIVITY = 1000.0  # LSB/g (1 mg/LSB)
 ACCEL_SCALE = 0.001 * 9.81  # 1 mg/LSB → m/s²
 
 # L3GD20H Gyroscope configuration
-# Base sensitivity: 8.75 mdps/LSB (±245 dps range)
-# If configured for ±2000 dps: 70 mdps/LSB (use 8x multiplier)
+# Base sensitivity: 8.75 mdps/LSB (±245 dps range - default, no CTRL_REG4 config in firmware)
+# Empirically calibrated multiplier: 6.6x (verified with ±30° step rotations in RX/RY)
+# Effective sensitivity: 8.75 × 6.6 = 57.75 mdps/LSB
 GYRO_SENSITIVITY = 1.0 / 0.00875  # LSB/(°/s) = 114.29 (±245 dps)
-GYRO_SCALE = 0.00875 * np.pi / 180  # 8.75 mdps/LSB → rad/s (multiply by 8 for ±2000 dps)
+GYRO_SCALE = 0.00875 * np.pi / 180  # 8.75 mdps/LSB → rad/s (multiply by 6.6 empirically calibrated)
 
 # Kalman Filter Configuration (measured from stationary IMU data)
 # Accelerometer noise (m/s²): X=0.0686, Y=0.0672, Z=0.0924
 # Using RMS of X,Y for tilt measurement: sqrt((0.0686² + 0.0672²)/2) ≈ 0.0679
-ACCEL_NOISE = 0.0679  # m/s² - RMS of X,Y accelerometer noise
+ACCEL_NOISE = 1.0 #0.0679  # m/s² - RMS of X,Y accelerometer noise
 
 # Gyroscope noise (rad/s) - base measurement (will be scaled by gyro_scale_multiplier)
 # Raw measurements: X=0.021750, Y=0.023157, Z=0.006303
@@ -226,10 +65,6 @@ PROCESS_NOISE_BIAS = 0.0    # Slow bias adaptation
 # These values are automatically scaled by gyro_scale_multiplier and transformed by axis flips/rotations
 GYRO_BIAS_X = 0.112679  # rad/s (X-axis mean from stationary data, base value)
 GYRO_BIAS_Y = 0.031500  # rad/s (Y-axis mean from stationary data, base value)
-
-# Measured gravity vector (m/s²) - from stationary data
-GRAVITY_VECTOR = np.array([-0.2725, -0.1496, -9.8283])
-GRAVITY_MAGNITUDE = np.linalg.norm(GRAVITY_VECTOR)  # 9.8332 m/s² (slightly above nominal 9.81)
 
 # IMU Axis Transformation Configuration
 ACCEL_AXIS_FLIP = np.array([-1, 1, -1])  # Axis orientation correction
@@ -247,40 +82,6 @@ GYRO_ROTATION = np.array([
     [0, 1, 0],
     [0, 0, 1]
 ])
-
-
-# ============================================================================
-# IMU DATA TRANSFORMATION
-# ============================================================================
-
-def apply_imu_transforms(raw_data, axis_flip, rotation_matrix, scale):
-    """Apply axis flip, rotation, and scaling to raw IMU data.
-
-    Args:
-        raw_data: Raw sensor values [LSB] (can be single sample or array)
-        axis_flip: Axis orientation multipliers [±1, ±1, ±1]
-        rotation_matrix: 3x3 rotation matrix or None
-        scale: Scaling factor to convert to physical units
-
-    Returns:
-        Transformed data in physical units
-    """
-    # Handle both single samples and arrays
-    is_single = (raw_data.ndim == 1)
-    data = raw_data.reshape(1, -1) if is_single else raw_data
-
-    # Apply scaling
-    scaled = data * scale
-
-    # Apply axis flip
-    scaled = scaled * axis_flip
-
-    # Apply rotation if provided
-    if rotation_matrix is not None:
-        scaled = scaled @ rotation_matrix.T
-
-    return scaled[0] if is_single else scaled
-
 
 # ============================================================================
 # DATA LOADING AND CONVERSION
@@ -441,10 +242,14 @@ def run_kalman_filter(accel_df, gyro_df, all_data, accel_noise, gyro_noise, proc
             accel_est_idx += 1
 
         else:
-            # Gyroscope prediction (skip if disabled)
+            # Gyroscope prediction
+            gyro_raw = np.array([row['x'], row['y'], row['z']])
             if enable_gyro_predictions:
-                gyro_raw = np.array([row['x'], row['y'], row['z']])
                 kalman.predict(gyro_raw, dt)
+            else:
+                # Still predict with zero gyro to propagate covariance
+                # This keeps the filter responsive to parameter changes
+                kalman.predict(np.zeros(3), dt)
 
         prev_time = current_time
 
@@ -814,10 +619,10 @@ class IMUPlotWindow(QMainWindow):
         self.gyro_scale_slider = QSlider(Qt.Orientation.Horizontal)
         self.gyro_scale_slider.setMinimum(1)
         self.gyro_scale_slider.setMaximum(10000)
-        self.gyro_scale_slider.setValue(8000)  # 8.0x default
+        self.gyro_scale_slider.setValue(6600)  # 6.6x empirically calibrated
         self.gyro_scale_slider.valueChanged.connect(self.schedule_update)
         params_layout.addWidget(self.gyro_scale_slider, 2, 2)
-        self.gyro_scale_label = QLabel("8.000x")
+        self.gyro_scale_label = QLabel("6.600x")
         params_layout.addWidget(self.gyro_scale_label, 2, 3)
 
         # Process noise angle slider (0-1 normalized with scalar)
@@ -1246,7 +1051,7 @@ class IMUPlotWindow(QMainWindow):
         # Reset sliders to 1.0 (fully scaled)
         self.accel_noise_slider.setValue(1000)
         self.gyro_noise_slider.setValue(1000)
-        self.gyro_scale_slider.setValue(8000)  # 8.0x
+        self.gyro_scale_slider.setValue(6600)  # 6.6x empirically calibrated
         self.proc_angle_slider.setValue(0)
         self.proc_bias_slider.setValue(0)
 
