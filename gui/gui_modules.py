@@ -687,9 +687,10 @@ class DebugLogModule(GUIModule):
 class SerialConnectionModule(GUIModule):
     """Serial port connection for hardware."""
 
-    def __init__(self, parent, colors, callbacks, port_var):
+    def __init__(self, parent, colors, callbacks, port_var, connected_var=False):
         super().__init__(parent, colors, callbacks)
         self.port_var = port_var
+        self.connected_var = connected_var
         self.port_combo = None
         self.port_status_label = None
 
@@ -737,6 +738,10 @@ class SerialConnectionModule(GUIModule):
 
         self._refresh_ports()
 
+        # Set initial connection state if already connected
+        if self.connected_var:
+            self.update({'connected': True})
+
         group.setLayout(layout)
         self.widget = group
         return self.widget
@@ -778,10 +783,10 @@ class SerialConnectionModule(GUIModule):
 
 
 class PerformanceStatsModule(GUIModule):
-    """Performance statistics for 100Hz hardware mode."""
+    """Performance statistics for hardware mode."""
 
     def create(self):
-        group = QGroupBox("100Hz MODE")
+        self.group = QGroupBox("Hardware Mode")
         layout = QVBoxLayout()
 
         self.fps_label = QLabel("Control Loop: 0 Hz")
@@ -803,13 +808,16 @@ class PerformanceStatsModule(GUIModule):
         stats_btn.clicked.connect(self.callbacks.get('show_stats'))
         layout.addWidget(stats_btn)
 
-        group.setLayout(layout)
-        self.widget = group
+        self.group.setLayout(layout)
+        self.widget = self.group
         return self.widget
 
     def update(self, state):
-        if 'fps' in state:
-            self.fps_label.setText(f"Control: {state['fps']:.1f} Hz")
+        # Accept both 'frequency' and 'fps' keys
+        freq = state.get('frequency', state.get('fps', 0))
+        if freq > 0:
+            self.fps_label.setText(f"Control: {freq:.0f} Hz")
+            self.group.setTitle(f"{freq:.0f}Hz Mode")
 
         if 'cache_hit_rate' in state:
             self.cache_label.setText(f"IK Cache: {state['cache_hit_rate'] * 100:.1f}%")
