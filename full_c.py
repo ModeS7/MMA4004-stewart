@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Comprehensive Stewart Platform Controller
-Unified interface supporting all features from PID_sim, LQR_sim, PID_real, LQR_real
+Stewart Platform Controller
 
-Inherits from BaseStewartSimulator and adds:
+Full-featured controller supporting multiple operation modes and control strategies.
+
+Features:
 - Mode switching: Simulation / Hardware
-- Controller switching: PID / LQR / Manual
-- Conditional GUI module loading based on mode and controller
+- Controller types: PID / LQR / Manual
+- IMU tilt correction and calibration
+- Kalman filtering for state estimation
+- Dynamic GUI configuration
 """
 
 import sys
@@ -34,8 +37,8 @@ from core.utils import IKZOptimizationConfig, MAX_TILT_ANGLE_DEG
 DEFAULT_HW_FREQUENCY_HZ = 250
 
 
-class ComprehensiveStewartController(BaseStewartSimulator):
-    """Comprehensive unified Stewart Platform controller with all features."""
+class StewartController(BaseStewartSimulator):
+    """Stewart Platform controller with full feature set."""
 
     def __init__(self, app):
         # Mode selection
@@ -53,15 +56,14 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.control_interval = 1.0 / DEFAULT_HW_FREQUENCY_HZ
         self.use_kalman_derivative = False  # PID-specific
 
-        # Pixy2 camera calibration (pixels to mm)
-        # Field of view at platform surface (calibrated for current camera distance)
-        self.pixy_width_mm = 558.0   # Was 350.0 before camera repositioning
-        self.pixy_height_mm = 424.0  # Was 266.0 before camera repositioning
-        self.pixels_to_mm_x = self.pixy_width_mm / 316.0  # = 1.766 mm/pixel
-        self.pixels_to_mm_y = self.pixy_height_mm / 208.0  # = 2.038 mm/pixel
+        # Camera calibration parameters (pixels to mm conversion)
+        self.pixy_width_mm = 558.0
+        self.pixy_height_mm = 424.0
+        self.pixels_to_mm_x = self.pixy_width_mm / 316.0  # 1.766 mm/pixel
+        self.pixels_to_mm_y = self.pixy_height_mm / 208.0  # 2.038 mm/pixel
         self.last_ball_update = 0.0
-        self.ball_pos_mm = np.array([0.0, 0.0])  # Initialize to center
-        self.ball_detected = False  # Track whether ball is currently detected
+        self.ball_pos_mm = np.array([0.0, 0.0])
+        self.ball_detected = False
 
         # Performance tracking for hardware mode
         self.performance_data = {
@@ -87,14 +89,14 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             ball_physics_params=ball_physics_params,
             dt=self.control_interval
         )
-        self.kalman_enabled = False  # User enables via GUI toggle
+        self.kalman_enabled = False
 
-        # Ball history for trail visualization
+        # Ball position trail visualization
         self.ball_history_x = []
         self.ball_history_y = []
-        self.max_history = 100  # ~5 seconds at camera rate
+        self.max_history = 100
 
-        # IMU orientation tracking (defaults from rot_core.py)
+        # IMU orientation tracking parameters
         ACCEL_NOISE = 1.0
         GYRO_NOISE = 0.0224
         PROCESS_NOISE_ANGLE = 0.001
@@ -129,15 +131,15 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.current_rx_imu = 0.0
         self.current_ry_imu = 0.0
         self.imu_tilt_correction_enabled = False
-        self.imu_compensation_gain = 1.0  # Full compensation
+        self.imu_compensation_gain = 1.0
 
-        # IMU initialization and calibration
+        # IMU initialization and calibration state
         self.imu_initializing = False
-        self.initialization_duration = 3.0  # 3 seconds stabilization
+        self.initialization_duration = 3.0
         self.initialization_start_time = None
         self.initialization_time_remaining = 0.0
         self.imu_calibrating = False
-        self.calibration_duration = 10.0  # 10 seconds calibration
+        self.calibration_duration = 10.0
         self.calibration_start_time = None
         self.calibration_time_remaining = 0.0
         self.calibration_raw_data = {'gyro': [], 'accel': [], 'mag': []}
@@ -165,8 +167,8 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 return LQRControllerConfig(mode='hardware')
             else:
                 return LQRControllerConfig(mode='simulation')
-        else:  # Manual
-            # For Manual mode, use a dummy config (won't be used)
+        else:
+            # Manual mode uses default configuration
             return HardwareControllerConfig()
 
     def _initialize_controller(self):
@@ -178,7 +180,7 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         sliders = self.controller_widgets['sliders']
         scalar_vars = self.controller_widgets['scalar_vars']
 
-        # Check if sliders exist (GUI might not be built yet)
+        # Validate GUI components availability
         controller_name = self.controller_config.get_controller_name()
         if "PID" in controller_name and 'kp' not in sliders:
             self.controller = None
@@ -214,15 +216,14 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 self.log(f"LQR initialized: Q_pos={Q_pos:.2e}, Q_vel={Q_vel:.2e}, R={R:.2e}")
             except Exception as e:
                 self.log(f"LQR initialization failed: {str(e)}")
-                self.log("Try adjusting Q/R parameters")
+                self.log("Adjust Q/R parameters and retry")
                 self.controller = None
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Update controller and return control output.
 
-        Handles Kalman filter in simulation mode:
-        - When enabled: predict, update, use filtered position/velocity
-        - When disabled: use raw position, velocity = (0, 0)
+        In simulation mode, applies Kalman filtering when enabled for improved
+        state estimation. Returns platform tilt angles (rx, ry) in degrees.
         """
         if self.controller is None:
             return None
@@ -253,20 +254,18 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 ball_pos_filtered = (filtered_x, filtered_y)
                 ball_vel_filtered = (filtered_vx, filtered_vy)
             else:
-                # No Kalman filter - no velocity available
+                # Kalman filter disabled
                 ball_pos_filtered = ball_pos_mm
-                ball_vel_filtered = (0.0, 0.0)  # Zero velocity when filter disabled
+                ball_vel_filtered = (0.0, 0.0)
         else:
-            # Hardware mode: position and velocity already handled in control thread
+            # Hardware mode uses pre-processed values from control thread
             ball_pos_filtered = ball_pos_mm
             ball_vel_filtered = ball_vel_mm_s
 
         controller_name = self.controller_config.get_controller_name()
         if "PID" in controller_name:
-            # PID uses position error and dt
             rx, ry = self.controller.update(ball_pos_filtered, target_pos_mm, dt)
         elif "LQR" in controller_name:
-            # LQR uses position, velocity, and target
             rx, ry = self.controller.update(ball_pos_filtered, ball_vel_filtered, target_pos_mm)
         else:
             return None
@@ -508,10 +507,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
     # ============================================================================
 
     def connect_serial(self):
-        """Connect to hardware."""
-        # Prevent double connection
+        """Establish serial connection to hardware."""
         if self.connected and self.serial_controller is not None:
-            self.log("Already connected")
+            self.log("Connection already established")
             return
 
         if 'serial_connection' in self.gui_modules:
@@ -535,14 +533,12 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             time.sleep(0.1)
             self.serial_controller.set_servo_acceleration(0)
             time.sleep(0.2)
-            self.log("Servos: Speed=0, Accel=0")
+            self.log("Servo parameters configured: Speed=0, Acceleration=0")
 
             success_timer, msg_timer = self.timer_manager.set_high_resolution()
             self.log(msg_timer)
 
-            self.prewarm_ik_cache()
-
-            # Start IMU initialization and calibration sequence
+            self.initialize_ik_cache()
             self.start_imu_initialization()
 
             if 'simulation_control' in self.gui_modules:
@@ -573,19 +569,19 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.log("Disconnected")
 
     def start_imu_initialization(self):
-        """Start 3-second IMU initialization phase."""
+        """Begin IMU initialization sequence (3 seconds)."""
         self.imu_initializing = True
         self.initialization_start_time = time.time()
         self.initialization_time_remaining = self.initialization_duration
-        self.log("IMU initialization: 3s stabilization...")
+        self.log("IMU initialization started: stabilizing for 3 seconds")
 
     def start_imu_calibration(self):
-        """Start 10-second IMU calibration phase."""
+        """Begin IMU calibration sequence (10 seconds)."""
         self.imu_calibrating = True
         self.calibration_start_time = time.time()
         self.calibration_time_remaining = self.calibration_duration
         self.calibration_raw_data = {'gyro': [], 'accel': [], 'mag': []}
-        self.log("IMU calibration: Keep platform stationary for 10s...")
+        self.log("IMU calibration started: maintain platform stationary for 10 seconds")
 
     def finish_imu_calibration(self):
         """Process calibration data and initialize Kalman filter."""
@@ -593,7 +589,7 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         accel_data = self.calibration_raw_data['accel']
 
         if not gyro_data or not accel_data:
-            self.log("WARNING: No calibration data collected!")
+            self.log("Warning: Insufficient calibration data collected")
             self.imu_calibrating = False
             return
 
@@ -618,13 +614,13 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                                         self.orientation_kalman.gyro_rotation,
                                         gyro_scale)
 
-        # Store calibrated gravity for initialization
+        # Store calibrated gravity reference
         self.calibrated_gravity = accel_mean.copy()
 
-        # Initialize Kalman filter
+        # Initialize orientation Kalman filter
         self.orientation_kalman.initialize(accel_mean_raw, calibrated_gravity=self.calibrated_gravity)
 
-        # Check tilt
+        # Validate calibration orientation
         ax, ay, az = accel_mean
         tilt_x = np.arctan2(ay, az)
         tilt_y = np.arctan2(-ax, np.sqrt(ay**2 + az**2))
@@ -632,20 +628,20 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         tilt_y_deg = np.degrees(tilt_y)
 
         if abs(tilt_x_deg) > 5 or abs(tilt_y_deg) > 5:
-            self.log(f"WARNING: IMU tilted during calibration! RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
+            self.log(f"Warning: Platform tilted during calibration - RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
         else:
-            self.log(f"IMU level check: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}° (good)")
+            self.log(f"Platform level verified: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
 
-        self.log(f"Gyro bias [°/s]: X={np.degrees(gyro_mean[0]):.4f}, Y={np.degrees(gyro_mean[1]):.4f}")
-        self.log("IMU calibration complete!")
+        self.log(f"Gyroscope bias (deg/s): X={np.degrees(gyro_mean[0]):.4f}, Y={np.degrees(gyro_mean[1]):.4f}")
+        self.log("IMU calibration completed successfully")
         self.imu_calibrating = False
 
-    def prewarm_ik_cache(self):
-        """Pre-calculate common IK solutions."""
+    def initialize_ik_cache(self):
+        """Pre-compute common inverse kinematics solutions."""
         if not hasattr(self, 'ik_cache') or self.ik_cache is None:
             self.ik_cache = IKCache(max_size=5000)
 
-        self.log("Pre-warming IK cache...")
+        self.log("Initializing IK cache...")
         tilts = np.arange(-15, 16, 2)
         count = 0
         for rx in tilts:
@@ -657,7 +653,7 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                     self.ik_cache.put(translation, rotation, angles)
                     count += 1
 
-        self.log(f"IK cache pre-warmed: {count} poses")
+        self.log(f"IK cache initialized: {count} poses cached")
 
     def on_frequency_change(self, frequency):
         """Handle control frequency change."""
@@ -1427,10 +1423,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
 
 def main():
-    """Launch comprehensive controller."""
-
+    """Launch controller application."""
     app = QApplication(sys.argv)
-    controller = ComprehensiveStewartController(app)
+    controller = StewartController(app)
     controller.show()
     sys.exit(app.exec())
 

@@ -552,9 +552,9 @@ class RealtimeOrientationWindow(QMainWindow):
         if hasattr(self, 'kalman'):
             self.kalman.enable_rejection = enabled
             if enabled:
-                print("Motion detection ENABLED - will reject accel updates during impacts")
+                print("Motion detection enabled: accelerometer updates rejected during impacts")
             else:
-                print("Motion detection DISABLED - all accel updates accepted (may freak out on impacts!)")
+                print("Motion detection disabled: all accelerometer updates accepted")
         else:
             print("Kalman filter not yet initialized")
 
@@ -896,11 +896,11 @@ class RealtimeOrientationWindow(QMainWindow):
                         with self.calibration_lock:
                             self.calibration_raw_lines.extend(calibration_batch)
                         calibration_batch = []
-                    # Very short sleep during calibration, longer during normal operation
+                    # Adjust sleep duration based on calibration state
                     if self.calibrating:
-                        time.sleep(0.00001)  # 10 microseconds - keep reading fast!
+                        time.sleep(0.00001)  # 10 microseconds for fast calibration reading
                     else:
-                        time.sleep(0.001)  # 1ms during normal operation
+                        time.sleep(0.001)  # 1 millisecond during normal operation
 
             except Exception as e:
                 if self.running:
@@ -1032,7 +1032,7 @@ class RealtimeOrientationWindow(QMainWindow):
             raw_lines = self.calibration_raw_lines.copy()
 
         if len(raw_lines) == 0:
-            print("WARNING: No calibration data collected!")
+            print("Warning: No calibration data collected")
             return
 
         print(f"\nParsing {len(raw_lines)} calibration lines...")
@@ -1079,7 +1079,7 @@ class RealtimeOrientationWindow(QMainWindow):
                 pass  # Skip malformed lines
 
         if len(calibration_samples) == 0:
-            print("WARNING: No valid calibration samples parsed!")
+            print("Warning: No valid calibration samples parsed")
             return
 
         # Sort all samples by timestamp (like data_logger.py)
@@ -1099,7 +1099,7 @@ class RealtimeOrientationWindow(QMainWindow):
                 mag_samples.append(data)
 
         if len(accel_samples) == 0 or len(gyro_samples) == 0:
-            print("WARNING: Missing accel or gyro data!")
+            print("Warning: Missing accelerometer or gyroscope data")
             return
 
         # Convert to arrays
@@ -1154,11 +1154,11 @@ class RealtimeOrientationWindow(QMainWindow):
         max_tilt = max(abs(tilt_x_deg), abs(tilt_y_deg))
 
         if max_tilt > 5.0:
-            print(f"\n*** WARNING: IMU was tilted during calibration! ***")
-            print(f"*** Tilt: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}° ***")
-            print(f"*** This will be used as the zero reference point ***")
+            print(f"\nWarning: IMU was tilted during calibration")
+            print(f"Tilt: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
+            print(f"This orientation will be used as the zero reference point")
         else:
-            print(f"IMU level check: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}° (good)")
+            print(f"IMU level check: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
         print(f"\nGyroscope bias [rad/s]: [{gyro_mean_transformed[0]:.6f}, "
               f"{gyro_mean_transformed[1]:.6f}, {gyro_mean_transformed[2]:.6f}]")
         print(f"Gyroscope bias [°/s]: [{np.degrees(gyro_mean_transformed[0]):.4f}, "

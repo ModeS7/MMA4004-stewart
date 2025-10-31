@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Unified Stewart Platform Controller
-Supports 4 modes: PID/LQR × Simulation/Real Hardware
-Clean minimal GUI with essential controls only
+Minimal Stewart Platform Controller
+
+Lightweight controller with essential features only.
+Supports PID/LQR control in simulation and hardware modes.
 """
 
 import sys
@@ -28,8 +29,8 @@ from core.utils import MAX_TILT_ANGLE_DEG
 DEFAULT_HW_FREQUENCY_HZ = 250
 
 
-class UnifiedStewartController(BaseStewartSimulator):
-    """Unified controller with minimal GUI supporting PID/LQR and Sim/Real modes."""
+class MinimalController(BaseStewartSimulator):
+    """Lightweight controller with minimal GUI for rapid development."""
 
     def __init__(self, app):
         # Mode selection
@@ -47,15 +48,14 @@ class UnifiedStewartController(BaseStewartSimulator):
         self.control_interval = 1.0 / DEFAULT_HW_FREQUENCY_HZ
         self.use_kalman_derivative = False
 
-        # Pixy2 camera calibration (pixels to mm)
-        # Field of view at platform surface (calibrated for current camera distance)
-        self.pixy_width_mm = 558.0   # Was 350.0 before camera repositioning
-        self.pixy_height_mm = 424.0  # Was 266.0 before camera repositioning
-        self.pixels_to_mm_x = self.pixy_width_mm / 316.0  # = 1.766 mm/pixel
-        self.pixels_to_mm_y = self.pixy_height_mm / 208.0  # = 2.038 mm/pixel
+        # Camera calibration parameters (pixels to mm conversion)
+        self.pixy_width_mm = 558.0
+        self.pixy_height_mm = 424.0
+        self.pixels_to_mm_x = self.pixy_width_mm / 316.0  # 1.766 mm/pixel
+        self.pixels_to_mm_y = self.pixy_height_mm / 208.0  # 2.038 mm/pixel
         self.last_ball_update = 0.0
-        self.ball_pos_mm = np.array([0.0, 0.0])  # Initialize to center
-        self.ball_detected = False  # Track whether ball is currently detected
+        self.ball_pos_mm = np.array([0.0, 0.0])
+        self.ball_detected = False
 
         # Performance tracking
         self.performance_data = {
@@ -77,12 +77,12 @@ class UnifiedStewartController(BaseStewartSimulator):
             ball_physics_params=ball_physics_params,
             dt=self.control_interval
         )
-        self.kalman_enabled = True  # Always enabled (no GUI toggle in unified controller)
+        self.kalman_enabled = True
 
-        # Ball history for trail visualization
+        # Ball position trail visualization
         self.ball_history_x = []
         self.ball_history_y = []
-        self.max_history = 100  # ~5 seconds at camera rate
+        self.max_history = 100
 
         # Create controller config
         controller_config = self._create_controller_config()
@@ -91,7 +91,7 @@ class UnifiedStewartController(BaseStewartSimulator):
         super().__init__(app, controller_config)
 
         # Window title
-        self.setWindowTitle("Stewart Platform - Unified Controller")
+        self.setWindowTitle("Stewart Platform - Minimal Controller")
 
     def _get_controller_type(self):
         """Override to return selected controller type."""
@@ -154,14 +154,14 @@ class UnifiedStewartController(BaseStewartSimulator):
                 self.log(f"LQR initialized: Q_pos={Q_pos:.2e}, Q_vel={Q_vel:.2e}, R={R:.2e}")
             except Exception as e:
                 self.log(f"LQR initialization failed: {str(e)}")
+                self.log("Adjust Q/R parameters and retry")
                 self.controller = None
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Update controller and return control output.
 
-        Handles Kalman filter in simulation mode:
-        - When enabled: predict, update, use filtered position/velocity
-        - When disabled: use raw position, velocity = (0, 0)
+        In simulation mode, applies Kalman filtering when enabled for improved
+        state estimation. Returns platform tilt angles (rx, ry) in degrees.
         """
         if self.controller is None:
             return None
@@ -192,11 +192,11 @@ class UnifiedStewartController(BaseStewartSimulator):
                 ball_pos_filtered = (filtered_x, filtered_y)
                 ball_vel_filtered = (filtered_vx, filtered_vy)
             else:
-                # No Kalman filter - no velocity available
+                # Kalman filter disabled
                 ball_pos_filtered = ball_pos_mm
-                ball_vel_filtered = (0.0, 0.0)  # Zero velocity when filter disabled
+                ball_vel_filtered = (0.0, 0.0)
         else:
-            # Hardware mode: position and velocity already handled in control thread
+            # Hardware mode uses pre-processed values from control thread
             ball_pos_filtered = ball_pos_mm
             ball_vel_filtered = ball_vel_mm_s
 
@@ -320,9 +320,9 @@ class UnifiedStewartController(BaseStewartSimulator):
             self.disconnect_serial()
 
         self.operation_mode = mode
-        self.log(f"Mode changed to: {mode.upper()}")
+        self.log(f"Operation mode changed to: {mode.upper()}")
 
-        # Update controller config and rebuild
+        # Update configuration and rebuild GUI
         self.controller_config = self._create_controller_config()
         self._create_controller_param_widgets()
         self._rebuild_gui()
@@ -332,7 +332,7 @@ class UnifiedStewartController(BaseStewartSimulator):
         self._initialize_controller()
 
         # Update window title
-        self.setWindowTitle(f"Stewart Platform - Unified Controller [{mode.upper()}]")
+        self.setWindowTitle(f"Stewart Platform - Minimal Controller [{mode.upper()}]")
 
     def on_controller_type_change(self, controller_type):
         """Handle controller type change between PID/LQR/Manual."""
@@ -343,13 +343,13 @@ class UnifiedStewartController(BaseStewartSimulator):
         if self.simulation_running:
             self.stop_simulation()
 
-        # If controller is currently enabled, disable it before switching
+        # Disable controller before switching if currently enabled
         if self.controller_enabled:
             self.controller_enabled = False
-            self.log("Auto-disabling controller for switch")
+            self.log("Controller disabled for mode transition")
 
         self.controller_type_selection = controller_type
-        self.log(f"Controller changed to: {controller_type}")
+        self.log(f"Controller type changed to: {controller_type}")
 
         self.controller_config = self._create_controller_config()
         self._create_controller_param_widgets()
@@ -413,9 +413,9 @@ class UnifiedStewartController(BaseStewartSimulator):
     def start_simulation(self):
         """Start simulation or hardware control based on mode."""
         if self.operation_mode == 'real':
-            # Hardware mode: use control thread
+            # Hardware mode requires active connection
             if not self.connected:
-                self.log("Connect to hardware first")
+                self.log("Hardware connection required before starting")
                 return
 
             if self.simulation_running:
@@ -425,7 +425,7 @@ class UnifiedStewartController(BaseStewartSimulator):
             self.simulation_time = 0.0
 
             gc.disable()
-            self.log(f"Control started ({self.control_frequency}Hz, GC disabled)")
+            self.log(f"Control loop started: {self.control_frequency} Hz (garbage collection disabled)")
 
             self.control_thread = threading.Thread(target=self._control_thread_func, daemon=True)
             self.control_thread.start()
@@ -553,7 +553,7 @@ class UnifiedStewartController(BaseStewartSimulator):
             self.simulation_time += self.control_interval
 
     def _gui_update_loop(self):
-        """Update GUI at lower rate (10Hz) while control thread runs."""
+        """Update GUI at 10 Hz while control thread is active."""
         if not self.simulation_running:
             return
 
@@ -580,10 +580,9 @@ class UnifiedStewartController(BaseStewartSimulator):
         self.ball_trail = plot_item.plot([], [], pen=pg.mkPen(color='#ff8888', width=2, style=Qt.PenStyle.DashLine))
 
     def connect_serial(self):
-        """Connect to serial hardware."""
-        # Prevent double connection
+        """Establish serial connection to hardware."""
         if self.connected and self.serial_controller is not None:
-            self.log("Already connected")
+            self.log("Connection already established")
             return
 
         if 'serial_connection' in self.gui_modules:
@@ -607,12 +606,12 @@ class UnifiedStewartController(BaseStewartSimulator):
             time.sleep(0.1)
             self.serial_controller.set_servo_acceleration(0)
             time.sleep(0.2)
-            self.log("Servos: Speed=0, Accel=0")
+            self.log("Servo parameters configured: Speed=0, Acceleration=0")
 
             success_timer, msg_timer = self.timer_manager.set_high_resolution()
             self.log(msg_timer)
 
-            self.prewarm_ik_cache()
+            self.initialize_ik_cache()
 
             if 'simulation_control' in self.gui_modules:
                 self.gui_modules['simulation_control'].start_btn.setEnabled(True)
@@ -641,12 +640,12 @@ class UnifiedStewartController(BaseStewartSimulator):
 
         self.log("Disconnected")
 
-    def prewarm_ik_cache(self):
-        """Pre-calculate common IK solutions."""
+    def initialize_ik_cache(self):
+        """Pre-compute common inverse kinematics solutions."""
         if not hasattr(self, 'ik_cache') or self.ik_cache is None:
             self.ik_cache = IKCache(max_size=5000)
 
-        self.log("Pre-warming IK cache...")
+        self.log("Initializing IK cache...")
         tilts = np.arange(-15, 16, 2)
         count = 0
         for rx in tilts:
@@ -658,7 +657,7 @@ class UnifiedStewartController(BaseStewartSimulator):
                     self.ik_cache.put(translation, rotation, angles)
                     count += 1
 
-        self.log(f"IK cache pre-warmed: {count} poses")
+        self.log(f"IK cache initialized: {count} poses cached")
 
     def update_gui_modules(self):
         """Override to provide hardware-specific state in real mode."""
@@ -753,9 +752,9 @@ class UnifiedStewartController(BaseStewartSimulator):
 
 
 def main():
-    """Launch unified controller."""
+    """Launch minimal controller application."""
     app = QApplication(sys.argv)
-    controller = UnifiedStewartController(app)
+    controller = MinimalController(app)
     controller.show()
     sys.exit(app.exec())
 
