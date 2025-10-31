@@ -19,7 +19,7 @@ from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, P
 from core.control_core import clip_tilt_vector
 from core.utils import (
     MAX_TILT_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM,
-    SimulationConfig, format_time, format_error_context
+    SimulationConfig, IKZOptimizationConfig, format_time, format_error_context
 )
 from gui.gui_builder import GUIBuilder
 from gui import gui_modules as gm
@@ -191,14 +191,14 @@ class BaseStewartSimulator(QMainWindow):
         }
 
         self.dof_config = {
-            'x': (-30.0, 30.0, 0.1, 0.0, "X Position (mm)"),
-            'y': (-30.0, 30.0, 0.1, 0.0, "Y Position (mm)"),
-            'z': (self.ik.home_height_top_surface - 30,
-                  self.ik.home_height_top_surface + 30,
+            'x': (-115.0, 115.0, 0.1, 0.0, "X Position (mm)"),
+            'y': (-115.0, 115.0, 0.1, 0.0, "Y Position (mm)"),
+            'z': (self.ik.home_height_top_surface - 90,
+                  self.ik.home_height_top_surface + 90,
                   0.1, self.ik.home_height_top_surface, "Z Height (mm)"),
-            'rx': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Roll (°)"),
-            'ry': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Pitch (°)"),
-            'rz': (-MAX_TILT_ANGLE_DEG, MAX_TILT_ANGLE_DEG, 0.1, 0.0, "Yaw (°)")
+            'rx': (-45.0, 45.0, 0.1, 0.0, "Roll (°)"),
+            'ry': (-45.0, 45.0, 0.1, 0.0, "Pitch (°)"),
+            'rz': (-115.0, 115.0, 0.1, 0.0, "Yaw (°)")
         }
 
         self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
@@ -208,6 +208,18 @@ class BaseStewartSimulator(QMainWindow):
         self.last_cmd_angles = np.zeros(6)
         self.last_fk_translation = np.zeros(3)
         self.last_fk_rotation = np.zeros(3)
+
+        # Z optimization state
+        self.z_optimization_enabled = IKZOptimizationConfig.ENABLED
+        self.z_offset = 0.0
+        self.servo_balance = (0.0, 0.0)
+
+        # Initialize servo balance with home position
+        home_translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
+        home_rotation = np.array([0.0, 0.0, 0.0])
+        home_angles = self.ik.calculate_servo_angles(home_translation, home_rotation, True)
+        if home_angles is not None:
+            self.servo_balance = (np.max(home_angles), np.min(home_angles))
 
         self.update_timer = None
         self.simulation_timer = QTimer()
@@ -433,6 +445,7 @@ class BaseStewartSimulator(QMainWindow):
             'camera_enable_change': self.on_camera_enable_change,
             'camera_param_change': self.on_camera_param_change,
             'camera_reset': self.on_camera_reset,
+            'z_optimization_toggle': self.on_z_optimization_toggle,
             'log': self.log,
         }
 
@@ -627,6 +640,9 @@ class BaseStewartSimulator(QMainWindow):
             'actual_angles': [s.get_angle() for s in self.servos],
             'fk_translation': self.last_fk_translation,
             'fk_rotation': self.last_fk_rotation,
+            'z_optimization_enabled': self.z_optimization_enabled,
+            'z_offset': self.z_offset,
+            'servo_balance': self.servo_balance,
         }
 
         if self.controller_enabled:
@@ -764,13 +780,13 @@ class BaseStewartSimulator(QMainWindow):
         if 'manual_pose' in self.gui_modules:
             manual_pose = self.gui_modules['manual_pose']
             z_config = self.dof_config['z']
-            new_config = (home_z - 30, home_z + 30, z_config[2], home_z, z_config[4])
+            new_config = (home_z - 90, home_z + 90, z_config[2], home_z, z_config[4])
             self.dof_config['z'] = new_config
 
             slider = manual_pose.sliders['z']
             res = z_config[2]
-            slider.setMinimum(int((home_z - 30) / res))
-            slider.setMaximum(int((home_z + 30) / res))
+            slider.setMinimum(int((home_z - 90) / res))
+            slider.setMaximum(int((home_z + 90) / res))
 
         self.dof_values['z'] = home_z
 
@@ -837,32 +853,76 @@ class BaseStewartSimulator(QMainWindow):
         self.pixy_camera.reset()
         self.log("Camera reset")
 
+    def on_z_optimization_toggle(self, enabled):
+        """Handle Z optimization enable/disable."""
+        self.z_optimization_enabled = enabled
+        self.log(f"Z Optimization: {'ENABLED' if enabled else 'DISABLED'}")
+
+        # Immediately recalculate IK with new optimization setting
+        if not self.controller_enabled:  # Only in manual mode
+            self.calculate_ik()
+
     def calculate_ik(self):
         """Calculate inverse kinematics for current pose."""
         translation = np.array([self.dof_values['x'],
                                 self.dof_values['y'],
                                 self.dof_values['z']])
 
-        rx_limited, ry_limited, tilt_mag = clip_tilt_vector(
-            self.dof_values['rx'],
-            self.dof_values['ry'],
-            MAX_TILT_ANGLE_DEG
-        )
+        # In manual mode, allow full slider range (no clipping)
+        # Clipping is handled in control logic (controller + IMU compensation)
+        rotation = np.array([self.dof_values['rx'],
+                            self.dof_values['ry'],
+                            self.dof_values['rz']])
 
-        if tilt_mag > MAX_TILT_ANGLE_DEG and not self.controller_enabled:
-            self.dof_values['rx'] = rx_limited
-            self.dof_values['ry'] = ry_limited
+        # Apply Z optimization if enabled
+        if self.z_optimization_enabled:
+            # Use CURRENT Z as search center (not home Z)
+            # This allows optimization at extreme angles where home Z is invalid
+            search_translation = translation.copy()
 
-        rotation = np.array([rx_limited, ry_limited, self.dof_values['rz']])
+            optimized_translation, angles, success = self.ik.optimize_z_offset(
+                search_translation, rotation,
+                use_top_surface_offset=self.use_top_surface_offset,
+                z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
+                ik_cache=getattr(self, 'ik_cache', None)
+            )
 
-        angles = self.ik.calculate_servo_angles(translation, rotation,
-                                                self.use_top_surface_offset)
+            if success and angles is not None:
+                # Z offset from initial search position
+                self.z_offset = optimized_translation[2] - translation[2]
+                max_angle = np.max(angles)
+                min_angle = np.min(angles)
+                self.servo_balance = (max_angle, min_angle)
+                # Use optimized angles for servos (not the regular IK)
+            else:
+                # Fallback to regular IK
+                self.log(f"Z opt FAILED at rx={rotation[0]:.1f}°, ry={rotation[1]:.1f}° - using regular IK")
+                angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                        self.use_top_surface_offset)
+                if angles is not None:
+                    max_angle = np.max(angles)
+                    min_angle = np.min(angles)
+                    self.servo_balance = (max_angle, min_angle)
+                    self.z_offset = 0.0
+        else:
+            angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                    self.use_top_surface_offset)
+            if angles is not None:
+                max_angle = np.max(angles)
+                min_angle = np.min(angles)
+                self.servo_balance = (max_angle, min_angle)
+                self.z_offset = 0.0
 
         if angles is not None:
             self.last_cmd_angles = angles
             if self.simulation_running:
                 for i, servo in enumerate(self.servos):
                     servo.send_command(angles[i], self.simulation_time)
+
+        # Update GUI to reflect Z optimization changes
+        self.update_gui_modules()
 
     def start_simulation(self):
         """Start simulation loop."""
@@ -1010,8 +1070,37 @@ class BaseStewartSimulator(QMainWindow):
                                                 self.dof_values['z']])
                         rotation = np.array([rx, ry, self.dof_values['rz']])
 
-                        angles = self.ik.calculate_servo_angles(translation, rotation,
-                                                                self.use_top_surface_offset)
+                        # Apply Z optimization if enabled
+                        if self.z_optimization_enabled:
+                            optimized_translation, angles, success = self.ik.optimize_z_offset(
+                                translation, rotation,
+                                use_top_surface_offset=self.use_top_surface_offset,
+                                z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                                max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                                tolerance=IKZOptimizationConfig.TOLERANCE_DEG
+                            )
+
+                            if success and angles is not None:
+                                self.z_offset = optimized_translation[2] - translation[2]
+                                max_angle = np.max(angles)
+                                min_angle = np.min(angles)
+                                self.servo_balance = (max_angle, min_angle)
+                                translation = optimized_translation
+                            else:
+                                angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                                        self.use_top_surface_offset)
+                                if angles is not None:
+                                    max_angle = np.max(angles)
+                                    min_angle = np.min(angles)
+                                    self.servo_balance = (max_angle, min_angle)
+                        else:
+                            angles = self.ik.calculate_servo_angles(translation, rotation,
+                                                                    self.use_top_surface_offset)
+                            if angles is not None:
+                                max_angle = np.max(angles)
+                                min_angle = np.min(angles)
+                                self.servo_balance = (max_angle, min_angle)
+                                self.z_offset = 0.0
 
                         if angles is not None:
                             self.last_cmd_angles = angles

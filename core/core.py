@@ -270,6 +270,217 @@ class StewartPlatformIK:
             vx * (2 * x * z - 2 * w * y) + vy * (2 * y * z + 2 * w * x) + vz * (w * w - x * x - y * y + z * z)
         ])
 
+    def optimize_z_offset(self, translation: np.ndarray, rotation: np.ndarray,
+                          use_top_surface_offset: bool = True,
+                          z_search_range: float = 30.0,
+                          max_iterations: int = 20,
+                          tolerance: float = 0.1,
+                          verbose: bool = False,
+                          ik_cache=None) -> tuple:
+        """
+        Dynamically adjust Z position to balance servo angles around neutral (0°).
+
+        Uses Brent's method for fast convergence (typically 3-5 iterations).
+        If standard optimization fails, automatically expands search range to find
+        ANY valid Z height that allows IK to succeed.
+
+        Args:
+            translation: [x, y, z] position in mm
+            rotation: [rx, ry, rz] angles in degrees
+            use_top_surface_offset: Use top surface as reference
+            z_search_range: Maximum Z adjustment range (±mm) for initial search
+            max_iterations: Maximum optimization iterations (unused with Brent)
+            tolerance: Convergence tolerance (degrees)
+            verbose: Enable debug output
+            ik_cache: Optional IKCache instance to speed up repeated IK calculations
+
+        Returns:
+            (optimized_translation, servo_angles, success)
+        """
+        from scipy.optimize import brentq, minimize_scalar
+
+        x, y, z_initial = translation
+        z_min = z_initial - z_search_range
+        z_max = z_initial + z_search_range
+
+        # Track best solution for fallback
+        best_imbalance = float('inf')
+        best_z = z_initial
+        best_angles = None
+        samples_evaluated = 0
+
+        def imbalance_at_z(z):
+            """Compute servo angle imbalance at given Z height."""
+            nonlocal best_imbalance, best_z, best_angles, samples_evaluated
+
+            trans = np.array([x, y, z])
+
+            # Check cache first
+            if ik_cache is not None:
+                angles = ik_cache.get(trans, rotation)
+                if angles is None:
+                    # Cache miss - calculate and store
+                    angles = self.calculate_servo_angles(trans, rotation, use_top_surface_offset)
+                    if angles is not None:
+                        ik_cache.put(trans, rotation, angles)
+            else:
+                # No cache - calculate directly
+                angles = self.calculate_servo_angles(trans, rotation, use_top_surface_offset)
+
+            samples_evaluated += 1
+
+            if angles is None:
+                # IK failed - return large penalty based on direction
+                return 1e6 if z > z_initial else -1e6
+
+            max_angle = np.max(angles)
+            min_angle = np.min(angles)
+            imbalance = max_angle + min_angle
+
+            # Track best solution
+            if abs(imbalance) < abs(best_imbalance):
+                best_imbalance = imbalance
+                best_z = z
+                best_angles = angles.copy()
+
+            if verbose and samples_evaluated <= 5:
+                print(f"  Sample {samples_evaluated}: z={z:.1f}mm, imbalance={imbalance:.2f}°")
+
+            return imbalance
+
+        # Find valid Z range by sampling
+        # At extreme angles, much of the search range may be invalid
+        # Use dense sampling (41 points) to reliably detect narrow valid ranges
+        # With 41 samples over ±80mm = 3.9mm spacing, can detect ranges as narrow as 8mm
+        z_samples = np.linspace(z_min, z_max, 41)
+        valid_z = []
+        valid_imbalances = []
+
+        for z_test in z_samples:
+            imb_test = imbalance_at_z(z_test)
+            if abs(imb_test) < 1e5:  # Valid IK solution
+                valid_z.append(z_test)
+                valid_imbalances.append(imb_test)
+
+        if len(valid_z) < 2:
+            # Not enough valid solutions in standard range
+            if best_angles is not None:
+                # Found at least one valid solution
+                if verbose:
+                    print(f"  Only {len(valid_z)} valid Z found - using best: z={best_z:.1f}mm")
+                return np.array([x, y, best_z]), best_angles, True
+
+            # No valid solutions in standard range - trigger extreme fallback
+            if verbose:
+                print(f"  No valid Z found in range [{z_min:.1f}, {z_max:.1f}]mm")
+                print(f"  Expanding search to full mechanical range...")
+
+            # Search from z=100mm to z=300mm (full mechanical range)
+            z_extreme_min = max(100.0, z_initial - 150.0)
+            z_extreme_max = min(300.0, z_initial + 150.0)
+
+            # Sample coarsely (31 points across full range)
+            z_extreme_samples = np.linspace(z_extreme_min, z_extreme_max, 31)
+
+            for z_test in z_extreme_samples:
+                trans_test = np.array([x, y, z_test])
+
+                # Check cache for extreme fallback samples too
+                if ik_cache is not None:
+                    angles_test = ik_cache.get(trans_test, rotation)
+                    if angles_test is None:
+                        angles_test = self.calculate_servo_angles(trans_test, rotation, use_top_surface_offset)
+                        if angles_test is not None:
+                            ik_cache.put(trans_test, rotation, angles_test)
+                else:
+                    angles_test = self.calculate_servo_angles(trans_test, rotation, use_top_surface_offset)
+
+                samples_evaluated += 1
+
+                if angles_test is not None:
+                    # Found a valid solution!
+                    max_angle = np.max(angles_test)
+                    min_angle = np.min(angles_test)
+                    imbalance = max_angle + min_angle
+
+                    if verbose:
+                        print(f"  Extreme fallback SUCCESS: z={z_test:.1f}mm, imbalance={imbalance:.2f}° ({samples_evaluated} samples)")
+
+                    return trans_test, angles_test, True
+
+            # Even extreme fallback failed
+            if verbose:
+                print(f"  Extreme fallback FAILED - no valid Z in [{z_extreme_min:.1f}, {z_extreme_max:.1f}]mm ({samples_evaluated} samples)")
+            return translation, None, False
+
+        # Narrow search range to valid region
+        z_min = min(valid_z)
+        z_max = max(valid_z)
+        imb_min = valid_imbalances[0]
+        imb_max = valid_imbalances[-1]
+
+        if verbose:
+            print(f"  Valid range: [{z_min:.1f}, {z_max:.1f}]mm ({len(valid_z)}/41 samples)")
+            print(f"  Imbalance at bounds: [{imb_min:.2f}°, {imb_max:.2f}°]")
+
+        # Check if there's a REAL zero crossing (both values are valid and have opposite signs)
+        # Don't use Brent if we have penalty values (IK failures)
+        has_valid_sign_change = (
+            abs(imb_min) < 1e5 and abs(imb_max) < 1e5 and  # Both are real values
+            imb_min * imb_max < 0  # Opposite signs
+        )
+
+        if has_valid_sign_change:
+            # Brent's method - fast convergence to zero
+            try:
+                z_opt = brentq(imbalance_at_z, z_min, z_max, xtol=tolerance / 10.0, maxiter=50)
+                trans_opt = np.array([x, y, z_opt])
+                angles_opt = self.calculate_servo_angles(trans_opt, rotation, use_top_surface_offset)
+
+                if angles_opt is not None:
+                    if verbose:
+                        final_imb = np.max(angles_opt) + np.min(angles_opt)
+                        print(f"  Brent converged: z={z_opt:.1f}mm, imbalance={final_imb:.4f}° ({samples_evaluated} samples)")
+                    return trans_opt, angles_opt, True
+            except (ValueError, RuntimeError) as e:
+                if verbose:
+                    print(f"  Brent failed: {e}")
+        else:
+            if verbose:
+                print(f"  No sign change - using minimize_scalar")
+
+            # No zero crossing - minimize absolute imbalance
+            result = minimize_scalar(
+                lambda z: abs(imbalance_at_z(z)),
+                bounds=(z_min, z_max),
+                method='bounded',
+                options={'xatol': tolerance / 10.0}
+            )
+
+            if result.success:
+                z_opt = result.x
+                trans_opt = np.array([x, y, z_opt])
+                angles_opt = self.calculate_servo_angles(trans_opt, rotation, use_top_surface_offset)
+
+                if angles_opt is not None:
+                    if verbose:
+                        final_imb = np.max(angles_opt) + np.min(angles_opt)
+                        print(f"  Minimizer converged: z={z_opt:.1f}mm, imbalance={final_imb:.2f}° ({samples_evaluated} samples)")
+                    return trans_opt, angles_opt, True
+
+        # Fallback to best solution found
+        # (This should always succeed since we found valid_z >= 2)
+        if best_angles is not None:
+            trans_best = np.array([x, y, best_z])
+            if verbose:
+                print(f"  Using best: z={best_z:.1f}mm, imbalance={best_imbalance:.2f}° ({samples_evaluated} samples)")
+            return trans_best, best_angles, True
+
+        # Should never reach here if we found valid Z range
+        if verbose:
+            print(f"  Unexpected: no valid solution after finding {len(valid_z)} valid Z values")
+        return translation, None, False
+
 
 class SimpleBallPhysics2D:
     """

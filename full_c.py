@@ -14,6 +14,9 @@ import gc
 import time
 import threading
 import numpy as np
+import serial
+import serial.tools.list_ports
+from queue import Queue, Empty
 from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
                               QPushButton, QApplication, QWidget, QHBoxLayout, QCheckBox)
 from PyQt6.QtGui import QFont
@@ -26,7 +29,9 @@ from setup.hardware_controller_config import (SerialController, IKCache, Windows
 from misc.old.LQR_sim import LQRControllerConfig as SimLQRConfig
 from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
-from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
+from core.control_core import (PIDController, LQRController, KalmanFilter, clip_tilt_vector,
+                                OrientationKalmanFilter, apply_imu_transforms, GRAVITY_MAGNITUDE)
+from core.utils import IKZOptimizationConfig
 
 # Control configurations
 DEFAULT_HW_FREQUENCY_HZ = 250
@@ -91,6 +96,55 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.ball_history_x = []
         self.ball_history_y = []
         self.max_history = 100  # ~5 seconds at camera rate
+
+        # IMU orientation tracking (defaults from rot_core.py)
+        ACCEL_NOISE = 1.0
+        GYRO_NOISE = 0.0224
+        PROCESS_NOISE_ANGLE = 0.001
+        PROCESS_NOISE_BIAS = 0.00001
+        GYRO_BIAS_X = 0.112679
+        GYRO_BIAS_Y = 0.031500
+        ACCEL_AXIS_FLIP = np.array([1, 1, 1])
+        GYRO_AXIS_FLIP = np.array([1, 1, 1])
+        ACCEL_ROTATION = np.eye(3)
+        GYRO_ROTATION = np.eye(3)
+        ACCEL_MAGNITUDE_THRESHOLD = 1.0
+        GYRO_MAGNITUDE_THRESHOLD = 0.5
+
+        # Initialize IMU Kalman filter
+        self.orientation_kalman = OrientationKalmanFilter(
+            accel_noise=ACCEL_NOISE,
+            gyro_noise=GYRO_NOISE,
+            process_noise_angle=PROCESS_NOISE_ANGLE,
+            process_noise_bias=PROCESS_NOISE_BIAS,
+            accel_axis_flip=ACCEL_AXIS_FLIP,
+            gyro_axis_flip=GYRO_AXIS_FLIP,
+            accel_rotation=ACCEL_ROTATION,
+            gyro_rotation=GYRO_ROTATION,
+            initial_bias_x=GYRO_BIAS_X,
+            initial_bias_y=GYRO_BIAS_Y,
+            gyro_scale_multiplier=6.6,
+            accel_magnitude_threshold=ACCEL_MAGNITUDE_THRESHOLD,
+            gyro_magnitude_threshold=GYRO_MAGNITUDE_THRESHOLD
+        )
+
+        # IMU state
+        self.current_rx_imu = 0.0
+        self.current_ry_imu = 0.0
+        self.imu_tilt_correction_enabled = False
+        self.imu_compensation_gain = 1.0  # Full compensation
+
+        # IMU initialization and calibration
+        self.imu_initializing = False
+        self.initialization_duration = 3.0  # 3 seconds stabilization
+        self.initialization_start_time = None
+        self.initialization_time_remaining = 0.0
+        self.imu_calibrating = False
+        self.calibration_duration = 10.0  # 10 seconds calibration
+        self.calibration_start_time = None
+        self.calibration_time_remaining = 0.0
+        self.calibration_raw_data = {'gyro': [], 'accel': [], 'mag': []}
+        self.calibrated_gravity = None
 
         # Create controller config based on mode and controller type
         controller_config = self._create_controller_config()
@@ -254,6 +308,16 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             'kalman_reset': self.on_kalman_reset,
         })
 
+        # Add IMU callbacks (hardware only)
+        if self.operation_mode == 'real':
+            callbacks.update({
+                'imu_tilt_correction_toggle': self.on_imu_tilt_correction_toggle,
+                'imu_kalman_param_change': self.on_imu_kalman_param_change,
+                'imu_motion_param_change': self.on_imu_motion_param_change,
+                'imu_detection_toggle': self.on_imu_detection_toggle,
+                'imu_mag_toggle': self.on_imu_mag_toggle,
+            })
+
         # Add LQR-specific callbacks
         if self.controller_type_selection == 'LQR':
             callbacks['show_gain_matrix'] = self.show_gain_matrix
@@ -306,6 +370,12 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         left_modules.append({'type': 'kalman_filter',
                            'args': {'kalman_filter': getattr(self, 'kalman_filter', None)}})
 
+        # Hardware-only: IMU modules
+        if self.operation_mode == 'real':
+            left_modules.append({'type': 'imu_kalman_parameters',
+                               'args': {'orientation_kalman': getattr(self, 'orientation_kalman', None)}})
+            left_modules.append({'type': 'imu_motion_detection'})
+
         # Configuration
         left_modules.append({'type': 'configuration',
                            'args': {'use_offset_var': self.use_top_surface_offset}})
@@ -342,6 +412,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         # Manual pose
         right_modules.append({'type': 'manual_pose', 'args': {'dof_config': self.dof_config}})
 
+        # IK Z Optimization
+        right_modules.append({'type': 'ik_z_optimization'})
+
         # Hardware-only: Performance stats
         if self.operation_mode == 'real':
             right_modules.append({'type': 'performance_stats'})
@@ -376,6 +449,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             'kalman_filter': gm.KalmanFilterModule,
             'control_frequency': gm.ControlFrequencyModule,
             'plot_control': gm.PlotControlModule,
+            'imu_kalman_parameters': gm.IMUKalmanParametersModule,
+            'imu_motion_detection': gm.IMUMotionDetectionModule,
+            'ik_z_optimization': gm.IKZOptimizationModule,
         }
 
         layout_config = self.get_layout_config()
@@ -469,6 +545,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
             self.prewarm_ik_cache()
 
+            # Start IMU initialization and calibration sequence
+            self.start_imu_initialization()
+
             if 'simulation_control' in self.gui_modules:
                 self.gui_modules['simulation_control'].start_btn.setEnabled(True)
 
@@ -495,6 +574,74 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             self.gui_modules['serial_connection'].update({'connected': False})
 
         self.log("Disconnected")
+
+    def start_imu_initialization(self):
+        """Start 3-second IMU initialization phase."""
+        self.imu_initializing = True
+        self.initialization_start_time = time.time()
+        self.initialization_time_remaining = self.initialization_duration
+        self.log("IMU initialization: 3s stabilization...")
+
+    def start_imu_calibration(self):
+        """Start 10-second IMU calibration phase."""
+        self.imu_calibrating = True
+        self.calibration_start_time = time.time()
+        self.calibration_time_remaining = self.calibration_duration
+        self.calibration_raw_data = {'gyro': [], 'accel': [], 'mag': []}
+        self.log("IMU calibration: Keep platform stationary for 10s...")
+
+    def finish_imu_calibration(self):
+        """Process calibration data and initialize Kalman filter."""
+        gyro_data = self.calibration_raw_data['gyro']
+        accel_data = self.calibration_raw_data['accel']
+
+        if not gyro_data or not accel_data:
+            self.log("WARNING: No calibration data collected!")
+            self.imu_calibrating = False
+            return
+
+        # Convert to arrays
+        accel_samples = np.array([sample[1] for sample in accel_data])
+        gyro_samples = np.array([sample[1] for sample in gyro_data])
+
+        # Calculate mean raw values
+        accel_mean_raw = np.mean(accel_samples, axis=0)
+        gyro_mean_raw = np.mean(gyro_samples, axis=0)
+
+        # Apply transformations (same as in OrientationKalmanFilter)
+        accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
+        gyro_scale = 0.00875 * np.pi / 180  # L3GD20: 8.75 mdps/LSB -> rad/s
+
+        accel_mean = apply_imu_transforms(accel_mean_raw,
+                                         self.orientation_kalman.accel_axis_flip,
+                                         self.orientation_kalman.accel_rotation,
+                                         accel_scale)
+        gyro_mean = apply_imu_transforms(gyro_mean_raw,
+                                        self.orientation_kalman.gyro_axis_flip,
+                                        self.orientation_kalman.gyro_rotation,
+                                        gyro_scale)
+
+        # Store calibrated gravity for initialization
+        self.calibrated_gravity = accel_mean.copy()
+
+        # Initialize Kalman filter
+        self.orientation_kalman.initialize(accel_mean_raw, calibrated_gravity=self.calibrated_gravity)
+
+        # Check tilt
+        ax, ay, az = accel_mean
+        tilt_x = np.arctan2(ay, az)
+        tilt_y = np.arctan2(-ax, np.sqrt(ay**2 + az**2))
+        tilt_x_deg = np.degrees(tilt_x)
+        tilt_y_deg = np.degrees(tilt_y)
+
+        if abs(tilt_x_deg) > 5 or abs(tilt_y_deg) > 5:
+            self.log(f"WARNING: IMU tilted during calibration! RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
+        else:
+            self.log(f"IMU level check: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}° (good)")
+
+        self.log(f"Gyro bias [°/s]: X={np.degrees(gyro_mean[0]):.4f}, Y={np.degrees(gyro_mean[1]):.4f}")
+        self.log("IMU calibration complete!")
+        self.imu_calibrating = False
 
     def prewarm_ik_cache(self):
         """Pre-calculate common IK solutions."""
@@ -729,6 +876,48 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         self.log("Kalman filter reset")
 
     # ============================================================================
+    # IMU callbacks
+    # ============================================================================
+
+    def on_imu_tilt_correction_toggle(self, enabled):
+        """Handle IMU tilt correction enable/disable."""
+        self.imu_tilt_correction_enabled = enabled
+        self.log(f"IMU tilt correction: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_imu_kalman_param_change(self, param_name, value):
+        """Handle IMU Kalman filter parameter change."""
+        param_map = {
+            'accel_noise': 'accel_noise',
+            'gyro_noise': 'gyro_noise',
+            'process_noise_angle': 'process_noise_angle',
+            'process_noise_bias': 'process_noise_bias'
+        }
+
+        if param_name in param_map:
+            attr_name = param_map[param_name]
+            setattr(self.orientation_kalman, attr_name, value)
+            self.log(f"IMU Kalman {param_name}: {value:.4f}")
+
+    def on_imu_motion_param_change(self, param_name, value):
+        """Handle IMU motion detection parameter change."""
+        if param_name == 'accel_threshold':
+            self.orientation_kalman.accel_magnitude_threshold = value
+            self.log(f"IMU accel threshold: {value:.2f} m/s²")
+        elif param_name == 'gyro_threshold':
+            self.orientation_kalman.gyro_magnitude_threshold = value
+            self.log(f"IMU gyro threshold: {value:.2f} rad/s")
+
+    def on_imu_detection_toggle(self, enabled):
+        """Handle IMU motion detection enable/disable."""
+        self.orientation_kalman.enable_rejection = enabled
+        self.log(f"IMU motion detection: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_imu_mag_toggle(self, enabled):
+        """Handle magnetometer enable/disable."""
+        self.orientation_kalman.use_magnetometer = enabled
+        self.log(f"Magnetometer backup: {'ENABLED' if enabled else 'DISABLED'}")
+
+    # ============================================================================
     # Mode/controller switching
     # ============================================================================
 
@@ -845,6 +1034,61 @@ class ComprehensiveStewartController(BaseStewartSimulator):
         while self.simulation_running:
             loop_start = time.perf_counter()
 
+            # Handle IMU initialization and calibration phases
+            if self.imu_initializing:
+                elapsed = time.time() - self.initialization_start_time
+                self.initialization_time_remaining = max(0.0, self.initialization_duration - elapsed)
+
+                if elapsed >= self.initialization_duration:
+                    self.imu_initializing = False
+                    self.initialization_time_remaining = 0.0
+                    self.start_imu_calibration()
+                else:
+                    # Just drain queues during initialization
+                    self.serial_controller.get_imu_data_batch()
+                    time.sleep(self.control_interval)
+                    continue
+
+            if self.imu_calibrating:
+                elapsed = time.time() - self.calibration_start_time
+                self.calibration_time_remaining = max(0.0, self.calibration_duration - elapsed)
+
+                # Collect calibration data
+                gyro_batch, accel_batch, mag_batch = self.serial_controller.get_imu_data_batch()
+                self.calibration_raw_data['gyro'].extend(gyro_batch)
+                self.calibration_raw_data['accel'].extend(accel_batch)
+                self.calibration_raw_data['mag'].extend(mag_batch)
+
+                if elapsed >= self.calibration_duration:
+                    self.finish_imu_calibration()
+                    self.calibration_time_remaining = 0.0
+
+                time.sleep(self.control_interval)
+                continue
+
+            # Normal operation: Process IMU data
+            gyro_data, accel_data, mag_data = self.serial_controller.get_single_imu_sample()
+
+            # Debug: Log IMU data reception (first 5 samples)
+            if not hasattr(self, '_imu_data_debug_count'):
+                self._imu_data_debug_count = 0
+            if self._imu_data_debug_count < 5:
+                if gyro_data or accel_data:
+                    self.log(f"IMU data: Gyro={'Yes' if gyro_data else 'No'} Accel={'Yes' if accel_data else 'No'} Mag={'Yes' if mag_data else 'No'}")
+                    self._imu_data_debug_count += 1
+
+            if gyro_data is not None:
+                timestamp_us, gyro_raw = gyro_data
+                self.orientation_kalman.predict(gyro_raw, self.control_interval)
+
+            if accel_data is not None:
+                timestamp_us, accel_raw = accel_data
+                self.orientation_kalman.update(accel_raw, mag_raw=mag_data[1] if mag_data else None)
+
+            # Get IMU orientation
+            self.current_rx_imu = np.degrees(self.orientation_kalman.state[0])
+            self.current_ry_imu = np.degrees(self.orientation_kalman.state[1])
+
             # Get ball data from Pixy2 camera via serial
             ball_data = self.serial_controller.get_latest_ball_data()
 
@@ -910,10 +1154,33 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 )
 
                 if control_output is not None:
-                    rx, ry = control_output
-                    rx, ry, _ = clip_tilt_vector(rx, ry, 15.0)
+                    rx_ctrl, ry_ctrl = control_output
+                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, 15.0)
 
-                    # Update dof_values so GUI reflects controller state
+                    # IMU tilt correction: add compensation (if enabled)
+                    if self.imu_tilt_correction_enabled:
+                        # IMU compensation: oppose platform tilt (up to ±15°)
+                        rx_imu_comp = -self.current_rx_imu * self.imu_compensation_gain
+                        ry_imu_comp = -self.current_ry_imu * self.imu_compensation_gain
+                        rx_imu_comp, ry_imu_comp, _ = clip_tilt_vector(rx_imu_comp, ry_imu_comp, 15.0)
+
+                        # Combine: controller output + IMU compensation (no additional clipping)
+                        rx = rx_ctrl + rx_imu_comp
+                        ry = ry_ctrl + ry_imu_comp
+
+                        # Debug logging (first 10 samples only)
+                        if not hasattr(self, '_imu_debug_count'):
+                            self._imu_debug_count = 0
+                        if self._imu_debug_count < 10:
+                            self.log(f"IMU correction: RX_IMU={self.current_rx_imu:.2f}° RY_IMU={self.current_ry_imu:.2f}° | "
+                                   f"Comp=({rx_imu_comp:.2f}°, {ry_imu_comp:.2f}°) | "
+                                   f"Ctrl=({rx_ctrl:.2f}°, {ry_ctrl:.2f}°) → Final=({rx:.2f}°, {ry:.2f}°)")
+                            self._imu_debug_count += 1
+                    else:
+                        rx = rx_ctrl
+                        ry = ry_ctrl
+
+                    # Update dof_values so GUI reflects final combined state
                     self.dof_values['rx'] = rx
                     self.dof_values['ry'] = ry
 
@@ -940,10 +1207,60 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
             # Manual control when controller disabled
             elif not self.controller_enabled:
-                translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
-                rotation = np.array([self.dof_values['rx'], self.dof_values['ry'], self.dof_values['rz']])
+                # Start with manual dof values
+                rx = self.dof_values['rx']
+                ry = self.dof_values['ry']
 
-                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                # Apply IMU tilt correction to manual values (if enabled)
+                if self.imu_tilt_correction_enabled:
+                    # IMU compensation: oppose platform tilt (clipped to ±15°)
+                    rx_imu_comp = -self.current_rx_imu * self.imu_compensation_gain
+                    ry_imu_comp = -self.current_ry_imu * self.imu_compensation_gain
+                    rx_imu_comp, ry_imu_comp, _ = clip_tilt_vector(rx_imu_comp, ry_imu_comp, 15.0)
+
+                    # Add compensation to manual values (no additional clipping)
+                    rx = rx + rx_imu_comp
+                    ry = ry + ry_imu_comp
+
+                    # Note: Don't update dof_values here to avoid feedback loop accumulation
+
+                translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
+                rotation = np.array([rx, ry, self.dof_values['rz']])
+
+                # Apply Z optimization if enabled
+                if self.z_optimization_enabled:
+                    # Use current Z as search center (not home Z)
+                    search_translation = translation.copy()
+
+                    optimized_translation, angles, success = self.ik.optimize_z_offset(
+                        search_translation, rotation,
+                        use_top_surface_offset=self.use_top_surface_offset,
+                        z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                        max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                        tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
+                        ik_cache=self.ik_cache if hasattr(self, 'ik_cache') else None
+                    )
+
+                    if success and angles is not None:
+                        self.z_offset = optimized_translation[2] - translation[2]
+                        max_angle = np.max(angles)
+                        min_angle = np.min(angles)
+                        self.servo_balance = (max_angle, min_angle)
+                    else:
+                        angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                        if angles is not None:
+                            max_angle = np.max(angles)
+                            min_angle = np.min(angles)
+                            self.servo_balance = (max_angle, min_angle)
+                            self.z_offset = 0.0
+                else:
+                    angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                    if angles is not None:
+                        max_angle = np.max(angles)
+                        min_angle = np.min(angles)
+                        self.servo_balance = (max_angle, min_angle)
+                        self.z_offset = 0.0
+
                 if angles is not None:
                     self.serial_controller.send_servo_angles(angles)
                     self.last_cmd_angles = angles
@@ -1033,6 +1350,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 'actual_angles': self.last_cmd_angles,  # No servo simulation in hardware
                 'fk_translation': fk_translation,
                 'fk_rotation': fk_rotation,
+                'z_optimization_enabled': self.z_optimization_enabled,
+                'z_offset': self.z_offset,
+                'servo_balance': self.servo_balance,
             }
 
             # Add Kalman filter state (flat keys for GUI module)
@@ -1068,6 +1388,23 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 error_x = ball_x_mm - target_x
                 error_y = ball_y_mm - target_y
                 state['controller_error'] = (error_x, error_y)
+
+            # Add IMU orientation state
+            state['imu_orientation'] = (self.current_rx_imu, self.current_ry_imu)
+            state['imu_bias'] = (self.orientation_kalman.state[2], self.orientation_kalman.state[3])
+
+            # Add IMU calibration status
+            state['imu_initializing'] = self.imu_initializing
+            state['imu_calibrating'] = self.imu_calibrating
+            state['initialization_time_remaining'] = self.initialization_time_remaining
+            state['calibration_time_remaining'] = self.calibration_time_remaining
+
+            # Add IMU motion detection statistics
+            state['imu_rejection_stats'] = (
+                self.orientation_kalman.rejected_accel_count,
+                self.orientation_kalman.total_accel_count
+            )
+            state['imu_mag_updates'] = self.orientation_kalman.mag_update_count
 
             # Update all modules (skip plot_panel which is a Qt widget, not a GUIModule)
             for key, module in self.gui_modules.items():

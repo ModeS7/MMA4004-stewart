@@ -75,6 +75,14 @@ class SimulationControlModule(GUIModule):
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.time_label)
 
+        # Calibration timer
+        self.calibration_label = QLabel("")
+        calib_font = QFont("Consolas", 10)
+        calib_font.setBold(True)
+        self.calibration_label.setFont(calib_font)
+        self.calibration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.calibration_label)
+
         group.setLayout(layout)
         self.widget = group
         return self.widget
@@ -82,6 +90,18 @@ class SimulationControlModule(GUIModule):
     def update(self, state):
         if 'simulation_time' in state:
             self.time_label.setText(f"Time: {format_time(state['simulation_time'])}")
+
+        # Update calibration timer
+        if state.get('imu_initializing', False):
+            time_remaining = state.get('initialization_time_remaining', 0.0)
+            self.calibration_label.setText(f"Initialization: {time_remaining:.1f}s")
+            self.calibration_label.setStyleSheet(f"color: {self.colors['warning']};")
+        elif state.get('imu_calibrating', False):
+            time_remaining = state.get('calibration_time_remaining', 0.0)
+            self.calibration_label.setText(f"Calibration: {time_remaining:.1f}s")
+            self.calibration_label.setStyleSheet(f"color: {self.colors['warning']};")
+        else:
+            self.calibration_label.setText("")
 
 
 class ControllerModule(GUIModule):
@@ -503,6 +523,12 @@ class ManualPoseControlModule(GUIModule):
             for dof, val in state['dof_values'].items():
                 if dof in self.value_labels:
                     self.value_labels[dof].setText(f"{val:.2f}")
+                    # Update slider position to match (for IMU tilt correction feedback)
+                    if dof in self.sliders:
+                        min_val, max_val, res, _, _ = self.dof_config[dof]
+                        self.sliders[dof].blockSignals(True)  # Prevent recursion
+                        self.sliders[dof].setValue(int(val / res))
+                        self.sliders[dof].blockSignals(False)
 
         if 'tilt_magnitude' in state:
             mag = state['tilt_magnitude']
@@ -1584,3 +1610,356 @@ class ControlFrequencyModule(GUIModule):
                 self.freq_label.setStyleSheet(f"color: {self.colors['warning']};")
             else:
                 self.freq_label.setStyleSheet(f"color: {self.colors['highlight']};")
+
+
+class IMUKalmanParametersModule(GUIModule):
+    """IMU Kalman filter parameters for orientation tracking."""
+
+    def __init__(self, parent, colors, callbacks, orientation_kalman=None):
+        super().__init__(parent, colors, callbacks)
+        self.orientation_kalman = orientation_kalman
+        self.sliders = {}
+        self.value_labels = {}
+
+    def create(self):
+        group = QGroupBox("IMU Kalman Filter Parameters")
+        layout = QVBoxLayout()
+
+        # Enable/Disable IMU tilt correction
+        enable_layout = QHBoxLayout()
+
+        self.enable_checkbox = QCheckBox("Enable IMU Tilt Correction")
+        self.enable_checkbox.setChecked(False)
+        self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
+        enable_layout.addWidget(self.enable_checkbox)
+
+        self.status_indicator = QLabel("[OFF]")
+        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+        enable_layout.addWidget(self.status_indicator)
+        enable_layout.addStretch()
+
+        layout.addLayout(enable_layout)
+
+        # Kalman filter noise parameters
+        self._create_parameter_slider(layout, "Accel Noise:", 0.1, 5.0, 1.0, 'accel_noise')
+        self._create_parameter_slider(layout, "Gyro Noise:", 0.001, 0.1, 0.0224, 'gyro_noise')
+        self._create_parameter_slider(layout, "Process Noise Angle:", 0.0001, 0.1, 0.001, 'process_noise_angle')
+        self._create_parameter_slider(layout, "Process Noise Bias:", 0.000001, 0.001, 0.00001, 'process_noise_bias')
+
+        # Current orientation display
+        state_layout = QVBoxLayout()
+        state_label = QLabel("IMU Orientation:")
+        font = QFont("Segoe UI", 9)
+        font.setBold(True)
+        state_label.setFont(font)
+        state_layout.addWidget(state_label)
+
+        self.orientation_label = QLabel("RX: 0.0°, RY: 0.0°")
+        self.orientation_label.setFont(QFont("Consolas", 9))
+        state_layout.addWidget(self.orientation_label)
+
+        self.bias_label = QLabel("Bias: (0.00, 0.00) rad/s")
+        self.bias_label.setFont(QFont("Consolas", 8))
+        self.bias_label.setStyleSheet(f"color: {self.colors['border']};")
+        state_layout.addWidget(self.bias_label)
+
+        layout.addLayout(state_layout)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _create_parameter_slider(self, parent_layout, label, min_val, max_val, default, param_name):
+        grid = QGridLayout()
+
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont("Segoe UI", 9))
+        grid.addWidget(label_widget, 0, 0)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        # Use logarithmic scale for very small values
+        if max_val < 1.0:
+            slider.setMinimum(int(min_val * 10000))
+            slider.setMaximum(int(max_val * 10000))
+            slider.setValue(int(default * 10000))
+        else:
+            slider.setMinimum(int(min_val * 100))
+            slider.setMaximum(int(max_val * 100))
+            slider.setValue(int(default * 100))
+        grid.addWidget(slider, 0, 1)
+
+        value_label = QLabel(f"{default:.4f}")
+        value_label.setFont(QFont("Consolas", 9))
+        value_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        value_label.setMinimumWidth(70)
+        grid.addWidget(value_label, 0, 2)
+
+        self.sliders[param_name] = slider
+        self.value_labels[param_name] = value_label
+
+        def on_change(val, pn=param_name):
+            if max_val < 1.0:
+                value = val / 10000.0
+            else:
+                value = val / 100.0
+            self.value_labels[pn].setText(f"{value:.4f}")
+            self._on_param_change(pn, value)
+
+        slider.valueChanged.connect(on_change)
+        grid.setColumnStretch(1, 1)
+
+        parent_layout.addLayout(grid)
+
+    def _on_enable_toggle(self):
+        enabled = self.enable_checkbox.isChecked()
+
+        if enabled:
+            self.status_indicator.setText("[ON]")
+            self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
+        else:
+            self.status_indicator.setText("[OFF]")
+            self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+
+        if self.callbacks.get('imu_tilt_correction_toggle'):
+            self.callbacks['imu_tilt_correction_toggle'](enabled)
+
+    def _on_param_change(self, param_name, value):
+        if self.callbacks.get('imu_kalman_param_change'):
+            self.callbacks['imu_kalman_param_change'](param_name, value)
+
+    def update(self, state):
+        if 'imu_orientation' in state:
+            rx, ry = state['imu_orientation']
+            self.orientation_label.setText(f"RX: {rx:.2f}°, RY: {ry:.2f}°")
+
+        if 'imu_bias' in state:
+            bias_x, bias_y = state['imu_bias']
+            self.bias_label.setText(f"Bias: ({bias_x:.4f}, {bias_y:.4f}) rad/s")
+
+
+class IMUMotionDetectionModule(GUIModule):
+    """IMU motion detection and magnetometer controls."""
+
+    def __init__(self, parent, colors, callbacks):
+        super().__init__(parent, colors, callbacks)
+
+    def create(self):
+        group = QGroupBox("IMU Motion Detection")
+        layout = QVBoxLayout()
+
+        # Enable/Disable motion detection
+        detection_layout = QHBoxLayout()
+
+        self.detection_checkbox = QCheckBox("Enable Motion Detection")
+        self.detection_checkbox.setChecked(False)
+        self.detection_checkbox.stateChanged.connect(self._on_detection_toggle)
+        detection_layout.addWidget(self.detection_checkbox)
+
+        self.detection_status = QLabel("[OFF]")
+        self.detection_status.setFont(QFont("Segoe UI", 10))
+        self.detection_status.setStyleSheet(f"color: {self.colors['border']};")
+        detection_layout.addWidget(self.detection_status)
+        detection_layout.addStretch()
+
+        layout.addLayout(detection_layout)
+
+        # Thresholds
+        self._create_parameter_slider(layout, "Accel Threshold (m/s²):", 0.5, 10.0, 1.0, 'accel_threshold')
+        self._create_parameter_slider(layout, "Gyro Threshold (rad/s):", 0.1, 2.0, 0.5, 'gyro_threshold')
+
+        # Magnetometer controls
+        mag_layout = QHBoxLayout()
+
+        self.mag_checkbox = QCheckBox("Use Magnetometer Backup")
+        self.mag_checkbox.setChecked(False)
+        self.mag_checkbox.stateChanged.connect(self._on_mag_toggle)
+        mag_layout.addWidget(self.mag_checkbox)
+
+        self.mag_status = QLabel("[OFF]")
+        self.mag_status.setFont(QFont("Segoe UI", 10))
+        self.mag_status.setStyleSheet(f"color: {self.colors['border']};")
+        mag_layout.addWidget(self.mag_status)
+        mag_layout.addStretch()
+
+        layout.addLayout(mag_layout)
+
+        # Statistics
+        self.stats_label = QLabel("Rejected: 0 / 0 (0.0%)")
+        self.stats_label.setFont(QFont("Consolas", 8))
+        self.stats_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(self.stats_label)
+
+        self.mag_stats_label = QLabel("Mag updates: 0")
+        self.mag_stats_label.setFont(QFont("Consolas", 8))
+        self.mag_stats_label.setStyleSheet(f"color: {self.colors['border']};")
+        layout.addWidget(self.mag_stats_label)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _create_parameter_slider(self, parent_layout, label, min_val, max_val, default, param_name):
+        grid = QGridLayout()
+
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont("Segoe UI", 9))
+        grid.addWidget(label_widget, 0, 0)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(int(min_val * 100))
+        slider.setMaximum(int(max_val * 100))
+        slider.setValue(int(default * 100))
+        grid.addWidget(slider, 0, 1)
+
+        value_label = QLabel(f"{default:.2f}")
+        value_label.setFont(QFont("Consolas", 9))
+        value_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        value_label.setMinimumWidth(60)
+        grid.addWidget(value_label, 0, 2)
+
+        def on_change(val, pn=param_name):
+            value = val / 100.0
+            value_label.setText(f"{value:.2f}")
+            if self.callbacks.get('imu_motion_param_change'):
+                self.callbacks['imu_motion_param_change'](pn, value)
+
+        slider.valueChanged.connect(on_change)
+        grid.setColumnStretch(1, 1)
+
+        parent_layout.addLayout(grid)
+
+    def _on_detection_toggle(self):
+        enabled = self.detection_checkbox.isChecked()
+
+        if enabled:
+            self.detection_status.setText("[ON]")
+            self.detection_status.setStyleSheet(f"color: {self.colors['success']};")
+        else:
+            self.detection_status.setText("[OFF]")
+            self.detection_status.setStyleSheet(f"color: {self.colors['border']};")
+
+        if self.callbacks.get('imu_detection_toggle'):
+            self.callbacks['imu_detection_toggle'](enabled)
+
+    def _on_mag_toggle(self):
+        enabled = self.mag_checkbox.isChecked()
+
+        if enabled:
+            self.mag_status.setText("[ON]")
+            self.mag_status.setStyleSheet(f"color: {self.colors['success']};")
+        else:
+            self.mag_status.setText("[OFF]")
+            self.mag_status.setStyleSheet(f"color: {self.colors['border']};")
+
+        if self.callbacks.get('imu_mag_toggle'):
+            self.callbacks['imu_mag_toggle'](enabled)
+
+    def update(self, state):
+        if 'imu_rejection_stats' in state:
+            rejected, total = state['imu_rejection_stats']
+            if total > 0:
+                percent = (rejected / total) * 100
+                self.stats_label.setText(f"Rejected: {rejected} / {total} ({percent:.1f}%)")
+            else:
+                self.stats_label.setText(f"Rejected: 0 / 0 (0.0%)")
+
+        if 'imu_mag_updates' in state:
+            count = state['imu_mag_updates']
+            self.mag_stats_label.setText(f"Mag updates: {count}")
+
+
+class IKZOptimizationModule(GUIModule):
+    """IK Z offset optimization control."""
+
+    def __init__(self, parent, colors, callbacks):
+        super().__init__(parent, colors, callbacks)
+        self.enabled = False
+
+    def create(self):
+        group = QGroupBox("IK Z Optimization")
+        layout = QVBoxLayout()
+
+        # Enable/Disable control
+        enable_layout = QHBoxLayout()
+
+        self.enable_checkbox = QCheckBox("Enable Z Optimization")
+        self.enable_checkbox.setChecked(False)
+        self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
+        enable_layout.addWidget(self.enable_checkbox)
+
+        self.status_indicator = QLabel("[OFF]")
+        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+        enable_layout.addWidget(self.status_indicator)
+        enable_layout.addStretch()
+
+        layout.addLayout(enable_layout)
+
+        # Description
+        description = QLabel(
+            "Dynamically adjusts Z height to balance servo angles around neutral (0°).\n"
+            "Keeps servos centered and maximizes available range."
+        )
+        description.setFont(QFont("Segoe UI", 8))
+        description.setStyleSheet(f"color: {self.colors['border']};")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        # Statistics display
+        stats_layout = QVBoxLayout()
+
+        self.z_offset_label = QLabel("Z Offset: 0.0 mm")
+        self.z_offset_label.setFont(QFont("Consolas", 8))
+        stats_layout.addWidget(self.z_offset_label)
+
+        self.servo_balance_label = QLabel("Servo Balance: Max=0.0°, Min=0.0°")
+        self.servo_balance_label.setFont(QFont("Consolas", 8))
+        stats_layout.addWidget(self.servo_balance_label)
+
+        self.imbalance_label = QLabel("Imbalance: 0.0°")
+        self.imbalance_label.setFont(QFont("Consolas", 8))
+        stats_layout.addWidget(self.imbalance_label)
+
+        layout.addLayout(stats_layout)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _on_enable_toggle(self, state):
+        self.enabled = state == Qt.CheckState.Checked.value
+        if self.enabled:
+            self.status_indicator.setText("[ON]")
+            self.status_indicator.setStyleSheet(f"color: {self.colors['highlight']};")
+        else:
+            self.status_indicator.setText("[OFF]")
+            self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+
+        if 'z_optimization_toggle' in self.callbacks:
+            self.callbacks['z_optimization_toggle'](self.enabled)
+
+    def update(self, state):
+        if not hasattr(self, 'widget'):
+            return
+
+        if 'z_optimization_enabled' in state:
+            enabled = state['z_optimization_enabled']
+            if enabled != self.enabled:
+                self.enable_checkbox.setChecked(enabled)
+
+        if 'z_offset' in state:
+            z_offset = state['z_offset']
+            self.z_offset_label.setText(f"Z Offset: {z_offset:.2f} mm")
+
+        if 'servo_balance' in state:
+            max_angle, min_angle = state['servo_balance']
+            self.servo_balance_label.setText(f"Servo Balance: Max={max_angle:.1f}°, Min={min_angle:.1f}°")
+
+            imbalance = max_angle + min_angle
+            self.imbalance_label.setText(f"Imbalance: {imbalance:.2f}°")
+
+            if abs(imbalance) < 1.0:
+                self.imbalance_label.setStyleSheet(f"color: {self.colors['highlight']};")
+            else:
+                self.imbalance_label.setStyleSheet(f"color: {self.colors['fg']};")

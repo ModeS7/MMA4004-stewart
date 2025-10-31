@@ -186,6 +186,22 @@ class KalmanFilterConfig:
 
 
 # ============================================================================
+# IK Z OPTIMIZATION CONFIGURATION
+# ============================================================================
+
+class IKZOptimizationConfig:
+    """Configuration for dynamic Z offset optimization."""
+
+    # Enable/disable flag (default off)
+    ENABLED = False
+
+    # Optimization parameters
+    Z_SEARCH_RANGE_MM = 80.0  # Maximum Z adjustment range (±mm)
+    MAX_ITERATIONS = 25  # Maximum optimization iterations
+    TOLERANCE_DEG = 0.1  # Convergence tolerance (degrees)
+
+
+# ============================================================================
 # PIXY2 CAMERA CONFIGURATION
 # ============================================================================
 

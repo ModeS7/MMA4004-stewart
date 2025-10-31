@@ -163,6 +163,16 @@ class SerialController:
         self.command_queue = Queue(maxsize=20)
         self.last_command_time = 0
 
+        # IMU data queues
+        self.gyro_queue = Queue(maxsize=1000)
+        self.accel_queue = Queue(maxsize=2000)
+        self.mag_queue = Queue(maxsize=500)
+
+        # IMU statistics
+        self.gyro_count = 0
+        self.accel_count = 0
+        self.mag_count = 0
+
     def connect(self):
         try:
             self.serial = serial.Serial(self.port, self.baudrate,
@@ -231,6 +241,51 @@ class SerialController:
                                         except Empty:
                                             pass
                                     self.ball_data_queue.put(ball_data)
+                            except (ValueError, IndexError):
+                                pass
+
+                        elif line.startswith("A:"):
+                            # Accelerometer data: A:timestamp_us,ax,ay,az
+                            try:
+                                parts = line[2:].split(',')
+                                if len(parts) == 4:
+                                    timestamp_us = int(parts[0])
+                                    ax, ay, az = int(parts[1]), int(parts[2]), int(parts[3])
+                                    accel_data = np.array([ax, ay, az])
+
+                                    if not self.accel_queue.full():
+                                        self.accel_queue.put((timestamp_us, accel_data))
+                                        self.accel_count += 1
+                            except (ValueError, IndexError):
+                                pass
+
+                        elif line.startswith("G:"):
+                            # Gyroscope data: G:timestamp_us,gx,gy,gz
+                            try:
+                                parts = line[2:].split(',')
+                                if len(parts) == 4:
+                                    timestamp_us = int(parts[0])
+                                    gx, gy, gz = int(parts[1]), int(parts[2]), int(parts[3])
+                                    gyro_data = np.array([gx, gy, gz])
+
+                                    if not self.gyro_queue.full():
+                                        self.gyro_queue.put((timestamp_us, gyro_data))
+                                        self.gyro_count += 1
+                            except (ValueError, IndexError):
+                                pass
+
+                        elif line.startswith("M:"):
+                            # Magnetometer data: M:timestamp_us,mx,my,mz
+                            try:
+                                parts = line[2:].split(',')
+                                if len(parts) == 4:
+                                    timestamp_us = int(parts[0])
+                                    mx, my, mz = int(parts[1]), int(parts[2]), int(parts[3])
+                                    mag_data = np.array([mx, my, mz])
+
+                                    if not self.mag_queue.full():
+                                        self.mag_queue.put((timestamp_us, mag_data))
+                                        self.mag_count += 1
                             except (ValueError, IndexError):
                                 pass
 
@@ -320,6 +375,59 @@ class SerialController:
             return data
         except Empty:
             return None
+
+    def get_imu_data_batch(self):
+        """Get all available IMU data from queues for calibration."""
+        gyro_batch = []
+        accel_batch = []
+        mag_batch = []
+
+        try:
+            while not self.gyro_queue.empty():
+                gyro_batch.append(self.gyro_queue.get_nowait())
+        except Empty:
+            pass
+
+        try:
+            while not self.accel_queue.empty():
+                accel_batch.append(self.accel_queue.get_nowait())
+        except Empty:
+            pass
+
+        try:
+            while not self.mag_queue.empty():
+                mag_batch.append(self.mag_queue.get_nowait())
+        except Empty:
+            pass
+
+        return gyro_batch, accel_batch, mag_batch
+
+    def get_single_imu_sample(self):
+        """Get one sample from each IMU sensor (for real-time processing)."""
+        gyro_data = None
+        accel_data = None
+        mag_data = None
+
+        try:
+            # Get latest from each queue
+            while not self.gyro_queue.empty():
+                gyro_data = self.gyro_queue.get_nowait()
+        except Empty:
+            pass
+
+        try:
+            while not self.accel_queue.empty():
+                accel_data = self.accel_queue.get_nowait()
+        except Empty:
+            pass
+
+        try:
+            while not self.mag_queue.empty():
+                mag_data = self.mag_queue.get_nowait()
+        except Empty:
+            pass
+
+        return gyro_data, accel_data, mag_data
 
 
 class HardwareControllerConfig(ControllerConfig):
