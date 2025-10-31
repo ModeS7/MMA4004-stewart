@@ -132,7 +132,8 @@ class RealtimeOrientationWindow(QMainWindow):
         self.calibrating = False  # Will start after initialization
         self.calibration_duration = 10.0  # 10 seconds calibration
         self.calibration_start_time = None
-        self.calibration_samples = []  # Store all samples with timestamps and type
+        self.calibration_raw_lines = []  # Buffer raw serial lines during calibration
+        self.calibration_lock = threading.Lock()  # Thread-safe access to calibration data
         self.calibrated_gravity_vector = None
         self.calibrated_gyro_bias = None
         self.calibrated_mag_offset = None
@@ -241,7 +242,7 @@ class RealtimeOrientationWindow(QMainWindow):
         self.proc_angle_slider = QSlider(Qt.Orientation.Horizontal)
         self.proc_angle_slider.setMinimum(0)
         self.proc_angle_slider.setMaximum(1000)
-        self.proc_angle_slider.setValue(1000)
+        self.proc_angle_slider.setValue(0)
         self.proc_angle_slider.valueChanged.connect(self.schedule_param_update)
         params_layout.addWidget(self.proc_angle_slider, 3, 2)
         self.proc_angle_label = QLabel("0.000")
@@ -256,7 +257,7 @@ class RealtimeOrientationWindow(QMainWindow):
         self.proc_bias_slider = QSlider(Qt.Orientation.Horizontal)
         self.proc_bias_slider.setMinimum(0)
         self.proc_bias_slider.setMaximum(1000)
-        self.proc_bias_slider.setValue(1000)
+        self.proc_bias_slider.setValue(0)
         self.proc_bias_slider.valueChanged.connect(self.schedule_param_update)
         params_layout.addWidget(self.proc_bias_slider, 4, 2)
         self.proc_bias_label = QLabel("0.000")
@@ -518,13 +519,12 @@ class RealtimeOrientationWindow(QMainWindow):
                 print("\nCalibration complete")
             else:
                 # Show calibration progress
-                # Count sample types
-                accel_samples = sum(1 for s in self.calibration_samples if s[0] == 'A')
-                gyro_samples = sum(1 for s in self.calibration_samples if s[0] == 'G')
-                mag_samples = sum(1 for s in self.calibration_samples if s[0] == 'M')
+                # Count buffered lines (thread-safe)
+                with self.calibration_lock:
+                    total_lines = len(self.calibration_raw_lines)
                 self.status_label.setText(
                     f"CALIBRATING... {calibration_remaining:.1f}s remaining | "
-                    f"Samples: Accel={accel_samples} Gyro={gyro_samples} Mag={mag_samples}"
+                    f"Buffered: {total_lines} lines"
                 )
         else:
             servo_status = "[ON]" if self.enable_servo_checkbox.isChecked() else "[OFF]"
@@ -554,7 +554,18 @@ class RealtimeOrientationWindow(QMainWindow):
         """Connect to Arduino/Teensy"""
         try:
             print(f"Connecting to {self.port}...")
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.1)
+            # Increase buffer sizes for high-speed data
+            self.serial = serial.Serial(
+                self.port,
+                self.baudrate,
+                timeout=0.01,
+                write_timeout=0.01
+            )
+            # Set large OS-level buffers (Windows)
+            try:
+                self.serial.set_buffer_size(rx_size=65536, tx_size=65536)
+            except:
+                pass  # May not be supported on all platforms
             time.sleep(2.5)
 
             # Clear startup messages (don't print them)
@@ -590,11 +601,15 @@ class RealtimeOrientationWindow(QMainWindow):
     def _read_loop(self):
         """Read IMU data"""
         buffer = ""
+        calibration_batch = []  # Batch calibration lines to reduce lock contention
 
         while self.running:
             try:
-                if self.serial.in_waiting > 0:
-                    chunk = self.serial.read(self.serial.in_waiting).decode('utf-8', errors='ignore')
+                # Read all available data
+                bytes_available = self.serial.in_waiting
+                if bytes_available > 0:
+                    # Read in large chunks for speed
+                    chunk = self.serial.read(bytes_available).decode('utf-8', errors='ignore')
                     buffer += chunk
 
                     while '\n' in buffer:
@@ -604,14 +619,28 @@ class RealtimeOrientationWindow(QMainWindow):
                         if not line:
                             continue
 
+                        # During calibration: ONLY buffer raw lines (skip all parsing)
+                        if self.calibrating:
+                            if line.startswith("A:") or line.startswith("G:") or line.startswith("M:"):
+                                calibration_batch.append(line)
+                                # Batch append every 100 lines to reduce lock overhead
+                                if len(calibration_batch) >= 100:
+                                    with self.calibration_lock:
+                                        self.calibration_raw_lines.extend(calibration_batch)
+                                    calibration_batch = []
+                            continue  # Skip all other processing during calibration
+
+                        # Normal operation: parse and queue data
                         if line.startswith("A:"):
                             parts = line[2:].split(',')
                             if len(parts) == 4:
                                 try:
                                     timestamp_us = int(parts[0])
                                     ax, ay, az = int(parts[1]), int(parts[2]), int(parts[3])
+                                    accel_data = np.array([ax, ay, az])
+
                                     if not self.accel_queue.full():
-                                        self.accel_queue.put((timestamp_us, np.array([ax, ay, az])))
+                                        self.accel_queue.put((timestamp_us, accel_data))
                                         self.accel_count += 1
                                 except ValueError:
                                     pass
@@ -622,8 +651,10 @@ class RealtimeOrientationWindow(QMainWindow):
                                 try:
                                     timestamp_us = int(parts[0])
                                     gx, gy, gz = int(parts[1]), int(parts[2]), int(parts[3])
+                                    gyro_data = np.array([gx, gy, gz])
+
                                     if not self.gyro_queue.full():
-                                        self.gyro_queue.put((timestamp_us, np.array([gx, gy, gz])))
+                                        self.gyro_queue.put((timestamp_us, gyro_data))
                                         self.gyro_count += 1
                                 except ValueError:
                                     pass
@@ -634,8 +665,10 @@ class RealtimeOrientationWindow(QMainWindow):
                                 try:
                                     timestamp_us = int(parts[0])
                                     mx, my, mz = int(parts[1]), int(parts[2]), int(parts[3])
+                                    mag_data = np.array([mx, my, mz])
+
                                     if not self.mag_queue.full():
-                                        self.mag_queue.put((timestamp_us, np.array([mx, my, mz])))
+                                        self.mag_queue.put((timestamp_us, mag_data))
                                         self.mag_count += 1
                                 except ValueError:
                                     pass
@@ -651,12 +684,26 @@ class RealtimeOrientationWindow(QMainWindow):
                                 except ValueError:
                                     pass
                 else:
-                    time.sleep(0.0001)
+                    # Flush any remaining calibration batch when no data available
+                    if calibration_batch:
+                        with self.calibration_lock:
+                            self.calibration_raw_lines.extend(calibration_batch)
+                        calibration_batch = []
+                    # Very short sleep during calibration, longer during normal operation
+                    if self.calibrating:
+                        time.sleep(0.00001)  # 10 microseconds - keep reading fast!
+                    else:
+                        time.sleep(0.001)  # 1ms during normal operation
 
             except Exception as e:
                 if self.running:
                     print(f"Read error: {e}")
                 break
+
+        # Flush final batch on exit
+        if calibration_batch:
+            with self.calibration_lock:
+                self.calibration_raw_lines.extend(calibration_batch)
 
     def _control_loop(self):
         """Process IMU data through filter"""
@@ -665,42 +712,23 @@ class RealtimeOrientationWindow(QMainWindow):
 
         while self.running:
             try:
-                # During initialization: drain queues but don't save (let sensors stabilize)
-                if self.initializing:
-                    # Drain all queues without saving
+                # During initialization or calibration: drain queues and skip filter processing
+                # (Serial thread writes directly to calibration_samples during calibration)
+                if self.initializing or self.calibrating:
+                    # Drain all queues (keep latest for display)
                     while not self.accel_queue.empty():
-                        self.accel_queue.get_nowait()
+                        _, accel_raw = self.accel_queue.get_nowait()
+                        latest_accel = accel_raw
                     while not self.gyro_queue.empty():
                         self.gyro_queue.get_nowait()
                     while not self.mag_queue.empty():
-                        self.mag_queue.get_nowait()
-
-                    time.sleep(0.001)
-                    continue  # Skip filter processing during initialization
-
-                # During calibration: collect ALL samples with timestamps
-                if self.calibrating:
-                    # Collect all accelerometer samples
-                    while not self.accel_queue.empty():
-                        timestamp_us, accel_raw = self.accel_queue.get_nowait()
-                        self.calibration_samples.append(('A', timestamp_us, accel_raw.copy()))
-                        latest_accel = accel_raw
-
-                    # Collect all gyroscope samples
-                    while not self.gyro_queue.empty():
-                        timestamp_us, gyro_raw = self.gyro_queue.get_nowait()
-                        self.calibration_samples.append(('G', timestamp_us, gyro_raw.copy()))
-
-                    # Collect all magnetometer samples
-                    while not self.mag_queue.empty():
-                        timestamp_us, mag_raw = self.mag_queue.get_nowait()
-                        self.calibration_samples.append(('M', timestamp_us, mag_raw.copy()))
+                        _, mag_raw = self.mag_queue.get_nowait()
                         self.current_mag_x = mag_raw[0]
                         self.current_mag_y = mag_raw[1]
                         self.current_mag_z = mag_raw[2]
 
                     time.sleep(0.001)
-                    continue  # Skip filter processing during calibration
+                    continue  # Skip filter processing during initialization/calibration
 
                 # Get checkbox states
                 enable_accel = self.enable_accel_checkbox.isChecked()
@@ -734,7 +762,7 @@ class RealtimeOrientationWindow(QMainWindow):
 
                         # Initialize if needed
                         if not self.kalman.initialized:
-                            self.kalman.initialize(latest_accel)
+                            self.kalman.initialize(latest_accel, self.calibrated_gravity_vector)
 
                         # Predict
                         if enable_gyro:
@@ -786,19 +814,70 @@ class RealtimeOrientationWindow(QMainWindow):
 
     def process_calibration_data(self):
         """Process collected calibration data to extract biases and gravity vector"""
-        if len(self.calibration_samples) == 0:
+        # Thread-safe copy of raw buffered lines
+        with self.calibration_lock:
+            raw_lines = self.calibration_raw_lines.copy()
+
+        if len(raw_lines) == 0:
             print("WARNING: No calibration data collected!")
             return
 
+        print(f"\nParsing {len(raw_lines)} calibration lines...")
+
+        # Diagnostic: check first and last timestamps
+        if len(raw_lines) > 0:
+            first_line = raw_lines[0]
+            last_line = raw_lines[-1]
+            try:
+                first_ts = int(first_line.split(',')[0].split(':')[1])
+                last_ts = int(last_line.split(',')[0].split(':')[1])
+                duration_us = last_ts - first_ts
+                duration_s = duration_us / 1e6
+                print(f"Time span: {duration_s:.2f}s (expected ~10s)")
+                print(f"Average rate: {len(raw_lines)/duration_s:.0f} lines/s (expected ~2364 lines/s)")
+            except:
+                pass
+
+        # Parse all buffered lines
+        calibration_samples = []
+        for line in raw_lines:
+            try:
+                if line.startswith("A:"):
+                    parts = line[2:].split(',')
+                    if len(parts) == 4:
+                        timestamp_us = int(parts[0])
+                        ax, ay, az = int(parts[1]), int(parts[2]), int(parts[3])
+                        calibration_samples.append(('A', timestamp_us, np.array([ax, ay, az])))
+
+                elif line.startswith("G:"):
+                    parts = line[2:].split(',')
+                    if len(parts) == 4:
+                        timestamp_us = int(parts[0])
+                        gx, gy, gz = int(parts[1]), int(parts[2]), int(parts[3])
+                        calibration_samples.append(('G', timestamp_us, np.array([gx, gy, gz])))
+
+                elif line.startswith("M:"):
+                    parts = line[2:].split(',')
+                    if len(parts) == 4:
+                        timestamp_us = int(parts[0])
+                        mx, my, mz = int(parts[1]), int(parts[2]), int(parts[3])
+                        calibration_samples.append(('M', timestamp_us, np.array([mx, my, mz])))
+            except (ValueError, IndexError):
+                pass  # Skip malformed lines
+
+        if len(calibration_samples) == 0:
+            print("WARNING: No valid calibration samples parsed!")
+            return
+
         # Sort all samples by timestamp (like data_logger.py)
-        self.calibration_samples.sort(key=lambda x: x[1])
+        calibration_samples.sort(key=lambda x: x[1])
 
         # Separate by sensor type
         accel_samples = []
         gyro_samples = []
         mag_samples = []
 
-        for sample_type, timestamp_us, data in self.calibration_samples:
+        for sample_type, timestamp_us, data in calibration_samples:
             if sample_type == 'A':
                 accel_samples.append(data)
             elif sample_type == 'G':
@@ -853,6 +932,20 @@ class RealtimeOrientationWindow(QMainWindow):
         print(f"\nGravity vector [m/s²]: [{accel_mean_transformed[0]:.4f}, "
               f"{accel_mean_transformed[1]:.4f}, {accel_mean_transformed[2]:.4f}]")
         print(f"Gravity magnitude: {np.linalg.norm(accel_mean_transformed):.4f} m/s²")
+
+        # Check if IMU was level during calibration
+        tilt_x = np.arctan2(accel_mean_transformed[1], accel_mean_transformed[2])
+        tilt_y = np.arctan2(-accel_mean_transformed[0], np.sqrt(accel_mean_transformed[1]**2 + accel_mean_transformed[2]**2))
+        tilt_x_deg = np.degrees(tilt_x)
+        tilt_y_deg = np.degrees(tilt_y)
+        max_tilt = max(abs(tilt_x_deg), abs(tilt_y_deg))
+
+        if max_tilt > 5.0:
+            print(f"\n*** WARNING: IMU was tilted during calibration! ***")
+            print(f"*** Tilt: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}° ***")
+            print(f"*** This will be used as the zero reference point ***")
+        else:
+            print(f"IMU level check: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}° (good)")
         print(f"\nGyroscope bias [rad/s]: [{gyro_mean_transformed[0]:.6f}, "
               f"{gyro_mean_transformed[1]:.6f}, {gyro_mean_transformed[2]:.6f}]")
         print(f"Gyroscope bias [°/s]: [{np.degrees(gyro_mean_transformed[0]):.4f}, "
@@ -887,9 +980,6 @@ class RealtimeOrientationWindow(QMainWindow):
                 initial_bias_y=gyro_mean_transformed[1],  # Use calibrated bias
                 gyro_scale_multiplier=gyro_scale_mult
             )
-
-            # Override the gravity vector in the filter
-            self.kalman.gravity_initial = self.calibrated_gravity_vector.copy()
 
             print("Kalman filter reinitialized with calibrated values\n")
 

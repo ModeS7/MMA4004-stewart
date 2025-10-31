@@ -666,11 +666,12 @@ class OrientationKalmanFilter:
         self.initialized = False
         self.initial_accel = None
 
-    def initialize(self, accel_raw):
+    def initialize(self, accel_raw, calibrated_gravity=None):
         """Initialize filter state from first accelerometer reading (raw LSB).
 
         Args:
             accel_raw: Initial acceleration measurement [LSB]
+            calibrated_gravity: Optional pre-calibrated gravity vector [m/s²] to use as zero reference
         """
         if not self.initialized:
             # Apply transformations and convert to m/s²
@@ -689,7 +690,13 @@ class OrientationKalmanFilter:
 
             self.state[0] = roll0
             self.state[1] = pitch0
-            self.initial_accel = accel.copy()
+
+            # Use calibrated gravity if provided, otherwise use current reading
+            if calibrated_gravity is not None:
+                self.initial_accel = calibrated_gravity.copy()
+            else:
+                self.initial_accel = accel.copy()
+
             self.initialized = True
 
     def predict(self, gyro_raw, dt):
