@@ -12,6 +12,8 @@ Centralized configuration for all system parameters:
 - Performance optimization
 """
 
+import numpy as np
+
 # ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS
 # ============================================================================
@@ -508,7 +510,6 @@ def is_position_in_bounds(x, y, max_size=PLATFORM_HALF_SIZE_MM):
 
 def is_tilt_magnitude_valid(rx, ry, max_tilt=MAX_TILT_ANGLE_DEG):
     """Check if tilt magnitude is within limits."""
-    import numpy as np
     magnitude = np.sqrt(rx ** 2 + ry ** 2)
     return magnitude <= max_tilt
 

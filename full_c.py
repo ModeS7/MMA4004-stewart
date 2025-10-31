@@ -14,24 +14,21 @@ import gc
 import time
 import threading
 import numpy as np
-import serial
-import serial.tools.list_ports
-from queue import Queue, Empty
+import pyqtgraph as pg
 from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
                               QPushButton, QApplication, QWidget, QHBoxLayout, QCheckBox)
 from PyQt6.QtGui import QFont
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import (SerialController, IKCache, WindowsTimerManager,
                                                ThreadPriorityManager, HardwareControllerConfig,
-                                               LQRControllerConfig as HardwareLQRConfig)
-from misc.old.LQR_sim import LQRControllerConfig as SimLQRConfig
+                                               LQRControllerConfig)
 from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.control_core import (PIDController, LQRController, KalmanFilter, clip_tilt_vector,
-                                OrientationKalmanFilter, apply_imu_transforms, GRAVITY_MAGNITUDE)
-from core.utils import IKZOptimizationConfig
+                                OrientationKalmanFilter, apply_imu_transforms)
+from core.utils import IKZOptimizationConfig, MAX_TILT_ANGLE_DEG
 
 # Control configurations
 DEFAULT_HW_FREQUENCY_HZ = 250
@@ -165,9 +162,9 @@ class ComprehensiveStewartController(BaseStewartSimulator):
             return HardwareControllerConfig()
         elif self.controller_type_selection == 'LQR':
             if self.operation_mode == 'real':
-                return HardwareLQRConfig()
+                return LQRControllerConfig(mode='hardware')
             else:
-                return SimLQRConfig(mode='simulation')
+                return LQRControllerConfig(mode='simulation')
         else:  # Manual
             # For Manual mode, use a dummy config (won't be used)
             return HardwareControllerConfig()
@@ -1301,9 +1298,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
 
     def _create_plot(self, plot_panel):
         """Override to add ball trail plot item."""
-        import pyqtgraph as pg
-        from PyQt6.QtCore import Qt
-
         # Call parent to create standard plot
         super()._create_plot(plot_panel)
 
@@ -1377,7 +1371,6 @@ class ComprehensiveStewartController(BaseStewartSimulator):
                 rx = self.dof_values['rx']
                 ry = self.dof_values['ry']
                 magnitude = np.sqrt(rx ** 2 + ry ** 2)
-                from core.utils import MAX_TILT_ANGLE_DEG
                 magnitude_percent = (magnitude / MAX_TILT_ANGLE_DEG) * 100
 
                 state['controller_output'] = (rx, ry)

@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtCore import Qt, QTimer
 import pyqtgraph as pg
 
-from core.control_core import OrientationKalmanFilter, apply_imu_transforms, GRAVITY_VECTOR, GRAVITY_MAGNITUDE
+from core.control_core import OrientationKalmanFilter, apply_imu_transforms
 from core.core import StewartPlatformIK
 
 # PyQtGraph dark theme

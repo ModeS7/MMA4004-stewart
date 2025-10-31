@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from collections import deque
 
+from scipy.optimize import brentq, minimize_scalar
+
 from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM
 
 
@@ -297,8 +299,6 @@ class StewartPlatformIK:
         Returns:
             (optimized_translation, servo_angles, success)
         """
-        from scipy.optimize import brentq, minimize_scalar
-
         x, y, z_initial = translation
         z_min = z_initial - z_search_range
         z_max = z_initial + z_search_range

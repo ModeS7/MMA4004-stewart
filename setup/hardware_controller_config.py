@@ -23,8 +23,8 @@ import sys
 import ctypes
 
 from setup.base_simulator import ControllerConfig
-from core.control_core import PIDController
-from core.utils import ControlLoopConfig
+from core.control_core import PIDController, LQRController
+from core.utils import get_controller_defaults, BallPhysicsConfig
 
 THREAD_PRIORITY_IDLE = -15
 THREAD_PRIORITY_LOWEST = -2
@@ -456,23 +456,34 @@ class HardwareControllerConfig(ControllerConfig):
 
 
 class LQRControllerConfig(ControllerConfig):
-    """LQR controller configuration."""
+    """LQR controller configuration for both simulation and hardware modes."""
 
-    def __init__(self):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
-                              0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
-        self.default_scalar_idx = 5
+    def __init__(self, mode='simulation'):
+        """
+        Initialize LQR configuration.
+
+        Args:
+            mode: 'simulation' or 'hardware'
+        """
+        config = get_controller_defaults('LQR', mode)
+        self.scalar_values = config['scalar_values']
+        self.default_weights = config['weights']
+        self.default_scalar_indices = config['scalar_indices']
+        self.output_limit = config['output_limit']
+        self.ball_physics_params = BallPhysicsConfig.as_dict()
+        self.controller_ref = None
+        self.mode = mode
 
     def get_controller_name(self) -> str:
         return "LQR"
 
     def create_controller(self, **kwargs):
-        from core.control_core import LQRController
         return LQRController(
-            Q_position=kwargs.get('Q_pos', 0.01),
-            Q_velocity=kwargs.get('Q_vel', 0.01),
-            R_control=kwargs.get('R', 0.01),
-            output_limit=kwargs.get('output_limit', 15.0)
+            Q_pos=kwargs.get('Q_pos', self.default_weights['Q_pos']),
+            Q_vel=kwargs.get('Q_vel', self.default_weights['Q_vel']),
+            R=kwargs.get('R', self.default_weights['R']),
+            output_limit=kwargs.get('output_limit', self.output_limit),
+            ball_physics_params=self.ball_physics_params
         )
 
     def get_scalar_values(self) -> list:

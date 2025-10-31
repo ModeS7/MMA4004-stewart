@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
 from core.control_core import clip_tilt_vector
 from core.utils import (
-    MAX_TILT_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM,
+    MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM,
     SimulationConfig, IKZOptimizationConfig, format_time, format_error_context
 )
 from gui.gui_builder import GUIBuilder

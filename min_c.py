@@ -10,18 +10,19 @@ import gc
 import time
 import threading
 import numpy as np
+import pyqtgraph as pg
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
 
 from setup.base_simulator import BaseStewartSimulator
 from setup.hardware_controller_config import (WindowsTimerManager,
                                               ThreadPriorityManager, HardwareControllerConfig,
-                                              LQRControllerConfig as HardwareLQRConfig,
+                                              LQRControllerConfig,
                                               SerialController, IKCache)
-from misc.old.LQR_sim import LQRControllerConfig as SimLQRConfig
 from gui import gui_modules as gm
 from gui.gui_builder import GUIBuilder
 from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
+from core.utils import MAX_TILT_ANGLE_DEG
 
 
 DEFAULT_HW_FREQUENCY_HZ = 250
@@ -103,9 +104,9 @@ class UnifiedStewartController(BaseStewartSimulator):
             return HardwareControllerConfig()
         elif "LQR" in controller_name:
             if self.operation_mode == 'real':
-                return HardwareLQRConfig()
+                return LQRControllerConfig(mode='hardware')
             else:
-                return SimLQRConfig(mode='simulation')
+                return LQRControllerConfig(mode='simulation')
         else:
             return HardwareControllerConfig()
 
@@ -571,9 +572,6 @@ class UnifiedStewartController(BaseStewartSimulator):
 
     def _create_plot(self, plot_panel):
         """Override to add ball trail plot item."""
-        import pyqtgraph as pg
-        from PyQt6.QtCore import Qt
-
         # Call parent to create standard plot
         super()._create_plot(plot_panel)
 
@@ -716,7 +714,6 @@ class UnifiedStewartController(BaseStewartSimulator):
                 rx = self.dof_values['rx']
                 ry = self.dof_values['ry']
                 magnitude = np.sqrt(rx ** 2 + ry ** 2)
-                from core.utils import MAX_TILT_ANGLE_DEG
                 magnitude_percent = (magnitude / MAX_TILT_ANGLE_DEG) * 100
 
                 state['controller_output'] = (rx, ry)
