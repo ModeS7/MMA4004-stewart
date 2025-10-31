@@ -50,6 +50,7 @@ import pyqtgraph as pg
 
 from core.control_core import OrientationKalmanFilter, apply_imu_transforms
 from core.core import StewartPlatformIK
+from core.utils import IMUKalmanConfig
 
 # PyQtGraph dark theme
 pg.setConfigOption('background', '#1e1e1e')
@@ -303,17 +304,17 @@ class RealtimeOrientationWindow(QMainWindow):
 
         # Accel magnitude threshold
         motion_layout.addWidget(QLabel("Accel Threshold [m/s²]:"), 1, 0)
-        self.accel_threshold_input = QLineEdit("2.0")
+        self.accel_threshold_input = QLineEdit(str(IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD))
         self.accel_threshold_input.setMaximumWidth(60)
         self.accel_threshold_input.editingFinished.connect(self.schedule_param_update)
         motion_layout.addWidget(self.accel_threshold_input, 1, 1)
         self.accel_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.accel_threshold_slider.setMinimum(0)
         self.accel_threshold_slider.setMaximum(10000)
-        self.accel_threshold_slider.setValue(2000)
+        self.accel_threshold_slider.setValue(int(IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD * 1000))
         self.accel_threshold_slider.valueChanged.connect(self.schedule_param_update)
         motion_layout.addWidget(self.accel_threshold_slider, 1, 2)
-        self.accel_threshold_label = QLabel("2.00")
+        self.accel_threshold_label = QLabel(f"{IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD:.2f}")
         motion_layout.addWidget(self.accel_threshold_label, 1, 3)
 
         # Gyro magnitude threshold

@@ -24,7 +24,8 @@ import ctypes
 
 from setup.base_simulator import ControllerConfig
 from core.control_core import PIDController, LQRController
-from core.utils import get_controller_defaults, BallPhysicsConfig
+from core.utils import (get_controller_defaults, BallPhysicsConfig, SerialConfig,
+                         PIDConfig)
 
 THREAD_PRIORITY_IDLE = -15
 THREAD_PRIORITY_LOWEST = -2
@@ -150,7 +151,7 @@ class IKCache:
 class SerialController:
     """Serial communication with hardware."""
 
-    def __init__(self, port, baudrate=200000):
+    def __init__(self, port, baudrate=SerialConfig.USB_BAUD_RATE):
         self.port = port
         self.baudrate = baudrate
         self.serial = None
@@ -159,14 +160,14 @@ class SerialController:
         self.write_thread = None
         self.running = False
 
-        self.ball_data_queue = Queue(maxsize=10)
-        self.command_queue = Queue(maxsize=20)
+        self.ball_data_queue = Queue(maxsize=SerialConfig.BALL_DATA_QUEUE_SIZE)
+        self.command_queue = Queue(maxsize=SerialConfig.COMMAND_QUEUE_SIZE)
         self.last_command_time = 0
 
         # IMU data queues
-        self.gyro_queue = Queue(maxsize=1000)
-        self.accel_queue = Queue(maxsize=2000)
-        self.mag_queue = Queue(maxsize=500)
+        self.gyro_queue = Queue(maxsize=SerialConfig.IMU_GYRO_QUEUE_SIZE)
+        self.accel_queue = Queue(maxsize=SerialConfig.IMU_ACCEL_QUEUE_SIZE)
+        self.mag_queue = Queue(maxsize=SerialConfig.IMU_MAG_QUEUE_SIZE)
 
         # IMU statistics
         self.gyro_count = 0
@@ -176,8 +177,9 @@ class SerialController:
     def connect(self):
         try:
             self.serial = serial.Serial(self.port, self.baudrate,
-                                        timeout=0.1, write_timeout=0.5)
-            time.sleep(2)
+                                        timeout=SerialConfig.READ_TIMEOUT_S,
+                                        write_timeout=SerialConfig.WRITE_TIMEOUT_S)
+            time.sleep(SerialConfig.CONNECTION_DELAY_S)
             self.connected = True
 
             self.serial.reset_input_buffer()
@@ -289,7 +291,7 @@ class SerialController:
                             except (ValueError, IndexError):
                                 pass
 
-                time.sleep(0.0005)
+                time.sleep(SerialConfig.READ_LOOP_SLEEP_S)
 
             except Exception as e:
                 if self.running:
@@ -307,7 +309,7 @@ class SerialController:
                     self.serial.write(command.encode('utf-8'))
                     self.last_command_time = time.time()
                     error_count = 0
-                    time.sleep(0.003)
+                    time.sleep(SerialConfig.WRITE_DELAY_S)
 
                 except Empty:
                     pass
@@ -337,7 +339,7 @@ class SerialController:
             command = ','.join([f'{angle:.2f}' for angle in angles]) + '\n'
 
             # Drop oldest commands if queue is full (keep system responsive)
-            if self.command_queue.qsize() >= 20:
+            if self.command_queue.qsize() >= SerialConfig.COMMAND_QUEUE_SIZE:
                 try:
                     self.command_queue.get_nowait()  # Remove oldest
                 except:
@@ -354,7 +356,7 @@ class SerialController:
         if not self.connected:
             return False
         try:
-            if self.command_queue.qsize() >= 15:
+            if self.command_queue.qsize() >= SerialConfig.COMMAND_QUEUE_THRESHOLD_HIGH:
                 return False
             self.command_queue.put_nowait(cmd + '\n')
             return True
@@ -448,7 +450,7 @@ class HardwareControllerConfig(ControllerConfig):
             ki=kwargs.get('ki', 0.0001),
             kd=kwargs.get('kd', 0.0003),
             output_limit=kwargs.get('output_limit', 15.0),
-            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', 0.1)
+            derivative_filter_alpha=kwargs.get('derivative_filter_alpha', PIDConfig.HW_DERIVATIVE_FILTER_ALPHA)
         )
 
     def get_scalar_values(self) -> list:

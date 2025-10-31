@@ -19,7 +19,8 @@ from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, P
 from core.control_core import clip_tilt_vector
 from core.utils import (
     MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM,
-    SimulationConfig, IKZOptimizationConfig, format_time, format_error_context
+    SimulationConfig, IKZOptimizationConfig, Pixy2CameraConfig,
+    format_time, format_error_context
 )
 from gui.gui_builder import GUIBuilder
 from gui import gui_modules as gm
@@ -159,10 +160,10 @@ class BaseStewartSimulator(QMainWindow):
         )
 
         self.pixy_camera = Pixy2Camera(
-            pixel_size_mm=1.4,
-            subpixel_noise_std=0.4,
-            detection_rate=0.999,
-            sample_rate_hz=19.3
+            pixel_size_mm=Pixy2CameraConfig.PIXEL_SIZE_MM,
+            subpixel_noise_std=Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM,
+            detection_rate=Pixy2CameraConfig.DEFAULT_DETECTION_RATE,
+            sample_rate_hz=Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ
         )
         self.camera_enabled = True
 

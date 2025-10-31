@@ -45,6 +45,8 @@ class GUIConfig:
     UPDATE_HZ = 5  # GUI refresh rate
     UPDATE_INTERVAL_MS = 200  # GUI update interval (milliseconds)
     LOG_INTERVAL_S = 2.0  # Debug log update interval
+    PLOT_DISABLED_INTERVAL_MS = 100  # Update interval when plotting disabled
+    SLIDER_RESOLUTION = 100  # Integer slider resolution multiplier
 
 
 class SimulationConfig:
@@ -148,6 +150,10 @@ class LQRConfig:
     # Controller limits
     OUTPUT_LIMIT = MAX_TILT_ANGLE_DEG  # Maximum controller output (degrees)
 
+    # Fallback gain matrix (used when Riccati solver fails)
+    FALLBACK_GAIN_MATRIX = np.array([[1.0, 0.0, 1.0, 0.0],
+                                      [0.0, 1.0, 0.0, 1.0]])
+
 
 # ============================================================================
 # KALMAN FILTER CONFIGURATION
@@ -214,9 +220,9 @@ class Pixy2CameraConfig:
     PIXEL_SIZE_MM = 1.4  # Physical size of one pixel (mm)
     SUBPIXEL_NOISE_STD_MM = 0.4  # Sub-pixel noise std dev (mm)
 
-    # Field of view dimensions
-    FOV_WIDTH_MM = 350.0  # Physical width of camera view (mm)
-    FOV_HEIGHT_MM = 266.0  # Physical height of camera view (mm)
+    # Field of view dimensions (calibrated for current camera distance)
+    FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm)
+    FOV_HEIGHT_MM = 424.0  # Physical height of camera view (mm)
 
     # Camera resolution
     RESOLUTION_WIDTH_PX = 316  # Camera width (pixels)
@@ -227,12 +233,14 @@ class Pixy2CameraConfig:
     PIXELS_TO_MM_Y = FOV_HEIGHT_MM / RESOLUTION_HEIGHT_PX
 
     # Camera center point (for coordinate transformation)
-    CENTER_X_PX = RESOLUTION_WIDTH_PX / 2.0  # 158
-    CENTER_Y_PX = RESOLUTION_HEIGHT_PX / 2.0  # 104
+    CENTER_X_PX = RESOLUTION_WIDTH_PX / 2.0  # 158 pixels
+    CENTER_Y_PX = RESOLUTION_HEIGHT_PX / 2.0  # 104 pixels
+    CENTER_X = 145.0  # Camera center X offset in mm
+    CENTER_Y = 102.0  # Camera center Y offset in mm
 
-    # Detection characteristics
-    DEFAULT_DETECTION_RATE = 0.999  # 99.9% detection rate (very reliable)
-    DEFAULT_SAMPLE_RATE_HZ = 19.3  # Measured camera update rate (Hz)
+    # Default operational parameters
+    DEFAULT_DETECTION_RATE = 0.999  # Ball detection probability (99.9%)
+    DEFAULT_SAMPLE_RATE_HZ = 19.3  # Camera update rate (Hz)
 
     # GUI slider ranges
     PIXEL_SIZE_RANGE = (0.5, 3.0)  # mm
@@ -353,6 +361,9 @@ class SerialConfig:
     # Queue sizes
     BALL_DATA_QUEUE_SIZE = 10  # Camera data queue depth
     COMMAND_QUEUE_SIZE = 20  # Servo command queue depth
+    IMU_GYRO_QUEUE_SIZE = 1000  # Gyroscope data queue depth
+    IMU_ACCEL_QUEUE_SIZE = 2000  # Accelerometer data queue depth
+    IMU_MAG_QUEUE_SIZE = 500  # Magnetometer data queue depth
 
     # Rate limiting
     MIN_COMMAND_INTERVAL_S = ControlLoopConfig.INTERVAL_S  # Minimum time between commands
@@ -364,6 +375,11 @@ class SerialConfig:
     RATE_LIMIT_HIGH_S = 0.05  # 20 Hz when queue is very full
     RATE_LIMIT_MEDIUM_S = 0.02  # 50 Hz when queue is moderately full
     RATE_LIMIT_NORMAL_S = MIN_COMMAND_INTERVAL_S  # 100 Hz in normal operation
+
+    # Thread management
+    THREAD_JOIN_TIMEOUT_S = 1.0  # Timeout for joining threads on shutdown
+    READ_LOOP_SLEEP_S = 0.0005  # Sleep duration in read loop (0.5ms)
+    WRITE_DELAY_S = 0.003  # Delay after each write in write loop (3ms)
 
 
 # ============================================================================
@@ -402,9 +418,6 @@ class PerformanceConfig:
     # Timing statistics
     TIMING_STATS_MAX_SAMPLES = 1000  # Maximum timing samples to keep
     TIMING_BREAKPOINT_MAX_SAMPLES = 1000  # Maximum breakpoint timing samples
-
-    # Debug logging
-    DEBUG_LOG_INTERVAL_LOOPS = 50  # Log control values every N loops (0.5s at 100Hz)
 
 
 # ============================================================================
@@ -473,6 +486,71 @@ class ColorScheme:
             'warning': cls.WARNING,
             'error': cls.ERROR
         }
+
+
+# ============================================================================
+# IMU KALMAN FILTER CONFIGURATION
+# ============================================================================
+
+class IMUKalmanConfig:
+    """IMU orientation Kalman filter parameters."""
+
+    # Kalman filter noise parameters
+    DEFAULT_ACCEL_NOISE = 1.0
+    DEFAULT_GYRO_NOISE = 0.0224
+    DEFAULT_PROCESS_NOISE_ANGLE = 0.001
+    DEFAULT_PROCESS_NOISE_BIAS = 0.00001
+
+    # Calibrated gyroscope bias (rad/s)
+    CALIBRATED_GYRO_BIAS_X = 0.112679
+    CALIBRATED_GYRO_BIAS_Y = 0.031500
+
+    # Motion detection thresholds
+    DEFAULT_ACCEL_THRESHOLD = 1.0  # m/s² - reject accel updates above this
+    DEFAULT_GYRO_THRESHOLD = 0.5   # rad/s - gyro magnitude threshold
+
+    # Scaling and transformation
+    DEFAULT_GYRO_SCALE_MULTIPLIER = 6.6
+    DEFAULT_MAG_INCLINATION_DEG = 75.0
+
+    # Default axis transformations (identity - no flipping)
+    DEFAULT_ACCEL_AXIS_FLIP = np.array([1, 1, 1])
+    DEFAULT_GYRO_AXIS_FLIP = np.array([1, 1, 1])
+    DEFAULT_ACCEL_ROTATION = np.eye(3)
+    DEFAULT_GYRO_ROTATION = np.eye(3)
+
+
+# ============================================================================
+# IMU CALIBRATION CONFIGURATION
+# ============================================================================
+
+class IMUCalibrationConfig:
+    """IMU calibration sequence timing parameters."""
+
+    INITIALIZATION_DURATION_S = 3.0   # Stabilization period before calibration
+    CALIBRATION_DURATION_S = 10.0     # Duration to collect calibration data
+
+
+# ============================================================================
+# HARDWARE CONNECTION CONFIGURATION
+# ============================================================================
+
+class HardwareConnectionConfig:
+    """Serial connection setup timing and delays."""
+
+    POST_CONNECTION_DELAY_S = 0.5      # Delay after establishing connection
+    POST_SERVO_SPEED_DELAY_S = 0.1     # Delay after setting servo speed
+    POST_SERVO_ACCEL_DELAY_S = 0.2     # Delay after setting servo acceleration
+
+
+# ============================================================================
+# VISUALIZATION CONFIGURATION
+# ============================================================================
+
+class VisualizationConfig:
+    """Visualization and display parameters."""
+
+    BALL_TRAIL_MAX_HISTORY = 100  # Maximum number of ball positions to track
 
 
 # ============================================================================

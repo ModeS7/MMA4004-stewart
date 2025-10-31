@@ -23,10 +23,9 @@ from setup.hardware_controller_config import (WindowsTimerManager,
 from gui import gui_modules as gm
 from gui.gui_builder import GUIBuilder
 from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
-from core.utils import MAX_TILT_ANGLE_DEG
-
-
-DEFAULT_HW_FREQUENCY_HZ = 250
+from core.utils import (MAX_TILT_ANGLE_DEG, ControlLoopConfig, Pixy2CameraConfig,
+                         BallPhysicsConfig, VisualizationConfig, HardwareConnectionConfig,
+                         PIDConfig, PerformanceConfig, GUIConfig)
 
 
 class MinimalController(BaseStewartSimulator):
@@ -44,15 +43,15 @@ class MinimalController(BaseStewartSimulator):
         self.ik_cache = None
         self.timer_manager = WindowsTimerManager()
         self.priority_manager = ThreadPriorityManager()
-        self.control_frequency = DEFAULT_HW_FREQUENCY_HZ
-        self.control_interval = 1.0 / DEFAULT_HW_FREQUENCY_HZ
+        self.control_frequency = ControlLoopConfig.DEFAULT_FREQUENCY_HZ
+        self.control_interval = 1.0 / ControlLoopConfig.DEFAULT_FREQUENCY_HZ
         self.use_kalman_derivative = False
 
         # Camera calibration parameters (pixels to mm conversion)
-        self.pixy_width_mm = 558.0
-        self.pixy_height_mm = 424.0
-        self.pixels_to_mm_x = self.pixy_width_mm / 316.0  # 1.766 mm/pixel
-        self.pixels_to_mm_y = self.pixy_height_mm / 208.0  # 2.038 mm/pixel
+        self.pixy_width_mm = Pixy2CameraConfig.FOV_WIDTH_MM
+        self.pixy_height_mm = Pixy2CameraConfig.FOV_HEIGHT_MM
+        self.pixels_to_mm_x = Pixy2CameraConfig.PIXELS_TO_MM_X
+        self.pixels_to_mm_y = Pixy2CameraConfig.PIXELS_TO_MM_Y
         self.last_ball_update = 0.0
         self.ball_pos_mm = np.array([0.0, 0.0])
         self.ball_detected = False
@@ -65,16 +64,10 @@ class MinimalController(BaseStewartSimulator):
         }
 
         # Initialize Kalman filter (required before super().__init__)
-        ball_physics_params = {
-            'radius': 0.02,
-            'mass': 0.0027,
-            'gravity': 9.81,
-            'mass_factor': 1.667
-        }
         self.kalman_filter = KalmanFilter(
             process_noise_scale=1.0,
             measurement_noise_scale=1.0,
-            ball_physics_params=ball_physics_params,
+            ball_physics_params=BallPhysicsConfig.as_dict(),
             dt=self.control_interval
         )
         self.kalman_enabled = True
@@ -82,7 +75,7 @@ class MinimalController(BaseStewartSimulator):
         # Ball position trail visualization
         self.ball_history_x = []
         self.ball_history_y = []
-        self.max_history = 100
+        self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
 
         # Create controller config
         controller_config = self._create_controller_config()
@@ -135,7 +128,7 @@ class MinimalController(BaseStewartSimulator):
             self.controller = PIDController(
                 kp=kp, ki=ki, kd=kd,
                 output_limit=15.0,
-                derivative_filter_alpha=0.1
+                derivative_filter_alpha=PIDConfig.HW_DERIVATIVE_FILTER_ALPHA
             )
             self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
 
@@ -452,11 +445,9 @@ class MinimalController(BaseStewartSimulator):
 
                 # Camera dimensions: 316×208 pixels, origin at top-left
                 CAMERA_HEIGHT_PIXELS = 208.0
-                CAMERA_CENTER_X = 145.0
-                CAMERA_CENTER_Y = 102.0
 
-                ball_x_mm = (pixy_x - CAMERA_CENTER_X) * self.pixels_to_mm_x
-                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - CAMERA_CENTER_Y) * self.pixels_to_mm_y
+                ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
+                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
@@ -568,7 +559,7 @@ class MinimalController(BaseStewartSimulator):
             self.ball_trail.setData(self.ball_history_x, self.ball_history_y)
 
         # Schedule next update
-        QTimer.singleShot(100, self._gui_update_loop)
+        QTimer.singleShot(GUIConfig.PLOT_DISABLED_INTERVAL_MS, self._gui_update_loop)
 
     def _create_plot(self, plot_panel):
         """Override to add ball trail plot item."""
@@ -601,11 +592,11 @@ class MinimalController(BaseStewartSimulator):
             self.connected = True
             self.log(f"Connected to {port}")
 
-            time.sleep(0.5)
+            time.sleep(HardwareConnectionConfig.POST_CONNECTION_DELAY_S)
             self.serial_controller.set_servo_speed(0)
-            time.sleep(0.1)
+            time.sleep(HardwareConnectionConfig.POST_SERVO_SPEED_DELAY_S)
             self.serial_controller.set_servo_acceleration(0)
-            time.sleep(0.2)
+            time.sleep(HardwareConnectionConfig.POST_SERVO_ACCEL_DELAY_S)
             self.log("Servo parameters configured: Speed=0, Acceleration=0")
 
             success_timer, msg_timer = self.timer_manager.set_high_resolution()
@@ -643,10 +634,12 @@ class MinimalController(BaseStewartSimulator):
     def initialize_ik_cache(self):
         """Pre-compute common inverse kinematics solutions."""
         if not hasattr(self, 'ik_cache') or self.ik_cache is None:
-            self.ik_cache = IKCache(max_size=5000)
+            self.ik_cache = IKCache(max_size=PerformanceConfig.IK_CACHE_SIZE)
 
         self.log("Initializing IK cache...")
-        tilts = np.arange(-15, 16, 2)
+        tilts = np.arange(PerformanceConfig.IK_PREWARM_TILT_RANGE[0],
+                          PerformanceConfig.IK_PREWARM_TILT_RANGE[1] + 1,
+                          PerformanceConfig.IK_PREWARM_TILT_STEP)
         count = 0
         for rx in tilts:
             for ry in tilts:

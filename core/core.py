@@ -14,13 +14,14 @@ from collections import deque
 
 from scipy.optimize import brentq, minimize_scalar
 
-from core.utils import MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM
+from core.utils import (MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM,
+                         SimulationConfig)
 
 
 class FirstOrderServo:
     """First-order servo model with command delay."""
 
-    def __init__(self, K=1.0, tau=0.05, delay=0.0, max_velocity=545.0):
+    def __init__(self, K=1.0, tau=0.05, delay=0.0, max_velocity=SimulationConfig.DEFAULT_SERVO_MAX_VELOCITY):
         self.K = K
         self.tau = tau
         self.delay = delay
