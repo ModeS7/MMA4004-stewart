@@ -35,6 +35,18 @@ int16_t accelData[3];
 int16_t gyroData[3];
 int16_t magData[3];
 
+// ===== AVERAGING BUFFERS =====
+#define ACCEL_AVG_COUNT 5
+#define GYRO_AVG_COUNT 5
+#define MAG_AVG_COUNT 2
+
+int32_t accelSum[3] = {0, 0, 0};
+int32_t gyroSum[3] = {0, 0, 0};
+int32_t magSum[3] = {0, 0, 0};
+uint8_t accelAvgIndex = 0;
+uint8_t gyroAvgIndex = 0;
+uint8_t magAvgIndex = 0;
+
 // ===== IMU TIMING =====
 unsigned long lastAccelTime = 0;
 unsigned long lastGyroTime = 0;
@@ -160,28 +172,91 @@ void setup() {
 void loop() {
   unsigned long now = micros();
 
-  // Read accelerometer at ~1265 Hz
+  // Read accelerometer at ~1344 Hz, average and send every 5 samples
   if (now - lastAccelTime >= ACCEL_INTERVAL_US) {
     readAccel();
-    sendAccel(now);
+
+    // Accumulate for averaging
+    accelSum[0] += accelData[0];
+    accelSum[1] += accelData[1];
+    accelSum[2] += accelData[2];
+    accelAvgIndex++;
+
+    // Send averaged sample when buffer full
+    if (accelAvgIndex >= ACCEL_AVG_COUNT) {
+      int16_t avgData[3];
+      avgData[0] = accelSum[0] / ACCEL_AVG_COUNT;
+      avgData[1] = accelSum[1] / ACCEL_AVG_COUNT;
+      avgData[2] = accelSum[2] / ACCEL_AVG_COUNT;
+      sendAccel(now, avgData);
+
+      // Reset accumulator
+      accelSum[0] = 0;
+      accelSum[1] = 0;
+      accelSum[2] = 0;
+      accelAvgIndex = 0;
+      accelCount++;
+    }
+
     lastAccelTime = now;
-    accelCount++;
   }
 
-  // Read gyroscope at ~759 Hz
+  // Read gyroscope at ~800 Hz, average and send every 5 samples
   if (now - lastGyroTime >= GYRO_INTERVAL_US) {
     readGyro();
-    sendGyro(now);
+
+    // Accumulate for averaging
+    gyroSum[0] += gyroData[0];
+    gyroSum[1] += gyroData[1];
+    gyroSum[2] += gyroData[2];
+    gyroAvgIndex++;
+
+    // Send averaged sample when buffer full
+    if (gyroAvgIndex >= GYRO_AVG_COUNT) {
+      int16_t avgData[3];
+      avgData[0] = gyroSum[0] / GYRO_AVG_COUNT;
+      avgData[1] = gyroSum[1] / GYRO_AVG_COUNT;
+      avgData[2] = gyroSum[2] / GYRO_AVG_COUNT;
+      sendGyro(now, avgData);
+
+      // Reset accumulator
+      gyroSum[0] = 0;
+      gyroSum[1] = 0;
+      gyroSum[2] = 0;
+      gyroAvgIndex = 0;
+      gyroCount++;
+    }
+
     lastGyroTime = now;
-    gyroCount++;
   }
 
-  // Read magnetometer at ~220 Hz
+  // Read magnetometer at ~220 Hz, average and send every 2 samples
   if (now - lastMagTime >= MAG_INTERVAL_US) {
     readMag();
-    sendMag(now);
+
+    // Accumulate for averaging
+    magSum[0] += magData[0];
+    magSum[1] += magData[1];
+    magSum[2] += magData[2];
+    magAvgIndex++;
+
+    // Send averaged sample when buffer full
+    if (magAvgIndex >= MAG_AVG_COUNT) {
+      int16_t avgData[3];
+      avgData[0] = magSum[0] / MAG_AVG_COUNT;
+      avgData[1] = magSum[1] / MAG_AVG_COUNT;
+      avgData[2] = magSum[2] / MAG_AVG_COUNT;
+      sendMag(now, avgData);
+
+      // Reset accumulator
+      magSum[0] = 0;
+      magSum[1] = 0;
+      magSum[2] = 0;
+      magAvgIndex = 0;
+      magCount++;
+    }
+
     lastMagTime = now;
-    magCount++;
   }
 
   // Report sampling rates every 2 seconds
@@ -196,11 +271,17 @@ void loop() {
 
     USB_SERIAL.print("RATE:Accel=");
     USB_SERIAL.print(accelHz, 2);
-    USB_SERIAL.print(",Gyro=");
+    USB_SERIAL.print(" Hz (avg ");
+    USB_SERIAL.print(ACCEL_AVG_COUNT);
+    USB_SERIAL.print("), Gyro=");
     USB_SERIAL.print(gyroHz, 2);
-    USB_SERIAL.print(",Mag=");
+    USB_SERIAL.print(" Hz (avg ");
+    USB_SERIAL.print(GYRO_AVG_COUNT);
+    USB_SERIAL.print("), Mag=");
     USB_SERIAL.print(magHz, 2);
-    USB_SERIAL.println(" Hz");
+    USB_SERIAL.print(" Hz (avg ");
+    USB_SERIAL.print(MAG_AVG_COUNT);
+    USB_SERIAL.println(")");
 
     lastRateReport = now;
   }
@@ -270,26 +351,16 @@ void readGyro() {
   gyroData[2] = (int16_t)(zhi << 8 | zlo);
 }
 
-void sendAccel(unsigned long timestamp_us) {
-  USB_SERIAL.print("A:");
-  USB_SERIAL.print(timestamp_us);
-  USB_SERIAL.print(",");
-  USB_SERIAL.print(accelData[0]);
-  USB_SERIAL.print(",");
-  USB_SERIAL.print(accelData[1]);
-  USB_SERIAL.print(",");
-  USB_SERIAL.println(accelData[2]);
+void sendAccel(unsigned long timestamp_us, int16_t* data) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "A:%lu,%d,%d,%d", timestamp_us, data[0], data[1], data[2]);
+  USB_SERIAL.println(buf);
 }
 
-void sendGyro(unsigned long timestamp_us) {
-  USB_SERIAL.print("G:");
-  USB_SERIAL.print(timestamp_us);
-  USB_SERIAL.print(",");
-  USB_SERIAL.print(gyroData[0]);
-  USB_SERIAL.print(",");
-  USB_SERIAL.print(gyroData[1]);
-  USB_SERIAL.print(",");
-  USB_SERIAL.println(gyroData[2]);
+void sendGyro(unsigned long timestamp_us, int16_t* data) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "G:%lu,%d,%d,%d", timestamp_us, data[0], data[1], data[2]);
+  USB_SERIAL.println(buf);
 }
 
 void readMag() {
@@ -312,15 +383,10 @@ void readMag() {
   magData[2] = (int16_t)(zhi << 8 | zlo);
 }
 
-void sendMag(unsigned long timestamp_us) {
-  USB_SERIAL.print("M:");
-  USB_SERIAL.print(timestamp_us);
-  USB_SERIAL.print(",");
-  USB_SERIAL.print(magData[0]);
-  USB_SERIAL.print(",");
-  USB_SERIAL.print(magData[1]);
-  USB_SERIAL.print(",");
-  USB_SERIAL.println(magData[2]);
+void sendMag(unsigned long timestamp_us, int16_t* data) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "M:%lu,%d,%d,%d", timestamp_us, data[0], data[1], data[2]);
+  USB_SERIAL.println(buf);
 }
 
 // ===== NON-BLOCKING SERIAL COMMAND PROCESSING =====

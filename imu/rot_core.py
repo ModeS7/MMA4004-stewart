@@ -66,8 +66,8 @@ GYRO_BIAS_X = 0.112679
 GYRO_BIAS_Y = 0.031500
 
 # Axis transformations (default: no inversions)
-ACCEL_AXIS_FLIP = np.array([1, 1, -1])
-GYRO_AXIS_FLIP = np.array([1, 1, -1])
+ACCEL_AXIS_FLIP = np.array([1, 1, 1])
+GYRO_AXIS_FLIP = np.array([1, 1, 1])
 ACCEL_ROTATION = np.eye(3)
 GYRO_ROTATION = np.eye(3)
 
