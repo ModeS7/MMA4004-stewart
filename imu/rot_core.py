@@ -65,6 +65,10 @@ PROCESS_NOISE_BIAS = 0.00001
 GYRO_BIAS_X = 0.112679
 GYRO_BIAS_Y = 0.031500
 
+# Motion detection thresholds
+ACCEL_MAGNITUDE_THRESHOLD = 2.0  # m/s² deviation from gravity to reject accel update
+GYRO_MAGNITUDE_THRESHOLD = 0.5   # rad/s rotation rate to reject accel update
+
 # Axis transformations (default: no inversions)
 ACCEL_AXIS_FLIP = np.array([1, 1, 1])
 GYRO_AXIS_FLIP = np.array([1, 1, 1])
@@ -97,7 +101,7 @@ class RealtimeOrientationWindow(QMainWindow):
             gyro_rotation=GYRO_ROTATION,
             initial_bias_x=GYRO_BIAS_X,
             initial_bias_y=GYRO_BIAS_Y,
-            gyro_scale_multiplier=6.6
+            gyro_scale_multiplier=1.0
         )
 
         # Data queues
@@ -124,6 +128,13 @@ class RealtimeOrientationWindow(QMainWindow):
         self.last_servo_time = 0.0
         self.servo_interval = 1.0 / 100.0  # 100 Hz
         self.compensation_gain = 1.0  # Full compensation
+
+        # Suspension control (active damping)
+        self.suspension_enabled = False
+        self.suspension_position_gain = 0.5  # Proportional to linear acceleration
+        self.suspension_velocity_gain = 0.0  # Damping (integrated accel)
+        self.linear_velocity = np.array([0.0, 0.0, 0.0])  # Integrated from acceleration
+        self.last_update_time = time.time()
 
         # Initialization and calibration phases
         self.initializing = True
@@ -279,6 +290,64 @@ class RealtimeOrientationWindow(QMainWindow):
 
         controls_layout.addWidget(params_group)
 
+        # Motion detection group
+        motion_group = QGroupBox("Motion Detection (Impact Rejection)")
+        motion_layout = QGridLayout()
+        motion_group.setLayout(motion_layout)
+
+        # Enable motion detection
+        self.enable_motion_detection_checkbox = QCheckBox("Enable Motion Detection")
+        self.enable_motion_detection_checkbox.setChecked(False)  # Default OFF to not affect basic operation
+        self.enable_motion_detection_checkbox.stateChanged.connect(self.toggle_motion_detection)
+        motion_layout.addWidget(self.enable_motion_detection_checkbox, 0, 0, 1, 4)
+
+        # Accel magnitude threshold
+        motion_layout.addWidget(QLabel("Accel Threshold [m/s²]:"), 1, 0)
+        self.accel_threshold_input = QLineEdit("2.0")
+        self.accel_threshold_input.setMaximumWidth(60)
+        self.accel_threshold_input.editingFinished.connect(self.schedule_param_update)
+        motion_layout.addWidget(self.accel_threshold_input, 1, 1)
+        self.accel_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.accel_threshold_slider.setMinimum(0)
+        self.accel_threshold_slider.setMaximum(10000)
+        self.accel_threshold_slider.setValue(2000)
+        self.accel_threshold_slider.valueChanged.connect(self.schedule_param_update)
+        motion_layout.addWidget(self.accel_threshold_slider, 1, 2)
+        self.accel_threshold_label = QLabel("2.00")
+        motion_layout.addWidget(self.accel_threshold_label, 1, 3)
+
+        # Gyro magnitude threshold
+        motion_layout.addWidget(QLabel("Gyro Threshold [rad/s]:"), 2, 0)
+        self.gyro_threshold_input = QLineEdit("0.5")
+        self.gyro_threshold_input.setMaximumWidth(60)
+        self.gyro_threshold_input.editingFinished.connect(self.schedule_param_update)
+        motion_layout.addWidget(self.gyro_threshold_input, 2, 1)
+        self.gyro_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gyro_threshold_slider.setMinimum(0)
+        self.gyro_threshold_slider.setMaximum(5000)
+        self.gyro_threshold_slider.setValue(500)
+        self.gyro_threshold_slider.valueChanged.connect(self.schedule_param_update)
+        motion_layout.addWidget(self.gyro_threshold_slider, 2, 2)
+        self.gyro_threshold_label = QLabel("0.50")
+        motion_layout.addWidget(self.gyro_threshold_label, 2, 3)
+
+        # Magnetometer backup
+        self.enable_magnetometer_checkbox = QCheckBox("Use Magnetometer Backup")
+        self.enable_magnetometer_checkbox.setChecked(False)
+        self.enable_magnetometer_checkbox.stateChanged.connect(self.toggle_magnetometer)
+        motion_layout.addWidget(self.enable_magnetometer_checkbox, 4, 0, 1, 2)
+
+        # Calibrate magnetometer offset button
+        self.calibrate_mag_button = QPushButton("Calibrate Mag")
+        self.calibrate_mag_button.clicked.connect(self.calibrate_magnetometer_offset)
+        motion_layout.addWidget(self.calibrate_mag_button, 4, 2, 1, 2)
+
+        # Rejection statistics
+        self.rejection_stats_label = QLabel("Rejected: 0 / 0 (0.0%) | Mag: 0")
+        motion_layout.addWidget(self.rejection_stats_label, 5, 0, 1, 4)
+
+        controls_layout.addWidget(motion_group)
+
         # Axis transformation controls
         transform_group = QGroupBox("IMU Axis Transformations")
         transform_layout = QVBoxLayout()
@@ -324,6 +393,49 @@ class RealtimeOrientationWindow(QMainWindow):
         transform_layout.addWidget(reset_btn)
 
         controls_layout.addWidget(transform_group)
+
+        # Suspension control group
+        suspension_group = QGroupBox("Active Suspension Control")
+        suspension_layout = QGridLayout()
+        suspension_group.setLayout(suspension_layout)
+
+        # Enable suspension
+        self.enable_suspension_checkbox = QCheckBox("Enable Suspension")
+        self.enable_suspension_checkbox.setChecked(False)
+        self.enable_suspension_checkbox.stateChanged.connect(self.toggle_suspension)
+        suspension_layout.addWidget(self.enable_suspension_checkbox, 0, 0, 1, 4)
+
+        # Position gain (accel feedback)
+        suspension_layout.addWidget(QLabel("Accel Gain [mm/(m/s²)]:"), 1, 0)
+        self.suspension_pos_gain_input = QLineEdit("0.5")
+        self.suspension_pos_gain_input.setMaximumWidth(60)
+        self.suspension_pos_gain_input.editingFinished.connect(self.update_suspension_gains)
+        suspension_layout.addWidget(self.suspension_pos_gain_input, 1, 1)
+        self.suspension_pos_slider = QSlider(Qt.Orientation.Horizontal)
+        self.suspension_pos_slider.setMinimum(0)
+        self.suspension_pos_slider.setMaximum(5000)
+        self.suspension_pos_slider.setValue(500)
+        self.suspension_pos_slider.valueChanged.connect(self.update_suspension_gains)
+        suspension_layout.addWidget(self.suspension_pos_slider, 1, 2)
+        self.suspension_pos_label = QLabel("0.50")
+        suspension_layout.addWidget(self.suspension_pos_label, 1, 3)
+
+        # Velocity gain (damping)
+        suspension_layout.addWidget(QLabel("Damping Gain [mm/(m/s)]:"), 2, 0)
+        self.suspension_vel_gain_input = QLineEdit("0.0")
+        self.suspension_vel_gain_input.setMaximumWidth(60)
+        self.suspension_vel_gain_input.editingFinished.connect(self.update_suspension_gains)
+        suspension_layout.addWidget(self.suspension_vel_gain_input, 2, 1)
+        self.suspension_vel_slider = QSlider(Qt.Orientation.Horizontal)
+        self.suspension_vel_slider.setMinimum(0)
+        self.suspension_vel_slider.setMaximum(5000)
+        self.suspension_vel_slider.setValue(0)
+        self.suspension_vel_slider.valueChanged.connect(self.update_suspension_gains)
+        suspension_layout.addWidget(self.suspension_vel_slider, 2, 2)
+        self.suspension_vel_label = QLabel("0.00")
+        suspension_layout.addWidget(self.suspension_vel_label, 2, 3)
+
+        controls_layout.addWidget(suspension_group)
         controls_layout.addStretch()
 
         main_layout.addWidget(controls)
@@ -423,6 +535,76 @@ class RealtimeOrientationWindow(QMainWindow):
         self.gyro_rotation = GYRO_ROTATION.copy()
         self.schedule_param_update()
 
+    def toggle_suspension(self):
+        """Enable/disable suspension control"""
+        self.suspension_enabled = self.enable_suspension_checkbox.isChecked()
+        if self.suspension_enabled:
+            # Reset velocity integrator when enabling
+            self.linear_velocity = np.array([0.0, 0.0, 0.0])
+            self.last_update_time = time.time()
+            print("Suspension control ENABLED")
+        else:
+            print("Suspension control DISABLED")
+
+    def toggle_motion_detection(self):
+        """Enable/disable motion detection (impact rejection)"""
+        enabled = self.enable_motion_detection_checkbox.isChecked()
+        if hasattr(self, 'kalman'):
+            self.kalman.enable_rejection = enabled
+            if enabled:
+                print("Motion detection ENABLED - will reject accel updates during impacts")
+            else:
+                print("Motion detection DISABLED - all accel updates accepted (may freak out on impacts!)")
+        else:
+            print("Kalman filter not yet initialized")
+
+    def toggle_magnetometer(self):
+        """Enable/disable magnetometer backup during accel rejection"""
+        enabled = self.enable_magnetometer_checkbox.isChecked()
+        if hasattr(self, 'kalman'):
+            self.kalman.use_magnetometer = enabled
+            if enabled:
+                print("Magnetometer backup ENABLED - will use mag tilt when accel rejected")
+                print(f"Current mag offset: {self.kalman.mag_offset}")
+            else:
+                print("Magnetometer backup DISABLED - gyro-only during rejection")
+        else:
+            print("Kalman filter not yet initialized")
+
+    def calibrate_magnetometer_offset(self):
+        """Calibrate magnetometer hard-iron offset from current reading"""
+        if not hasattr(self, 'current_mag_x'):
+            print("No magnetometer data available yet")
+            return
+
+        # Use current mag reading as offset (assumes sensor is level and stationary)
+        mag_raw = np.array([self.current_mag_x, self.current_mag_y, self.current_mag_z])
+
+        if hasattr(self, 'kalman'):
+            self.kalman.mag_offset = mag_raw
+            print(f"Magnetometer offset calibrated: [{mag_raw[0]:.1f}, {mag_raw[1]:.1f}, {mag_raw[2]:.1f}]")
+            print("Keep sensor level during calibration for best results")
+        else:
+            print("Kalman filter not yet initialized")
+
+    def update_suspension_gains(self):
+        """Update suspension gains from UI"""
+        try:
+            # Position gain (accel feedback)
+            scalar_pos = float(self.suspension_pos_gain_input.text())
+            slider_pos = self.suspension_pos_slider.value() / 1000
+            self.suspension_position_gain = scalar_pos * slider_pos
+            self.suspension_pos_label.setText(f"{self.suspension_position_gain:.2f}")
+
+            # Velocity gain (damping)
+            scalar_vel = float(self.suspension_vel_gain_input.text())
+            slider_vel = self.suspension_vel_slider.value() / 1000
+            self.suspension_velocity_gain = scalar_vel * slider_vel
+            self.suspension_vel_label.setText(f"{self.suspension_velocity_gain:.2f}")
+
+        except ValueError:
+            pass
+
     def update_filter_parameters(self):
         """Recreate Kalman filter with new parameters"""
         try:
@@ -431,6 +613,19 @@ class RealtimeOrientationWindow(QMainWindow):
             gyro_scale_mult = self.gyro_scale_slider.value() / 1000
             proc_noise_angle = float(self.proc_angle_scalar.text()) * (self.proc_angle_slider.value() / 1000)
             proc_noise_bias = float(self.proc_bias_scalar.text()) * (self.proc_bias_slider.value() / 1000)
+
+            # Motion detection thresholds
+            accel_threshold = float(self.accel_threshold_input.text()) * (self.accel_threshold_slider.value() / 1000)
+            gyro_threshold = float(self.gyro_threshold_input.text()) * (self.gyro_threshold_slider.value() / 1000)
+
+            # Update labels
+            self.accel_noise_label.setText(f"{accel_noise:.3f}")
+            self.gyro_noise_label.setText(f"{gyro_noise * gyro_scale_mult:.3f}")
+            self.gyro_scale_label.setText(f"{gyro_scale_mult:.3f}x")
+            self.proc_angle_label.setText(f"{proc_noise_angle:.3f}")
+            self.proc_bias_label.setText(f"{proc_noise_bias:.5f}")
+            self.accel_threshold_label.setText(f"{accel_threshold:.2f}")
+            self.gyro_threshold_label.setText(f"{gyro_threshold:.2f}")
 
             # Scale gyro noise by multiplier
             gyro_noise_scaled = gyro_noise * gyro_scale_mult
@@ -447,11 +642,18 @@ class RealtimeOrientationWindow(QMainWindow):
                 gyro_rotation=self.gyro_rotation,
                 initial_bias_x=GYRO_BIAS_X,
                 initial_bias_y=GYRO_BIAS_Y,
-                gyro_scale_multiplier=gyro_scale_mult
+                gyro_scale_multiplier=gyro_scale_mult,
+                accel_magnitude_threshold=accel_threshold,
+                gyro_magnitude_threshold=gyro_threshold
             )
 
+            # Apply current motion detection enable/disable state
+            self.kalman.enable_rejection = self.enable_motion_detection_checkbox.isChecked()
+
             print(f"Filter updated: accel={accel_noise:.3f}, gyro={gyro_noise_scaled:.3f}, "
-                  f"proc_angle={proc_noise_angle:.6f}, proc_bias={proc_noise_bias:.6f}, scale={gyro_scale_mult:.2f}x")
+                  f"proc_angle={proc_noise_angle:.6f}, proc_bias={proc_noise_bias:.6f}, scale={gyro_scale_mult:.2f}x, "
+                  f"accel_thresh={accel_threshold:.2f}, gyro_thresh={gyro_threshold:.2f}, "
+                  f"rejection={'ON' if self.kalman.enable_rejection else 'OFF'}")
 
         except ValueError as e:
             print(f"Parameter update error: {e}")
@@ -462,6 +664,11 @@ class RealtimeOrientationWindow(QMainWindow):
             self.plot_start_time = time.time()
 
         elapsed = time.time() - self.plot_start_time
+
+        # Update rejection statistics display
+        if hasattr(self, 'kalman') and self.kalman.initialized:
+            rejected, total, rate, mag_updates = self.kalman.get_rejection_stats()
+            self.rejection_stats_label.setText(f"Rejected: {rejected} / {total} ({rate:.1f}%) | Mag: {mag_updates}")
 
         # Add current data
         self.time_history.append(elapsed)
@@ -734,7 +941,10 @@ class RealtimeOrientationWindow(QMainWindow):
                 enable_accel = self.enable_accel_checkbox.isChecked()
                 enable_gyro = self.enable_gyro_checkbox.isChecked()
 
-                # Normal operation: Process magnetometer queue (for display only)
+                # Initialize latest sensor data
+                latest_mag = None
+
+                # Normal operation: Process magnetometer queue
                 while not self.mag_queue.empty():
                     timestamp_us, mag_raw = self.mag_queue.get_nowait()
                     latest_mag = mag_raw
@@ -770,9 +980,12 @@ class RealtimeOrientationWindow(QMainWindow):
                         else:
                             self.kalman.predict(np.zeros(3), dt)
 
-                        # Update
+                        # Update (pass magnetometer data for backup during impacts)
                         if enable_accel:
-                            self.kalman.update(latest_accel)
+                            self.kalman.update(latest_accel, latest_mag)
+
+                        # Store latest accel for suspension control
+                        self.latest_accel = latest_accel
 
                         # Get orientation
                         roll, pitch = self.kalman.get_orientation()
@@ -966,6 +1179,10 @@ class RealtimeOrientationWindow(QMainWindow):
             proc_noise_bias = float(self.proc_bias_scalar.text()) * (self.proc_bias_slider.value() / 1000)
             gyro_noise_scaled = gyro_noise * gyro_scale_mult
 
+            # Motion detection thresholds
+            accel_threshold = float(self.accel_threshold_input.text()) * (self.accel_threshold_slider.value() / 1000)
+            gyro_threshold = float(self.gyro_threshold_input.text()) * (self.gyro_threshold_slider.value() / 1000)
+
             # Create new filter with calibrated biases
             self.kalman = OrientationKalmanFilter(
                 accel_noise=accel_noise,
@@ -978,10 +1195,15 @@ class RealtimeOrientationWindow(QMainWindow):
                 gyro_rotation=self.gyro_rotation,
                 initial_bias_x=gyro_mean_transformed[0],  # Use calibrated bias
                 initial_bias_y=gyro_mean_transformed[1],  # Use calibrated bias
-                gyro_scale_multiplier=gyro_scale_mult
+                gyro_scale_multiplier=gyro_scale_mult,
+                accel_magnitude_threshold=accel_threshold,
+                gyro_magnitude_threshold=gyro_threshold
             )
 
-            print("Kalman filter reinitialized with calibrated values\n")
+            # Apply current motion detection enable/disable state
+            self.kalman.enable_rejection = self.enable_motion_detection_checkbox.isChecked()
+
+            print(f"Kalman filter reinitialized with calibrated values (rejection={'ON' if self.kalman.enable_rejection else 'OFF'})\n")
 
         except Exception as e:
             print(f"Error reinitializing filter: {e}")
@@ -1008,8 +1230,41 @@ class RealtimeOrientationWindow(QMainWindow):
 
             # Only compute IK and send if servo commands are enabled
             if self.enable_servo_checkbox.isChecked():
-                # Compute IK with NO translation (x=0, y=0, z=0)
-                translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
+                # Calculate suspension compensation from linear acceleration
+                translation_compensation = np.array([0.0, 0.0, 0.0])
+
+                if self.suspension_enabled and hasattr(self, 'latest_accel'):
+                    # Get linear acceleration (gravity removed)
+                    linear_accel = self.kalman.get_linear_acceleration(self.latest_accel)
+
+                    # Time step for integration
+                    current_time = time.time()
+                    dt = current_time - self.last_update_time
+                    self.last_update_time = current_time
+
+                    # Integrate acceleration to get velocity (simple Euler)
+                    self.linear_velocity += linear_accel * dt
+
+                    # Apply decay to velocity (prevents drift)
+                    self.linear_velocity *= 0.95
+
+                    # Suspension control law: move opposite to acceleration (like damper)
+                    # Position term: proportional to acceleration
+                    # Velocity term: damping based on integrated velocity
+                    translation_compensation = (
+                        -self.suspension_position_gain * linear_accel * 1000.0 +  # m/s² to mm
+                        -self.suspension_velocity_gain * self.linear_velocity * 1000.0  # m/s to mm
+                    )
+
+                    # Limit translation compensation (±20mm)
+                    translation_compensation = np.clip(translation_compensation, -20.0, 20.0)
+
+                # Compute IK with translation compensation
+                translation = np.array([
+                    translation_compensation[0],
+                    translation_compensation[1],
+                    self.ik.home_height_top_surface + translation_compensation[2]
+                ])
                 rotation = np.array([rx_compensate, ry_compensate, 0.0])
 
                 servo_angles = self.ik.calculate_servo_angles(translation, rotation, use_top_surface_offset=True)

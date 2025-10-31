@@ -620,10 +620,24 @@ class OrientationKalmanFilter:
 
     def __init__(self, accel_noise=1.0, gyro_noise=1.0, process_noise_angle=0.0, process_noise_bias=0.0,
                  accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None,
-                 initial_bias_x=0.0, initial_bias_y=0.0, gyro_scale_multiplier=1.0):
+                 initial_bias_x=0.0, initial_bias_y=0.0, gyro_scale_multiplier=1.0,
+                 accel_magnitude_threshold=2.0, gyro_magnitude_threshold=0.5):
         # IMU scaling
         self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
         self.gyro_scale = 0.00875 * np.pi / 180 * gyro_scale_multiplier  # L3GD20: 8.75 mdps/LSB -> rad/s (with calibration multiplier)
+
+        # Motion detection thresholds
+        self.accel_magnitude_threshold = accel_magnitude_threshold  # m/s² deviation from gravity
+        self.gyro_magnitude_threshold = gyro_magnitude_threshold  # rad/s - high rotation rate
+        self.enable_rejection = False  # Default OFF - can be toggled on/off via GUI
+        self.rejected_accel_count = 0  # Statistics
+        self.total_accel_count = 0
+
+        # Magnetometer parameters
+        self.use_magnetometer = False  # Enable mag-based tilt during accel rejection
+        self.mag_offset = np.array([0.0, 0.0, 0.0])  # Hard-iron calibration offset
+        self.mag_inclination = np.radians(75.0)  # Magnetic inclination angle (dip) - default for Norway
+        self.mag_update_count = 0  # Statistics
 
         # Axis transformations
         self.accel_axis_flip = accel_axis_flip if accel_axis_flip is not None else np.array([1, 1, 1])
@@ -665,6 +679,7 @@ class OrientationKalmanFilter:
 
         self.initialized = False
         self.initial_accel = None
+        self.last_gyro_magnitude = 0.0  # Track gyro magnitude for motion detection
 
     def initialize(self, accel_raw, calibrated_gravity=None):
         """Initialize filter state from first accelerometer reading (raw LSB).
@@ -710,6 +725,9 @@ class OrientationKalmanFilter:
         gyro = apply_imu_transforms(gyro_raw, self.gyro_axis_flip, self.gyro_rotation, self.gyro_scale)
         gx, gy = gyro[0], gyro[1]
 
+        # Store gyro magnitude for motion detection (used in update step)
+        self.last_gyro_magnitude = np.sqrt(gx**2 + gy**2)
+
         # Bias-corrected angular velocity
         gx_corrected = gx - self.state[2]
         gy_corrected = gy - self.state[3]
@@ -729,15 +747,43 @@ class OrientationKalmanFilter:
         # Covariance propagation
         self.P = F @ self.P @ F.T + self.Q
 
-    def update(self, accel_raw):
+    def update(self, accel_raw, mag_raw=None):
         """Update step using accelerometer measurements (raw LSB).
 
         Args:
             accel_raw: Acceleration measurement [LSB]
+            mag_raw: Optional magnetometer measurement [LSB] - used when accel is rejected
+
+        Note:
+            Skips update if motion is detected (prevents accelerometer corruption during impacts).
+            If magnetometer is available and enabled, uses it as backup tilt reference during impacts.
         """
+        self.total_accel_count += 1
+
         # Apply transformations and convert to m/s²
         accel = apply_imu_transforms(accel_raw, self.accel_axis_flip, self.accel_rotation, self.accel_scale)
         ax, ay, az = accel
+
+        # Motion detection: Check acceleration magnitude
+        accel_magnitude = np.linalg.norm(accel)
+        accel_deviation = abs(accel_magnitude - GRAVITY_MAGNITUDE)
+
+        # Motion detection: Check gyroscope magnitude (high rotation rate)
+        gyro_is_high = self.last_gyro_magnitude > self.gyro_magnitude_threshold
+
+        # Check if we should reject accelerometer update
+        motion_detected = accel_deviation > self.accel_magnitude_threshold or gyro_is_high
+
+        # If motion detected and rejection enabled
+        if self.enable_rejection and motion_detected:
+            self.rejected_accel_count += 1
+
+            # Try to use magnetometer as backup if available
+            if self.use_magnetometer and mag_raw is not None:
+                self.update_with_magnetometer(mag_raw)
+                return
+            else:
+                return  # Skip update - rely on gyro prediction only
 
         # Tilt angles from accelerometer
         roll_meas = np.arctan2(ay, az)
@@ -768,6 +814,79 @@ class OrientationKalmanFilter:
         self.state = self.state + K @ y
         self.P = (np.eye(4) - K @ H) @ self.P
 
+    def update_with_magnetometer(self, mag_raw):
+        """Update step using magnetometer when accelerometer is corrupted.
+
+        Args:
+            mag_raw: Magnetometer measurement [LSB]
+
+        Note:
+            Uses magnetic field direction to estimate tilt angles.
+            Less accurate than accelerometer but immune to linear acceleration.
+        """
+        # Apply transformations (no scaling needed - we use direction only)
+        mag = apply_imu_transforms(mag_raw, self.accel_axis_flip, self.accel_rotation, scale=1.0)
+
+        # Remove hard-iron offset
+        mag = mag - self.mag_offset
+
+        # Normalize (we only care about direction)
+        mag_magnitude = np.linalg.norm(mag)
+        if mag_magnitude < 1.0:  # Avoid division by zero
+            return
+
+        mag_norm = mag / mag_magnitude
+        mx, my, mz = mag_norm
+
+        # Calculate tilt from magnetic field direction
+        # Assumes Earth's magnetic field has known inclination (dip angle)
+        # Roll primarily affects my/mz ratio
+        # Pitch affects mx and horizontal components
+
+        # For steep inclination (Norway ~75°), magnetic field is mostly vertical
+        # When level: mag ≈ [Bh, 0, Bv] where Bv >> Bh
+        # Roll rotates around X: affects my and mz
+        # Pitch rotates around Y: affects mx and mz
+
+        # Tilt-compensated magnetometer equations
+        roll_meas = np.arctan2(-my, mz)
+        pitch_meas = np.arctan2(mx, np.sqrt(my ** 2 + mz ** 2))
+
+        # Adjust for magnetic inclination (field not horizontal)
+        # This is approximate - works well for small tilts
+        roll_meas = roll_meas * np.cos(self.mag_inclination)
+        pitch_meas = pitch_meas * np.cos(self.mag_inclination)
+
+        # Remove initial offset (same as accelerometer)
+        if self.initial_accel is not None:
+            roll_init = np.arctan2(self.initial_accel[1], self.initial_accel[2])
+            pitch_init = np.arctan2(-self.initial_accel[0],
+                                    np.sqrt(self.initial_accel[1] ** 2 + self.initial_accel[2] ** 2))
+            roll_meas -= roll_init
+            pitch_meas -= pitch_init
+
+        z = np.array([roll_meas, pitch_meas])
+
+        # Measurement matrix
+        H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ])
+
+        # Use higher measurement noise for magnetometer (less accurate than accel)
+        R_mag = self.R * 4.0  # 2x higher noise covariance
+
+        # Innovation
+        y = z - H @ self.state
+        S = H @ self.P @ H.T + R_mag
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        # State and covariance update
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+        self.mag_update_count += 1
+
     def get_orientation(self):
         """Return current orientation estimate.
 
@@ -775,3 +894,58 @@ class OrientationKalmanFilter:
             Tuple of (roll, pitch) in radians
         """
         return self.state[0], self.state[1]
+
+    def get_rejection_stats(self):
+        """Return accelerometer rejection statistics.
+
+        Returns:
+            Tuple of (rejected_count, total_count, rejection_rate_percent, mag_update_count)
+        """
+        if self.total_accel_count > 0:
+            rejection_rate = 100.0 * self.rejected_accel_count / self.total_accel_count
+        else:
+            rejection_rate = 0.0
+        return self.rejected_accel_count, self.total_accel_count, rejection_rate, self.mag_update_count
+
+    def get_linear_acceleration(self, accel_raw):
+        """Extract linear acceleration by removing gravity component.
+
+        Args:
+            accel_raw: Raw accelerometer reading [LSB]
+
+        Returns:
+            Linear acceleration in world frame [ax, ay, az] in m/s²
+
+        Note:
+            Since Kalman filter tracks RELATIVE orientation (zeroed at calibration),
+            we must subtract the calibrated gravity in SENSOR frame before rotation.
+        """
+        # Convert to m/s² and apply transformations
+        accel = apply_imu_transforms(accel_raw, self.accel_axis_flip, self.accel_rotation, self.accel_scale)
+
+        # Remove calibrated gravity in sensor frame (this gives acceleration relative to calibration position)
+        if self.initial_accel is not None:
+            accel_no_gravity = accel - self.initial_accel
+        else:
+            # Fallback: assume gravity is [0, 0, -9.83] in sensor frame
+            accel_no_gravity = accel - np.array([0, 0, -GRAVITY_MAGNITUDE])
+
+        # Get current RELATIVE orientation estimate
+        roll, pitch = self.state[0], self.state[1]
+
+        # Rotation matrix from sensor frame to world frame (Z-X-Y Euler)
+        # Uses relative angles, so world frame is relative to calibration position
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+
+        # Rotation matrix for roll and pitch only (no yaw)
+        R = np.array([
+            [cp, sr*sp, cr*sp],
+            [0, cr, -sr],
+            [-sp, sr*cp, cr*cp]
+        ])
+
+        # Rotate gravity-compensated acceleration to relative world frame
+        linear_accel = R @ accel_no_gravity
+
+        return linear_accel
