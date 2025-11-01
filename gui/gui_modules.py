@@ -852,59 +852,6 @@ class PerformanceStatsModule(GUIModule):
             self.timeout_label.setText(f"IK Timeouts: {state['ik_timeouts']}")
 
 
-class BallFilterModule(GUIModule):
-    """Ball position EMA filter control."""
-
-    def __init__(self, parent, colors, callbacks, ball_filter):
-        super().__init__(parent, colors, callbacks)
-        self.ball_filter = ball_filter
-
-    def create(self):
-        group = QGroupBox("Ball Position Filter (EMA)")
-        layout = QVBoxLayout()
-
-        slider_layout = QHBoxLayout()
-
-        label = QLabel("α:")
-        font = QFont("Segoe UI", 9)
-        font.setBold(True)
-        label.setFont(font)
-        slider_layout.addWidget(label)
-
-        self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
-        self.alpha_slider.setMinimum(0)
-        self.alpha_slider.setMaximum(100)
-        self.alpha_slider.setValue(int(self.ball_filter.get_alpha() * 100))
-        self.alpha_slider.valueChanged.connect(self._on_alpha_change)
-        slider_layout.addWidget(self.alpha_slider)
-
-        self.alpha_value_label = QLabel(f"{self.ball_filter.get_alpha():.2f}")
-        font = QFont("Consolas", 10)
-        font.setBold(True)
-        self.alpha_value_label.setFont(font)
-        self.alpha_value_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        self.alpha_value_label.setMinimumWidth(40)
-        slider_layout.addWidget(self.alpha_value_label)
-
-        layout.addLayout(slider_layout)
-
-        info_label = QLabel("0=Smooth/Lag  →  1=Raw/Responsive")
-        font = QFont("Segoe UI", 7)
-        font.setItalic(True)
-        info_label.setFont(font)
-        info_label.setStyleSheet(f"color: {self.colors['border']};")
-        layout.addWidget(info_label)
-
-        group.setLayout(layout)
-        self.widget = group
-        return self.widget
-
-    def _on_alpha_change(self, value):
-        alpha = value / 100.0
-        self.ball_filter.set_alpha(alpha)
-        self.alpha_value_label.setText(f"{alpha:.2f}")
-
-
 class Pixy2CameraModule(GUIModule):
     """Pixy2 camera noise model configuration and control."""
 

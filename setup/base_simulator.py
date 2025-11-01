@@ -410,7 +410,6 @@ class BaseStewartSimulator(QMainWindow):
             'debug_log': gm.DebugLogModule,
             'serial_connection': gm.SerialConnectionModule,
             'performance_stats': gm.PerformanceStatsModule,
-            'ball_filter': gm.BallFilterModule,
             'pixy2_camera': gm.Pixy2CameraModule,
             'kalman_filter': gm.KalmanFilterModule,
             'plot_control': gm.PlotControlModule,
