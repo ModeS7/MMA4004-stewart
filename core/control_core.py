@@ -949,3 +949,344 @@ class OrientationKalmanFilter:
         linear_accel = R @ accel_no_gravity
 
         return linear_accel
+
+
+class IMUControllerMixin:
+    """Mixin for IMU orientation tracking and tilt correction.
+
+    Provides IMU integration for hardware controllers. This mixin adds:
+    - IMU orientation Kalman filtering
+    - Calibration sequences (initialization + calibration)
+    - Tilt correction/compensation
+    - Real-time IMU data processing
+
+    Requirements (must be provided by parent class):
+    - self.serial_controller: SerialController instance with IMU data queues
+    - self.control_interval: float, control loop timestep (seconds)
+    - self.log(message): logging method
+
+    Usage:
+        class MyController(IMUControllerMixin, HardwareControllerBase):
+            def __init__(self, ...):
+                self._init_imu_system()
+                super().__init__(...)
+    """
+
+    def _init_imu_system(self):
+        """Initialize IMU state variables and Kalman filter.
+
+        Must be called BEFORE parent __init__ to set up IMU attributes.
+        """
+        from core.utils import IMUKalmanConfig, IMUCalibrationConfig
+
+        # Initialize orientation Kalman filter with default configuration
+        self.orientation_kalman = OrientationKalmanFilter(
+            accel_noise=IMUKalmanConfig.DEFAULT_ACCEL_NOISE,
+            gyro_noise=IMUKalmanConfig.DEFAULT_GYRO_NOISE,
+            process_noise_angle=IMUKalmanConfig.DEFAULT_PROCESS_NOISE_ANGLE,
+            process_noise_bias=IMUKalmanConfig.DEFAULT_PROCESS_NOISE_BIAS,
+            accel_axis_flip=IMUKalmanConfig.DEFAULT_ACCEL_AXIS_FLIP,
+            gyro_axis_flip=IMUKalmanConfig.DEFAULT_GYRO_AXIS_FLIP,
+            accel_rotation=IMUKalmanConfig.DEFAULT_ACCEL_ROTATION,
+            gyro_rotation=IMUKalmanConfig.DEFAULT_GYRO_ROTATION,
+            initial_bias_x=IMUKalmanConfig.CALIBRATED_GYRO_BIAS_X,
+            initial_bias_y=IMUKalmanConfig.CALIBRATED_GYRO_BIAS_Y,
+            gyro_scale_multiplier=IMUKalmanConfig.DEFAULT_GYRO_SCALE_MULTIPLIER,
+            accel_magnitude_threshold=IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD,
+            gyro_magnitude_threshold=IMUKalmanConfig.DEFAULT_GYRO_THRESHOLD
+        )
+
+        # Current IMU orientation state
+        self.current_rx_imu = 0.0
+        self.current_ry_imu = 0.0
+        self.imu_tilt_correction_enabled = False
+        self.imu_compensation_gain = 1.0
+
+        # Initialization phase (3 seconds - stabilization)
+        self.imu_initializing = False
+        self.initialization_duration = IMUCalibrationConfig.INITIALIZATION_DURATION_S
+        self.initialization_start_time = None
+        self.initialization_time_remaining = 0.0
+
+        # Calibration phase (10 seconds - data collection)
+        self.imu_calibrating = False
+        self.calibration_duration = IMUCalibrationConfig.CALIBRATION_DURATION_S
+        self.calibration_start_time = None
+        self.calibration_time_remaining = 0.0
+        self.calibration_raw_data = {'gyro': [], 'accel': [], 'mag': []}
+        self.calibrated_gravity = None
+
+        # Debug tracking
+        self._imu_data_debug_count = 0
+        self._imu_debug_count = 0
+
+    def start_imu_initialization(self):
+        """Begin IMU initialization sequence (3 seconds).
+
+        During initialization:
+        - IMU queues are drained (sensors stabilize)
+        - Platform should remain stationary
+        - Automatically transitions to calibration
+        """
+        import time
+        self.imu_initializing = True
+        self.initialization_start_time = time.time()
+        self.initialization_time_remaining = self.initialization_duration
+        self.log("IMU initialization started: stabilizing for 3 seconds")
+
+    def start_imu_calibration(self):
+        """Begin IMU calibration sequence (10 seconds).
+
+        During calibration:
+        - Raw IMU data is collected
+        - Gyro bias is measured
+        - Gravity vector is established
+        - Platform MUST remain stationary and level
+        """
+        import time
+        self.imu_calibrating = True
+        self.calibration_start_time = time.time()
+        self.calibration_time_remaining = self.calibration_duration
+        self.calibration_raw_data = {'gyro': [], 'accel': [], 'mag': []}
+        self.log("IMU calibration started: maintain platform stationary for 10 seconds")
+
+    def finish_imu_calibration(self):
+        """Process calibration data and initialize Kalman filter.
+
+        Calibration processing:
+        1. Calculates mean gyro values (bias estimation)
+        2. Calculates mean accel values (gravity reference)
+        3. Applies sensor transformations
+        4. Initializes orientation Kalman filter
+        5. Validates platform levelness (warns if >5° tilt)
+        """
+        import numpy as np
+
+        gyro_data = self.calibration_raw_data['gyro']
+        accel_data = self.calibration_raw_data['accel']
+
+        if not gyro_data or not accel_data:
+            self.log("Warning: Insufficient calibration data collected")
+            self.imu_calibrating = False
+            return
+
+        # Convert to arrays
+        accel_samples = np.array([sample[1] for sample in accel_data])
+        gyro_samples = np.array([sample[1] for sample in gyro_data])
+
+        # Calculate mean raw values
+        accel_mean_raw = np.mean(accel_samples, axis=0)
+        gyro_mean_raw = np.mean(gyro_samples, axis=0)
+
+        # Apply sensor-specific transformations
+        # LSM303 accelerometer: 1mg/LSB → m/s²
+        accel_scale = 0.001 * 9.81
+        # L3GD20 gyroscope: 8.75 mdps/LSB → rad/s
+        gyro_scale = 0.00875 * np.pi / 180
+
+        accel_mean = apply_imu_transforms(accel_mean_raw,
+                                         self.orientation_kalman.accel_axis_flip,
+                                         self.orientation_kalman.accel_rotation,
+                                         accel_scale)
+        gyro_mean = apply_imu_transforms(gyro_mean_raw,
+                                        self.orientation_kalman.gyro_axis_flip,
+                                        self.orientation_kalman.gyro_rotation,
+                                        gyro_scale)
+
+        # Store calibrated gravity reference
+        self.calibrated_gravity = accel_mean.copy()
+
+        # Initialize orientation Kalman filter with calibration data
+        self.orientation_kalman.initialize(accel_mean_raw, calibrated_gravity=self.calibrated_gravity)
+
+        # Validate calibration quality (check platform levelness)
+        ax, ay, az = accel_mean
+        tilt_x = np.arctan2(ay, az)
+        tilt_y = np.arctan2(-ax, np.sqrt(ay**2 + az**2))
+        tilt_x_deg = np.degrees(tilt_x)
+        tilt_y_deg = np.degrees(tilt_y)
+
+        if abs(tilt_x_deg) > 5 or abs(tilt_y_deg) > 5:
+            self.log(f"Warning: Platform tilted during calibration - RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
+        else:
+            self.log(f"Platform level verified: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
+
+        self.log(f"Gyroscope bias (deg/s): X={np.degrees(gyro_mean[0]):.4f}, Y={np.degrees(gyro_mean[1]):.4f}")
+        self.log("IMU calibration completed successfully")
+        self.imu_calibrating = False
+
+    def _process_imu_calibration_phase(self):
+        """Process IMU during initialization/calibration phases.
+
+        Call this from control thread BEFORE normal operation.
+
+        Returns:
+            bool: True if still calibrating (skip rest of control loop), False if ready
+        """
+        import time
+
+        # Handle initialization phase (3 seconds)
+        if self.imu_initializing:
+            elapsed = time.time() - self.initialization_start_time
+            self.initialization_time_remaining = max(0.0, self.initialization_duration - elapsed)
+
+            if elapsed >= self.initialization_duration:
+                self.imu_initializing = False
+                self.initialization_time_remaining = 0.0
+                self.start_imu_calibration()
+            else:
+                # Drain queues during initialization
+                self.serial_controller.get_imu_data_batch()
+
+            return True  # Skip rest of control loop
+
+        # Handle calibration phase (10 seconds)
+        if self.imu_calibrating:
+            elapsed = time.time() - self.calibration_start_time
+            self.calibration_time_remaining = max(0.0, self.calibration_duration - elapsed)
+
+            # Collect calibration data
+            gyro_batch, accel_batch, mag_batch = self.serial_controller.get_imu_data_batch()
+            self.calibration_raw_data['gyro'].extend(gyro_batch)
+            self.calibration_raw_data['accel'].extend(accel_batch)
+            self.calibration_raw_data['mag'].extend(mag_batch)
+
+            if elapsed >= self.calibration_duration:
+                self.finish_imu_calibration()
+                self.calibration_time_remaining = 0.0
+
+            return True  # Skip rest of control loop
+
+        return False  # Calibration complete, proceed with normal operation
+
+    def _update_imu_orientation(self):
+        """Update IMU orientation estimate from sensor data.
+
+        Call this from control thread during normal operation.
+
+        Processing:
+        1. Fetches latest IMU sample from serial queues
+        2. Predict step (gyro data → integrate orientation)
+        3. Update step (accel + optional mag → correct drift)
+        4. Updates self.current_rx_imu and self.current_ry_imu
+        """
+        import numpy as np
+
+        # Get latest IMU sample (non-blocking)
+        gyro_data, accel_data, mag_data = self.serial_controller.get_single_imu_sample()
+
+        # Debug logging (first 5 samples only)
+        if self._imu_data_debug_count < 5:
+            if gyro_data or accel_data:
+                self.log(f"IMU data: Gyro={'Yes' if gyro_data else 'No'} "
+                        f"Accel={'Yes' if accel_data else 'No'} "
+                        f"Mag={'Yes' if mag_data else 'No'}")
+                self._imu_data_debug_count += 1
+
+        # Kalman filter predict step (gyroscope integration)
+        if gyro_data is not None:
+            timestamp_us, gyro_raw = gyro_data
+            self.orientation_kalman.predict(gyro_raw, self.control_interval)
+
+        # Kalman filter update step (accelerometer + magnetometer correction)
+        if accel_data is not None:
+            timestamp_us, accel_raw = accel_data
+            mag_raw = mag_data[1] if mag_data else None
+            self.orientation_kalman.update(accel_raw, mag_raw=mag_raw)
+
+        # Extract current orientation estimate (radians → degrees)
+        self.current_rx_imu = np.degrees(self.orientation_kalman.state[0])
+        self.current_ry_imu = np.degrees(self.orientation_kalman.state[1])
+
+    def _apply_imu_tilt_correction(self, rx_ctrl, ry_ctrl):
+        """Apply IMU compensation to controller output.
+
+        Args:
+            rx_ctrl: Controller X tilt output (degrees)
+            ry_ctrl: Controller Y tilt output (degrees)
+
+        Returns:
+            (rx_final, ry_final): Combined tilt with IMU correction (degrees)
+
+        IMU Correction Logic:
+        - Opposes platform tilt: compensation = -imu_angle * gain
+        - Clipped to ±15° to prevent excessive compensation
+        - Combined with controller output (no additional clipping)
+        - If disabled, returns controller output unchanged
+        """
+        if not self.imu_tilt_correction_enabled:
+            return rx_ctrl, ry_ctrl
+
+        import numpy as np
+
+        # Calculate IMU compensation (oppose platform tilt)
+        rx_imu_comp = -self.current_rx_imu * self.imu_compensation_gain
+        ry_imu_comp = -self.current_ry_imu * self.imu_compensation_gain
+
+        # Clip compensation to safe range
+        rx_imu_comp, ry_imu_comp, _ = clip_tilt_vector(rx_imu_comp, ry_imu_comp, 15.0)
+
+        # Combine controller output + IMU compensation
+        rx_final = rx_ctrl + rx_imu_comp
+        ry_final = ry_ctrl + ry_imu_comp
+
+        # Debug logging (first 10 samples only)
+        if self._imu_debug_count < 10:
+            self.log(f"IMU correction: RX_IMU={self.current_rx_imu:.2f}° RY_IMU={self.current_ry_imu:.2f}° | "
+                    f"Comp=({rx_imu_comp:.2f}°, {ry_imu_comp:.2f}°) | "
+                    f"Ctrl=({rx_ctrl:.2f}°, {ry_ctrl:.2f}°) → Final=({rx_final:.2f}°, {ry_final:.2f}°)")
+            self._imu_debug_count += 1
+
+        return rx_final, ry_final
+
+    # ============================================================================
+    # GUI CALLBACKS
+    # ============================================================================
+
+    def on_imu_tilt_correction_toggle(self, enabled):
+        """Handle IMU tilt correction enable/disable."""
+        self.imu_tilt_correction_enabled = enabled
+        self.log(f"IMU tilt correction: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_imu_kalman_param_change(self, param_name, value):
+        """Handle IMU Kalman filter parameter change.
+
+        Args:
+            param_name: Parameter to update ('accel_noise', 'gyro_noise', etc.)
+            value: New parameter value (float)
+        """
+        param_map = {
+            'accel_noise': 'accel_noise',
+            'gyro_noise': 'gyro_noise',
+            'process_noise_angle': 'process_noise_angle',
+            'process_noise_bias': 'process_noise_bias'
+        }
+
+        if param_name in param_map:
+            attr_name = param_map[param_name]
+            setattr(self.orientation_kalman, attr_name, value)
+            self.log(f"IMU Kalman {param_name}: {value:.4f}")
+
+    def on_imu_motion_param_change(self, param_name, value):
+        """Handle IMU motion detection parameter change.
+
+        Args:
+            param_name: 'accel_threshold' or 'gyro_threshold'
+            value: New threshold value (float)
+        """
+        if param_name == 'accel_threshold':
+            self.orientation_kalman.accel_magnitude_threshold = value
+            self.log(f"IMU accel threshold: {value:.2f} m/s²")
+        elif param_name == 'gyro_threshold':
+            self.orientation_kalman.gyro_magnitude_threshold = value
+            self.log(f"IMU gyro threshold: {value:.2f} rad/s")
+
+    def on_imu_detection_toggle(self, enabled):
+        """Handle IMU motion detection enable/disable."""
+        self.orientation_kalman.enable_rejection = enabled
+        self.log(f"IMU motion detection: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_imu_mag_toggle(self, enabled):
+        """Handle magnetometer enable/disable."""
+        self.orientation_kalman.use_magnetometer = enabled
+        self.log(f"Magnetometer backup: {'ENABLED' if enabled else 'DISABLED'}")

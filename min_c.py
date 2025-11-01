@@ -9,26 +9,19 @@ Supports PID/LQR control in simulation and hardware modes.
 import sys
 import gc
 import time
-import threading
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox
 from PyQt6.QtCore import QTimer, Qt
 
-from setup.base_simulator import BaseStewartSimulator
-from setup.hardware_controller_config import (WindowsTimerManager,
-                                              ThreadPriorityManager, HardwareControllerConfig,
-                                              LQRControllerConfig,
-                                              SerialController, IKCache)
+from setup.base_hardware import HardwareControllerBase, SerialController
 from gui import gui_modules as gm
 from gui.gui_builder import GUIBuilder
-from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
-from core.utils import (MAX_TILT_ANGLE_DEG, ControlLoopConfig, Pixy2CameraConfig,
-                         BallPhysicsConfig, VisualizationConfig, HardwareConnectionConfig,
-                         PIDConfig, PerformanceConfig, GUIConfig)
+from core.control_core import IMUControllerMixin, clip_tilt_vector
+from core.utils import MAX_TILT_ANGLE_DEG, Pixy2CameraConfig, HardwareConnectionConfig, GUIConfig
 
 
-class MinimalController(BaseStewartSimulator):
+class MinimalController(IMUControllerMixin, HardwareControllerBase):
     """Lightweight controller with minimal GUI for rapid development."""
 
     def __init__(self, app):
@@ -36,119 +29,17 @@ class MinimalController(BaseStewartSimulator):
         self.operation_mode = 'sim'  # 'sim' or 'real'
         self.controller_type_selection = 'Manual'  # 'PID', 'LQR', or 'Manual'
 
-        # Hardware components
-        self.serial_controller = None
-        self.connected = False
-        self.port_var = ''
-        self.ik_cache = None
-        self.timer_manager = WindowsTimerManager()
-        self.priority_manager = ThreadPriorityManager()
-        self.control_frequency = ControlLoopConfig.DEFAULT_FREQUENCY_HZ
-        self.control_interval = 1.0 / ControlLoopConfig.DEFAULT_FREQUENCY_HZ
-        self.use_kalman_derivative = False
+        # Initialize IMU system (MUST be called before super().__init__)
+        self._init_imu_system()
 
-        # Camera calibration parameters (pixels to mm conversion)
-        self.pixy_width_mm = Pixy2CameraConfig.FOV_WIDTH_MM
-        self.pixy_height_mm = Pixy2CameraConfig.FOV_HEIGHT_MM
-        self.pixels_to_mm_x = Pixy2CameraConfig.PIXELS_TO_MM_X
-        self.pixels_to_mm_y = Pixy2CameraConfig.PIXELS_TO_MM_Y
-        self.last_ball_update = 0.0
-        self.ball_pos_mm = np.array([0.0, 0.0])
-        self.ball_detected = False
-
-        # Performance tracking
-        self.performance_data = {
-            'loop_times': [],
-            'ik_times': [],
-            'serial_times': []
-        }
-
-        # Initialize Kalman filter (required before super().__init__)
-        self.kalman_filter = KalmanFilter(
-            process_noise_scale=1.0,
-            measurement_noise_scale=1.0,
-            ball_physics_params=BallPhysicsConfig.as_dict(),
-            dt=self.control_interval
-        )
-        self.kalman_enabled = True
-
-        # Ball position trail visualization
-        self.ball_history_x = []
-        self.ball_history_y = []
-        self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
-
-        # Create controller config
+        # Create controller config based on mode and controller type
         controller_config = self._create_controller_config()
 
-        # Call parent constructor
+        # Call parent constructor (HardwareControllerBase handles hardware init)
         super().__init__(app, controller_config)
 
         # Window title
         self.setWindowTitle("Stewart Platform - Minimal Controller")
-
-    def _get_controller_type(self):
-        """Override to return selected controller type."""
-        return self.controller_type_selection
-
-    def _create_controller_config(self):
-        """Create controller config based on mode and controller type."""
-        controller_name = self.controller_type_selection
-        if "PID" in controller_name:
-            return HardwareControllerConfig()
-        elif "LQR" in controller_name:
-            if self.operation_mode == 'real':
-                return LQRControllerConfig(mode='hardware')
-            else:
-                return LQRControllerConfig(mode='simulation')
-        else:
-            return HardwareControllerConfig()
-
-    def _initialize_controller(self):
-        """Initialize controller based on current type."""
-        if self.controller_type_selection == 'Manual':
-            self.controller = None
-            return
-
-        sliders = self.controller_widgets['sliders']
-        scalar_vars = self.controller_widgets['scalar_vars']
-
-        controller_name = self.controller_config.get_controller_name()
-        if "PID" in controller_name and 'kp' not in sliders:
-            self.controller = None
-            return
-        if "LQR" in controller_name and 'Q_pos' not in sliders:
-            self.controller = None
-            return
-
-        if "PID" in controller_name:
-            kp = self.controller_config.get_scaled_param('kp', sliders, scalar_vars)
-            ki = self.controller_config.get_scaled_param('ki', sliders, scalar_vars)
-            kd = self.controller_config.get_scaled_param('kd', sliders, scalar_vars)
-
-            self.controller = PIDController(
-                kp=kp, ki=ki, kd=kd,
-                output_limit=15.0,
-                derivative_filter_alpha=PIDConfig.HW_DERIVATIVE_FILTER_ALPHA
-            )
-            self.log(f"PID initialized: Kp={kp:.6f}, Ki={ki:.6f}, Kd={kd:.6f}")
-
-        elif "LQR" in controller_name:
-            Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
-            Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
-            R = self.controller_config.get_scaled_param('R', sliders, scalar_vars)
-
-            try:
-                self.controller = LQRController(
-                    Q_pos=Q_pos,
-                    Q_vel=Q_vel,
-                    R=R,
-                    output_limit=15.0
-                )
-                self.log(f"LQR initialized: Q_pos={Q_pos:.2e}, Q_vel={Q_vel:.2e}, R={R:.2e}")
-            except Exception as e:
-                self.log(f"LQR initialization failed: {str(e)}")
-                self.log("Adjust Q/R parameters and retry")
-                self.controller = None
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Update controller and return control output.
@@ -403,36 +294,18 @@ class MinimalController(BaseStewartSimulator):
 
         QApplication.processEvents()
 
-    def start_simulation(self):
-        """Start simulation or hardware control based on mode."""
-        if self.operation_mode == 'real':
-            # Hardware mode requires active connection
-            if not self.connected:
-                self.log("Hardware connection required before starting")
-                return
-
-            if self.simulation_running:
-                return
-
-            self.simulation_running = True
-            self.simulation_time = 0.0
-
-            gc.disable()
-            self.log(f"Control loop started: {self.control_frequency} Hz (garbage collection disabled)")
-
-            self.control_thread = threading.Thread(target=self._control_thread_func, daemon=True)
-            self.control_thread.start()
-
-            self.last_gui_update = time.time()
-            self._gui_update_loop()
-        else:
-            # Simulation mode: use parent's timer-based loop
-            super().start_simulation()
-
     def _control_thread_func(self):
-        """Hardware control thread."""
+        """Hardware control thread with IMU integration."""
         while self.simulation_running:
             loop_start = time.perf_counter()
+
+            # Handle IMU calibration phases (from mixin)
+            if self._process_imu_calibration_phase():
+                time.sleep(self.control_interval)
+                continue
+
+            # Update IMU orientation (from mixin)
+            self._update_imu_orientation()
 
             # Get ball data from Pixy2 camera via serial
             ball_data = self.serial_controller.get_latest_ball_data()
@@ -497,10 +370,13 @@ class MinimalController(BaseStewartSimulator):
                 )
 
                 if control_output is not None:
-                    rx, ry = control_output
-                    rx, ry, _ = clip_tilt_vector(rx, ry, 15.0)
+                    rx_ctrl, ry_ctrl = control_output
+                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, 15.0)
 
-                    # Update dof_values so GUI reflects controller state
+                    # Apply IMU tilt correction (from mixin)
+                    rx, ry = self._apply_imu_tilt_correction(rx_ctrl, ry_ctrl)
+
+                    # Update dof_values so GUI reflects final combined state
                     self.dof_values['rx'] = rx
                     self.dof_values['ry'] = ry
 
@@ -527,8 +403,15 @@ class MinimalController(BaseStewartSimulator):
 
             # Manual control when controller disabled
             elif not self.controller_enabled:
+                # Start with manual dof values
+                rx = self.dof_values['rx']
+                ry = self.dof_values['ry']
+
+                # Apply IMU tilt correction to manual values (from mixin)
+                rx, ry = self._apply_imu_tilt_correction(rx, ry)
+
                 translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
-                rotation = np.array([self.dof_values['rx'], self.dof_values['ry'], self.dof_values['rz']])
+                rotation = np.array([rx, ry, self.dof_values['rz']])
 
                 angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
                 if angles is not None:
@@ -561,10 +444,10 @@ class MinimalController(BaseStewartSimulator):
         # Schedule next update
         QTimer.singleShot(GUIConfig.PLOT_DISABLED_INTERVAL_MS, self._gui_update_loop)
 
-    def _create_plot(self, plot_panel):
+    def _create_plot(self, parent):
         """Override to add ball trail plot item."""
         # Call parent to create standard plot
-        super()._create_plot(plot_panel)
+        super()._create_plot(parent)
 
         # Add ball trail plot item (dashed red line)
         plot_item = self.plot_widget.getPlotItem()
@@ -603,6 +486,7 @@ class MinimalController(BaseStewartSimulator):
             self.log(msg_timer)
 
             self.initialize_ik_cache()
+            self.start_imu_initialization()
 
             if 'simulation_control' in self.gui_modules:
                 self.gui_modules['simulation_control'].start_btn.setEnabled(True)
@@ -630,27 +514,6 @@ class MinimalController(BaseStewartSimulator):
             self.gui_modules['serial_connection'].update({'connected': False})
 
         self.log("Disconnected")
-
-    def initialize_ik_cache(self):
-        """Pre-compute common inverse kinematics solutions."""
-        if not hasattr(self, 'ik_cache') or self.ik_cache is None:
-            self.ik_cache = IKCache(max_size=PerformanceConfig.IK_CACHE_SIZE)
-
-        self.log("Initializing IK cache...")
-        tilts = np.arange(PerformanceConfig.IK_PREWARM_TILT_RANGE[0],
-                          PerformanceConfig.IK_PREWARM_TILT_RANGE[1] + 1,
-                          PerformanceConfig.IK_PREWARM_TILT_STEP)
-        count = 0
-        for rx in tilts:
-            for ry in tilts:
-                translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
-                rotation = np.array([float(rx), float(ry), 0.0])
-                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
-                if angles is not None:
-                    self.ik_cache.put(translation, rotation, angles)
-                    count += 1
-
-        self.log(f"IK cache initialized: {count} poses cached")
 
     def update_gui_modules(self):
         """Override to provide hardware-specific state in real mode."""
@@ -701,6 +564,23 @@ class MinimalController(BaseStewartSimulator):
             state['kalman_velocity'] = kalman_vel
             state['kalman_uncertainty'] = kalman_std_pos
             state['kalman_stats'] = kalman_stats
+
+            # Add IMU orientation state
+            state['imu_orientation'] = (self.current_rx_imu, self.current_ry_imu)
+            state['imu_bias'] = (self.orientation_kalman.state[2], self.orientation_kalman.state[3])
+
+            # Add IMU calibration status
+            state['imu_initializing'] = self.imu_initializing
+            state['imu_calibrating'] = self.imu_calibrating
+            state['initialization_time_remaining'] = self.initialization_time_remaining
+            state['calibration_time_remaining'] = self.calibration_time_remaining
+
+            # Add IMU motion detection statistics
+            state['imu_rejection_stats'] = (
+                self.orientation_kalman.rejected_accel_count,
+                self.orientation_kalman.total_accel_count
+            )
+            state['imu_mag_updates'] = self.orientation_kalman.mag_update_count
 
             if self.controller_enabled:
                 rx = self.dof_values['rx']
