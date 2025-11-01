@@ -50,6 +50,10 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Call parent constructor (HardwareControllerBase handles hardware init)
         super().__init__(app, controller_config)
 
+        # Effective platform angles (gravity frame) for Kalman filter prediction
+        # Excludes IMU compensation to maintain consistent physics model
+        self.prev_effective_angles = {'rx': 0.0, 'ry': 0.0}
+
         # Override window title
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}]")
 
@@ -728,9 +732,10 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
             # Kalman filter (only if enabled)
             if self.kalman_enabled:
-                # Predict step (always predict, even without new measurement)
-                rx_deg = self.prev_platform_angles.get('rx', 0.0)
-                ry_deg = self.prev_platform_angles.get('ry', 0.0)
+                # Predict ball dynamics using effective platform tilt (gravity-relative)
+                # IMU compensation is excluded to maintain consistent physics model
+                rx_deg = self.prev_effective_angles.get('rx', 0.0)
+                ry_deg = self.prev_effective_angles.get('ry', 0.0)
                 self.kalman_filter.predict([rx_deg, ry_deg])
 
                 # Update step (only when ball is detected)
@@ -762,7 +767,11 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                     rx_ctrl, ry_ctrl = control_output
                     rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, 15.0)
 
-                    # Apply IMU tilt correction (from mixin)
+                    # Store controller output (gravity-relative) for Kalman physics prediction
+                    self.prev_effective_angles['rx'] = rx_ctrl
+                    self.prev_effective_angles['ry'] = ry_ctrl
+
+                    # Apply IMU compensation to achieve desired effective tilt
                     rx, ry = self._apply_imu_tilt_correction(rx_ctrl, ry_ctrl)
 
                     # Update dof_values so GUI reflects final combined state
@@ -792,12 +801,16 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
             # Manual control when controller disabled
             elif not self.controller_enabled:
-                # Start with manual dof values
-                rx = self.dof_values['rx']
-                ry = self.dof_values['ry']
+                # Manual DOF values represent desired effective tilt (gravity-relative)
+                rx_effective = self.dof_values['rx']
+                ry_effective = self.dof_values['ry']
 
-                # Apply IMU tilt correction to manual values (from mixin)
-                rx, ry = self._apply_imu_tilt_correction(rx, ry)
+                # Store effective angles for Kalman physics prediction
+                self.prev_effective_angles['rx'] = rx_effective
+                self.prev_effective_angles['ry'] = ry_effective
+
+                # Apply IMU compensation to achieve desired effective tilt
+                rx, ry = self._apply_imu_tilt_correction(rx_effective, ry_effective)
 
                 translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
                 rotation = np.array([rx, ry, self.dof_values['rz']])
