@@ -23,6 +23,70 @@ MAX_SERVO_ANGLE_DEG = 70.0  # Maximum individual servo angle (degrees)
 PLATFORM_HALF_SIZE_MM = 100.0  # Half platform size for boundary checks (mm)
 PLATFORM_RADIUS_MM = 150.0  # Circular platform radius (mm)
 
+# ============================================================================
+# STEWART PLATFORM GEOMETRY CONFIGURATION
+# ============================================================================
+
+class StewartPlatformConfig:
+    """Stewart platform geometric parameters (measured from actual hardware)."""
+
+    # Actual hardware measurements
+    HORN_LENGTH_MM = 45.3722  # Servo horn length (mm) - measured from hardware  #31.75
+    ROD_LENGTH_MM = 205.0  # Push rod length (mm) - measured from hardware  #145.0
+    BASE_RADIUS_MM = 116.3525  # Base circle radius (mm) - 86.6025 + 18.75 + 11  #73.025
+    BASE_ANCHORS_OFFSET_MM = 64.75  # Anchor offset from base circle (mm) - measured from hardware  #36.8893
+    PLATFORM_RADIUS_MM = 84.0759  # Platform circle radius (mm) - measured from hardware  #67.775
+    PLATFORM_ANCHORS_OFFSET_MM = 12.5  # Anchor offset from platform circle (mm) - measured from hardware  #12.7
+    TOP_SURFACE_OFFSET_MM = 38.0  # Distance from platform anchors to top surface (mm) - measured from hardware  #26.0
+
+    @classmethod
+    def as_dict(cls):
+        """Return platform parameters as dictionary for StewartPlatformIK."""
+        return {
+            'horn_length': cls.HORN_LENGTH_MM,
+            'rod_length': cls.ROD_LENGTH_MM,
+            'base': cls.BASE_RADIUS_MM,
+            'base_anchors': cls.BASE_ANCHORS_OFFSET_MM,
+            'platform': cls.PLATFORM_RADIUS_MM,
+            'platform_anchors': cls.PLATFORM_ANCHORS_OFFSET_MM,
+            'top_surface_offset': cls.TOP_SURFACE_OFFSET_MM
+        }
+
+# ============================================================================
+# COLOR SCHEME CONFIGURATION
+# ============================================================================
+
+class ColorScheme:
+    """Dark theme color scheme for GUI."""
+
+    BG = '#1e1e1e'
+    PANEL_BG = '#2d2d2d'
+    WIDGET_BG = '#3d3d3d'
+    FG = '#e0e0e0'
+    HIGHLIGHT = '#007acc'
+    BUTTON_BG = '#0e639c'
+    BUTTON_FG = '#ffffff'
+    ENTRY_BG = '#3d3d3d'
+    BORDER = '#555555'
+    SUCCESS = '#4ec9b0'
+    WARNING = '#ce9178'
+
+    @classmethod
+    def as_dict(cls):
+        """Return colors as dictionary."""
+        return {
+            'bg': cls.BG,
+            'panel_bg': cls.PANEL_BG,
+            'widget_bg': cls.WIDGET_BG,
+            'fg': cls.FG,
+            'highlight': cls.HIGHLIGHT,
+            'button_bg': cls.BUTTON_BG,
+            'button_fg': cls.BUTTON_FG,
+            'entry_bg': cls.ENTRY_BG,
+            'border': cls.BORDER,
+            'success': cls.SUCCESS,
+            'warning': cls.WARNING
+        }
 
 # ============================================================================
 # CONTROL LOOP CONFIGURATION
@@ -55,7 +119,6 @@ class SimulationConfig:
     DEFAULT_SERVO_DELAY = 0.04  # Servo command delay (seconds)
     DEFAULT_SERVO_MAX_VELOCITY = 545.0  # Maximum servo velocity (deg/s)
     PHYSICS_SUBSTEPS = 1  # Physics integration substeps per update
-
 
 # ============================================================================
 # PID CONTROLLER CONFIGURATION
@@ -105,9 +168,6 @@ class PIDConfig:
     DERIVATIVE_FILTER_ALPHA = 0.0  # Low-pass filter coefficient (0=none, >0=filtering)
     HW_DERIVATIVE_FILTER_ALPHA = 0.1  # More filtering for hardware (noisy measurements)
 
-
-
-
 # ============================================================================
 # IK Z OPTIMIZATION CONFIGURATION
 # ============================================================================
@@ -123,7 +183,6 @@ class IKZOptimizationConfig:
     MAX_ITERATIONS = 25  # Maximum optimization iterations
     TOLERANCE_DEG = 0.1  # Convergence tolerance (degrees)
 
-
 # ============================================================================
 # PIXY2 CAMERA CONFIGURATION
 # ============================================================================
@@ -135,9 +194,9 @@ class Pixy2CameraConfig:
     PIXEL_SIZE_MM = 1.4  # Physical size of one pixel (mm)
     SUBPIXEL_NOISE_STD_MM = 0.4  # Sub-pixel noise std dev (mm)
 
-    # Field of view dimensions (calibrated for current camera distance)
-    FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm)
-    FOV_HEIGHT_MM = 424.0  # Physical height of camera view (mm)
+    # Field of view dimensions (calibrated after camera repositioning)
+    FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm) - calibrated  #350.0
+    FOV_HEIGHT_MM = 424.0  # Physical height of camera view (mm) - calibrated  #266.0
 
     # Camera resolution
     RESOLUTION_WIDTH_PX = 316  # Camera width (pixels)
@@ -159,10 +218,9 @@ class Pixy2CameraConfig:
 
     # GUI slider ranges
     PIXEL_SIZE_RANGE = (0.5, 3.0)  # mm
-    NOISE_RANGE = (0.0, 1.0)  # mm
+    NOISE_RANGE = (0.0, 2.0)  # mm (extended range for testing)  #1.0
     DETECTION_RATE_RANGE = (0.90, 1.0)  # probability
     SAMPLE_RATE_RANGE = (0.0, 60.0)  # Hz (0 = every frame)
-
 
 # ============================================================================
 # BALL PHYSICS CONFIGURATION
@@ -181,7 +239,7 @@ class BallPhysicsConfig:
     DRAG_COEFFICIENT = 0.47  # Drag coefficient for sphere
 
     # Rolling dynamics
-    ROLLING_FRICTION = 0.0225  # Rolling resistance coefficient
+    ROLLING_FRICTION = 0.01  # Rolling resistance coefficient (measured from hardware)  #0.0225
     SPHERE_TYPE = 'hollow'  # 'hollow' or 'solid'
 
     # Moment of inertia factor (computed from sphere type)
@@ -198,10 +256,10 @@ class BallPhysicsConfig:
         # mass_factor = 1 + I/(m*r²)
         return 1.0 + I_factor
 
-    # Get as dictionary for easy passing
+    # Get as dictionary for easy passing (for controllers: KalmanFilter, LQRController)
     @classmethod
     def as_dict(cls):
-        """Return ball physics parameters as dictionary."""
+        """Return ball physics parameters for controllers (KalmanFilter, LQRController)."""
         return {
             'radius': cls.RADIUS_M,
             'mass': cls.MASS_KG,
@@ -213,8 +271,18 @@ class BallPhysicsConfig:
             'drag_coefficient': cls.DRAG_COEFFICIENT
         }
 
-
-
+    @classmethod
+    def for_physics_sim(cls):
+        """Return ball physics parameters for SimpleBallPhysics2D (different parameter names)."""
+        return {
+            'ball_radius': cls.RADIUS_M,
+            'ball_mass': cls.MASS_KG,
+            'gravity': cls.GRAVITY_M_S2,
+            'rolling_friction': cls.ROLLING_FRICTION,
+            'sphere_type': cls.SPHERE_TYPE,
+            'air_density': cls.AIR_DENSITY_KG_M3,
+            'drag_coefficient': cls.DRAG_COEFFICIENT
+        }
 
 # ============================================================================
 # SERIAL COMMUNICATION CONFIGURATION
@@ -258,7 +326,6 @@ class SerialConfig:
     READ_LOOP_SLEEP_S = 0.0005  # Sleep duration in read loop (0.5ms)
     WRITE_DELAY_S = 0.003  # Delay after each write in write loop (3ms)
 
-
 # ============================================================================
 # PERFORMANCE OPTIMIZATION CONFIGURATION
 # ============================================================================
@@ -296,9 +363,6 @@ class PerformanceConfig:
     TIMING_STATS_MAX_SAMPLES = 1000  # Maximum timing samples to keep
     TIMING_BREAKPOINT_MAX_SAMPLES = 1000  # Maximum breakpoint timing samples
 
-
-
-
 # ============================================================================
 # IMU KALMAN FILTER CONFIGURATION
 # ============================================================================
@@ -330,7 +394,6 @@ class IMUKalmanConfig:
     DEFAULT_ACCEL_ROTATION = np.eye(3)
     DEFAULT_GYRO_ROTATION = np.eye(3)
 
-
 # ============================================================================
 # IMU CALIBRATION CONFIGURATION
 # ============================================================================
@@ -340,7 +403,6 @@ class IMUCalibrationConfig:
 
     INITIALIZATION_DURATION_S = 3.0   # Stabilization period before calibration
     CALIBRATION_DURATION_S = 10.0     # Duration to collect calibration data
-
 
 # ============================================================================
 # HARDWARE CONNECTION CONFIGURATION
@@ -353,7 +415,6 @@ class HardwareConnectionConfig:
     POST_SERVO_SPEED_DELAY_S = 0.1     # Delay after setting servo speed
     POST_SERVO_ACCEL_DELAY_S = 0.2     # Delay after setting servo acceleration
 
-
 # ============================================================================
 # VISUALIZATION CONFIGURATION
 # ============================================================================
@@ -361,8 +422,7 @@ class HardwareConnectionConfig:
 class VisualizationConfig:
     """Visualization and display parameters."""
 
-    BALL_TRAIL_MAX_HISTORY = 100  # Maximum number of ball positions to track
-
+    BALL_TRAIL_MAX_HISTORY = 200  # Maximum number of ball positions to track
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -385,7 +445,6 @@ def format_error_context(sim_time, ball_pos, ball_vel, error_msg):
         f"Ball state: pos={format_vector_2d(ball_pos[:2])}, "
         f"vel={format_vector_2d(ball_vel[:2], 'mm/s')}"
     )
-
 
 # ============================================================================
 # CONFIGURATION UTILITY FUNCTIONS

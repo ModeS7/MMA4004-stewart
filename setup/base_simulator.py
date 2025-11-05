@@ -20,6 +20,7 @@ from core.control_core import clip_tilt_vector
 from core.utils import (
     MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM,
     SimulationConfig, IKZOptimizationConfig, Pixy2CameraConfig,
+    StewartPlatformConfig, ColorScheme, BallPhysicsConfig, VisualizationConfig,
     format_time, format_error_context
 )
 from gui.gui_builder import GUIBuilder
@@ -115,31 +116,11 @@ class BaseStewartSimulator(QMainWindow):
         self.setWindowTitle(f"Stewart Platform - {controller_name} Ball Balancing Control")
         self.resize(1400, 900)
 
-        self.colors = {
-            'bg': '#1e1e1e',
-            'panel_bg': '#2d2d2d',
-            'widget_bg': '#3d3d3d',
-            'fg': '#e0e0e0',
-            'highlight': '#007acc',
-            'button_bg': '#0e639c',
-            'button_fg': '#ffffff',
-            'entry_bg': '#3d3d3d',
-            'border': '#555555',
-            'success': '#4ec9b0',
-            'warning': '#ce9178'
-        }
+        self.colors = ColorScheme.as_dict()
 
         self.setup_dark_theme()
 
-        self.platform_params = {
-            "horn_length": 45.3722,             #31.75
-            "rod_length": 205.0,                #145.0
-            "base": 86.6025 + 18.75 + 11,       #73.025
-            "base_anchors": 64.75,              #36.8893
-            "platform": 84.0759,                #67.775
-            "platform_anchors": 12.5,           #12.7
-            "top_surface_offset": 38.0
-        }
+        self.platform_params = StewartPlatformConfig.as_dict()
         self.ik = StewartPlatformIK(**self.platform_params)
         self.servos = [
             FirstOrderServo(
@@ -151,13 +132,7 @@ class BaseStewartSimulator(QMainWindow):
             for _ in range(6)
         ]
 
-        self.ball_physics = SimpleBallPhysics2D(
-            ball_radius=0.02,
-            ball_mass=0.0027,
-            gravity=9.81,
-            rolling_friction=0.01,
-            sphere_type='hollow'
-        )
+        self.ball_physics = SimpleBallPhysics2D(**BallPhysicsConfig.for_physics_sim())
 
         self.pixy_camera = Pixy2Camera(
             pixel_size_mm=Pixy2CameraConfig.PIXEL_SIZE_MM,
@@ -179,6 +154,11 @@ class BaseStewartSimulator(QMainWindow):
         self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
         self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
         self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+
+        # Ball trail history
+        self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
+        self.ball_history_x = []
+        self.ball_history_y = []
 
         self.simulation_running = False
         self.simulation_time = 0.0
@@ -569,6 +549,28 @@ class BaseStewartSimulator(QMainWindow):
         except RuntimeError:
             # Plot items have been deleted, stop trying to update
             return
+
+        # Update ball trail if it exists (only in simulation mode)
+        # In hardware mode, the control thread handles trail updates
+        if hasattr(self, 'ball_trail') and hasattr(self, 'ball_history_x'):
+            # Only update trail in simulation mode (check if we're running simulation loop)
+            if hasattr(self, 'operation_mode'):
+                # full_c.py/min_c.py with operation_mode attribute
+                if self.operation_mode == 'sim':
+                    measured_x, measured_y = self.ball_pos_measured_mm
+                    self.ball_history_x.append(measured_x)
+                    self.ball_history_y.append(measured_y)
+                    if len(self.ball_history_x) > self.max_history:
+                        self.ball_history_x.pop(0)
+                        self.ball_history_y.pop(0)
+            else:
+                # Simple simulator without operation_mode (always simulation)
+                measured_x, measured_y = self.ball_pos_measured_mm
+                self.ball_history_x.append(measured_x)
+                self.ball_history_y.append(measured_y)
+                if len(self.ball_history_x) > self.max_history:
+                    self.ball_history_x.pop(0)
+                    self.ball_history_y.pop(0)
 
         try:
             if self.pattern_type != 'static':
@@ -997,15 +999,16 @@ class BaseStewartSimulator(QMainWindow):
             dt = min(dt, 0.1)  # Max 100ms per step
             self.simulation_time += dt
 
+            # Get true ball position for camera measurement (always needed for visualization)
+            ball_x_mm_true = self.ball_pos[0, 0].item() * 1000
+            ball_y_mm_true = self.ball_pos[0, 1].item() * 1000
+
             if self.controller_enabled:
                 try:
-                    # Get true ball position
-                    ball_x_mm_true = self.ball_pos[0, 0].item() * 1000
-                    ball_y_mm_true = self.ball_pos[0, 1].item() * 1000
                     ball_vx_mm_s = self.ball_vel[0, 0].item() * 1000
                     ball_vy_mm_s = self.ball_vel[0, 1].item() * 1000
 
-                    # Apply camera noise if enabled
+                    # Apply camera noise if enabled (for ball trail visualization)
                     if self.camera_enabled:
                         measured_x, measured_y, detected, is_new = self.pixy_camera.measure(
                             (ball_x_mm_true, ball_y_mm_true),
@@ -1034,10 +1037,18 @@ class BaseStewartSimulator(QMainWindow):
                             # Use raw measured position
                             ball_x_mm = measured_x
                             ball_y_mm = measured_y
+
+                        ball_x_mm_measured = measured_x
+                        ball_y_mm_measured = measured_y
                     else:
                         # Camera disabled - use true position
                         ball_x_mm = ball_x_mm_true
                         ball_y_mm = ball_y_mm_true
+                        ball_x_mm_measured = ball_x_mm_true
+                        ball_y_mm_measured = ball_y_mm_true
+
+                    # Store measured position for ball trail (position after camera noise)
+                    self.ball_pos_measured_mm = (ball_x_mm_measured, ball_y_mm_measured)
 
                     pattern_time = self.simulation_time - self.pattern_start_time
                     target_x, target_y = self.current_pattern.get_position(pattern_time)

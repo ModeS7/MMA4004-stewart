@@ -26,7 +26,7 @@ from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.control_core import IMUControllerMixin, LQRController, clip_tilt_vector
 from core.utils import (IKZOptimizationConfig, MAX_TILT_ANGLE_DEG,
-                         Pixy2CameraConfig, HardwareConnectionConfig, GUIConfig)
+                         Pixy2CameraConfig, BallPhysicsConfig, HardwareConnectionConfig, GUIConfig, VisualizationConfig)
 
 
 class StewartController(IMUControllerMixin, HardwareControllerBase):
@@ -53,6 +53,11 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Effective platform angles (gravity frame) for Kalman filter prediction
         # Excludes IMU compensation to maintain consistent physics model
         self.prev_effective_angles = {'rx': 0.0, 'ry': 0.0}
+
+        # Ball trail history (for hardware mode)
+        self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
+        self.ball_history_x = []
+        self.ball_history_y = []
 
         # Override window title
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}]")
@@ -712,8 +717,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 # Camera dimensions: 316×208 pixels, origin at top-left
                 CAMERA_HEIGHT_PIXELS = 208.0
 
-                ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
-                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
+                ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
+                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
@@ -722,8 +727,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 self.ball_pos[0, 0] = ball_x_mm / 1000.0
                 self.ball_pos[0, 1] = ball_y_mm / 1000.0
 
-                # Track ball history for trail (only if detected)
-                if self.ball_detected:
+                # Track ball history for trail (only in hardware mode, only if detected)
+                # In simulation mode, base_simulator.py handles trail updates
+                if self.operation_mode == 'real' and self.ball_detected:
                     self.ball_history_x.append(ball_x_mm)
                     self.ball_history_y.append(ball_y_mm)
                     if len(self.ball_history_x) > self.max_history:

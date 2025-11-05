@@ -291,7 +291,7 @@ class StewartPlatformIK:
             rotation: [rx, ry, rz] angles in degrees
             use_top_surface_offset: Use top surface as reference
             z_search_range: Maximum Z adjustment range (±mm) for initial search
-            max_iterations: Maximum optimization iterations (unused with Brent)
+            max_iterations: Maximum optimization iterations for Brent's method
             tolerance: Convergence tolerance (degrees)
             verbose: Enable debug output
             ik_cache: Optional IKCache instance to speed up repeated IK calculations
@@ -430,7 +430,7 @@ class StewartPlatformIK:
         if has_valid_sign_change:
             # Apply Brent's method for root finding
             try:
-                z_opt = brentq(imbalance_at_z, z_min, z_max, xtol=tolerance / 10.0, maxiter=50)
+                z_opt = brentq(imbalance_at_z, z_min, z_max, xtol=tolerance / 10.0, maxiter=max_iterations)
                 trans_opt = np.array([x, y, z_opt])
                 angles_opt = self.calculate_servo_angles(trans_opt, rotation, use_top_surface_offset)
 

@@ -5,7 +5,8 @@ Stewart Platform Control Core
 Controllers:
 - PIDController: PID control for ball balancing
 - LQRController: Linear Quadratic Regulator for optimal control
-- BallPositionFilter: EMA filter for camera noise reduction
+- KalmanFilter: Linear Kalman Filter for ball state estimation
+- OrientationKalmanFilter: EKF for IMU-based orientation estimation
 """
 import numpy as np
 from scipy import linalg
@@ -663,7 +664,12 @@ class OrientationKalmanFilter:
         self.state = np.array([0.0, 0.0, bias_vec[0], bias_vec[1]])
         self.P = np.eye(4) * 0.1
 
-        # Process noise covariance
+        # Store noise parameters for process noise calculation
+        self.gyro_noise = gyro_noise
+        self.process_noise_angle = process_noise_angle
+        self.process_noise_bias = process_noise_bias
+
+        # Process noise covariance (will be computed dynamically in predict())
         self.Q = np.diag([
             process_noise_angle,
             process_noise_angle,
@@ -744,8 +750,18 @@ class OrientationKalmanFilter:
             [0, 0, 0, 1]
         ])
 
+        # Process noise covariance (gyro noise affects angle uncertainty)
+        # Angle uncertainty grows with gyro noise * dt
+        # Bias uncertainty grows with process_noise_bias
+        Q = np.diag([
+            self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+            self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+            self.process_noise_bias,
+            self.process_noise_bias
+        ])
+
         # Covariance propagation
-        self.P = F @ self.P @ F.T + self.Q
+        self.P = F @ self.P @ F.T + Q
 
     def update(self, accel_raw, mag_raw=None):
         """Update step using accelerometer measurements (raw LSB).
