@@ -191,8 +191,8 @@ class Pixy2CameraConfig:
     """Pixy2 camera model parameters (based on measured hardware behavior)."""
 
     # Physical camera characteristics
-    PIXEL_SIZE_MM = 1.4  # Physical size of one pixel (mm)
-    SUBPIXEL_NOISE_STD_MM = 0.4  # Sub-pixel noise std dev (mm)
+    PIXEL_SIZE_MM = 2.0  # Physical size of one pixel (mm)
+    SUBPIXEL_NOISE_STD_MM = 1.0  # Sub-pixel noise std dev (mm)
 
     # Field of view dimensions (calibrated after camera repositioning)
     FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm) - calibrated  #350.0
@@ -210,7 +210,7 @@ class Pixy2CameraConfig:
     CENTER_X_PX = RESOLUTION_WIDTH_PX / 2.0  # 158 pixels
     CENTER_Y_PX = RESOLUTION_HEIGHT_PX / 2.0  # 104 pixels
     CENTER_X = 145.0  # Camera center X offset in mm
-    CENTER_Y = 102.0  # Camera center Y offset in mm
+    CENTER_Y = 109.0  # Camera center Y offset in mm
 
     # Default operational parameters
     DEFAULT_DETECTION_RATE = 0.999  # Ball detection probability (99.9%)
