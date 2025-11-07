@@ -20,7 +20,7 @@ import numpy as np
 
 MAX_TILT_ANGLE_DEG = 15.0  # Maximum platform tilt magnitude (degrees)
 MAX_SERVO_ANGLE_DEG = 70.0  # Maximum individual servo angle (degrees)
-PLATFORM_HALF_SIZE_MM = 100.0  # Half platform size for boundary checks (mm)
+PLATFORM_HALF_SIZE_MM = 150.0  # Half platform size for boundary checks (mm)
 PLATFORM_RADIUS_MM = 150.0  # Circular platform radius (mm)
 
 # ============================================================================
