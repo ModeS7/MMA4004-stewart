@@ -40,12 +40,14 @@ class FirstOrderServo:
             self.target_angle = angle
 
         # Compute ideal response using analytical solution
+        # For τẏ + y = K·u, solution is: y(t+dt) = K·u + (y(t) - K·u)·e^(-dt/τ)
         if self.tau > 1e-6:
-            alpha = np.exp(-self.K * dt / self.tau)
-            ideal_angle = self.target_angle + (self.current_angle - self.target_angle) * alpha
+            decay = np.exp(-dt / self.tau)
+            steady_state = self.K * self.target_angle
+            ideal_angle = steady_state + (self.current_angle - steady_state) * decay
         else:
             # Instantaneous response when time constant approaches zero
-            ideal_angle = self.target_angle
+            ideal_angle = self.K * self.target_angle
 
         # Apply velocity constraints
         angle_change = ideal_angle - self.current_angle
@@ -243,8 +245,10 @@ class StewartPlatformIK:
                 return None, None, False, iteration
             if translation[2] < 0 or translation[2] > 300:
                 return None, None, False, iteration
-            if np.any(np.abs(rotation) > 45):
-                return None, None, False, iteration
+            if abs(rotation[0]) > 60 or abs(rotation[1]) > 60:  # Check roll/pitch
+                return None
+            if abs(rotation[2]) > 120:  # Separate yaw check
+                return None
 
         return None, None, False, max_iterations
 
