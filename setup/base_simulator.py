@@ -13,6 +13,7 @@ import pyqtgraph as pg
 import numpy as np
 import torch
 import time
+from datetime import datetime
 from abc import ABC, abstractmethod
 
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
@@ -394,6 +395,7 @@ class BaseStewartSimulator(QMainWindow):
             'kalman_filter': gm.KalmanFilterModule,
             'plot_control': gm.PlotControlModule,
             'control_frequency': gm.ControlFrequencyModule,
+            'performance_data': gm.PerformanceDataCollectionModule,
         }
 
         layout_config = self.get_layout_config()
@@ -552,25 +554,43 @@ class BaseStewartSimulator(QMainWindow):
 
         # Update ball trail if it exists (only in simulation mode)
         # In hardware mode, the control thread handles trail updates
-        if hasattr(self, 'ball_trail') and hasattr(self, 'ball_history_x'):
+        if hasattr(self, 'ball_trail') and hasattr(self, 'ball_history_x') and hasattr(self, 'ball_pos_measured_mm'):
             # Only update trail in simulation mode (check if we're running simulation loop)
             if hasattr(self, 'operation_mode'):
                 # full_c.py/min_c.py with operation_mode attribute
                 if self.operation_mode == 'sim':
                     measured_x, measured_y = self.ball_pos_measured_mm
+                    # Skip if None values
+                    if measured_x is not None and measured_y is not None:
+                        # Ensure numeric values
+                        measured_x = float(measured_x)
+                        measured_y = float(measured_y)
+                        self.ball_history_x.append(measured_x)
+                        self.ball_history_y.append(measured_y)
+                        if len(self.ball_history_x) > self.max_history:
+                            self.ball_history_x.pop(0)
+                            self.ball_history_y.pop(0)
+                        # Update the trail plot
+                        if len(self.ball_history_x) > 1:
+                            self.ball_trail.setData(np.array(self.ball_history_x, dtype=np.float64),
+                                                   np.array(self.ball_history_y, dtype=np.float64))
+            else:
+                # Simple simulator without operation_mode (always simulation)
+                measured_x, measured_y = self.ball_pos_measured_mm
+                # Skip if None values
+                if measured_x is not None and measured_y is not None:
+                    # Ensure numeric values
+                    measured_x = float(measured_x)
+                    measured_y = float(measured_y)
                     self.ball_history_x.append(measured_x)
                     self.ball_history_y.append(measured_y)
                     if len(self.ball_history_x) > self.max_history:
                         self.ball_history_x.pop(0)
                         self.ball_history_y.pop(0)
-            else:
-                # Simple simulator without operation_mode (always simulation)
-                measured_x, measured_y = self.ball_pos_measured_mm
-                self.ball_history_x.append(measured_x)
-                self.ball_history_y.append(measured_y)
-                if len(self.ball_history_x) > self.max_history:
-                    self.ball_history_x.pop(0)
-                    self.ball_history_y.pop(0)
+                    # Update the trail plot
+                    if len(self.ball_history_x) > 1:
+                        self.ball_trail.setData(np.array(self.ball_history_x, dtype=np.float64),
+                                               np.array(self.ball_history_y, dtype=np.float64))
 
         try:
             if self.pattern_type != 'static':
@@ -1075,6 +1095,41 @@ class BaseStewartSimulator(QMainWindow):
 
                         self.dof_values['rx'] = rx
                         self.dof_values['ry'] = ry
+
+                        # Record performance data if recording (for full_c.py/min_c.py)
+                        if hasattr(self, 'recording') and self.recording and hasattr(self, 'csv_writer') and self.csv_writer:
+                            try:
+                                current_time = time.time()
+                                elapsed_time = current_time - self.recording_start_time
+
+                                error_x = ball_x_mm - target_pos_mm[0]
+                                error_y = ball_y_mm - target_pos_mm[1]
+                                error_magnitude = np.sqrt(error_x**2 + error_y**2)
+                                tilt_magnitude = np.sqrt(rx**2 + ry**2)
+
+                                self.csv_writer.writerow({
+                                    'timestamp': datetime.fromtimestamp(current_time).strftime('%H:%M:%S.%f')[:-3],
+                                    'elapsed_time': f'{elapsed_time:.3f}',
+                                    'ball_x': f'{ball_x_mm:.3f}',
+                                    'ball_y': f'{ball_y_mm:.3f}',
+                                    'target_x': f'{target_pos_mm[0]:.3f}',
+                                    'target_y': f'{target_pos_mm[1]:.3f}',
+                                    'error_x': f'{error_x:.3f}',
+                                    'error_y': f'{error_y:.3f}',
+                                    'error_magnitude': f'{error_magnitude:.3f}',
+                                    'controller_rx': f'{rx:.3f}',
+                                    'controller_ry': f'{ry:.3f}',
+                                    'tilt_magnitude': f'{tilt_magnitude:.3f}'
+                                })
+                                self.sample_count += 1
+
+                                # Flush every 100 samples to ensure data is written
+                                if self.sample_count % 100 == 0:
+                                    self.csv_file.flush()
+                            except Exception as e:
+                                if hasattr(self, 'log'):
+                                    self.log(f"CSV write error: {e}")
+                                self.recording = False
 
                         translation = np.array([self.dof_values['x'],
                                                 self.dof_values['y'],

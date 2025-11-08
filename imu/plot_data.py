@@ -22,7 +22,7 @@ import pyqtgraph as pg
 # Add parent directory to path to import core modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.core import StewartPlatformIK, FirstOrderServo
-from core.utils import SimulationConfig
+from core.utils import SimulationConfig, StewartPlatformConfig
 from core.control_core import OrientationKalmanFilter, GRAVITY_VECTOR, GRAVITY_MAGNITUDE
 
 # PyQtGraph dark theme configuration
@@ -1122,18 +1122,9 @@ def process_kalman_filter(df, output_file=None):
     print(f"  Gravity vector: [{GRAVITY_VECTOR[0]:.4f}, {GRAVITY_VECTOR[1]:.4f}, {GRAVITY_VECTOR[2]:.4f}] m/s² (mag={GRAVITY_MAGNITUDE:.4f})")
     print(f"\nUse sliders to tune filter parameters...")
 
-    # Initialize Stewart platform IK with same parameters as data_logger
-    platform_params = {
-        "horn_length": 45.3722,
-        "rod_length": 205.0,
-        "base": 86.6025 + 18.75 + 11,
-        "base_anchors": 64.75,
-        "platform": 84.0759,
-        "platform_anchors": 12.5,
-        "top_surface_offset": 38.0
-    }
-    stewart_ik = StewartPlatformIK(**platform_params)
-    print(f"Using platform parameters from data_logger:")
+    # Initialize Stewart platform IK with parameters from config
+    stewart_ik = StewartPlatformIK(**StewartPlatformConfig.as_dict())
+    print(f"Using platform parameters from StewartPlatformConfig")
 
     # Create and show PyQt6 window
     app = QApplication.instance()

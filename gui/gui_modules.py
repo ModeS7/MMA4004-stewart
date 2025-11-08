@@ -1591,7 +1591,7 @@ class IMUKalmanParametersModule(GUIModule):
         # Kalman filter noise parameters
         self._create_parameter_slider(layout, "Accel Noise:", 0.1, 5.0, 1.0, 'accel_noise')
         self._create_parameter_slider(layout, "Gyro Noise:", 0.001, 0.1, 0.0224, 'gyro_noise')
-        self._create_parameter_slider(layout, "Process Noise Angle:", 0.0001, 0.1, 0.001, 'process_noise_angle')
+        self._create_parameter_slider(layout, "Process Noise Angle:", 0.000001, 0.1, 0.00001, 'process_noise_angle')
         self._create_parameter_slider(layout, "Process Noise Bias:", 0.000001, 0.001, 0.00001, 'process_noise_bias')
 
         # Current orientation display
@@ -1910,3 +1910,104 @@ class IKZOptimizationModule(GUIModule):
                 self.imbalance_label.setStyleSheet(f"color: {self.colors['highlight']};")
             else:
                 self.imbalance_label.setStyleSheet(f"color: {self.colors['fg']};")
+
+
+class PerformanceDataCollectionModule(GUIModule):
+    """Performance data collection for PID vs LQR comparison."""
+
+    def __init__(self, parent, colors, callbacks, controller_type='PID'):
+        super().__init__(parent, colors, callbacks)
+        self.controller_type = controller_type
+        self.recording = False
+
+    def create(self):
+        group = QGroupBox("Performance Data Collection")
+        layout = QVBoxLayout()
+
+        # Recording control
+        control_layout = QHBoxLayout()
+        self.start_btn = QPushButton("Start Recording")
+        self.start_btn.clicked.connect(self._on_start_recording)
+        control_layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("Stop Recording")
+        self.stop_btn.clicked.connect(self._on_stop_recording)
+        self.stop_btn.setEnabled(False)
+        control_layout.addWidget(self.stop_btn)
+
+        layout.addLayout(control_layout)
+
+        # Status display
+        status_layout = QVBoxLayout()
+
+        self.status_label = QLabel("Status: Not recording")
+        self.status_label.setStyleSheet(f"color: {self.colors['fg']}; font-weight: bold;")
+        status_layout.addWidget(self.status_label)
+
+        self.stats_label = QLabel("Duration: 0.0s | Samples: 0 | Rate: 0.0 Hz")
+        self.stats_label.setStyleSheet(f"color: {self.colors['fg']};")
+        status_layout.addWidget(self.stats_label)
+
+        self.filename_label = QLabel("File: None")
+        self.filename_label.setStyleSheet(f"color: {self.colors['fg']};")
+        status_layout.addWidget(self.filename_label)
+
+        layout.addLayout(status_layout)
+
+        # Instructions
+        instructions_label = QLabel(
+            "Instructions:\n"
+            "1. Enable controller and let system stabilize\n"
+            "2. Click 'Start Recording' to begin data collection\n"
+            "3. Disturb the ball or change target position\n"
+            "4. Wait for ball to settle (~10-20 seconds)\n"
+            "5. Click 'Stop Recording' to save data\n\n"
+            "Repeat for both PID and LQR controllers, then use:\n"
+            "  python scripts/plot_comp.py \\\n"
+            "    --pid data/performance/performance_PID_*.csv \\\n"
+            "    --lqr data/performance/performance_LQR_*.csv"
+        )
+        instructions_label.setStyleSheet(f"color: {self.colors['border']}; font-size: 9pt;")
+        instructions_label.setWordWrap(True)
+        layout.addWidget(instructions_label)
+
+        group.setLayout(layout)
+        self.widget = group
+        return self.widget
+
+    def _on_start_recording(self):
+        """Handle start recording button click."""
+        callback = self.callbacks.get('start_recording')
+        if callback:
+            callback()
+
+    def _on_stop_recording(self):
+        """Handle stop recording button click."""
+        callback = self.callbacks.get('stop_recording')
+        if callback:
+            callback()
+
+    def update(self, state):
+        """Update module display with current state."""
+        recording = state.get('recording', False)
+
+        if recording:
+            self.status_label.setText("Status: Recording")
+            self.status_label.setStyleSheet(f"color: {self.colors['highlight']}; font-weight: bold;")
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+
+            duration = state.get('recording_duration', 0.0)
+            samples = state.get('recording_samples', 0)
+            rate = state.get('recording_rate', 0.0)
+            self.stats_label.setText(f"Duration: {duration:.1f}s | Samples: {samples} | Rate: {rate:.1f} Hz")
+
+            filename = state.get('recording_filename', 'None')
+            self.filename_label.setText(f"File: {filename}")
+        else:
+            self.status_label.setText("Status: Not recording")
+            self.status_label.setStyleSheet(f"color: {self.colors['fg']}; font-weight: bold;")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.stats_label.setText("Duration: 0.0s | Samples: 0 | Rate: 0.0 Hz")
+            self.filename_label.setText("File: None")

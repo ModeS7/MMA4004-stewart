@@ -14,6 +14,9 @@ Features:
 
 import sys
 import time
+import csv
+from datetime import datetime
+from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
@@ -58,6 +61,14 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
         self.ball_history_x = []
         self.ball_history_y = []
+
+        # Performance data recording
+        self.csv_writer = None
+        self.csv_file = None
+        self.recording = False
+        self.recording_start_time = 0.0
+        self.sample_count = 0
+        self.recording_filename = None
 
         # Override window title
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}]")
@@ -147,6 +158,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             'kalman_reset': self.on_kalman_reset,
         })
 
+        # Add performance data recording callbacks (both sim and hardware)
+        callbacks.update({
+            'start_recording': self.start_recording,
+            'stop_recording': self.stop_recording,
+        })
+
         # Add IMU callbacks (hardware only)
         if self.operation_mode == 'real':
             callbacks.update({
@@ -195,6 +212,10 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         # Trajectory pattern
         left_modules.append({'type': 'trajectory_pattern', 'args': {'pattern_var': self.pattern_type}})
+
+        # Performance data collection (both sim and hardware)
+        left_modules.append({'type': 'performance_data',
+                           'args': {'controller_type': self.controller_type_selection}})
 
         # Simulation-only: Ball control
         if self.operation_mode == 'sim':
@@ -291,6 +312,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             'imu_kalman_parameters': gm.IMUKalmanParametersModule,
             'imu_motion_detection': gm.IMUMotionDetectionModule,
             'ik_z_optimization': gm.IKZOptimizationModule,
+            'performance_data': gm.PerformanceDataCollectionModule,
         }
 
         layout_config = self.get_layout_config()
@@ -690,6 +712,63 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.kalman_filter.reset(self.ball_pos_mm)
         self.log("Kalman filter reset")
 
+    def start_recording(self):
+        """Start recording performance data to CSV."""
+        if self.recording:
+            self.log("Already recording!")
+            return
+
+        # Create output directory
+        output_dir = Path('data/performance')
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = output_dir / f"performance_{self.controller_type_selection}_{timestamp}.csv"
+
+        try:
+            self.csv_file = open(filename, 'w', newline='')
+            self.csv_writer = csv.DictWriter(
+                self.csv_file,
+                fieldnames=['timestamp', 'elapsed_time', 'ball_x', 'ball_y',
+                           'target_x', 'target_y', 'error_x', 'error_y', 'error_magnitude',
+                           'controller_rx', 'controller_ry', 'tilt_magnitude', 'loop_time_ms']
+            )
+            self.csv_writer.writeheader()
+
+            self.recording = True
+            self.recording_start_time = time.time()
+            self.sample_count = 0
+            self.recording_filename = str(filename)
+
+            self.log(f"Started recording to {filename.name}")
+        except Exception as e:
+            self.log(f"ERROR: Failed to start recording: {e}")
+
+    def stop_recording(self):
+        """Stop recording performance data."""
+        self.log("Stop recording called")  # Debug
+        if not self.recording:
+            self.log("Not currently recording")
+            return
+
+        try:
+            if self.csv_file:
+                self.csv_file.close()
+                self.csv_file = None
+            self.csv_writer = None
+
+            elapsed = time.time() - self.recording_start_time
+            sample_rate = self.sample_count / elapsed if elapsed > 0 else 0
+
+            self.log(f"Recording stopped. {self.sample_count} samples in {elapsed:.1f}s ({sample_rate:.1f} Hz)")
+            self.log(f"Data saved to {Path(self.recording_filename).name}")
+
+            self.recording = False
+            self.recording_filename = None
+        except Exception as e:
+            self.log(f"ERROR: Failed to stop recording: {e}")
+
     def _control_thread_func(self):
         """Hardware control thread with IMU integration."""
         self.log("Control thread started")
@@ -804,6 +883,40 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
                         self.prev_platform_angles['rx'] = rx
                         self.prev_platform_angles['ry'] = ry
+
+                    # Record performance data if recording
+                    if self.recording and self.csv_writer:
+                        try:
+                            current_time = time.time()
+                            elapsed_time = current_time - self.recording_start_time
+
+                            error_x = ball_pos_mm[0] - target_pos_mm[0]
+                            error_y = ball_pos_mm[1] - target_pos_mm[1]
+                            error_magnitude = np.sqrt(error_x**2 + error_y**2)
+                            tilt_magnitude = np.sqrt(rx_ctrl**2 + ry_ctrl**2)
+
+                            self.csv_writer.writerow({
+                                'timestamp': datetime.fromtimestamp(current_time).strftime('%H:%M:%S.%f')[:-3],
+                                'elapsed_time': f'{elapsed_time:.3f}',
+                                'ball_x': f'{ball_pos_mm[0]:.3f}',
+                                'ball_y': f'{ball_pos_mm[1]:.3f}',
+                                'target_x': f'{target_pos_mm[0]:.3f}',
+                                'target_y': f'{target_pos_mm[1]:.3f}',
+                                'error_x': f'{error_x:.3f}',
+                                'error_y': f'{error_y:.3f}',
+                                'error_magnitude': f'{error_magnitude:.3f}',
+                                'controller_rx': f'{rx_ctrl:.3f}',
+                                'controller_ry': f'{ry_ctrl:.3f}',
+                                'tilt_magnitude': f'{tilt_magnitude:.3f}'
+                            })
+                            self.sample_count += 1
+
+                            # Flush every 100 samples to ensure data is written
+                            if self.sample_count % 100 == 0:
+                                self.csv_file.flush()
+                        except Exception as e:
+                            self.log(f"CSV write error: {e}")
+                            self.recording = False
 
             # Manual control when controller disabled
             elif not self.controller_enabled:
@@ -996,6 +1109,21 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             )
             state['imu_mag_updates'] = self.orientation_kalman.mag_update_count
 
+            # Add recording state
+            state['recording'] = self.recording
+            if self.recording:
+                elapsed = time.time() - self.recording_start_time
+                sample_rate = self.sample_count / elapsed if elapsed > 0 else 0
+                state['recording_duration'] = elapsed
+                state['recording_samples'] = self.sample_count
+                state['recording_rate'] = sample_rate
+                state['recording_filename'] = Path(self.recording_filename).name if self.recording_filename else None
+            else:
+                state['recording_duration'] = 0.0
+                state['recording_samples'] = 0
+                state['recording_rate'] = 0.0
+                state['recording_filename'] = None
+
             # Update all modules (skip plot_panel which is a Qt widget, not a GUIModule)
             for key, module in self.gui_modules.items():
                 if key == 'plot_panel':
@@ -1005,6 +1133,26 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         else:
             # Simulation mode: use parent implementation first
             super().update_gui_modules()
+
+            # Add recording state for performance data module
+            recording_state = {
+                'recording': self.recording
+            }
+            if self.recording:
+                elapsed = time.time() - self.recording_start_time
+                sample_rate = self.sample_count / elapsed if elapsed > 0 else 0
+                recording_state['recording_duration'] = elapsed
+                recording_state['recording_samples'] = self.sample_count
+                recording_state['recording_rate'] = sample_rate
+                recording_state['recording_filename'] = Path(self.recording_filename).name if self.recording_filename else None
+            else:
+                recording_state['recording_duration'] = 0.0
+                recording_state['recording_samples'] = 0
+                recording_state['recording_rate'] = 0.0
+                recording_state['recording_filename'] = None
+
+            if 'performance_data' in self.gui_modules:
+                self.gui_modules['performance_data'].update(recording_state)
 
             # Then update Kalman filter GUI if enabled
             if self.kalman_enabled and hasattr(self, 'kalman_filter'):
