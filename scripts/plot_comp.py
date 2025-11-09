@@ -113,13 +113,9 @@ def plot_comparison(pid_file, lqr_file, output_dir='plots', pid_time_shift=0.0, 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Create figure with four subplots (2 rows, 2 columns)
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax3 = fig.add_subplot(gs[1, 0])
-    ax4 = fig.add_subplot(gs[1, 1])
+    # Create figure with two subplots (2 rows, 1 column)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    plt.subplots_adjust(hspace=0.3)
 
     # Plot 1: Error magnitude over time
     ax1.plot(pid_df['elapsed_time'], pid_df['error_magnitude'],
@@ -134,83 +130,23 @@ def plot_comparison(pid_file, lqr_file, output_dir='plots', pid_time_shift=0.0, 
     ax1.set_xlim(left=0)
     ax1.tick_params(axis='both', labelsize=11)
 
-    # Plot 2: Top view - Ball and Target Trajectories
-    ax2.plot(pid_df['target_x'], pid_df['target_y'],
-             label='Target', color='#000000', linewidth=2, alpha=0.5, linestyle='--')
-    ax2.plot(pid_df['ball_x'], pid_df['ball_y'],
-             label='PID Ball', color='#2E86AB', linewidth=2, alpha=0.7)
-    ax2.plot(lqr_df['ball_x'], lqr_df['ball_y'],
-             label='LQR Ball', color='#A23B72', linewidth=2, alpha=0.7)
-    ax2.scatter([0], [0], color='green', s=150, marker='X', label='Center', zorder=5)
-    ax2.set_xlabel('X Position (mm)', fontsize=13, fontweight='bold')
-    ax2.set_ylabel('Y Position (mm)', fontsize=13, fontweight='bold')
-    ax2.set_title('Ball Trajectories (Top View)', fontsize=15, fontweight='bold', pad=15)
-    ax2.legend(loc='upper right', fontsize=12, framealpha=0.95)
-    ax2.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-    ax2.set_aspect('equal', adjustable='box')
-    ax2.axhline(y=0, color='#000000', linewidth=1, alpha=0.3)
-    ax2.axvline(x=0, color='#000000', linewidth=1, alpha=0.3)
-    ax2.tick_params(axis='both', labelsize=11)
-
-    # Plot 3: Error components (X and Y)
-    ax3.plot(pid_df['elapsed_time'], pid_df['error_x'],
+    # Plot 2: Error components (X and Y)
+    ax2.plot(pid_df['elapsed_time'], pid_df['error_x'],
              label='PID X', color='#2E86AB', linewidth=2, alpha=0.9)
-    ax3.plot(pid_df['elapsed_time'], pid_df['error_y'],
+    ax2.plot(pid_df['elapsed_time'], pid_df['error_y'],
              label='PID Y', color='#2E86AB', linewidth=2, alpha=0.9, linestyle='--')
-    ax3.plot(lqr_df['elapsed_time'], lqr_df['error_x'],
+    ax2.plot(lqr_df['elapsed_time'], lqr_df['error_x'],
              label='LQR X', color='#A23B72', linewidth=2, alpha=0.9)
-    ax3.plot(lqr_df['elapsed_time'], lqr_df['error_y'],
+    ax2.plot(lqr_df['elapsed_time'], lqr_df['error_y'],
              label='LQR Y', color='#A23B72', linewidth=2, alpha=0.9, linestyle='--')
-    ax3.axhline(y=0, color='#000000', linewidth=1, alpha=0.4)
-    ax3.set_xlabel('Time (s)', fontsize=13, fontweight='bold')
-    ax3.set_ylabel('Error (mm)', fontsize=13, fontweight='bold')
-    ax3.set_title('Error Components vs Time', fontsize=15, fontweight='bold', pad=15)
-    ax3.legend(loc='upper right', fontsize=12, ncol=2, framealpha=0.95)
-    ax3.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-    ax3.set_xlim(left=0)
-    ax3.tick_params(axis='both', labelsize=11)
-
-    # Plot 4: Top view - Error Vectors
-    # Sample every N points to avoid cluttering
-    sample_rate = max(1, len(pid_df) // 50)
-    pid_sample = pid_df.iloc[::sample_rate]
-    lqr_sample = lqr_df.iloc[::sample_rate]
-
-    # Plot error vectors from target to ball position
-    for i in range(len(pid_sample)):
-        row = pid_sample.iloc[i]
-        ax4.arrow(row['target_x'], row['target_y'], row['error_x'], row['error_y'],
-                 head_width=2, head_length=1, fc='#2E86AB', ec='#2E86AB',
-                 alpha=0.3, linewidth=0.5)
-
-    for i in range(len(lqr_sample)):
-        row = lqr_sample.iloc[i]
-        ax4.arrow(row['target_x'], row['target_y'], row['error_x'], row['error_y'],
-                 head_width=2, head_length=1, fc='#A23B72', ec='#A23B72',
-                 alpha=0.3, linewidth=0.5)
-
-    # Plot target trajectory
-    ax4.plot(pid_df['target_x'], pid_df['target_y'],
-             label='Target', color='#000000', linewidth=2, alpha=0.5, linestyle='--')
-    ax4.scatter([0], [0], color='green', s=150, marker='X', label='Center', zorder=5)
-    ax4.set_xlabel('X Position (mm)', fontsize=13, fontweight='bold')
-    ax4.set_ylabel('Y Position (mm)', fontsize=13, fontweight='bold')
-    ax4.set_title('Error Vectors (Top View)', fontsize=15, fontweight='bold', pad=15)
-    ax4.legend(loc='upper right', fontsize=12, framealpha=0.95)
-    ax4.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-    ax4.set_aspect('equal', adjustable='box')
-    ax4.axhline(y=0, color='#000000', linewidth=1, alpha=0.3)
-    ax4.axvline(x=0, color='#000000', linewidth=1, alpha=0.3)
-    ax4.tick_params(axis='both', labelsize=11)
-
-    # Add manual legend entries for error vectors
-    from matplotlib.patches import FancyArrow
-    pid_arrow = FancyArrow(0, 0, 0, 0, color='#2E86AB', alpha=0.3)
-    lqr_arrow = FancyArrow(0, 0, 0, 0, color='#A23B72', alpha=0.3)
-    handles, labels = ax4.get_legend_handles_labels()
-    handles.extend([pid_arrow, lqr_arrow])
-    labels.extend(['PID Error', 'LQR Error'])
-    ax4.legend(handles, labels, loc='upper right', fontsize=12, framealpha=0.95)
+    ax2.axhline(y=0, color='#000000', linewidth=1, alpha=0.4)
+    ax2.set_xlabel('Time (s)', fontsize=13, fontweight='bold')
+    ax2.set_ylabel('Error (mm)', fontsize=13, fontweight='bold')
+    ax2.set_title('Error Components vs Time', fontsize=15, fontweight='bold', pad=15)
+    ax2.legend(loc='upper right', fontsize=12, ncol=2, framealpha=0.95)
+    ax2.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+    ax2.set_xlim(left=0)
+    ax2.tick_params(axis='both', labelsize=11)
 
     # Save plot
     output_file = output_path / 'pid_vs_lqr_comparison.png'
