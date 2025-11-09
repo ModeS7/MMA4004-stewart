@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
 from core.control_core import clip_tilt_vector
 from core.utils import (
-    MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM,
+    MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM, PLATFORM_HALF_SIZE_MM, PLATFORM_VERSION,
     SimulationConfig, IKZOptimizationConfig, Pixy2CameraConfig,
     StewartPlatformConfig, ColorScheme, BallPhysicsConfig, VisualizationConfig,
     format_time, format_error_context
@@ -511,14 +511,22 @@ class BaseStewartSimulator(QMainWindow):
         plot_item.showGrid(x=True, y=True, alpha=0.2)
         plot_item.setAspectLocked(True)
 
-        # Platform boundary (circular)
-        self.platform_circle = pg.QtWidgets.QGraphicsEllipseItem(
-            -PLATFORM_RADIUS_MM, -PLATFORM_RADIUS_MM,
-            PLATFORM_RADIUS_MM * 2, PLATFORM_RADIUS_MM * 2
-        )
+        # Platform boundary (shape depends on platform version)
         pen = pg.mkPen(color=self.colors['fg'], width=2, style=Qt.PenStyle.DashLine)
-        self.platform_circle.setPen(pen)
-        plot_item.addItem(self.platform_circle)
+        if PLATFORM_VERSION == 'V1':
+            # V1: Square platform (200x200mm)
+            self.platform_boundary = pg.QtWidgets.QGraphicsRectItem(
+                -PLATFORM_HALF_SIZE_MM, -PLATFORM_HALF_SIZE_MM,
+                PLATFORM_HALF_SIZE_MM * 2, PLATFORM_HALF_SIZE_MM * 2
+            )
+        else:
+            # V2: Circular platform
+            self.platform_boundary = pg.QtWidgets.QGraphicsEllipseItem(
+                -PLATFORM_RADIUS_MM, -PLATFORM_RADIUS_MM,
+                PLATFORM_RADIUS_MM * 2, PLATFORM_RADIUS_MM * 2
+            )
+        self.platform_boundary.setPen(pen)
+        plot_item.addItem(self.platform_boundary)
 
         # Trajectory line
         self.trajectory_line = plot_item.plot([], [], pen=pg.mkPen(color=self.colors['highlight'],

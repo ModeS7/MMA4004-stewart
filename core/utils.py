@@ -15,13 +15,24 @@ Centralized configuration for all system parameters:
 import numpy as np
 
 # ============================================================================
+# PLATFORM VERSION SELECTION
+# ============================================================================
+PLATFORM_VERSION = 'V1'  # Options: 'V1' (200x200mm square) or 'V2' (larger platform)
+
+# ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS
 # ============================================================================
 
 MAX_TILT_ANGLE_DEG = 15.0  # Maximum platform tilt magnitude (degrees)
 MAX_SERVO_ANGLE_DEG = 70.0  # Maximum individual servo angle (degrees)
-PLATFORM_HALF_SIZE_MM = 150.0  # Half platform size for boundary checks (mm)
-PLATFORM_RADIUS_MM = 150.0  # Circular platform radius (mm)
+
+# Platform boundaries (version-dependent)
+if PLATFORM_VERSION == 'V1':
+    PLATFORM_HALF_SIZE_MM = 100.0  # V1: 200x200mm square platform (half = 100mm)
+    PLATFORM_RADIUS_MM = 100.0  # V1: Square platform uses half-size for radius (boundaries are square)
+else:  # V2
+    PLATFORM_HALF_SIZE_MM = 150.0  # V2: Larger platform
+    PLATFORM_RADIUS_MM = 150.0  # V2: Circular platform radius
 
 # ============================================================================
 # STEWART PLATFORM GEOMETRY CONFIGURATION
@@ -30,14 +41,25 @@ PLATFORM_RADIUS_MM = 150.0  # Circular platform radius (mm)
 class StewartPlatformConfig:
     """Stewart platform geometric parameters (measured from actual hardware)."""
 
-    # Actual hardware measurements
-    HORN_LENGTH_MM = 45.3722  # Servo horn length (mm) - measured from hardware  #31.75
-    ROD_LENGTH_MM = 205.0  # Push rod length (mm) - measured from hardware  #145.0
-    BASE_RADIUS_MM = 116.3525  # Base circle radius (mm) - 86.6025 + 18.75 + 11  #73.025
-    BASE_ANCHORS_OFFSET_MM = 64.75  # Anchor offset from base circle (mm) - measured from hardware  #36.8893
-    PLATFORM_RADIUS_MM = 84.0759  # Platform circle radius (mm) - measured from hardware  #67.775
-    PLATFORM_ANCHORS_OFFSET_MM = 12.5  # Anchor offset from platform circle (mm) - measured from hardware  #12.7
-    TOP_SURFACE_OFFSET_MM = 38.0  # Distance from platform anchors to top surface (mm) - measured from hardware  #26.0
+    # Platform version-specific parameters
+    if PLATFORM_VERSION == 'V1':
+        # V1 Platform (original 200x200mm square platform)
+        HORN_LENGTH_MM = 31.75  # Servo horn length (mm)
+        ROD_LENGTH_MM = 145.0  # Push rod length (mm)
+        BASE_RADIUS_MM = 73.025  # Base circle radius (mm)
+        BASE_ANCHORS_OFFSET_MM = 36.8893  # Anchor offset from base circle (mm)
+        PLATFORM_RADIUS_MM = 67.775  # Platform circle radius (mm)
+        PLATFORM_ANCHORS_OFFSET_MM = 12.7  # Anchor offset from platform circle (mm)
+        TOP_SURFACE_OFFSET_MM = 26.0  # Distance from platform anchors to top surface (mm)
+    else:  # V2
+        # V2 Platform (current larger platform)
+        HORN_LENGTH_MM = 45.3722  # Servo horn length (mm) - measured from hardware
+        ROD_LENGTH_MM = 205.0  # Push rod length (mm) - measured from hardware
+        BASE_RADIUS_MM = 116.3525  # Base circle radius (mm) - 86.6025 + 18.75 + 11
+        BASE_ANCHORS_OFFSET_MM = 64.75  # Anchor offset from base circle (mm) - measured from hardware
+        PLATFORM_RADIUS_MM = 84.0759  # Platform circle radius (mm) - measured from hardware
+        PLATFORM_ANCHORS_OFFSET_MM = 12.5  # Anchor offset from platform circle (mm) - measured from hardware
+        TOP_SURFACE_OFFSET_MM = 38.0  # Distance from platform anchors to top surface (mm) - measured from hardware
 
     @classmethod
     def as_dict(cls):
@@ -190,27 +212,35 @@ class IKZOptimizationConfig:
 class Pixy2CameraConfig:
     """Pixy2 camera model parameters (based on measured hardware behavior)."""
 
-    # Physical camera characteristics
-    PIXEL_SIZE_MM = 2.0  # Physical size of one pixel (mm)
-    SUBPIXEL_NOISE_STD_MM = 1.0  # Sub-pixel noise std dev (mm)
-
-    # Field of view dimensions (calibrated after camera repositioning)
-    FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm) - calibrated  #350.0
-    FOV_HEIGHT_MM = 424.0  # Physical height of camera view (mm) - calibrated  #266.0
-
-    # Camera resolution
+    # Camera resolution (same for both V1 and V2)
     RESOLUTION_WIDTH_PX = 316  # Camera width (pixels)
     RESOLUTION_HEIGHT_PX = 208  # Camera height (pixels)
 
-    # Computed pixel-to-mm conversion factors
-    PIXELS_TO_MM_X = FOV_WIDTH_MM / RESOLUTION_WIDTH_PX
-    PIXELS_TO_MM_Y = FOV_HEIGHT_MM / RESOLUTION_HEIGHT_PX
-
-    # Camera center point (for coordinate transformation)
+    # Camera center point in pixels (same for both V1 and V2)
     CENTER_X_PX = RESOLUTION_WIDTH_PX / 2.0  # 158 pixels
     CENTER_Y_PX = RESOLUTION_HEIGHT_PX / 2.0  # 104 pixels
-    CENTER_X = 145.0  # Camera center X offset in mm
-    CENTER_Y = 109.0  # Camera center Y offset in mm
+
+    # Platform version-specific camera calibration
+    if PLATFORM_VERSION == 'V1':
+        # V1 Camera (original mounting and calibration)
+        PIXEL_SIZE_MM = 1.4  # Physical size of one pixel (mm)
+        SUBPIXEL_NOISE_STD_MM = 0.4  # Sub-pixel noise std dev (mm)
+        FOV_WIDTH_MM = 350.0  # Physical width of camera view (mm)
+        FOV_HEIGHT_MM = 266.0  # Physical height of camera view (mm)
+        CENTER_X = 158.0  # Platform center X position in pixels (from control_v1.ino ORIGIN_X)
+        CENTER_Y = 104.0  # Platform center Y position in pixels (from control_v1.ino ORIGIN_Y)
+    else:  # V2
+        # V2 Camera (repositioned and recalibrated)
+        PIXEL_SIZE_MM = 2.0  # Physical size of one pixel (mm)
+        SUBPIXEL_NOISE_STD_MM = 1.0  # Sub-pixel noise std dev (mm)
+        FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm) - calibrated
+        FOV_HEIGHT_MM = 424.0  # Physical height of camera view (mm) - calibrated
+        CENTER_X = 145.0  # Platform center X position offset (pixels + mm offset combined)
+        CENTER_Y = 109.0  # Platform center Y position offset (pixels + mm offset combined)
+
+    # Computed pixel-to-mm conversion factors (calculated from FOV and resolution)
+    PIXELS_TO_MM_X = FOV_WIDTH_MM / RESOLUTION_WIDTH_PX
+    PIXELS_TO_MM_Y = FOV_HEIGHT_MM / RESOLUTION_HEIGHT_PX
 
     # Default operational parameters
     DEFAULT_DETECTION_RATE = 0.999  # Ball detection probability (99.9%)
