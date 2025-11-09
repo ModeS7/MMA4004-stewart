@@ -152,14 +152,14 @@ class PIDConfig:
     # Simulation defaults (aggressive tuning for ideal conditions)
     SIM_DEFAULT_GAINS = {
         'kp': 3.0,
-        'ki': 1.0,
+        'ki': 0.0,
         'kd': 3.0
     }
 
     # Hardware defaults (conservative tuning for real system)
     HW_DEFAULT_GAINS = {
         'kp': 1.0,
-        'ki': 1.0,
+        'ki': 0.0,
         'kd': 4.0
     }
 
