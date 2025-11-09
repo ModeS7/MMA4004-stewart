@@ -83,7 +83,7 @@ def calculate_metrics(df, settling_threshold=5.0):
     return metrics
 
 
-def plot_comparison(pid_file, lqr_file, output_dir='plots'):
+def plot_comparison(pid_file, lqr_file, output_dir='plots', cutoff_time=None):
     """Generate synchronized comparison plots for PID vs LQR performance."""
     print(f"Loading data...")
     print(f"  PID: {pid_file}")
@@ -110,7 +110,12 @@ def plot_comparison(pid_file, lqr_file, output_dir='plots'):
     lqr_df['elapsed_time'] = lqr_df['elapsed_time'] - lqr_df['elapsed_time'].iloc[0]
 
     # Find common time range
-    max_time = min(pid_df['elapsed_time'].max(), lqr_df['elapsed_time'].max())
+    if cutoff_time is not None:
+        max_time = cutoff_time
+        print(f"\nUsing user-specified cutoff time: {cutoff_time:.3f}s")
+    else:
+        max_time = min(pid_df['elapsed_time'].max(), lqr_df['elapsed_time'].max())
+        print(f"\nUsing automatic cutoff time (min of both datasets)")
 
     # Trim to common duration
     pid_df = pid_df[pid_df['elapsed_time'] <= max_time].copy()
@@ -284,10 +289,12 @@ def main():
                        help='Output directory for plots (default: plots)')
     parser.add_argument('--threshold', type=float, default=1.0,
                        help='Movement threshold (mm) to detect pattern start (default: 1.0)')
+    parser.add_argument('--cutoff', type=float, default=None,
+                       help='Cutoff time (s) for plotting. If not specified, uses minimum of both datasets')
 
     args = parser.parse_args()
 
-    plot_comparison(args.pid, args.lqr, args.output)
+    plot_comparison(args.pid, args.lqr, args.output, cutoff_time=args.cutoff)
 
 
 if __name__ == '__main__':
