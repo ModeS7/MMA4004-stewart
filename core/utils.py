@@ -17,7 +17,7 @@ import numpy as np
 # ============================================================================
 # PLATFORM VERSION SELECTION
 # ============================================================================
-PLATFORM_VERSION = 'V1'  # Options: 'V1' (200x200mm square) or 'V2' (larger platform)
+PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger platform)
 
 # ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS

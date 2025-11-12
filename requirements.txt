@@ -1,7 +1,5 @@
 pyserial
 numpy
-mujoco
-mujoco-mjx
 PyQt6
 pyqtgraph
 pandas
