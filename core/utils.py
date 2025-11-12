@@ -17,7 +17,7 @@ import numpy as np
 # ============================================================================
 # PLATFORM VERSION SELECTION
 # ============================================================================
-PLATFORM_VERSION = 'V1'  # Options: 'V1' (200x200mm square) or 'V2' (larger platform)
+PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger platform)
 
 # ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS
@@ -133,6 +133,12 @@ class GUIConfig:
     PLOT_DISABLED_INTERVAL_MS = 100  # Update interval when plotting disabled
     SLIDER_RESOLUTION = 100  # Integer slider resolution multiplier
 
+    # Plot control settings
+    DEFAULT_PLOT_RATE_HZ = 10  # Default plot refresh rate
+    MIN_PLOT_RATE_HZ = 1  # Minimum plot refresh rate
+    MAX_PLOT_RATE_HZ = 100  # Maximum plot refresh rate
+    DEFAULT_PLOT_ENABLED = True  # Plot updates enabled by default
+
 
 class SimulationConfig:
     """Configuration for simulation mode."""
@@ -189,6 +195,100 @@ class PIDConfig:
     # Derivative filtering
     DERIVATIVE_FILTER_ALPHA = 0.0  # Low-pass filter coefficient (0=none, >0=filtering)
     HW_DERIVATIVE_FILTER_ALPHA = 0.1  # More filtering for hardware (noisy measurements)
+
+class LQRConfig:
+    """Default LQR controller parameters."""
+
+    # Default weights (same for simulation and hardware)
+    DEFAULT_WEIGHTS = {
+        'Q_pos': 1.0,  # Position error weight
+        'Q_vel': 1.0,  # Velocity error weight
+        'R': 1.0       # Control effort weight
+    }
+
+    # Scalar multiplier values for GUI sliders
+    SCALAR_VALUES = [
+        0.0000001, 0.000001, 0.00001, 0.0001,
+        0.001, 0.01, 0.1, 1.0, 10.0, 100.0
+    ]
+
+    # Default scalar indices (index into SCALAR_VALUES)
+    DEFAULT_SCALAR_INDICES = {
+        'Q_pos': 9,  # 100.0
+        'Q_vel': 5,  # 0.01
+        'R': 5       # 0.01
+    }
+
+    # Controller limits
+    OUTPUT_LIMIT = MAX_TILT_ANGLE_DEG  # Maximum controller output (degrees)
+
+class TrajectoryPatternConfig:
+    """Trajectory pattern parameters for target tracking."""
+
+    # Circle pattern
+    CIRCLE_RADIUS_RANGE_MM = (10.0, 100.0)
+    CIRCLE_DEFAULT_RADIUS_MM = 50.0
+    CIRCLE_PERIOD_RANGE_S = (3.0, 30.0)
+    CIRCLE_DEFAULT_PERIOD_S = 10.0
+
+    # Figure-8 pattern
+    FIGURE8_WIDTH_RANGE_MM = (10.0, 150.0)
+    FIGURE8_DEFAULT_WIDTH_MM = 60.0
+    FIGURE8_HEIGHT_RANGE_MM = (10.0, 100.0)
+    FIGURE8_DEFAULT_HEIGHT_MM = 40.0
+    FIGURE8_PERIOD_RANGE_S = (3.0, 30.0)
+    FIGURE8_DEFAULT_PERIOD_S = 12.0
+
+    # Star pattern
+    STAR_RADIUS_RANGE_MM = (10.0, 100.0)
+    STAR_DEFAULT_RADIUS_MM = 60.0
+    STAR_PERIOD_RANGE_S = (3.0, 30.0)
+    STAR_DEFAULT_PERIOD_S = 15.0
+
+class ManualPoseControlConfig:
+    """Manual 6-DOF pose control slider limits."""
+
+    # Translation limits (mm)
+    X_RANGE_MM = (-115.0, 115.0)
+    X_DEFAULT_MM = 0.0
+    X_RESOLUTION_MM = 0.1
+
+    Y_RANGE_MM = (-115.0, 115.0)
+    Y_DEFAULT_MM = 0.0
+    Y_RESOLUTION_MM = 0.1
+
+    Z_OFFSET_RANGE_MM = (-90.0, 90.0)  # Offset from home height
+    Z_RESOLUTION_MM = 0.1
+
+    # Rotation limits (degrees)
+    RX_RANGE_DEG = (-45.0, 45.0)
+    RX_DEFAULT_DEG = 0.0
+    RX_RESOLUTION_DEG = 0.1
+
+    RY_RANGE_DEG = (-45.0, 45.0)
+    RY_DEFAULT_DEG = 0.0
+    RY_RESOLUTION_DEG = 0.1
+
+    RZ_RANGE_DEG = (-115.0, 115.0)
+    RZ_DEFAULT_DEG = 0.0
+    RZ_RESOLUTION_DEG = 0.1
+
+class KalmanFilterConfig:
+    """Ball position/velocity Kalman filter parameters."""
+
+    # Process noise (Q matrix scaling)
+    PROCESS_NOISE_RANGE = (0.01, 10.0)
+    DEFAULT_PROCESS_NOISE = 1.0
+
+    # Measurement noise (R matrix scaling)
+    MEASUREMENT_NOISE_RANGE = (0.01, 10.0)
+    DEFAULT_MEASUREMENT_NOISE = 1.0
+
+class BallControlConfig:
+    """Ball control parameters (reset, push, etc.)."""
+
+    # Ball push velocity (m/s)
+    PUSH_VELOCITY_MS = 0.05  # Random velocity range: ±PUSH_VELOCITY_MS
 
 # ============================================================================
 # IK Z OPTIMIZATION CONFIGURATION
@@ -404,7 +504,7 @@ class IMUKalmanConfig:
     DEFAULT_ACCEL_NOISE = 1.0
     DEFAULT_GYRO_NOISE = 0.0224
     DEFAULT_PROCESS_NOISE_ANGLE = 0.001
-    DEFAULT_PROCESS_NOISE_BIAS = 0.00001
+    DEFAULT_PROCESS_NOISE_BIAS = 0.001
 
     # Calibrated gyroscope bias (rad/s)
     CALIBRATED_GYRO_BIAS_X = 0.112679
@@ -415,8 +515,8 @@ class IMUKalmanConfig:
     DEFAULT_GYRO_THRESHOLD = 0.5   # rad/s - gyro magnitude threshold
 
     # Scaling and transformation
-    DEFAULT_GYRO_SCALE_MULTIPLIER = 6.6
-    DEFAULT_MAG_INCLINATION_DEG = 75.0
+    DEFAULT_GYRO_SCALE_MULTIPLIER = 1.0
+    DEFAULT_MAG_INCLINATION_DEG = 74.283  # Magnetic inclination for Trondheim, Norway (74° 17')
 
     # Default axis transformations (identity - no flipping)
     DEFAULT_ACCEL_AXIS_FLIP = np.array([1, 1, 1])
@@ -513,18 +613,11 @@ def get_controller_defaults(controller_type='PID', mode='simulation'):
 
     elif controller_type.upper() == 'LQR':
         # LQR defaults (same for sim and hardware)
-        lqr_scalar_values = [
-            0.0000001, 0.000001, 0.00001, 0.0001,
-            0.001, 0.01, 0.1, 1.0, 10.0, 100.0
-        ]
-        lqr_weights = {'Q_pos': 1.0, 'Q_vel': 1.0, 'R': 1.0}
-        lqr_scalar_indices = {'Q_pos': 9, 'Q_vel': 5, 'R': 5}  # 100.0, 0.01, 0.01
-
         return {
-            'weights': lqr_weights.copy(),
-            'scalar_indices': lqr_scalar_indices.copy(),
-            'scalar_values': lqr_scalar_values.copy(),
-            'output_limit': MAX_TILT_ANGLE_DEG,
+            'weights': LQRConfig.DEFAULT_WEIGHTS.copy(),
+            'scalar_indices': LQRConfig.DEFAULT_SCALAR_INDICES.copy(),
+            'scalar_values': LQRConfig.SCALAR_VALUES.copy(),
+            'output_limit': LQRConfig.OUTPUT_LIMIT,
             'ball_physics': BallPhysicsConfig.as_dict()
         }
 
