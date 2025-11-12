@@ -781,6 +781,12 @@ class HardwareControllerBase(BaseStewartSimulator):
             self.simulation_running = True
             self.simulation_time = 0.0
 
+            # Update button states
+            if 'simulation_control' in self.gui_modules:
+                sim_ctrl = self.gui_modules['simulation_control']
+                sim_ctrl.start_btn.setEnabled(False)
+                sim_ctrl.stop_btn.setEnabled(True)
+
             gc.disable()
             self.log(f"Control started ({self.control_frequency}Hz, GC disabled)")
 
@@ -958,6 +964,13 @@ class HardwareControllerBase(BaseStewartSimulator):
         # Hardware mode: partial updates (hardware-specific)
         if not hasattr(self, 'gui_modules'):
             return
+
+        # Update simulation control (button states and time)
+        if 'simulation_control' in self.gui_modules:
+            self.gui_modules['simulation_control'].update({
+                'simulation_time': self.simulation_time,
+                'simulation_running': self.simulation_running
+            })
 
         # Update ball state
         if 'ball_state' in self.gui_modules:

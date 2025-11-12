@@ -22,6 +22,7 @@ from core.utils import (
     MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM, PLATFORM_HALF_SIZE_MM, PLATFORM_VERSION,
     SimulationConfig, IKZOptimizationConfig, Pixy2CameraConfig,
     StewartPlatformConfig, ColorScheme, BallPhysicsConfig, VisualizationConfig,
+    PIDConfig, LQRConfig, ManualPoseControlConfig, BallControlConfig, GUIConfig,
     format_time, format_error_context
 )
 from gui.gui_builder import GUIBuilder
@@ -172,15 +173,16 @@ class BaseStewartSimulator(QMainWindow):
             'rx': 0.0, 'ry': 0.0, 'rz': 0.0
         }
 
+        # Manual pose control configuration (from ManualPoseControlConfig)
         self.dof_config = {
-            'x': (-115.0, 115.0, 0.1, 0.0, "X Position (mm)"),
-            'y': (-115.0, 115.0, 0.1, 0.0, "Y Position (mm)"),
-            'z': (self.ik.home_height_top_surface - 90,
-                  self.ik.home_height_top_surface + 90,
-                  0.1, self.ik.home_height_top_surface, "Z Height (mm)"),
-            'rx': (-45.0, 45.0, 0.1, 0.0, "Roll (°)"),
-            'ry': (-45.0, 45.0, 0.1, 0.0, "Pitch (°)"),
-            'rz': (-115.0, 115.0, 0.1, 0.0, "Yaw (°)")
+            'x': (*ManualPoseControlConfig.X_RANGE_MM, ManualPoseControlConfig.X_RESOLUTION_MM, ManualPoseControlConfig.X_DEFAULT_MM, "X Position (mm)"),
+            'y': (*ManualPoseControlConfig.Y_RANGE_MM, ManualPoseControlConfig.Y_RESOLUTION_MM, ManualPoseControlConfig.Y_DEFAULT_MM, "Y Position (mm)"),
+            'z': (self.ik.home_height_top_surface + ManualPoseControlConfig.Z_OFFSET_RANGE_MM[0],
+                  self.ik.home_height_top_surface + ManualPoseControlConfig.Z_OFFSET_RANGE_MM[1],
+                  ManualPoseControlConfig.Z_RESOLUTION_MM, self.ik.home_height_top_surface, "Z Height (mm)"),
+            'rx': (*ManualPoseControlConfig.RX_RANGE_DEG, ManualPoseControlConfig.RX_RESOLUTION_DEG, ManualPoseControlConfig.RX_DEFAULT_DEG, "Roll (°)"),
+            'ry': (*ManualPoseControlConfig.RY_RANGE_DEG, ManualPoseControlConfig.RY_RESOLUTION_DEG, ManualPoseControlConfig.RY_DEFAULT_DEG, "Pitch (°)"),
+            'rz': (*ManualPoseControlConfig.RZ_RANGE_DEG, ManualPoseControlConfig.RZ_RESOLUTION_DEG, ManualPoseControlConfig.RZ_DEFAULT_DEG, "Yaw (°)")
         }
 
         self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
@@ -345,16 +347,31 @@ class BaseStewartSimulator(QMainWindow):
 
         # Check if controller is PID (handles both "PID" and "PID (Hardware)")
         if "PID" in controller_name:
+            # Determine if hardware or simulation mode
+            is_hardware = "(Hardware)" in controller_name
+
+            # Get defaults from PIDConfig
+            if is_hardware:
+                gains = PIDConfig.HW_DEFAULT_GAINS
+                scalar_indices = PIDConfig.HW_SCALAR_INDICES
+            else:
+                gains = PIDConfig.SIM_DEFAULT_GAINS
+                scalar_indices = PIDConfig.SIM_SCALAR_INDICES
+
             self.param_definitions = [
-                ('kp', 'P (Proportional)', 1.0, 6),
-                ('ki', 'I (Integral)', 1.0, 6),
-                ('kd', 'D (Derivative)', 4.0, 5)
+                ('kp', 'P (Proportional)', gains['kp'], scalar_indices['kp']),
+                ('ki', 'I (Integral)', gains['ki'], scalar_indices['ki']),
+                ('kd', 'D (Derivative)', gains['kd'], scalar_indices['kd'])
             ]
         elif "LQR" in controller_name:
+            # Get defaults from LQRConfig
+            weights = LQRConfig.DEFAULT_WEIGHTS
+            scalar_indices = LQRConfig.DEFAULT_SCALAR_INDICES
+
             self.param_definitions = [
-                ('Q_pos', 'Q Position Weight', 1.0, 9),
-                ('Q_vel', 'Q Velocity Weight', 1.0, 5),
-                ('R', 'R Control Weight', 1.0, 5)
+                ('Q_pos', 'Q Position Weight', weights['Q_pos'], scalar_indices['Q_pos']),
+                ('Q_vel', 'Q Velocity Weight', weights['Q_vel'], scalar_indices['Q_vel']),
+                ('R', 'R Control Weight', weights['R'], scalar_indices['R'])
             ]
         else:
             self.param_definitions = []
@@ -662,6 +679,7 @@ class BaseStewartSimulator(QMainWindow):
 
         state = {
             'simulation_time': self.simulation_time,
+            'simulation_running': self.simulation_running,
             'controller_enabled': self.controller_enabled,
             'ball_pos': (ball_x_mm, ball_y_mm),
             'ball_vel': (vel_x_mm, vel_y_mm),
@@ -794,9 +812,10 @@ class BaseStewartSimulator(QMainWindow):
         self.log("Ball reset to center")
 
     def push_ball(self):
-        """Apply random velocity to ball."""
-        vx = np.random.uniform(-0.05, 0.05)
-        vy = np.random.uniform(-0.05, 0.05)
+        """Apply random velocity to ball (magnitude from BallControlConfig)."""
+        push_vel = BallControlConfig.PUSH_VELOCITY_MS
+        vx = np.random.uniform(-push_vel, push_vel)
+        vy = np.random.uniform(-push_vel, push_vel)
         self.ball_vel = torch.tensor([[vx, vy, 0.0]], dtype=torch.float32)
         self.log(f"Ball pushed: vx={vx:.3f}, vy={vy:.3f} m/s")
 

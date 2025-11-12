@@ -628,6 +628,7 @@ class OrientationKalmanFilter:
                  accel_magnitude_threshold=2.0, gyro_magnitude_threshold=0.5, enable_yaw_tracking=True):
         # IMU scaling
         self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
+        self.gyro_scale_multiplier = gyro_scale_multiplier  # Store for later updates
         self.gyro_scale = 0.00875 * np.pi / 180 * gyro_scale_multiplier  # L3GD20: 8.75 mdps/LSB -> rad/s (with calibration multiplier)
 
         # Motion detection thresholds
@@ -643,6 +644,8 @@ class OrientationKalmanFilter:
         self.mag_offset = np.array([0.0, 0.0, 0.0])  # Hard-iron calibration offset
         self.mag_inclination = np.radians(75.0)  # Magnetic inclination angle (dip) - default for Norway
         self.mag_noise = mag_noise  # Magnetometer measurement noise
+        from core.utils import IMUKalmanConfig
+        self.mag_inclination = np.radians(IMUKalmanConfig.DEFAULT_MAG_INCLINATION_DEG)  # Magnetic inclination for Trondheim
         self.mag_update_count = 0  # Statistics
 
         # Axis transformations
@@ -1171,6 +1174,25 @@ class OrientationKalmanFilter:
 
         return linear_accel
 
+    def set_gyro_scale_multiplier(self, multiplier):
+        """Update gyro scale multiplier and recompute gyro_scale.
+
+        This recalibrates the gyroscope sensitivity in real-time.
+        Gyro bias estimates are rescaled to maintain consistency.
+
+        Args:
+            multiplier: New gyro scale multiplier
+        """
+        old_multiplier = self.gyro_scale_multiplier
+        self.gyro_scale_multiplier = multiplier
+        self.gyro_scale = 0.00875 * np.pi / 180 * multiplier
+
+        # Rescale bias estimates (they were calibrated with old scale)
+        if old_multiplier > 0:
+            scale_ratio = multiplier / old_multiplier
+            self.state[2] *= scale_ratio  # bias_x
+            self.state[3] *= scale_ratio  # bias_y
+
 
 class IMUControllerMixin:
     """Mixin for IMU orientation tracking and tilt correction.
@@ -1487,17 +1509,22 @@ class IMUControllerMixin:
             param_name: Parameter to update ('accel_noise', 'gyro_noise', etc.)
             value: New parameter value (float)
         """
-        param_map = {
-            'accel_noise': 'accel_noise',
-            'gyro_noise': 'gyro_noise',
-            'process_noise_angle': 'process_noise_angle',
-            'process_noise_bias': 'process_noise_bias'
-        }
+        if param_name == 'gyro_scale':
+            # Special handling for gyro scale multiplier (uses setter method)
+            self.orientation_kalman.set_gyro_scale_multiplier(value)
+            self.log(f"Gyro scale multiplier: {value:.2f}")
+        else:
+            param_map = {
+                'accel_noise': 'accel_noise',
+                'gyro_noise': 'gyro_noise',
+                'process_noise_angle': 'process_noise_angle',
+                'process_noise_bias': 'process_noise_bias'
+            }
 
-        if param_name in param_map:
-            attr_name = param_map[param_name]
-            setattr(self.orientation_kalman, attr_name, value)
-            self.log(f"IMU Kalman {param_name}: {value:.4f}")
+            if param_name in param_map:
+                attr_name = param_map[param_name]
+                setattr(self.orientation_kalman, attr_name, value)
+                self.log(f"IMU Kalman {param_name}: {value:.4f}")
 
     def on_imu_motion_param_change(self, param_name, value):
         """Handle IMU motion detection parameter change.

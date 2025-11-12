@@ -14,7 +14,9 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 import serial.tools.list_ports
 
-from core.utils import format_time, format_vector_2d, MAX_TILT_ANGLE_DEG
+from core.utils import (format_time, format_vector_2d, MAX_TILT_ANGLE_DEG, IMUKalmanConfig,
+                         TrajectoryPatternConfig, ManualPoseControlConfig, KalmanFilterConfig,
+                         Pixy2CameraConfig, GUIConfig, ControlLoopConfig, BallControlConfig)
 
 
 class GUIModule:
@@ -90,6 +92,12 @@ class SimulationControlModule(GUIModule):
     def update(self, state):
         if 'simulation_time' in state:
             self.time_label.setText(f"Time: {format_time(state['simulation_time'])}")
+
+        # Update button states based on simulation running status
+        if 'simulation_running' in state:
+            running = state['simulation_running']
+            self.start_btn.setEnabled(not running)
+            self.stop_btn.setEnabled(running)
 
         # Update calibration timer
         if state.get('imu_initializing', False):
@@ -296,17 +304,17 @@ class TrajectoryPatternModule(GUIModule):
         pattern_params = {
             'static': [],
             'circle': [
-                ('radius', 'Radius (mm)', 10.0, 100.0, 50.0, 1.0),
-                ('period', 'Period (s)', 3.0, 30.0, 10.0, 0.5)
+                ('radius', 'Radius (mm)', *TrajectoryPatternConfig.CIRCLE_RADIUS_RANGE_MM, TrajectoryPatternConfig.CIRCLE_DEFAULT_RADIUS_MM, 1.0),
+                ('period', 'Period (s)', *TrajectoryPatternConfig.CIRCLE_PERIOD_RANGE_S, TrajectoryPatternConfig.CIRCLE_DEFAULT_PERIOD_S, 0.5)
             ],
             'figure8': [
-                ('width', 'Width (mm)', 10.0, 150.0, 60.0, 1.0),
-                ('height', 'Height (mm)', 10.0, 100.0, 40.0, 1.0),
-                ('period', 'Period (s)', 3.0, 30.0, 12.0, 0.5)
+                ('width', 'Width (mm)', *TrajectoryPatternConfig.FIGURE8_WIDTH_RANGE_MM, TrajectoryPatternConfig.FIGURE8_DEFAULT_WIDTH_MM, 1.0),
+                ('height', 'Height (mm)', *TrajectoryPatternConfig.FIGURE8_HEIGHT_RANGE_MM, TrajectoryPatternConfig.FIGURE8_DEFAULT_HEIGHT_MM, 1.0),
+                ('period', 'Period (s)', *TrajectoryPatternConfig.FIGURE8_PERIOD_RANGE_S, TrajectoryPatternConfig.FIGURE8_DEFAULT_PERIOD_S, 0.5)
             ],
             'star': [
-                ('radius', 'Radius (mm)', 10.0, 100.0, 60.0, 1.0),
-                ('period', 'Period (s)', 3.0, 30.0, 15.0, 0.5)
+                ('radius', 'Radius (mm)', *TrajectoryPatternConfig.STAR_RADIUS_RANGE_MM, TrajectoryPatternConfig.STAR_DEFAULT_RADIUS_MM, 1.0),
+                ('period', 'Period (s)', *TrajectoryPatternConfig.STAR_PERIOD_RANGE_S, TrajectoryPatternConfig.STAR_DEFAULT_PERIOD_S, 0.5)
             ]
         }
 
@@ -882,11 +890,11 @@ class Pixy2CameraModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
-        # Parameters
-        self._create_parameter_row(layout, "Pixel Size:", 0.5, 3.0, 1.4, 0.1, 'pixel_size', 'mm')
-        self._create_parameter_row(layout, "Sub-pixel Noise:", 0.0, 1.0, 0.4, 0.01, 'noise_std', 'mm')
-        self._create_parameter_row(layout, "Detection Rate:", 0.90, 1.0, 0.999, 0.001, 'detection_rate', '', "{:.3f}")
-        self._create_parameter_row(layout, "Sample Rate:", 0.0, 60.0, 19.3, 0.1, 'sample_rate', 'Hz', "{:.1f}")
+        # Parameters (defaults from Pixy2CameraConfig)
+        self._create_parameter_row(layout, "Pixel Size:", *Pixy2CameraConfig.PIXEL_SIZE_RANGE, Pixy2CameraConfig.PIXEL_SIZE_MM, 0.1, 'pixel_size', 'mm')
+        self._create_parameter_row(layout, "Sub-pixel Noise:", *Pixy2CameraConfig.NOISE_RANGE, Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM, 0.01, 'noise_std', 'mm')
+        self._create_parameter_row(layout, "Detection Rate:", *Pixy2CameraConfig.DETECTION_RATE_RANGE, Pixy2CameraConfig.DEFAULT_DETECTION_RATE, 0.001, 'detection_rate', '', "{:.3f}")
+        self._create_parameter_row(layout, "Sample Rate:", *Pixy2CameraConfig.SAMPLE_RATE_RANGE, Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ, 0.1, 'sample_rate', 'Hz', "{:.1f}")
 
         info_label = QLabel("(0 Hz = sample every frame)")
         font = QFont("Segoe UI", 7)
@@ -1094,9 +1102,9 @@ class KalmanFilterModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
-        # Parameters
-        self._create_parameter_slider(layout, "Process Noise (Q):", 0.01, 10.0, 1.0, 'process_noise')
-        self._create_parameter_slider(layout, "Measurement Noise (R):", 0.01, 10.0, 1.0, 'measurement_noise')
+        # Parameters (defaults from KalmanFilterConfig)
+        self._create_parameter_slider(layout, "Process Noise (Q):", *KalmanFilterConfig.PROCESS_NOISE_RANGE, KalmanFilterConfig.DEFAULT_PROCESS_NOISE, 'process_noise')
+        self._create_parameter_slider(layout, "Measurement Noise (R):", *KalmanFilterConfig.MEASUREMENT_NOISE_RANGE, KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE, 'measurement_noise')
 
         # Filter state display
         state_layout = QVBoxLayout()
@@ -1302,14 +1310,14 @@ class PlotControlModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
-        # Rate slider
+        # Rate slider (defaults from GUIConfig)
         rate_grid = QGridLayout()
 
         rate_grid.addWidget(QLabel("Plot Refresh Rate:"), 0, 0)
 
         self.rate_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rate_slider.setMinimum(1)
-        self.rate_slider.setMaximum(100)
+        self.rate_slider.setMinimum(GUIConfig.MIN_PLOT_RATE_HZ)
+        self.rate_slider.setMaximum(GUIConfig.MAX_PLOT_RATE_HZ)
         self.rate_slider.setValue(self.plot_rate_var)
         self.rate_slider.valueChanged.connect(self._on_rate_change)
         rate_grid.addWidget(self.rate_slider, 0, 1)
@@ -1588,11 +1596,14 @@ class IMUKalmanParametersModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
-        # Kalman filter noise parameters
-        self._create_parameter_slider(layout, "Accel Noise:", 0.1, 5.0, 1.0, 'accel_noise')
-        self._create_parameter_slider(layout, "Gyro Noise:", 0.001, 0.1, 0.0224, 'gyro_noise')
-        self._create_parameter_slider(layout, "Process Noise Angle:", 0.000001, 0.1, 0.00001, 'process_noise_angle')
-        self._create_parameter_slider(layout, "Process Noise Bias:", 0.000001, 0.001, 0.00001, 'process_noise_bias')
+        # Kalman filter noise parameters (defaults from utils.py)
+        self._create_parameter_slider(layout, "Accel Noise:", 0.1, 5.0, IMUKalmanConfig.DEFAULT_ACCEL_NOISE, 'accel_noise')
+        self._create_parameter_slider(layout, "Gyro Noise:", 0.001, 0.1, IMUKalmanConfig.DEFAULT_GYRO_NOISE, 'gyro_noise')
+        self._create_parameter_slider(layout, "Process Noise Angle:", 0.000001, 0.1, IMUKalmanConfig.DEFAULT_PROCESS_NOISE_ANGLE, 'process_noise_angle')
+        self._create_parameter_slider(layout, "Process Noise Bias:", 0.000001, 0.01, IMUKalmanConfig.DEFAULT_PROCESS_NOISE_BIAS, 'process_noise_bias')
+
+        # Gyro scale multiplier (for tilt correction tuning, default from utils.py)
+        self._create_parameter_slider(layout, "Gyro Scale Multiplier:", 0.1, 15.0, IMUKalmanConfig.DEFAULT_GYRO_SCALE_MULTIPLIER, 'gyro_scale')
 
         # Current orientation display
         state_layout = QVBoxLayout()
@@ -1711,9 +1722,9 @@ class IMUMotionDetectionModule(GUIModule):
 
         layout.addLayout(detection_layout)
 
-        # Thresholds
-        self._create_parameter_slider(layout, "Accel Threshold (m/s²):", 0.5, 10.0, 1.0, 'accel_threshold')
-        self._create_parameter_slider(layout, "Gyro Threshold (rad/s):", 0.1, 2.0, 0.5, 'gyro_threshold')
+        # Thresholds (defaults from utils.py)
+        self._create_parameter_slider(layout, "Accel Threshold (m/s²):", 0.5, 10.0, IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD, 'accel_threshold')
+        self._create_parameter_slider(layout, "Gyro Threshold (rad/s):", 0.1, 2.0, IMUKalmanConfig.DEFAULT_GYRO_THRESHOLD, 'gyro_threshold')
 
         # Magnetometer controls
         mag_layout = QHBoxLayout()

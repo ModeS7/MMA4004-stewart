@@ -29,7 +29,8 @@ from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.control_core import IMUControllerMixin, LQRController, clip_tilt_vector
 from core.utils import (IKZOptimizationConfig, MAX_TILT_ANGLE_DEG,
-                         Pixy2CameraConfig, BallPhysicsConfig, HardwareConnectionConfig, GUIConfig, VisualizationConfig)
+                         Pixy2CameraConfig, BallPhysicsConfig, HardwareConnectionConfig, GUIConfig,
+                         VisualizationConfig, ControlLoopConfig)
 
 
 class StewartController(IMUControllerMixin, HardwareControllerBase):
@@ -40,9 +41,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.operation_mode = 'real'  # 'sim' or 'real'
         self.controller_type_selection = 'LQR'  # 'PID', 'LQR', or 'Manual'
 
-        # Plot control settings (unique to full controller)
-        self.plot_enabled = True
-        self.plot_rate_hz = 10
+        # Plot control settings (unique to full controller, from GUIConfig)
+        self.plot_enabled = GUIConfig.DEFAULT_PLOT_ENABLED
+        self.plot_rate_hz = GUIConfig.DEFAULT_PLOT_RATE_HZ
 
         # Initialize IMU system (MUST be called before super().__init__)
         self._init_imu_system()
@@ -205,7 +206,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                                 'args': {'port_var': self.port_var, 'connected_var': self.connected}})
             left_modules.append({'type': 'control_frequency',
                                'args': {'frequency_var': self.control_frequency,
-                                       'min_freq': 50, 'max_freq': 500}})
+                                       'min_freq': ControlLoopConfig.MIN_FREQUENCY_HZ,
+                                       'max_freq': ControlLoopConfig.MAX_FREQUENCY_HZ}})
 
         # Simulation control
         left_modules.append({'type': 'simulation_control'})
@@ -867,15 +869,47 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                     translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
                     rotation = np.array([rx, ry, 0.0])
 
-                    # Check cache first
-                    if self.ik_cache:
-                        angles = self.ik_cache.get(translation, rotation)
-                        if angles is None:
+                    # Apply Z optimization if enabled
+                    if self.z_optimization_enabled:
+                        optimized_translation, angles, success = self.ik.optimize_z_offset(
+                            translation, rotation,
+                            use_top_surface_offset=self.use_top_surface_offset,
+                            z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                            max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                            tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
+                            ik_cache=self.ik_cache if hasattr(self, 'ik_cache') else None
+                        )
+
+                        if success and angles is not None:
+                            self.z_offset = optimized_translation[2] - translation[2]
+                            max_angle = np.max(angles)
+                            min_angle = np.min(angles)
+                            self.servo_balance = (max_angle, min_angle)
+                        else:
+                            # Fallback to standard IK
                             angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
                             if angles is not None:
-                                self.ik_cache.put(translation, rotation, angles)
+                                max_angle = np.max(angles)
+                                min_angle = np.min(angles)
+                                self.servo_balance = (max_angle, min_angle)
+                                self.z_offset = 0.0
                     else:
-                        angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                        # Standard IK (with cache if available)
+                        if self.ik_cache:
+                            angles = self.ik_cache.get(translation, rotation)
+                            if angles is None:
+                                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                                if angles is not None:
+                                    self.ik_cache.put(translation, rotation, angles)
+                        else:
+                            angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+
+                        # Update servo balance for display
+                        if angles is not None:
+                            max_angle = np.max(angles)
+                            min_angle = np.min(angles)
+                            self.servo_balance = (max_angle, min_angle)
+                            self.z_offset = 0.0
 
                     if angles is not None:
                         self.serial_controller.send_servo_angles(angles)
