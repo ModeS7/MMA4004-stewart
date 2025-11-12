@@ -608,21 +608,24 @@ def apply_imu_transforms(raw_data, axis_flip, rotation_matrix, scale):
 
 
 class OrientationKalmanFilter:
-    """Extended Kalman Filter for roll and pitch estimation from IMU.
+    """Extended Kalman Filter for full 3D orientation (roll, pitch, yaw) from IMU.
 
-    State vector: [roll, pitch, gyro_bias_x, gyro_bias_y]
+    State vector: [roll, pitch, yaw, gyro_bias_x, gyro_bias_y, gyro_bias_z]
 
     Features:
+        - Full 6-DOF orientation estimation with yaw tracking
+        - Gyroscope bias estimation (3-axis)
+        - Magnetometer-based yaw measurement with tilt compensation
+        - Accelerometer-based roll/pitch measurement
+        - Motion detection and measurement rejection
         - Automatic gravity vector zeroing at initialization
-        - Gyroscope bias estimation
-        - Removes initial gravity offset to make orientation relative
         - Supports axis transformations and gyro scale calibration
     """
 
-    def __init__(self, accel_noise=1.0, gyro_noise=1.0, process_noise_angle=0.0, process_noise_bias=0.0,
+    def __init__(self, accel_noise=1.0, gyro_noise=1.0, mag_noise=0.1, process_noise_angle=0.0, process_noise_bias=0.0,
                  accel_axis_flip=None, gyro_axis_flip=None, accel_rotation=None, gyro_rotation=None,
-                 initial_bias_x=0.0, initial_bias_y=0.0, gyro_scale_multiplier=1.0,
-                 accel_magnitude_threshold=2.0, gyro_magnitude_threshold=0.5):
+                 initial_bias_x=0.0, initial_bias_y=0.0, initial_bias_z=0.0, gyro_scale_multiplier=1.0,
+                 accel_magnitude_threshold=2.0, gyro_magnitude_threshold=0.5, enable_yaw_tracking=True):
         # IMU scaling
         self.accel_scale = 0.001 * 9.81  # LSM303: 1mg/LSB -> m/s²
         self.gyro_scale = 0.00875 * np.pi / 180 * gyro_scale_multiplier  # L3GD20: 8.75 mdps/LSB -> rad/s (with calibration multiplier)
@@ -635,9 +638,11 @@ class OrientationKalmanFilter:
         self.total_accel_count = 0
 
         # Magnetometer parameters
-        self.use_magnetometer = False  # Enable mag-based tilt during accel rejection
+        self.enable_yaw_tracking = enable_yaw_tracking  # Enable full 6-DOF with yaw tracking
+        self.use_magnetometer = enable_yaw_tracking  # Auto-enable magnetometer if yaw tracking enabled
         self.mag_offset = np.array([0.0, 0.0, 0.0])  # Hard-iron calibration offset
         self.mag_inclination = np.radians(75.0)  # Magnetic inclination angle (dip) - default for Norway
+        self.mag_noise = mag_noise  # Magnetometer measurement noise
         self.mag_update_count = 0  # Statistics
 
         # Axis transformations
@@ -651,7 +656,7 @@ class OrientationKalmanFilter:
         # 2. Apply axis flips and rotation
         bias_vec = np.array([initial_bias_x * gyro_scale_multiplier,
                             initial_bias_y * gyro_scale_multiplier,
-                            0.0])
+                            initial_bias_z * gyro_scale_multiplier])
 
         # Apply axis flip
         bias_vec = bias_vec * self.gyro_axis_flip
@@ -660,9 +665,14 @@ class OrientationKalmanFilter:
         if self.gyro_rotation is not None:
             bias_vec = bias_vec @ self.gyro_rotation.T
 
-        # State: [roll, pitch, gyro_bias_x, gyro_bias_y]
-        self.state = np.array([0.0, 0.0, bias_vec[0], bias_vec[1]])
-        self.P = np.eye(4) * 0.1
+        # State: [roll, pitch, yaw, gyro_bias_x, gyro_bias_y, gyro_bias_z]
+        if self.enable_yaw_tracking:
+            self.state = np.array([0.0, 0.0, 0.0, bias_vec[0], bias_vec[1], bias_vec[2]])
+            self.P = np.eye(6) * 0.1
+        else:
+            # Backward compatibility: 4D state without yaw
+            self.state = np.array([0.0, 0.0, bias_vec[0], bias_vec[1]])
+            self.P = np.eye(4) * 0.1
 
         # Store noise parameters for process noise calculation
         self.gyro_noise = gyro_noise
@@ -670,28 +680,43 @@ class OrientationKalmanFilter:
         self.process_noise_bias = process_noise_bias
 
         # Process noise covariance (will be computed dynamically in predict())
-        self.Q = np.diag([
-            process_noise_angle,
-            process_noise_angle,
-            process_noise_bias,
-            process_noise_bias
-        ])
+        if self.enable_yaw_tracking:
+            self.Q = np.diag([
+                process_noise_angle,
+                process_noise_angle,
+                process_noise_angle,  # yaw
+                process_noise_bias,
+                process_noise_bias,
+                process_noise_bias    # z-axis bias
+            ])
+        else:
+            self.Q = np.diag([
+                process_noise_angle,
+                process_noise_angle,
+                process_noise_bias,
+                process_noise_bias
+            ])
 
-        # Measurement noise covariance
-        self.R = np.diag([
+        # Measurement noise covariance (accelerometer)
+        self.R_accel = np.diag([
+            accel_noise ** 2,
             accel_noise ** 2,
             accel_noise ** 2
         ])
+
+        # Measurement noise covariance (magnetometer yaw)
+        self.R_mag = mag_noise ** 2
 
         self.initialized = False
         self.initial_accel = None
         self.last_gyro_magnitude = 0.0  # Track gyro magnitude for motion detection
 
-    def initialize(self, accel_raw, calibrated_gravity=None):
+    def initialize(self, accel_raw, mag_raw=None, calibrated_gravity=None):
         """Initialize filter state from first accelerometer reading (raw LSB).
 
         Args:
             accel_raw: Initial acceleration measurement [LSB]
+            mag_raw: Optional magnetometer reading [LSB] for yaw initialization
             calibrated_gravity: Optional pre-calibrated gravity vector [m/s²] to use as zero reference
         """
         if not self.initialized:
@@ -712,6 +737,20 @@ class OrientationKalmanFilter:
             self.state[0] = roll0
             self.state[1] = pitch0
 
+            # Initialize yaw from magnetometer if enabled
+            if self.enable_yaw_tracking and mag_raw is not None:
+                mag = apply_imu_transforms(mag_raw, self.accel_axis_flip, self.accel_rotation, scale=1.0)
+                mag = mag - self.mag_offset
+                mag_norm = mag / (np.linalg.norm(mag) + 1e-9)
+
+                # Tilt-compensated heading
+                mx, my, mz = mag_norm
+                n_y = my * np.cos(roll0) + mz * np.sin(roll0)
+                n_x = (mx * np.cos(pitch0) + my * np.sin(pitch0) * np.sin(roll0) -
+                       mz * np.sin(pitch0) * np.cos(roll0))
+                yaw0 = np.arctan2(n_y, n_x)
+                self.state[2] = yaw0
+
             # Use calibrated gravity if provided, otherwise use current reading
             if calibrated_gravity is not None:
                 self.initial_accel = calibrated_gravity.copy()
@@ -729,36 +768,101 @@ class OrientationKalmanFilter:
         """
         # Apply transformations and convert to rad/s
         gyro = apply_imu_transforms(gyro_raw, self.gyro_axis_flip, self.gyro_rotation, self.gyro_scale)
-        gx, gy = gyro[0], gyro[1]
 
-        # Store gyro magnitude for motion detection (used in update step)
-        self.last_gyro_magnitude = np.sqrt(gx**2 + gy**2)
+        if self.enable_yaw_tracking:
+            # Full 6-DOF prediction with yaw
+            gx, gy, gz = gyro[0], gyro[1], gyro[2]
 
-        # Bias-corrected angular velocity
-        gx_corrected = gx - self.state[2]
-        gy_corrected = gy - self.state[3]
+            # Store gyro magnitude for motion detection
+            self.last_gyro_magnitude = np.sqrt(gx**2 + gy**2 + gz**2)
 
-        # State propagation
-        self.state[0] += gx_corrected * dt
-        self.state[1] += gy_corrected * dt
+            # Bias-corrected angular velocity (body rates)
+            p = gx - self.state[3]  # roll rate
+            q = gy - self.state[4]  # pitch rate
+            r = gz - self.state[5]  # yaw rate
 
-        # Jacobian of state transition
-        F = np.array([
-            [1, 0, -dt, 0],
-            [0, 1, 0, -dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
+            # Current orientation
+            phi = self.state[0]
+            theta = self.state[1]
 
-        # Process noise covariance (gyro noise affects angle uncertainty)
-        # Angle uncertainty grows with gyro noise * dt
-        # Bias uncertainty grows with process_noise_bias
-        Q = np.diag([
-            self.process_noise_angle + (self.gyro_noise * dt) ** 2,
-            self.process_noise_angle + (self.gyro_noise * dt) ** 2,
-            self.process_noise_bias,
-            self.process_noise_bias
-        ])
+            # Kinematic transformation matrix M(φ,θ): converts body rates to Euler rates
+            # [φ̇]   [1  sin(φ)tan(θ)   cos(φ)tan(θ)  ] [p]
+            # [θ̇] = [0      cos(φ)         -sin(φ)    ] [q]
+            # [ψ̇]   [0  sin(φ)/cos(θ)   cos(φ)/cos(θ)] [r]
+            cos_phi = np.cos(phi)
+            sin_phi = np.sin(phi)
+            cos_theta = np.cos(theta)
+            sin_theta = np.sin(theta)
+            tan_theta = np.tan(theta)
+
+            # Avoid singularity at θ = ±90°
+            if abs(cos_theta) < 0.01:
+                cos_theta = np.sign(cos_theta) * 0.01
+
+            M = np.array([
+                [1, sin_phi * tan_theta, cos_phi * tan_theta],
+                [0, cos_phi, -sin_phi],
+                [0, sin_phi / cos_theta, cos_phi / cos_theta]
+            ])
+
+            # Euler angle rates
+            euler_rates = M @ np.array([p, q, r])
+
+            # State propagation
+            self.state[0] += euler_rates[0] * dt  # roll
+            self.state[1] += euler_rates[1] * dt  # pitch
+            self.state[2] += euler_rates[2] * dt  # yaw
+            # Bias states remain constant (random walk model)
+
+            # Wrap yaw to [-π, π]
+            self.state[2] = np.arctan2(np.sin(self.state[2]), np.cos(self.state[2]))
+
+            # Jacobian of state transition F = ∂f/∂x
+            # State: [φ, θ, ψ, bx, by, bz]
+            F = np.eye(6)
+            F[0, 3] = -dt  # ∂φ/∂bx = -M[0,0]*dt = -dt
+            F[0, 4] = -sin_phi * tan_theta * dt  # ∂φ/∂by = -M[0,1]*dt
+            F[0, 5] = -cos_phi * tan_theta * dt  # ∂φ/∂bz = -M[0,2]*dt
+            F[1, 3] = 0    # ∂θ/∂bx = 0
+            F[1, 4] = -cos_phi * dt  # ∂θ/∂by = -M[1,1]*dt
+            F[1, 5] = sin_phi * dt   # ∂θ/∂bz = -M[1,2]*dt
+            F[2, 3] = 0    # ∂ψ/∂bx = 0
+            F[2, 4] = -sin_phi / cos_theta * dt  # ∂ψ/∂by = -M[2,1]*dt
+            F[2, 5] = -cos_phi / cos_theta * dt  # ∂ψ/∂bz = -M[2,2]*dt
+
+            # Process noise
+            Q = np.diag([
+                self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+                self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+                self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+                self.process_noise_bias,
+                self.process_noise_bias,
+                self.process_noise_bias
+            ])
+        else:
+            # Backward compatibility: 4D prediction (roll/pitch only)
+            gx, gy = gyro[0], gyro[1]
+            self.last_gyro_magnitude = np.sqrt(gx**2 + gy**2)
+
+            gx_corrected = gx - self.state[2]
+            gy_corrected = gy - self.state[3]
+
+            self.state[0] += gx_corrected * dt
+            self.state[1] += gy_corrected * dt
+
+            F = np.array([
+                [1, 0, -dt, 0],
+                [0, 1, 0, -dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ])
+
+            Q = np.diag([
+                self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+                self.process_noise_angle + (self.gyro_noise * dt) ** 2,
+                self.process_noise_bias,
+                self.process_noise_bias
+            ])
 
         # Covariance propagation
         self.P = F @ self.P @ F.T + Q
@@ -801,79 +905,186 @@ class OrientationKalmanFilter:
             else:
                 return  # Skip update - rely on gyro prediction only
 
-        # Tilt angles from accelerometer
-        roll_meas = np.arctan2(ay, az)
-        pitch_meas = np.arctan2(-ax, np.sqrt(ay ** 2 + az ** 2))
+        if self.enable_yaw_tracking:
+            # Full measurement model: z = a_m - h_a(φ,θ)
+            # Predicted gravity vector in body frame
+            phi = self.state[0]
+            theta = self.state[1]
+            g = GRAVITY_MAGNITUDE
 
-        # Remove initial gravity offset (KEY: makes orientation relative to start)
-        if self.initial_accel is not None:
-            roll_init = np.arctan2(self.initial_accel[1], self.initial_accel[2])
-            pitch_init = np.arctan2(-self.initial_accel[0],
-                                    np.sqrt(self.initial_accel[1] ** 2 + self.initial_accel[2] ** 2))
-            roll_meas -= roll_init
-            pitch_meas -= pitch_init
+            # Remove initial gravity offset if available
+            if self.initial_accel is not None:
+                accel = accel - self.initial_accel
 
-        z = np.array([roll_meas, pitch_meas])
+            # Predicted gravity vector h_a(φ,θ) = Rot(φ,θ)·[0, 0, g]
+            h_a = np.array([
+                -g * np.sin(theta),
+                g * np.cos(theta) * np.sin(phi),
+                g * np.cos(theta) * np.cos(phi)
+            ])
 
-        # Measurement matrix
-        H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ])
+            # Innovation: measured - predicted
+            z = accel - h_a
 
-        # Innovation
-        y = z - H @ self.state
-        S = H @ self.P @ H.T + self.R
-        K = self.P @ H.T @ np.linalg.inv(S)
+            # Measurement Jacobian H = ∂h_a/∂x
+            # State: [φ, θ, ψ, bx, by, bz]
+            # h_a only depends on φ and θ (not ψ or biases)
+            H = np.zeros((3, 6))
+            H[0, 0] = 0  # ∂h_ax/∂φ = 0
+            H[0, 1] = -g * np.cos(theta)  # ∂h_ax/∂θ
+            H[1, 0] = g * np.cos(theta) * np.cos(phi)  # ∂h_ay/∂φ
+            H[1, 1] = -g * np.sin(theta) * np.sin(phi)  # ∂h_ay/∂θ
+            H[2, 0] = -g * np.cos(theta) * np.sin(phi)  # ∂h_az/∂φ
+            H[2, 1] = -g * np.sin(theta) * np.cos(phi)  # ∂h_az/∂θ
 
-        # State and covariance update
-        self.state = self.state + K @ y
-        self.P = (np.eye(4) - K @ H) @ self.P
+            # Kalman update
+            S = H @ self.P @ H.T + self.R_accel
+            K = self.P @ H.T @ np.linalg.inv(S)
+            self.state = self.state + K @ z
+            self.P = (np.eye(6) - K @ H) @ self.P
 
-    def update_with_magnetometer(self, mag_raw):
-        """Update step using magnetometer when accelerometer is corrupted.
+            # Update magnetometer if available (for yaw)
+            if mag_raw is not None:
+                self.update_magnetometer_yaw(mag_raw)
+
+        else:
+            # Backward compatibility: direct roll/pitch measurement
+            roll_meas = np.arctan2(ay, az)
+            pitch_meas = np.arctan2(-ax, np.sqrt(ay ** 2 + az ** 2))
+
+            # Remove initial gravity offset
+            if self.initial_accel is not None:
+                roll_init = np.arctan2(self.initial_accel[1], self.initial_accel[2])
+                pitch_init = np.arctan2(-self.initial_accel[0],
+                                        np.sqrt(self.initial_accel[1] ** 2 + self.initial_accel[2] ** 2))
+                roll_meas -= roll_init
+                pitch_meas -= pitch_init
+
+            z = np.array([roll_meas, pitch_meas])
+
+            H = np.array([
+                [1, 0, 0, 0],
+                [0, 1, 0, 0]
+            ])
+
+            # Use simple R for 4D mode
+            R = np.diag([self.R_accel[0,0], self.R_accel[1,1]])
+
+            y = z - H @ self.state
+            S = H @ self.P @ H.T + R
+            K = self.P @ H.T @ np.linalg.inv(S)
+            self.state = self.state + K @ y
+            self.P = (np.eye(4) - K @ H) @ self.P
+
+    def update_magnetometer_yaw(self, mag_raw):
+        """Update yaw using magnetometer with tilt compensation.
 
         Args:
             mag_raw: Magnetometer measurement [LSB]
 
         Note:
-            Uses magnetic field direction to estimate tilt angles.
-            Less accurate than accelerometer but immune to linear acceleration.
+            Implements tilt-compensated heading calculation.
+            Uses measurement Jacobian for proper EKF update.
         """
-        # Apply transformations (no scaling needed - we use direction only)
+        # Apply transformations (no scaling needed - direction only)
         mag = apply_imu_transforms(mag_raw, self.accel_axis_flip, self.accel_rotation, scale=1.0)
 
         # Remove hard-iron offset
         mag = mag - self.mag_offset
 
-        # Normalize (we only care about direction)
+        # Check magnitude
         mag_magnitude = np.linalg.norm(mag)
-        if mag_magnitude < 1.0:  # Avoid division by zero
+        if mag_magnitude < 1e-6:
+            return
+
+        # Get current orientation estimate
+        phi = self.state[0]
+        theta = self.state[1]
+        psi_pred = self.state[2]
+
+        mx, my, mz = mag
+
+        # Tilt-compensated heading calculation
+        # n_y = my·cos(φ) + mz·sin(φ)
+        # n_x = mx·cos(θ) + my·sin(θ)·sin(φ) - mz·sin(θ)·cos(φ)
+        # ψ_mag = atan2(n_y, n_x)
+        cos_phi = np.cos(phi)
+        sin_phi = np.sin(phi)
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+
+        n_y = my * cos_phi + mz * sin_phi
+        n_x = mx * cos_theta + my * sin_theta * sin_phi - mz * sin_theta * cos_phi
+
+        # Measured yaw from magnetometer
+        psi_mag = np.arctan2(n_y, n_x)
+
+        # Innovation (handle angle wrapping)
+        innov = psi_mag - psi_pred
+        # Wrap to [-π, π]
+        innov = np.arctan2(np.sin(innov), np.cos(innov))
+
+        # Measurement Jacobian H = ∂ψ_mag/∂x
+        # State: [φ, θ, ψ, bx, by, bz]
+        # ψ_mag depends on φ and θ (not ψ or biases)
+        d = np.sqrt(n_y**2 + n_x**2) + 1e-9  # Avoid division by zero
+
+        # ∂ψ_mag/∂φ
+        dn_y_dphi = -my * sin_phi + mz * cos_phi
+        dn_x_dphi = my * sin_theta * cos_phi + mz * sin_theta * sin_phi
+        dpsi_dphi = (n_x * dn_y_dphi - n_y * dn_x_dphi) / (d**2)
+
+        # ∂ψ_mag/∂θ
+        dn_y_dtheta = 0
+        dn_x_dtheta = -mx * sin_theta + my * cos_theta * sin_phi - mz * cos_theta * cos_phi
+        dpsi_dtheta = (n_x * dn_y_dtheta - n_y * dn_x_dtheta) / (d**2)
+
+        # Build H matrix (1×6 for scalar yaw measurement)
+        H = np.zeros((1, 6))
+        H[0, 0] = dpsi_dphi   # ∂ψ/∂φ
+        H[0, 1] = dpsi_dtheta # ∂ψ/∂θ
+        H[0, 2] = 0           # ∂ψ/∂ψ (yaw doesn't affect measurement directly in this formulation)
+        # Biases don't affect magnetometer
+
+        # Kalman update for yaw
+        S = H @ self.P @ H.T + self.R_mag
+        K = self.P @ H.T / S  # Scalar division for 1D measurement
+
+        # State update
+        self.state = self.state + K.flatten() * innov
+        self.P = (np.eye(6) - np.outer(K, H)) @ self.P
+
+        # Wrap yaw to [-π, π]
+        self.state[2] = np.arctan2(np.sin(self.state[2]), np.cos(self.state[2]))
+
+        self.mag_update_count += 1
+
+    def update_with_magnetometer(self, mag_raw):
+        """Backward compatibility: Update step using magnetometer when accelerometer is corrupted.
+
+        For 4D mode (without yaw tracking), uses magnetometer to estimate tilt.
+        For 6D mode, this is replaced by update_magnetometer_yaw().
+        """
+        if self.enable_yaw_tracking:
+            # In 6D mode, magnetometer updates yaw only
+            self.update_magnetometer_yaw(mag_raw)
+            return
+
+        # 4D mode: Use magnetometer for tilt estimation (old behavior)
+        mag = apply_imu_transforms(mag_raw, self.accel_axis_flip, self.accel_rotation, scale=1.0)
+        mag = mag - self.mag_offset
+
+        mag_magnitude = np.linalg.norm(mag)
+        if mag_magnitude < 1.0:
             return
 
         mag_norm = mag / mag_magnitude
         mx, my, mz = mag_norm
 
-        # Calculate tilt from magnetic field direction
-        # Assumes Earth's magnetic field has known inclination (dip angle)
-        # Roll primarily affects my/mz ratio
-        # Pitch affects mx and horizontal components
+        # Simple tilt estimation from mag direction
+        roll_meas = np.arctan2(-my, mz) * np.cos(self.mag_inclination)
+        pitch_meas = np.arctan2(mx, np.sqrt(my ** 2 + mz ** 2)) * np.cos(self.mag_inclination)
 
-        # For steep inclination (Norway ~75°), magnetic field is mostly vertical
-        # When level: mag ≈ [Bh, 0, Bv] where Bv >> Bh
-        # Roll rotates around X: affects my and mz
-        # Pitch rotates around Y: affects mx and mz
-
-        # Tilt-compensated magnetometer equations
-        roll_meas = np.arctan2(-my, mz)
-        pitch_meas = np.arctan2(mx, np.sqrt(my ** 2 + mz ** 2))
-
-        # Adjust for magnetic inclination (field not horizontal)
-        # This is approximate - works well for small tilts
-        roll_meas = roll_meas * np.cos(self.mag_inclination)
-        pitch_meas = pitch_meas * np.cos(self.mag_inclination)
-
-        # Remove initial offset (same as accelerometer)
         if self.initial_accel is not None:
             roll_init = np.arctan2(self.initial_accel[1], self.initial_accel[2])
             pitch_init = np.arctan2(-self.initial_accel[0],
@@ -882,22 +1093,12 @@ class OrientationKalmanFilter:
             pitch_meas -= pitch_init
 
         z = np.array([roll_meas, pitch_meas])
+        H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
+        R = np.diag([self.R_accel[0,0], self.R_accel[1,1]]) * 4.0
 
-        # Measurement matrix
-        H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ])
-
-        # Use higher measurement noise for magnetometer (less accurate than accel)
-        R_mag = self.R * 4.0  # 2x higher noise covariance
-
-        # Innovation
         y = z - H @ self.state
-        S = H @ self.P @ H.T + R_mag
+        S = H @ self.P @ H.T + R
         K = self.P @ H.T @ np.linalg.inv(S)
-
-        # State and covariance update
         self.state = self.state + K @ y
         self.P = (np.eye(4) - K @ H) @ self.P
 
@@ -907,9 +1108,13 @@ class OrientationKalmanFilter:
         """Return current orientation estimate.
 
         Returns:
-            Tuple of (roll, pitch) in radians
+            - 6D mode: Tuple of (roll, pitch, yaw) in radians
+            - 4D mode: Tuple of (roll, pitch) in radians
         """
-        return self.state[0], self.state[1]
+        if self.enable_yaw_tracking:
+            return self.state[0], self.state[1], self.state[2]
+        else:
+            return self.state[0], self.state[1]
 
     def get_rejection_stats(self):
         """Return accelerometer rejection statistics.
@@ -999,6 +1204,7 @@ class IMUControllerMixin:
         self.orientation_kalman = OrientationKalmanFilter(
             accel_noise=IMUKalmanConfig.DEFAULT_ACCEL_NOISE,
             gyro_noise=IMUKalmanConfig.DEFAULT_GYRO_NOISE,
+            mag_noise=IMUKalmanConfig.DEFAULT_MAG_NOISE,
             process_noise_angle=IMUKalmanConfig.DEFAULT_PROCESS_NOISE_ANGLE,
             process_noise_bias=IMUKalmanConfig.DEFAULT_PROCESS_NOISE_BIAS,
             accel_axis_flip=IMUKalmanConfig.DEFAULT_ACCEL_AXIS_FLIP,
@@ -1007,10 +1213,20 @@ class IMUControllerMixin:
             gyro_rotation=IMUKalmanConfig.DEFAULT_GYRO_ROTATION,
             initial_bias_x=IMUKalmanConfig.CALIBRATED_GYRO_BIAS_X,
             initial_bias_y=IMUKalmanConfig.CALIBRATED_GYRO_BIAS_Y,
+            initial_bias_z=IMUKalmanConfig.CALIBRATED_GYRO_BIAS_Z,
             gyro_scale_multiplier=IMUKalmanConfig.DEFAULT_GYRO_SCALE_MULTIPLIER,
             accel_magnitude_threshold=IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD,
-            gyro_magnitude_threshold=IMUKalmanConfig.DEFAULT_GYRO_THRESHOLD
+            gyro_magnitude_threshold=IMUKalmanConfig.DEFAULT_GYRO_THRESHOLD,
+            enable_yaw_tracking=IMUKalmanConfig.ENABLE_YAW_TRACKING
         )
+
+        # Set magnetometer calibration
+        self.orientation_kalman.mag_offset = np.array([
+            IMUKalmanConfig.MAG_OFFSET_X,
+            IMUKalmanConfig.MAG_OFFSET_Y,
+            IMUKalmanConfig.MAG_OFFSET_Z
+        ])
+        self.orientation_kalman.mag_inclination = np.radians(IMUKalmanConfig.MAG_INCLINATION_DEG)
 
         # Current IMU orientation state
         self.current_rx_imu = 0.0

@@ -400,6 +400,10 @@ class PerformanceConfig:
 class IMUKalmanConfig:
     """IMU orientation Kalman filter parameters."""
 
+    # Yaw tracking configuration
+    ENABLE_YAW_TRACKING = False  # Enable full 6-DOF with magnetometer yaw tracking
+    DEFAULT_MAG_NOISE = 0.1  # Magnetometer measurement noise (rad)
+
     # Kalman filter noise parameters
     DEFAULT_ACCEL_NOISE = 1.0
     DEFAULT_GYRO_NOISE = 0.0224
@@ -409,6 +413,13 @@ class IMUKalmanConfig:
     # Calibrated gyroscope bias (rad/s)
     CALIBRATED_GYRO_BIAS_X = 0.112679
     CALIBRATED_GYRO_BIAS_Y = 0.031500
+    CALIBRATED_GYRO_BIAS_Z = 0.0  # Z-axis bias (for yaw tracking)
+
+    # Magnetometer calibration
+    MAG_OFFSET_X = 0.0  # Hard-iron offset X
+    MAG_OFFSET_Y = 0.0  # Hard-iron offset Y
+    MAG_OFFSET_Z = 0.0  # Hard-iron offset Z
+    MAG_INCLINATION_DEG = 74.0  # Magnetic inclination angle (Norway, Ålesund)
 
     # Motion detection thresholds
     DEFAULT_ACCEL_THRESHOLD = 1.0  # m/s² - reject accel updates above this
@@ -416,7 +427,6 @@ class IMUKalmanConfig:
 
     # Scaling and transformation
     DEFAULT_GYRO_SCALE_MULTIPLIER = 6.6
-    DEFAULT_MAG_INCLINATION_DEG = 75.0
 
     # Default axis transformations (identity - no flipping)
     DEFAULT_ACCEL_AXIS_FLIP = np.array([1, 1, 1])
