@@ -9,6 +9,7 @@ This base class eliminates code duplication between StewartController (full_c.py
 and MinimalController (min_c.py) while allowing each to have unique GUIs.
 """
 
+import gc
 import numpy as np
 import time
 import threading
@@ -16,6 +17,9 @@ import serial
 from queue import Queue, Empty
 import sys
 import ctypes
+
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QWidget, QApplication
 
 from setup.base_simulator import BaseStewartSimulator, ControllerConfig
 from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
@@ -768,8 +772,6 @@ class HardwareControllerBase(BaseStewartSimulator):
 
     def start_simulation(self):
         """Start control loop (hardware or simulation mode)."""
-        import gc
-
         if self.operation_mode == 'real':
             if not self.connected:
                 self.log("Connect to hardware first")
@@ -951,7 +953,6 @@ class HardwareControllerBase(BaseStewartSimulator):
             self.ball_trail.setData(self.ball_history_x, self.ball_history_y)
 
         # Schedule next update
-        from PyQt6.QtCore import QTimer
         QTimer.singleShot(GUIConfig.PLOT_DISABLED_INTERVAL_MS, self._gui_update_loop)
 
     def update_gui_modules(self):
@@ -1044,9 +1045,6 @@ class HardwareControllerBase(BaseStewartSimulator):
 
     def _rebuild_gui(self):
         """Rebuild GUI after mode/controller change."""
-        import gc
-        from PyQt6.QtWidgets import QWidget, QApplication
-
         # Stop and clear current GUI
         if self.simulation_running:
             self.stop_simulation()

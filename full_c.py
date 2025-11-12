@@ -648,7 +648,6 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self._create_controller_param_widgets()
         self._rebuild_gui()
 
-        from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
         self._initialize_controller()
@@ -677,7 +676,6 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self._create_controller_param_widgets()
         self._rebuild_gui()
 
-        from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
         self._initialize_controller()

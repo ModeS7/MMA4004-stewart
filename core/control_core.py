@@ -8,10 +8,11 @@ Controllers:
 - KalmanFilter: Linear Kalman Filter for ball state estimation
 - OrientationKalmanFilter: EKF for IMU-based orientation estimation
 """
+import time
 import numpy as np
 from scipy import linalg
 
-from core.utils import MAX_TILT_ANGLE_DEG
+from core.utils import MAX_TILT_ANGLE_DEG, IMUKalmanConfig, IMUCalibrationConfig
 
 
 def clip_tilt_vector(rx, ry, max_magnitude=MAX_TILT_ANGLE_DEG):
@@ -642,9 +643,7 @@ class OrientationKalmanFilter:
         self.enable_yaw_tracking = enable_yaw_tracking  # Enable full 6-DOF with yaw tracking
         self.use_magnetometer = enable_yaw_tracking  # Auto-enable magnetometer if yaw tracking enabled
         self.mag_offset = np.array([0.0, 0.0, 0.0])  # Hard-iron calibration offset
-        self.mag_inclination = np.radians(75.0)  # Magnetic inclination angle (dip) - default for Norway
         self.mag_noise = mag_noise  # Magnetometer measurement noise
-        from core.utils import IMUKalmanConfig
         self.mag_inclination = np.radians(IMUKalmanConfig.DEFAULT_MAG_INCLINATION_DEG)  # Magnetic inclination for Trondheim
         self.mag_update_count = 0  # Statistics
 
@@ -1220,8 +1219,6 @@ class IMUControllerMixin:
 
         Must be called BEFORE parent __init__ to set up IMU attributes.
         """
-        from core.utils import IMUKalmanConfig, IMUCalibrationConfig
-
         # Initialize orientation Kalman filter with default configuration
         self.orientation_kalman = OrientationKalmanFilter(
             accel_noise=IMUKalmanConfig.DEFAULT_ACCEL_NOISE,
@@ -1282,7 +1279,6 @@ class IMUControllerMixin:
         - Platform should remain stationary
         - Automatically transitions to calibration
         """
-        import time
         self.imu_initializing = True
         self.initialization_start_time = time.time()
         self.initialization_time_remaining = self.initialization_duration
@@ -1297,7 +1293,6 @@ class IMUControllerMixin:
         - Gravity vector is established
         - Platform MUST remain stationary and level
         """
-        import time
         self.imu_calibrating = True
         self.calibration_start_time = time.time()
         self.calibration_time_remaining = self.calibration_duration
@@ -1314,8 +1309,6 @@ class IMUControllerMixin:
         4. Initializes orientation Kalman filter
         5. Validates platform levelness (warns if >5° tilt)
         """
-        import numpy as np
-
         gyro_data = self.calibration_raw_data['gyro']
         accel_data = self.calibration_raw_data['accel']
 
@@ -1377,8 +1370,6 @@ class IMUControllerMixin:
         Returns:
             bool: True if still calibrating (skip rest of control loop), False if ready
         """
-        import time
-
         # Handle initialization phase (3 seconds)
         if self.imu_initializing:
             elapsed = time.time() - self.initialization_start_time
@@ -1424,8 +1415,6 @@ class IMUControllerMixin:
         3. Update step (accel + optional mag → correct drift)
         4. Updates self.current_rx_imu and self.current_ry_imu
         """
-        import numpy as np
-
         # Get latest IMU sample (non-blocking)
         gyro_data, accel_data, mag_data = self.serial_controller.get_single_imu_sample()
 
@@ -1470,8 +1459,6 @@ class IMUControllerMixin:
         """
         if not self.imu_tilt_correction_enabled:
             return rx_ctrl, ry_ctrl
-
-        import numpy as np
 
         # Calculate IMU compensation (oppose platform tilt)
         rx_imu_comp = -self.current_rx_imu * self.imu_compensation_gain
