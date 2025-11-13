@@ -20,7 +20,8 @@ from gui import gui_modules as gm
 from gui.gui_builder import GUIBuilder
 from core.control_core import IMUControllerMixin, clip_tilt_vector
 from core.utils import (MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG, Pixy2CameraConfig,
-                        HardwareConnectionConfig, GUIConfig, VisualizationConfig)
+                        HardwareConnectionConfig, GUIConfig, VisualizationConfig,
+                        IKZOptimizationConfig)
 
 
 class MinimalController(IMUControllerMixin, HardwareControllerBase):
@@ -44,6 +45,15 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         # Call parent constructor (HardwareControllerBase handles hardware init)
         super().__init__(app, controller_config)
+
+        # Enable advanced features by default (no GUI controls in minimal controller)
+        self.z_optimization_enabled = True  # Dynamic Z height optimization for servo balance
+        self.imu_tilt_correction_enabled = True  # IMU-based platform tilt compensation
+        self.use_kalman_derivative = True  # Use Kalman velocity for PID derivative (PID only)
+
+        # Z optimization tracking variables
+        self.z_offset = 0.0  # Current Z offset from optimization (mm)
+        self.servo_balance = (0.0, 0.0)  # (max_angle, min_angle) in degrees
 
         # Effective platform angles (gravity frame) for Kalman filter prediction
         # Excludes IMU compensation to maintain consistent physics model
@@ -433,15 +443,35 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
                     translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
                     rotation = np.array([rx, ry, 0.0])
 
-                    # Check cache first
-                    if self.ik_cache:
-                        angles = self.ik_cache.get(translation, rotation)
-                        if angles is None:
+                    # Apply Z optimization if enabled
+                    if self.z_optimization_enabled:
+                        optimized_translation, angles, success = self.ik.optimize_z_offset(
+                            translation, rotation,
+                            use_top_surface_offset=self.use_top_surface_offset,
+                            z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                            max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                            tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
+                            ik_cache=self.ik_cache if hasattr(self, 'ik_cache') else None
+                        )
+
+                        if success and angles is not None:
+                            self.z_offset = optimized_translation[2] - translation[2]
+                            self.servo_balance = (np.max(angles), np.min(angles))
+                        else:
+                            # Fallback to normal IK if optimization fails
                             angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
-                            if angles is not None:
-                                self.ik_cache.put(translation, rotation, angles)
+                            self.z_offset = 0.0
+                            self.servo_balance = (0.0, 0.0)
                     else:
-                        angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                        # Normal IK without optimization
+                        if self.ik_cache:
+                            angles = self.ik_cache.get(translation, rotation)
+                            if angles is None:
+                                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                                if angles is not None:
+                                    self.ik_cache.put(translation, rotation, angles)
+                        else:
+                            angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
 
                     if angles is not None:
                         self.serial_controller.send_servo_angles(angles)
@@ -466,7 +496,27 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
                 translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
                 rotation = np.array([rx, ry, self.dof_values['rz']])
 
-                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                # Apply Z optimization if enabled (manual control)
+                if self.z_optimization_enabled:
+                    search_translation = translation.copy()
+                    optimized_translation, angles, success = self.ik.optimize_z_offset(
+                        search_translation, rotation,
+                        use_top_surface_offset=self.use_top_surface_offset,
+                        z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                        max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                        tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
+                        ik_cache=self.ik_cache if hasattr(self, 'ik_cache') else None
+                    )
+
+                    if success and angles is not None:
+                        self.dof_values['z'] = optimized_translation[2]
+                        self.z_offset = optimized_translation[2] - translation[2]
+                        self.servo_balance = (np.max(angles), np.min(angles))
+                    else:
+                        angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                else:
+                    angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+
                 if angles is not None:
                     self.serial_controller.send_servo_angles(angles)
                     self.last_cmd_angles = angles
@@ -632,11 +682,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
             state['initialization_time_remaining'] = self.initialization_time_remaining
             state['calibration_time_remaining'] = self.calibration_time_remaining
 
-            # Add IMU motion detection statistics
-            state['imu_rejection_stats'] = (
-                self.orientation_kalman.rejected_accel_count,
-                self.orientation_kalman.total_accel_count
-            )
+            # Add magnetometer statistics
             state['imu_mag_updates'] = self.orientation_kalman.mag_update_count
 
             if self.controller_enabled:

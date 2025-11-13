@@ -124,7 +124,6 @@ from gui import (
     Pixy2CameraModule,
     KalmanFilterModule,
     IMUKalmanParametersModule,
-    IMUMotionDetectionModule,
 
     # Optimization modules
     IKZOptimizationModule,
@@ -235,7 +234,6 @@ __all__ = [
     'Pixy2CameraModule',
     'KalmanFilterModule',
     'IMUKalmanParametersModule',
-    'IMUMotionDetectionModule',
 
     # GUI - Optimization
     'IKZOptimizationModule',

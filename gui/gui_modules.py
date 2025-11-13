@@ -1827,14 +1827,54 @@ class IMUKalmanParametersModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
+        # Yaw tracking toggle (6-DOF mode with magnetometer)
+        yaw_layout = QHBoxLayout()
+
+        self.yaw_tracking_checkbox = QCheckBox("Enable Yaw Tracking (6-DOF)")
+        self.yaw_tracking_checkbox.setChecked(IMUKalmanConfig.ENABLE_YAW_TRACKING)
+        self.yaw_tracking_checkbox.stateChanged.connect(self._on_yaw_tracking_toggle)
+        yaw_layout.addWidget(self.yaw_tracking_checkbox)
+
+        self.yaw_status_indicator = QLabel("[4-DOF]" if not IMUKalmanConfig.ENABLE_YAW_TRACKING else "[6-DOF]")
+        self.yaw_status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
+        self.yaw_status_indicator.setStyleSheet(f"color: {self.colors['border'] if not IMUKalmanConfig.ENABLE_YAW_TRACKING else self.colors['success']};")
+        yaw_layout.addWidget(self.yaw_status_indicator)
+        yaw_layout.addStretch()
+
+        layout.addLayout(yaw_layout)
+
         # Kalman filter noise parameters (defaults from utils.py)
         self._create_parameter_slider(layout, "Accel Noise:", 0.1, 5.0, IMUKalmanConfig.DEFAULT_ACCEL_NOISE, 'accel_noise')
         self._create_parameter_slider(layout, "Gyro Noise:", 0.001, 0.1, IMUKalmanConfig.DEFAULT_GYRO_NOISE, 'gyro_noise')
         self._create_parameter_slider(layout, "Process Noise Angle:", 0.000001, 0.1, IMUKalmanConfig.DEFAULT_PROCESS_NOISE_ANGLE, 'process_noise_angle')
         self._create_parameter_slider(layout, "Process Noise Bias:", 0.000001, 0.01, IMUKalmanConfig.DEFAULT_PROCESS_NOISE_BIAS, 'process_noise_bias')
 
+        # Magnetometer noise (only relevant when yaw tracking enabled)
+        self._create_parameter_slider(layout, "Mag Noise (yaw):", 0.01, 1.0, IMUKalmanConfig.DEFAULT_MAG_NOISE, 'mag_noise')
+
         # Gyro scale multiplier (for tilt correction tuning, default from utils.py)
         self._create_parameter_slider(layout, "Gyro Scale Multiplier:", 0.1, 15.0, IMUKalmanConfig.DEFAULT_GYRO_SCALE_MULTIPLIER, 'gyro_scale')
+
+        # Yaw reference and control
+        yaw_control_layout = QVBoxLayout()
+        yaw_control_label = QLabel("Yaw Control:")
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL)
+        font.setBold(True)
+        yaw_control_label.setFont(font)
+        yaw_control_layout.addWidget(yaw_control_label)
+
+        # Button to set current orientation as reference
+        button_layout = QHBoxLayout()
+        self.set_yaw_ref_button = QPushButton("Set Current as 0°")
+        self.set_yaw_ref_button.clicked.connect(self._on_set_yaw_reference)
+        button_layout.addWidget(self.set_yaw_ref_button)
+        button_layout.addStretch()
+        yaw_control_layout.addLayout(button_layout)
+
+        # Slider for manual yaw offset adjustment
+        self._create_yaw_offset_slider(yaw_control_layout)
+
+        layout.addLayout(yaw_control_layout)
 
         # Current orientation display
         state_layout = QVBoxLayout()
@@ -1848,10 +1888,15 @@ class IMUKalmanParametersModule(GUIModule):
         self.orientation_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         state_layout.addWidget(self.orientation_label)
 
-        self.bias_label = QLabel("Bias: (0.00, 0.00) rad/s")
+        self.bias_label = QLabel("Bias: (0.00, 0.00, 0.00) rad/s")
         self.bias_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.bias_label.setStyleSheet(f"color: {self.colors['border']};")
         state_layout.addWidget(self.bias_label)
+
+        self.mag_count_label = QLabel("Mag updates: 0")
+        self.mag_count_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
+        self.mag_count_label.setStyleSheet(f"color: {self.colors['border']};")
+        state_layout.addWidget(self.mag_count_label)
 
         layout.addLayout(state_layout)
 
@@ -1916,6 +1961,56 @@ class IMUKalmanParametersModule(GUIModule):
         if self.callbacks.get('imu_tilt_correction_toggle'):
             self.callbacks['imu_tilt_correction_toggle'](enabled)
 
+    def _on_yaw_tracking_toggle(self) -> None:
+        """Handle yaw tracking (6-DOF) enable/disable toggle."""
+        enabled = self.yaw_tracking_checkbox.isChecked()
+
+        if enabled:
+            self.yaw_status_indicator.setText("[6-DOF]")
+            self.yaw_status_indicator.setStyleSheet(f"color: {self.colors['success']};")
+        else:
+            self.yaw_status_indicator.setText("[4-DOF]")
+            self.yaw_status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+
+        if self.callbacks.get('imu_yaw_tracking_toggle'):
+            self.callbacks['imu_yaw_tracking_toggle'](enabled)
+
+    def _create_yaw_offset_slider(self, parent_layout: QVBoxLayout) -> None:
+        """Create yaw offset adjustment slider for reference frame calibration."""
+        grid = QGridLayout()
+
+        label_widget = QLabel("Yaw Offset:")
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
+        grid.addWidget(label_widget, 0, 0)
+
+        self.yaw_offset_slider = QSlider(Qt.Orientation.Horizontal)
+        self.yaw_offset_slider.setMinimum(-180 * 10)
+        self.yaw_offset_slider.setMaximum(180 * 10)
+        self.yaw_offset_slider.setValue(0)
+        grid.addWidget(self.yaw_offset_slider, 0, 1)
+
+        self.yaw_offset_label = QLabel("0.0°")
+        self.yaw_offset_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
+        self.yaw_offset_label.setStyleSheet(f"color: {self.colors['highlight']};")
+        self.yaw_offset_label.setFixedWidth(80)
+        grid.addWidget(self.yaw_offset_label, 0, 2)
+
+        def on_change(val):
+            offset_deg = val / 10.0
+            self.yaw_offset_label.setText(f"{offset_deg:.1f}°")
+            if self.callbacks.get('imu_yaw_offset_change'):
+                self.callbacks['imu_yaw_offset_change'](offset_deg)
+
+        self.yaw_offset_slider.valueChanged.connect(on_change)
+        grid.setColumnStretch(1, 1)
+
+        parent_layout.addLayout(grid)
+
+    def _on_set_yaw_reference(self) -> None:
+        """Set current yaw as reference (0°)."""
+        if self.callbacks.get('imu_set_yaw_reference'):
+            self.callbacks['imu_set_yaw_reference']()
+
     def _on_param_change(self, param_name: str, value: float) -> None:
         """Apply IMU Kalman parameter change."""
         if self.callbacks.get('imu_kalman_param_change'):
@@ -1924,157 +2019,30 @@ class IMUKalmanParametersModule(GUIModule):
     def update(self, state: Dict[str, Any]) -> None:
         """Update IMU orientation and bias display."""
         if 'imu_orientation' in state:
-            rx, ry = state['imu_orientation']
-            self.orientation_label.setText(f"RX: {rx:.2f}°, RY: {ry:.2f}°")
+            orientation = state['imu_orientation']
+            if len(orientation) == 3:
+                # 6-DOF mode (roll, pitch, yaw)
+                rx, ry, yaw = orientation
+                self.orientation_label.setText(f"RX: {rx:.2f}°, RY: {ry:.2f}°, Yaw: {yaw:.2f}°")
+            else:
+                # 4-DOF mode (roll, pitch only)
+                rx, ry = orientation
+                self.orientation_label.setText(f"RX: {rx:.2f}°, RY: {ry:.2f}°")
 
         if 'imu_bias' in state:
-            bias_x, bias_y = state['imu_bias']
-            self.bias_label.setText(f"Bias: ({bias_x:.4f}, {bias_y:.4f}) rad/s")
-
-
-class IMUMotionDetectionModule(GUIModule):
-    """IMU motion detection and magnetometer controls."""
-
-    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any]) -> None:
-        """
-        Initialize IMU motion detection module.
-
-        Args:
-            parent: Parent QWidget
-            colors: Color scheme dict
-            callbacks: Callback functions dict
-        """
-        super().__init__(parent, colors, callbacks)
-
-    def create(self) -> QWidget:
-        """Create IMU motion detection panel with thresholds and magnetometer controls."""
-        group = QGroupBox("IMU Motion Detection")
-        layout = QVBoxLayout()
-
-        # Enable/Disable motion detection
-        detection_layout = QHBoxLayout()
-
-        self.detection_checkbox = QCheckBox("Enable Motion Detection")
-        self.detection_checkbox.setChecked(False)
-        self.detection_checkbox.stateChanged.connect(self._on_detection_toggle)
-        detection_layout.addWidget(self.detection_checkbox)
-
-        self.detection_status = QLabel("[OFF]")
-        self.detection_status.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
-        self.detection_status.setStyleSheet(f"color: {self.colors['border']};")
-        detection_layout.addWidget(self.detection_status)
-        detection_layout.addStretch()
-
-        layout.addLayout(detection_layout)
-
-        # Thresholds (defaults from utils.py)
-        self._create_parameter_slider(layout, "Accel Threshold (m/s²):", 0.5, 10.0, IMUKalmanConfig.DEFAULT_ACCEL_THRESHOLD, 'accel_threshold')
-        self._create_parameter_slider(layout, "Gyro Threshold (rad/s):", 0.1, 2.0, IMUKalmanConfig.DEFAULT_GYRO_THRESHOLD, 'gyro_threshold')
-
-        # Magnetometer controls
-        mag_layout = QHBoxLayout()
-
-        self.mag_checkbox = QCheckBox("Use Magnetometer Backup")
-        self.mag_checkbox.setChecked(False)
-        self.mag_checkbox.stateChanged.connect(self._on_mag_toggle)
-        mag_layout.addWidget(self.mag_checkbox)
-
-        self.mag_status = QLabel("[OFF]")
-        self.mag_status.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
-        self.mag_status.setStyleSheet(f"color: {self.colors['border']};")
-        mag_layout.addWidget(self.mag_status)
-        mag_layout.addStretch()
-
-        layout.addLayout(mag_layout)
-
-        # Statistics
-        self.stats_label = QLabel("Rejected: 0 / 0 (0.0%)")
-        self.stats_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
-        self.stats_label.setStyleSheet(f"color: {self.colors['border']};")
-        layout.addWidget(self.stats_label)
-
-        self.mag_stats_label = QLabel("Mag updates: 0")
-        self.mag_stats_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
-        self.mag_stats_label.setStyleSheet(f"color: {self.colors['border']};")
-        layout.addWidget(self.mag_stats_label)
-
-        group.setLayout(layout)
-        self.widget = group
-        return self.widget
-
-    def _create_parameter_slider(self, parent_layout: QVBoxLayout, label: str, min_val: float,
-                                  max_val: float, default: float, param_name: str) -> None:
-        """Create a threshold parameter slider."""
-        grid = QGridLayout()
-
-        label_widget = QLabel(label)
-        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
-        grid.addWidget(label_widget, 0, 0)
-
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setMinimum(int(min_val * GUI_SLIDER_SCALE_COARSE))
-        slider.setMaximum(int(max_val * GUI_SLIDER_SCALE_COARSE))
-        slider.setValue(int(default * GUI_SLIDER_SCALE_COARSE))
-        grid.addWidget(slider, 0, 1)
-
-        value_label = QLabel(f"{default:.2f}")
-        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
-        value_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        value_label.setMinimumWidth(60)
-        grid.addWidget(value_label, 0, 2)
-
-        def on_change(val, param=param_name):
-            value = val / 100.0
-            value_label.setText(f"{value:.2f}")
-            if self.callbacks.get('imu_motion_param_change'):
-                self.callbacks['imu_motion_param_change'](param, value)
-
-        slider.valueChanged.connect(on_change)
-        grid.setColumnStretch(1, 1)
-
-        parent_layout.addLayout(grid)
-
-    def _on_detection_toggle(self) -> None:
-        """Handle motion detection enable/disable toggle."""
-        enabled = self.detection_checkbox.isChecked()
-
-        if enabled:
-            self.detection_status.setText("[ON]")
-            self.detection_status.setStyleSheet(f"color: {self.colors['success']};")
-        else:
-            self.detection_status.setText("[OFF]")
-            self.detection_status.setStyleSheet(f"color: {self.colors['border']};")
-
-        if self.callbacks.get('imu_detection_toggle'):
-            self.callbacks['imu_detection_toggle'](enabled)
-
-    def _on_mag_toggle(self) -> None:
-        """Handle magnetometer backup enable/disable toggle."""
-        enabled = self.mag_checkbox.isChecked()
-
-        if enabled:
-            self.mag_status.setText("[ON]")
-            self.mag_status.setStyleSheet(f"color: {self.colors['success']};")
-        else:
-            self.mag_status.setText("[OFF]")
-            self.mag_status.setStyleSheet(f"color: {self.colors['border']};")
-
-        if self.callbacks.get('imu_mag_toggle'):
-            self.callbacks['imu_mag_toggle'](enabled)
-
-    def update(self, state: Dict[str, Any]) -> None:
-        """Update motion detection statistics and magnetometer update count."""
-        if 'imu_rejection_stats' in state:
-            rejected, total = state['imu_rejection_stats']
-            if total > 0:
-                percent = (rejected / total) * 100
-                self.stats_label.setText(f"Rejected: {rejected} / {total} ({percent:.1f}%)")
+            bias = state['imu_bias']
+            if len(bias) == 3:
+                # 6-DOF mode (bx, by, bz)
+                bias_x, bias_y, bias_z = bias
+                self.bias_label.setText(f"Bias: ({bias_x:.4f}, {bias_y:.4f}, {bias_z:.4f}) rad/s")
             else:
-                self.stats_label.setText(f"Rejected: 0 / 0 (0.0%)")
+                # 4-DOF mode (bx, by only)
+                bias_x, bias_y = bias
+                self.bias_label.setText(f"Bias: ({bias_x:.4f}, {bias_y:.4f}) rad/s")
 
         if 'imu_mag_updates' in state:
-            count = state['imu_mag_updates']
-            self.mag_stats_label.setText(f"Mag updates: {count}")
+            mag_count = state['imu_mag_updates']
+            self.mag_count_label.setText(f"Mag updates: {mag_count}")
 
 
 class IKZOptimizationModule(GUIModule):

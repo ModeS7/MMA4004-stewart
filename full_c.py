@@ -30,9 +30,9 @@ from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.control_core import IMUControllerMixin, LQRController, clip_tilt_vector
 from core.utils import (IKZOptimizationConfig, MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG,
-                         Pixy2CameraConfig, BallPhysicsConfig, HardwareConnectionConfig, GUIConfig,
-                         VisualizationConfig, ControlLoopConfig, GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL,
-                         PerformanceConfig)
+                         MAX_YAW_ANGLE_DEG, Pixy2CameraConfig, BallPhysicsConfig,
+                         HardwareConnectionConfig, GUIConfig, VisualizationConfig, ControlLoopConfig,
+                         GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL, PerformanceConfig)
 
 
 class StewartController(IMUControllerMixin, HardwareControllerBase):
@@ -77,6 +77,11 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.recording_start_time = 0.0
         self.sample_count = 0
         self.recording_filename = None
+
+        # Z optimization (controlled by GUI toggle in IKZOptimizationModule)
+        self.z_optimization_enabled = IKZOptimizationConfig.ENABLED  # Default from config
+        self.z_offset = 0.0  # Current Z offset from optimization (mm)
+        self.servo_balance = (0.0, 0.0)  # (max_angle, min_angle) in degrees
 
         # Override window title
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}]")
@@ -181,6 +186,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             'kalman_reset': self.on_kalman_reset,
         })
 
+        # Add Z optimization callback
+        callbacks['z_optimization_toggle'] = self.on_z_optimization_toggle
+
         # Add performance data recording callbacks (both sim and hardware)
         callbacks.update({
             'start_recording': self.start_recording,
@@ -192,9 +200,10 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             callbacks.update({
                 'imu_tilt_correction_toggle': self.on_imu_tilt_correction_toggle,
                 'imu_kalman_param_change': self.on_imu_kalman_param_change,
-                'imu_motion_param_change': self.on_imu_motion_param_change,
-                'imu_detection_toggle': self.on_imu_detection_toggle,
                 'imu_mag_toggle': self.on_imu_mag_toggle,
+                'imu_yaw_tracking_toggle': self.on_imu_yaw_tracking_toggle,
+                'imu_set_yaw_reference': self.on_imu_set_yaw_reference,
+                'imu_yaw_offset_change': self.on_imu_yaw_offset_change,
             })
 
         # Add LQR-specific callbacks
@@ -262,7 +271,6 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         if self.operation_mode == 'real':
             left_modules.append({'type': 'imu_kalman_parameters',
                                'args': {'orientation_kalman': getattr(self, 'orientation_kalman', None)}})
-            left_modules.append({'type': 'imu_motion_detection'})
 
         # Configuration
         left_modules.append({'type': 'configuration',
@@ -338,7 +346,6 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             'control_frequency': gm.ControlFrequencyModule,
             'plot_control': gm.PlotControlModule,
             'imu_kalman_parameters': gm.IMUKalmanParametersModule,
-            'imu_motion_detection': gm.IMUMotionDetectionModule,
             'ik_z_optimization': gm.IKZOptimizationModule,
             'performance_data': gm.PerformanceDataCollectionModule,
         }
@@ -767,6 +774,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.kalman_filter.reset(self.ball_pos_mm)
         self.log("Kalman filter reset")
 
+    def on_z_optimization_toggle(self, enabled: bool) -> None:
+        """Handle Z optimization enable/disable toggle."""
+        self.z_optimization_enabled = enabled
+        status = "ENABLED" if enabled else "DISABLED"
+        self.log(f"Z optimization: {status}")
+
     def start_recording(self) -> None:
         """Start recording performance data to CSV file."""
         if self.recording:
@@ -1017,8 +1030,14 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 # Apply IMU compensation to achieve desired effective tilt
                 rx, ry = self._apply_imu_tilt_correction(rx_effective, ry_effective)
 
+                # Determine yaw angle (from IMU if 6-DOF enabled, otherwise manual)
+                if self.orientation_kalman.enable_yaw_tracking and self.imu_tilt_correction_enabled:
+                    rz = np.clip(self.current_yaw_imu, -MAX_YAW_ANGLE_DEG, MAX_YAW_ANGLE_DEG)
+                else:
+                    rz = self.dof_values['rz']
+
                 translation = np.array([self.dof_values['x'], self.dof_values['y'], self.dof_values['z']])
-                rotation = np.array([rx, ry, self.dof_values['rz']])
+                rotation = np.array([rx, ry, rz])
 
                 # Apply Z optimization if enabled
                 if self.z_optimization_enabled:
@@ -1182,9 +1201,15 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 error_y = ball_y_mm - target_y
                 state['controller_error'] = (error_x, error_y)
 
-            # Add IMU orientation state
-            state['imu_orientation'] = (self.current_rx_imu, self.current_ry_imu)
-            state['imu_bias'] = (self.orientation_kalman.state[2], self.orientation_kalman.state[3])
+            # Add IMU orientation state (handles both 4-DOF and 6-DOF modes)
+            if self.orientation_kalman.enable_yaw_tracking:
+                # 6-DOF mode: roll, pitch, yaw
+                state['imu_orientation'] = (self.current_rx_imu, self.current_ry_imu, self.current_yaw_imu)
+                state['imu_bias'] = (self.orientation_kalman.state[3], self.orientation_kalman.state[4], self.orientation_kalman.state[5])
+            else:
+                # 4-DOF mode: roll, pitch only
+                state['imu_orientation'] = (self.current_rx_imu, self.current_ry_imu)
+                state['imu_bias'] = (self.orientation_kalman.state[2], self.orientation_kalman.state[3])
 
             # Add IMU calibration status
             state['imu_initializing'] = self.imu_initializing
@@ -1192,11 +1217,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             state['initialization_time_remaining'] = self.initialization_time_remaining
             state['calibration_time_remaining'] = self.calibration_time_remaining
 
-            # Add IMU motion detection statistics
-            state['imu_rejection_stats'] = (
-                self.orientation_kalman.rejected_accel_count,
-                self.orientation_kalman.total_accel_count
-            )
+            # Add magnetometer statistics
             state['imu_mag_updates'] = self.orientation_kalman.mag_update_count
 
             # Add recording state

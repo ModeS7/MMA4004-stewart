@@ -27,6 +27,7 @@ PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger plat
 MAX_TILT_ANGLE_DEG = 15.0  # Maximum platform tilt magnitude (degrees) - general reference
 MAX_CONTROLLER_OUTPUT_DEG = 15.0  # Maximum controller output tilt (degrees)
 MAX_IMU_CORRECTION_DEG = 15.0  # Maximum IMU-based tilt correction (degrees)
+MAX_YAW_ANGLE_DEG = 45.0  # Maximum platform yaw rotation (degrees)
 MAX_SERVO_ANGLE_DEG = 70.0  # Maximum individual servo angle (degrees)
 
 # Control algorithm constants
@@ -189,7 +190,7 @@ class ColorScheme:
 
 class ControlLoopConfig:
     """Configuration for real-time control loop (hardware mode)."""
-    DEFAULT_FREQUENCY_HZ = 250  # Default control loop frequency
+    DEFAULT_FREQUENCY_HZ = 50  # Default control loop frequency
     MIN_FREQUENCY_HZ = 50  # Minimum control loop frequency
     MAX_FREQUENCY_HZ = 500  # Maximum control loop frequency
     FREQUENCY_HZ = DEFAULT_FREQUENCY_HZ  # Current control loop frequency (configurable)
@@ -213,7 +214,7 @@ class GUIConfig:
     DEFAULT_PLOT_ENABLED = True  # Plot updates enabled by default
 
     # Layout settings
-    MINIMAL_CONTROLLER_COLUMN_WIDTH = 350  # Width of control column in minimal controller (pixels)
+    MINIMAL_CONTROLLER_COLUMN_WIDTH = 450  # Width of control column in minimal controller (pixels)
 
 
 class SimulationConfig:
@@ -600,10 +601,6 @@ class IMUKalmanConfig:
     MAG_OFFSET_Y = 0.0  # Hard-iron offset Y
     MAG_OFFSET_Z = 0.0  # Hard-iron offset Z
     MAG_INCLINATION_DEG = 74.0  # Magnetic inclination angle (Norway, Ålesund)
-
-    # Motion detection thresholds
-    DEFAULT_ACCEL_THRESHOLD = 1.0  # m/s² - reject accel updates above this
-    DEFAULT_GYRO_THRESHOLD = 0.5   # rad/s - gyro magnitude threshold
 
     # Scaling and transformation
     DEFAULT_GYRO_SCALE_MULTIPLIER = 1.0
