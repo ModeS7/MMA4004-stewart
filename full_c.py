@@ -930,9 +930,15 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                     self.dof_values['rx'] = rx
                     self.dof_values['ry'] = ry
 
+                    # Determine yaw angle (from IMU if 6-DOF enabled, otherwise manual)
+                    if self.orientation_kalman.enable_yaw_tracking and self.imu_tilt_correction_enabled:
+                        rz = np.clip(self.current_yaw_imu, -MAX_YAW_ANGLE_DEG, MAX_YAW_ANGLE_DEG)
+                    else:
+                        rz = self.dof_values['rz']
+
                     # Calculate servo angles
                     translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
-                    rotation = np.array([rx, ry, 0.0])
+                    rotation = np.array([rx, ry, rz])
 
                     # Apply Z optimization if enabled
                     if self.z_optimization_enabled:
