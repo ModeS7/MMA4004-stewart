@@ -330,9 +330,12 @@ Extended Kalman Filter for orientation estimation:
 ## Software Dependencies
 
 ```
+torch
 PyQt6>=6.0.0
 pyqtgraph>=0.13.0
 numpy>=1.20.0
 scipy>=1.7.0
 pyserial>=3.5
+pandas
+numba
 ```

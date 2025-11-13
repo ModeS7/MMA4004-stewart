@@ -11,7 +11,6 @@ Shared classes for Stewart platform simulation and control:
 import logging
 from typing import Optional, Tuple, Dict
 import numpy as np
-import torch
 from collections import deque
 
 from scipy.optimize import brentq, minimize_scalar
@@ -622,7 +621,7 @@ class SimpleBallPhysics2D:
 
         # Check if ball fell off circular platform
         max_radius = PLATFORM_RADIUS_MM / 1000.0
-        distance_from_center = torch.norm(new_xy_pos, dim=1)
+        distance_from_center = np.linalg.norm(new_xy_pos, axis=1)
         fell_off = distance_from_center > max_radius
 
         contact_info = {'fell_off': False}
@@ -637,18 +636,18 @@ class SimpleBallPhysics2D:
 
         platform_z = self._compute_platform_height(new_xy_pos, platform_pose)
 
-        new_ball_pos = torch.zeros((batch_size, 3), device=device)
+        new_ball_pos = np.zeros((batch_size, 3), dtype=np.float32)
         new_ball_pos[:, :2] = new_xy_pos
         new_ball_pos[:, 2] = platform_z + self.radius
 
-        new_ball_vel = torch.zeros((batch_size, 3), device=device)
+        new_ball_vel = np.zeros((batch_size, 3), dtype=np.float32)
         new_ball_vel[:, :2] = new_xy_vel
 
-        new_ball_omega = torch.zeros((batch_size, 3), device=device)
+        new_ball_omega = np.zeros((batch_size, 3), dtype=np.float32)
         new_ball_omega[:, :2] = new_xy_omega
 
-        contact_info['in_contact'] = torch.ones(batch_size, dtype=torch.bool)
-        contact_info['rolling_speed'] = torch.norm(new_xy_omega, dim=1) * self.radius
+        contact_info['in_contact'] = np.ones(batch_size, dtype=bool)
+        contact_info['rolling_speed'] = np.linalg.norm(new_xy_omega, axis=1) * self.radius
 
         return new_ball_pos, new_ball_vel, new_ball_omega, contact_info
 
@@ -667,8 +666,8 @@ class SimpleBallPhysics2D:
         batch_size = xy_pos.shape[0]
 
         # Extract platform orientation
-        rx = torch.deg2rad(platform_pose[:, 3])  # Roll angle (rotation about X)
-        ry = torch.deg2rad(platform_pose[:, 4])  # Pitch angle (rotation about Y)
+        rx = np.radians(platform_pose[:, 3])  # Roll angle (rotation about X)
+        ry = np.radians(platform_pose[:, 4])  # Pitch angle (rotation about Y)
 
         ball_x = xy_pos[:, 0]
         ball_y = xy_pos[:, 1]
@@ -686,12 +685,12 @@ class SimpleBallPhysics2D:
             a_z_platform = ball_x * alpha_ry_rad - ball_y * alpha_rx_rad
             g_eff = self.g - a_z_platform
             # Clamp to reasonable range to prevent numerical instability
-            g_eff = torch.clamp(g_eff, BALL_GEFF_MIN_FACTOR * self.g, BALL_GEFF_MAX_FACTOR * self.g)
+            g_eff = np.clip(g_eff, BALL_GEFF_MIN_FACTOR * self.g, BALL_GEFF_MAX_FACTOR * self.g)
 
-        cos_rx = torch.cos(rx)
-        cos_ry = torch.cos(ry)
-        sin_rx = torch.sin(rx)
-        sin_ry = torch.sin(ry)
+        cos_rx = np.cos(rx)
+        cos_ry = np.cos(ry)
+        sin_rx = np.sin(rx)
+        sin_ry = np.sin(ry)
 
         # Project gravity onto tilted surface to get downslope acceleration
         # For a tilted plane, gravity component along surface = g * sin(θ) * cos(φ)
@@ -704,9 +703,9 @@ class SimpleBallPhysics2D:
         ax = gx / self.mass_factor
         ay = gy / self.mass_factor
 
-        accel_linear = torch.stack([ax, ay], dim=1)
+        accel_linear = np.stack([ax, ay], axis=1)
 
-        vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
+        vel_magnitude = np.linalg.norm(xy_vel, axis=1, keepdims=True)
         # Rolling resistance: F_roll = μ_roll * N * v_hat (opposes motion)
         rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + DIVISION_BY_ZERO_EPSILON)
 
@@ -735,13 +734,13 @@ class SimpleBallPhysics2D:
         py = platform_pose[:, 1] / 1000
         pz = platform_pose[:, 2] / 1000
 
-        rx = torch.deg2rad(platform_pose[:, 3])
-        ry = torch.deg2rad(platform_pose[:, 4])
+        rx = np.radians(platform_pose[:, 3])
+        ry = np.radians(platform_pose[:, 4])
 
         dx = xy_pos[:, 0] - px
         dy = xy_pos[:, 1] - py
 
-        height = pz - dx * torch.tan(ry) - dy * torch.tan(rx)
+        height = pz - dx * np.tan(ry) - dy * np.tan(rx)
 
         return height
 
@@ -1106,18 +1105,17 @@ class Pixy2Camera:
             detected: (batch,) boolean tensor
         """
         batch_size = true_positions_mm.shape[0]
-        device = true_positions_mm.device
 
         # Detection mask
-        detection_probs = torch.rand(batch_size, device=device)
+        detection_probs = np.random.rand(batch_size)
         detected = detection_probs < self.detection_rate
 
         # Sub-pixel noise
-        noise = torch.randn_like(true_positions_mm) * self.subpixel_noise_std
+        noise = np.random.randn(*true_positions_mm.shape) * self.subpixel_noise_std
         noisy_positions = true_positions_mm + noise
 
         # Quantize to pixel grid
-        measured = torch.round(noisy_positions / self.pixel_size) * self.pixel_size
+        measured = np.round(noisy_positions / self.pixel_size) * self.pixel_size
 
         # Set undetected measurements to zero
         measured[~detected] = 0.0

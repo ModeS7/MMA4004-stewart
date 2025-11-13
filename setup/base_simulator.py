@@ -11,7 +11,6 @@ from PyQt6.QtCore import QTimer, Qt, QEvent
 from PyQt6.QtGui import QFont
 import pyqtgraph as pg
 import numpy as np
-import torch
 import time
 from datetime import datetime
 from abc import ABC, abstractmethod
@@ -174,9 +173,9 @@ class BaseStewartSimulator(QMainWindow):
         self.pattern_params = {}
 
         ball_start_height = (self.ik.home_height_top_surface / 1000) + self.ball_physics.radius
-        self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
-        self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
-        self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+        self.ball_pos = np.array([[0.0, 0.0, ball_start_height]], dtype=np.float32)
+        self.ball_vel = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        self.ball_omega = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
 
         # Ball trail history
         self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
@@ -825,9 +824,9 @@ class BaseStewartSimulator(QMainWindow):
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset else self.ik.home_height
         ball_start_height = (home_z / 1000) + self.ball_physics.radius
 
-        self.ball_pos = torch.tensor([[0.0, 0.0, ball_start_height]], dtype=torch.float32)
-        self.ball_vel = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
-        self.ball_omega = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+        self.ball_pos = np.array([[0.0, 0.0, ball_start_height]], dtype=np.float32)
+        self.ball_vel = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        self.ball_omega = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
 
         if self.controller_enabled and self.controller is not None:
             self.controller.reset()
@@ -840,7 +839,7 @@ class BaseStewartSimulator(QMainWindow):
         push_vel = BallControlConfig.PUSH_VELOCITY_MS
         vx = np.random.uniform(-push_vel, push_vel)
         vy = np.random.uniform(-push_vel, push_vel)
-        self.ball_vel = torch.tensor([[vx, vy, 0.0]], dtype=torch.float32)
+        self.ball_vel = np.array([[vx, vy, 0.0]], dtype=np.float32)
         self.log(f"Ball pushed: vx={vx:.3f}, vy={vy:.3f} m/s")
 
     def on_offset_toggle(self) -> None:
@@ -1272,10 +1271,10 @@ class BaseStewartSimulator(QMainWindow):
                 self.last_fk_rotation = rotation
 
                 try:
-                    platform_pose = torch.tensor([[
+                    platform_pose = np.array([[
                         translation[0] / 1000, translation[1] / 1000, translation[2] / 1000,
                         rotation[0], rotation[1], rotation[2]
-                    ]], dtype=torch.float32)
+                    ]], dtype=np.float32)
 
                     self.ball_pos, self.ball_vel, self.ball_omega, contact_info = \
                         self.ball_physics.step(

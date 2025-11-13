@@ -4,6 +4,4 @@ PyQt6
 pyqtgraph
 pandas
 scipy
-torch
-torchvision
 numba
