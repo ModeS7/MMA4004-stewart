@@ -6,8 +6,8 @@ Reusable simulator with pluggable controller support and modular GUI.
 PyQt6 + PyQtGraph implementation.
 """
 
-from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QGroupBox, QGridLayout, QLabel, QSlider, QComboBox
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QGroupBox, QGridLayout, QLabel, QSlider, QComboBox, QApplication
+from PyQt6.QtCore import QTimer, Qt, QEvent
 from PyQt6.QtGui import QFont
 import pyqtgraph as pg
 import numpy as np
@@ -15,18 +15,30 @@ import torch
 import time
 from datetime import datetime
 from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, Tuple, List
 
 from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
 from core.control_core import clip_tilt_vector
 from core.utils import (
-    MAX_TILT_ANGLE_DEG, PLATFORM_RADIUS_MM, PLATFORM_HALF_SIZE_MM, PLATFORM_VERSION,
+    MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG, PLATFORM_RADIUS_MM, PLATFORM_HALF_SIZE_MM, PLATFORM_VERSION,
     SimulationConfig, IKZOptimizationConfig, Pixy2CameraConfig,
     StewartPlatformConfig, ColorScheme, BallPhysicsConfig, VisualizationConfig,
     PIDConfig, LQRConfig, ManualPoseControlConfig, BallControlConfig, GUIConfig,
-    format_time, format_error_context
+    format_time, format_error_context,
+    GUI_FONT_SANS, GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL,
+    GUI_VALUE_LABEL_WIDTH_SMALL
 )
 from gui.gui_builder import GUIBuilder
 from gui import gui_modules as gm
+
+# UI color constants for theme
+BUTTON_PRESSED_COLOR = '#005a9e'
+CHECKBOX_HOVER_COLOR = '#0088dd'
+BALL_COLOR = '#ff4444'
+
+# Plot visualization constants
+BALL_MARKER_SIZE = 20
+TARGET_MARKER_SIZE = 15
 
 
 class ControllerConfig(ABC):
@@ -38,29 +50,31 @@ class ControllerConfig(ABC):
         pass
 
     @abstractmethod
-    def create_controller(self, **kwargs):
+    def create_controller(self, **kwargs) -> Any:
         """Create and return controller instance."""
         pass
 
     @abstractmethod
-    def get_scalar_values(self) -> list:
+    def get_scalar_values(self) -> List[float]:
         """Return list of scalar multipliers for parameters."""
         pass
 
-    def get_scaled_param(self, param_name, sliders, scalar_vars):
+    def get_scaled_param(self, param_name: str, sliders: Dict[str, QSlider],
+                        scalar_vars: Dict[str, int]) -> float:
         """Extract and scale a parameter value from widgets."""
         raw = sliders[param_name].value() / 100.0  # QSlider uses integers
         scalar = self.get_scalar_values()[scalar_vars[param_name]]
         return raw * scalar
 
-    def create_parameter_slider(self, parent_layout, param_name, label, default,
-                                sliders, value_labels, scalar_vars,
-                                on_change_callback):
+    def create_parameter_slider(self, parent_layout: QVBoxLayout, param_name: str, label: str,
+                                default: float, sliders: Dict[str, QSlider],
+                                value_labels: Dict[str, QLabel], scalar_vars: Dict[str, int],
+                                on_change_callback: Any) -> None:
         """Create standard parameter slider with scalar multiplier."""
         grid = QGridLayout()
 
         label_widget = QLabel(label)
-        label_widget.setFont(QFont('Segoe UI', 9))
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
         grid.addWidget(label_widget, 0, 0, Qt.AlignmentFlag.AlignLeft)
 
         slider = QSlider(Qt.Orientation.Horizontal)
@@ -71,15 +85,15 @@ class ControllerConfig(ABC):
         sliders[param_name] = slider
 
         value_label = QLabel(f"{default:.2f}")
-        value_label.setFont(QFont('Consolas', 9))
-        value_label.setMinimumWidth(60)
+        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
+        value_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_SMALL)
         grid.addWidget(value_label, 0, 2)
         value_labels[param_name] = value_label
 
         scalar_combo = QComboBox()
-        scalar_combo.addItems([f'×{s:.7g}' for s in self.get_scalar_values()])
+        scalar_combo.addItems([f'×{scalar:.7g}' for scalar in self.get_scalar_values()])
         scalar_combo.setCurrentIndex(getattr(self, 'default_scalar_idx', 4))
-        scalar_combo.setMinimumWidth(120)
+        scalar_combo.setMinimumWidth(120)  # Scalar selector width
         grid.addWidget(scalar_combo, 0, 3)
 
         scalar_vars[param_name] = scalar_combo.currentIndex()
@@ -109,10 +123,17 @@ class BaseStewartSimulator(QMainWindow):
     Subclasses define layout via get_layout_config().
     """
 
-    def __init__(self, app, controller_config: ControllerConfig):
+    def __init__(self, app: QApplication, controller_config: ControllerConfig) -> None:
+        """
+        Initialize Stewart Platform Simulator.
+
+        Args:
+            app: QApplication instance
+            controller_config: Controller configuration instance
+        """
         super().__init__()
-        self.app = app
-        self.controller_config = controller_config
+        self.app: QApplication = app
+        self.controller_config: ControllerConfig = controller_config
 
         controller_name = controller_config.get_controller_name()
         self.setWindowTitle(f"Stewart Platform - {controller_name} Ball Balancing Control")
@@ -217,7 +238,7 @@ class BaseStewartSimulator(QMainWindow):
         self._build_modular_gui()
         self._initialize_controller()
 
-    def setup_dark_theme(self):
+    def setup_dark_theme(self) -> None:
         """Configure PyQt6 dark theme using QSS."""
         stylesheet = f"""
             QMainWindow {{
@@ -255,7 +276,7 @@ class BaseStewartSimulator(QMainWindow):
                 background-color: {self.colors['highlight']};
             }}
             QPushButton:pressed {{
-                background-color: #005a9e;
+                background-color: {BUTTON_PRESSED_COLOR};
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['widget_bg']};
@@ -293,8 +314,8 @@ class BaseStewartSimulator(QMainWindow):
                 border-color: {self.colors['highlight']};
             }}
             QCheckBox::indicator:checked:hover {{
-                background-color: #0088dd;
-                border-color: #0088dd;
+                background-color: {CHECKBOX_HOVER_COLOR};
+                border-color: {CHECKBOX_HOVER_COLOR};
             }}
             QComboBox {{
                 background-color: {self.colors['widget_bg']};
@@ -341,7 +362,7 @@ class BaseStewartSimulator(QMainWindow):
         """
         self.app.setStyleSheet(stylesheet)
 
-    def _create_controller_param_widgets(self):
+    def _create_controller_param_widgets(self) -> None:
         """Create controller parameter widgets."""
         controller_name = self.controller_config.get_controller_name()
 
@@ -392,7 +413,7 @@ class BaseStewartSimulator(QMainWindow):
             self.controller_widgets['scalar_vars'].clear()
             self.controller_widgets['param_definitions'] = self.param_definitions
 
-    def _build_modular_gui(self):
+    def _build_modular_gui(self) -> None:
         """Build GUI using modular system."""
         module_registry = {
             'simulation_control': gm.SimulationControlModule,
@@ -424,7 +445,7 @@ class BaseStewartSimulator(QMainWindow):
         if 'plot_panel' in self.gui_modules:
             self._create_plot(self.gui_modules['plot_panel'])
 
-    def _create_callbacks(self):
+    def _create_callbacks(self) -> Dict[str, Any]:
         """Create callback dictionary for modules."""
         return {
             'start': self.start_simulation,
@@ -448,7 +469,7 @@ class BaseStewartSimulator(QMainWindow):
             'log': self.log,
         }
 
-    def on_pattern_param_change(self, param_name, value):
+    def on_pattern_param_change(self, param_name: str, value: float) -> None:
         """Update pattern with new parameters."""
         pattern_type = self.pattern_type
 
@@ -493,11 +514,11 @@ class BaseStewartSimulator(QMainWindow):
         self.update_plot()
 
     @abstractmethod
-    def get_layout_config(self):
+    def get_layout_config(self) -> Dict[str, Any]:
         """Return layout configuration for this simulator."""
         raise NotImplementedError
 
-    def _create_plot(self, parent):
+    def _create_plot(self, parent: QWidget) -> None:
         """Create PyQtGraph plot."""
         plot_group = QGroupBox("Ball Position (Top View)")
         plot_layout = QVBoxLayout()
@@ -517,8 +538,8 @@ class BaseStewartSimulator(QMainWindow):
 
         self.setup_plot()
 
-    def setup_plot(self):
-        """Setup PyQtGraph plot."""
+    def setup_plot(self) -> None:
+        """Setup PyQtGraph plot with platform boundary, ball, and trajectory markers."""
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(-180, 180)
         plot_item.setYRange(-180, 180)
@@ -550,21 +571,21 @@ class BaseStewartSimulator(QMainWindow):
                                                                      width=1, style=Qt.PenStyle.DashLine))
 
         # Target marker
-        self.target_marker = pg.ScatterPlotItem([0], [0], symbol='x', size=15,
+        self.target_marker = pg.ScatterPlotItem([0], [0], symbol='x', size=TARGET_MARKER_SIZE,
                                                  pen=pg.mkPen(color=self.colors['success'], width=2))
         plot_item.addItem(self.target_marker)
 
         # Ball
-        self.ball_scatter = pg.ScatterPlotItem([0], [0], symbol='o', size=20,
+        self.ball_scatter = pg.ScatterPlotItem([0], [0], symbol='o', size=BALL_MARKER_SIZE,
                                                 pen=pg.mkPen(None),
-                                                brush=pg.mkBrush('#ff4444'))
+                                                brush=pg.mkBrush(BALL_COLOR))
         plot_item.addItem(self.ball_scatter)
 
         # Tilt arrow (will be added dynamically)
         self.tilt_arrow = None
 
-    def update_plot(self):
-        """Update plot with current state."""
+    def update_plot(self) -> None:
+        """Update plot with current state (ball position, trajectory, tilt arrow)."""
         # Check if plot items still exist (window might be closing)
         if not hasattr(self, 'ball_scatter') or self.ball_scatter is None:
             return
@@ -622,10 +643,13 @@ class BaseStewartSimulator(QMainWindow):
                 # Use actual period from pattern object instead of hardcoded defaults
                 period = getattr(self.current_pattern, 'period', 10.0)
 
-                t_samples = np.linspace(0, period, 100)
+                # Period-adaptive sampling: sample every 0.05 seconds for smooth curves
+                # More samples for longer periods, ensuring smooth visualization
+                num_samples = max(100, int(period / 0.05))
+                t_samples = np.linspace(0, period, num_samples, endpoint=True)
                 path_x, path_y = [], []
-                for t in t_samples:
-                    x, y = self.current_pattern.get_position(t)
+                for time_sample in t_samples:
+                    x, y = self.current_pattern.get_position(time_sample)
                     path_x.append(x)
                     path_y.append(y)
 
@@ -665,12 +689,12 @@ class BaseStewartSimulator(QMainWindow):
             # Plot items deleted during update, skip
             pass
 
-    def log(self, message):
+    def log(self, message: str) -> None:
         """Add message to debug log."""
         if 'debug_log' in self.gui_modules:
             self.gui_modules['debug_log'].log(message, self.simulation_time)
 
-    def update_gui_modules(self):
+    def update_gui_modules(self) -> None:
         """Update all GUI modules with current state."""
         ball_x_mm = self.ball_pos[0, 0].item() * 1000
         ball_y_mm = self.ball_pos[0, 1].item() * 1000
@@ -685,7 +709,7 @@ class BaseStewartSimulator(QMainWindow):
             'ball_vel': (vel_x_mm, vel_y_mm),
             'dof_values': self.dof_values,
             'cmd_angles': self.last_cmd_angles,
-            'actual_angles': [s.get_angle() for s in self.servos],
+            'actual_angles': [servo.get_angle() for servo in self.servos],
             'fk_translation': self.last_fk_translation,
             'fk_rotation': self.last_fk_rotation,
             'z_optimization_enabled': self.z_optimization_enabled,
@@ -723,7 +747,7 @@ class BaseStewartSimulator(QMainWindow):
 
         self.gui_builder.update_modules(state)
 
-    def on_controller_toggle(self):
+    def on_controller_toggle(self) -> None:
         """Handle controller enable/disable."""
         # Check if controller exists
         if self.controller is None:
@@ -759,7 +783,7 @@ class BaseStewartSimulator(QMainWindow):
                 manual_pose.sliders['rx'].setEnabled(True)
                 manual_pose.sliders['ry'].setEnabled(True)
 
-    def on_pattern_change(self, pattern_type=None):
+    def on_pattern_change(self, pattern_type: Optional[str] = None) -> None:
         """Handle pattern selection change."""
         if pattern_type is not None:
             self.pattern_type = pattern_type
@@ -787,8 +811,8 @@ class BaseStewartSimulator(QMainWindow):
             self.update_plot()
             self.log(f"Pattern changed to: {pattern_type}")
 
-    def reset_pattern(self):
-        """Reset pattern timing."""
+    def reset_pattern(self) -> None:
+        """Reset pattern timing and controller state."""
         self.pattern_start_time = self.simulation_time
         self.current_pattern.reset()
         self.log(f"Pattern reset at t={format_time(self.simulation_time)}")
@@ -796,8 +820,8 @@ class BaseStewartSimulator(QMainWindow):
         if self.controller_enabled and self.controller is not None:
             self.controller.reset()
 
-    def reset_ball(self):
-        """Reset ball to center."""
+    def reset_ball(self) -> None:
+        """Reset ball to center position with zero velocity."""
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset else self.ik.home_height
         ball_start_height = (home_z / 1000) + self.ball_physics.radius
 
@@ -811,7 +835,7 @@ class BaseStewartSimulator(QMainWindow):
         self.update_plot()
         self.log("Ball reset to center")
 
-    def push_ball(self):
+    def push_ball(self) -> None:
         """Apply random velocity to ball (magnitude from BallControlConfig)."""
         push_vel = BallControlConfig.PUSH_VELOCITY_MS
         vx = np.random.uniform(-push_vel, push_vel)
@@ -819,8 +843,8 @@ class BaseStewartSimulator(QMainWindow):
         self.ball_vel = torch.tensor([[vx, vy, 0.0]], dtype=torch.float32)
         self.log(f"Ball pushed: vx={vx:.3f}, vy={vy:.3f} m/s")
 
-    def on_offset_toggle(self):
-        """Handle top surface offset toggle."""
+    def on_offset_toggle(self) -> None:
+        """Handle top surface offset toggle between anchor center and top surface."""
         # Toggle the state
         self.use_top_surface_offset = not self.use_top_surface_offset
         enabled = self.use_top_surface_offset
@@ -843,7 +867,7 @@ class BaseStewartSimulator(QMainWindow):
         self.ball_pos[0, 2] = ball_start_height
         self.log(f"Offset: {'Top Surface' if enabled else 'Anchor Center'}")
 
-    def on_slider_change(self, dof, value):
+    def on_slider_change(self, dof: str, value: float) -> None:
         """Handle manual DOF slider change."""
         val = float(value)
         self.dof_values[dof] = val
@@ -855,8 +879,8 @@ class BaseStewartSimulator(QMainWindow):
         self.update_timer.timeout.connect(self.calculate_ik)
         self.update_timer.start(50)
 
-    def go_home(self):
-        """Return platform to home position."""
+    def go_home(self) -> None:
+        """Return platform to home position (all DOFs to default)."""
         if self.controller_enabled:
             self.log("Disable controller to use manual control")
             return
@@ -888,21 +912,21 @@ class BaseStewartSimulator(QMainWindow):
         self.update_plot()
         self.log("Platform moved to home position")
 
-    def on_camera_enable_change(self, enabled):
+    def on_camera_enable_change(self, enabled: bool) -> None:
         """Handle camera enable/disable."""
         self.camera_enabled = enabled
         self.log(f"Camera noise: {'ENABLED' if enabled else 'DISABLED'}")
 
-    def on_camera_param_change(self, param_name, value):
+    def on_camera_param_change(self, param_name: str, value: float) -> None:
         """Handle camera parameter change."""
         self.log(f"Camera {param_name}: {value}")
 
-    def on_camera_reset(self):
-        """Handle camera reset."""
+    def on_camera_reset(self) -> None:
+        """Handle camera reset to default state."""
         self.pixy_camera.reset()
         self.log("Camera reset")
 
-    def on_z_optimization_toggle(self, enabled):
+    def on_z_optimization_toggle(self, enabled: bool) -> None:
         """Handle Z optimization enable/disable."""
         self.z_optimization_enabled = enabled
         self.log(f"Z Optimization: {'ENABLED' if enabled else 'DISABLED'}")
@@ -911,8 +935,8 @@ class BaseStewartSimulator(QMainWindow):
         if not self.controller_enabled:  # Only in manual mode
             self.calculate_ik()
 
-    def calculate_ik(self):
-        """Calculate inverse kinematics for current pose."""
+    def calculate_ik(self) -> None:
+        """Calculate inverse kinematics for current pose and update servos."""
         translation = np.array([self.dof_values['x'],
                                 self.dof_values['y'],
                                 self.dof_values['z']])
@@ -973,8 +997,8 @@ class BaseStewartSimulator(QMainWindow):
         # Update GUI to reflect Z optimization changes
         self.update_gui_modules()
 
-    def start_simulation(self):
-        """Start simulation loop."""
+    def start_simulation(self) -> None:
+        """Start simulation loop and enable controls."""
         self.simulation_running = True
         self.last_update_time = time.time()
         self.log("Simulation started")
@@ -986,8 +1010,8 @@ class BaseStewartSimulator(QMainWindow):
 
         self.simulation_timer.start(self.update_rate_ms)
 
-    def stop_simulation(self):
-        """Stop simulation loop."""
+    def stop_simulation(self) -> None:
+        """Stop simulation loop and disable controls."""
         self.simulation_running = False
         self.simulation_timer.stop()
 
@@ -998,8 +1022,8 @@ class BaseStewartSimulator(QMainWindow):
 
         self.log("Simulation stopped")
 
-    def reset_simulation(self):
-        """Reset simulation to initial state."""
+    def reset_simulation(self) -> None:
+        """Reset simulation to initial state and clear all data."""
         was_running = self.simulation_running
         if was_running:
             self.stop_simulation()
@@ -1028,8 +1052,8 @@ class BaseStewartSimulator(QMainWindow):
         if was_running:
             self.start_simulation()
 
-    def simulation_loop(self):
-        """Main simulation update loop."""
+    def simulation_loop(self) -> None:
+        """Main simulation update loop - physics, controller, and visualization."""
         if not self.simulation_running:
             return
 
@@ -1113,9 +1137,9 @@ class BaseStewartSimulator(QMainWindow):
                         self.controller_enabled = False
                     else:
                         rx_raw, ry_raw = controller_output
-                        rx, ry, tilt_mag = clip_tilt_vector(rx_raw, ry_raw, MAX_TILT_ANGLE_DEG)
+                        rx, ry, tilt_mag = clip_tilt_vector(rx_raw, ry_raw, MAX_CONTROLLER_OUTPUT_DEG)
 
-                        if tilt_mag > MAX_TILT_ANGLE_DEG:
+                        if tilt_mag > MAX_CONTROLLER_OUTPUT_DEG:
                             controller_name = self.controller_config.get_controller_name()
                             self.log(f"{controller_name} output clipped: "
                                      f"({rx_raw:.2f}, {ry_raw:.2f}) → ({rx:.2f}, {ry:.2f})")
@@ -1294,20 +1318,23 @@ class BaseStewartSimulator(QMainWindow):
         self.last_update_time = current_time
 
     @abstractmethod
-    def _initialize_controller(self):
+    def _initialize_controller(self) -> None:
         """Initialize controller (implemented by subclass)."""
         pass
 
     @abstractmethod
-    def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
+    def _update_controller(self, ball_pos_mm: Tuple[float, float],
+                          ball_vel_mm_s: Tuple[float, float],
+                          target_pos_mm: Tuple[float, float],
+                          dt: float) -> Optional[Tuple[float, float]]:
         """Update controller and return control output (implemented by subclass)."""
         pass
 
-    def on_controller_param_change(self):
+    def on_controller_param_change(self) -> None:
         """Callback when controller parameters change."""
         pass
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: QEvent) -> None:
         """Clean shutdown when window is closed."""
         # Stop simulation first
         self.simulation_running = False

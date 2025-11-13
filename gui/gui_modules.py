@@ -7,22 +7,34 @@ Modules communicate with the main simulator through callbacks.
 PyQt6 implementation for high-performance rendering.
 """
 
+from typing import Dict, Any, Optional, Tuple
+import serial.tools.list_ports
+
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                               QLabel, QPushButton, QSlider, QCheckBox, QComboBox,
                               QGroupBox, QTextEdit, QMessageBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
-import serial.tools.list_ports
 
-from core.utils import (format_time, format_vector_2d, MAX_TILT_ANGLE_DEG, IMUKalmanConfig,
-                         TrajectoryPatternConfig, ManualPoseControlConfig, KalmanFilterConfig,
-                         Pixy2CameraConfig, GUIConfig, ControlLoopConfig, BallControlConfig)
+from core.utils import (
+    format_time, format_vector_2d, MAX_TILT_ANGLE_DEG,
+    IMUKalmanConfig, TrajectoryPatternConfig,
+    KalmanFilterConfig, Pixy2CameraConfig, GUIConfig,
+    # GUI constants
+    GUI_FONT_MONOSPACE, GUI_FONT_SANS,
+    GUI_FONT_SIZE_TINY, GUI_FONT_SIZE_SMALL, GUI_FONT_SIZE_NORMAL, GUI_FONT_SIZE_LARGE,
+    GUI_BUTTON_WIDTH_SMALL, GUI_BUTTON_WIDTH_MEDIUM, GUI_BUTTON_WIDTH_LARGE,
+    GUI_BUTTON_HEIGHT_NORMAL, GUI_BUTTON_HEIGHT_LARGE,
+    GUI_VALUE_LABEL_WIDTH_SMALL, GUI_VALUE_LABEL_WIDTH_MEDIUM, GUI_VALUE_LABEL_WIDTH_LARGE,
+    GUI_SLIDER_SCALE_COARSE, GUI_SLIDER_SCALE_FINE,
+    GUI_COLOR_ORANGE, GUI_LOG_HEIGHT_MULTIPLIER
+)
 
 
 class GUIModule:
     """Base class for all GUI modules."""
 
-    def __init__(self, parent, colors, callbacks=None):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Optional[Dict[str, Any]] = None) -> None:
         """
         Args:
             parent: Parent QWidget
@@ -32,13 +44,13 @@ class GUIModule:
         self.parent = parent
         self.colors = colors
         self.callbacks = callbacks or {}
-        self.widget = None
+        self.widget: Optional[QWidget] = None
 
-    def create(self):
+    def create(self) -> Optional[QWidget]:
         """Create and return the module's widget."""
         raise NotImplementedError
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
         """Update module with new state."""
         pass
 
@@ -46,7 +58,8 @@ class GUIModule:
 class SimulationControlModule(GUIModule):
     """Start/Stop/Reset simulation controls."""
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create simulation control widget with start/stop/reset buttons and time display."""
         group = QGroupBox("Simulation Control")
         layout = QVBoxLayout()
 
@@ -54,24 +67,24 @@ class SimulationControlModule(GUIModule):
 
         self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self.callbacks.get('start'))
-        self.start_btn.setMinimumWidth(100)
+        self.start_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
         btn_layout.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.callbacks.get('stop'))
         self.stop_btn.setEnabled(False)
-        self.stop_btn.setMinimumWidth(100)
+        self.stop_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
         btn_layout.addWidget(self.stop_btn)
 
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.clicked.connect(self.callbacks.get('reset'))
-        self.reset_btn.setMinimumWidth(100)
+        self.reset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
         btn_layout.addWidget(self.reset_btn)
 
         layout.addLayout(btn_layout)
 
         self.time_label = QLabel("Time: 0.00s")
-        font = QFont("Consolas", 10)
+        font = QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_LARGE)
         font.setBold(True)
         self.time_label.setFont(font)
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -79,7 +92,7 @@ class SimulationControlModule(GUIModule):
 
         # Calibration timer
         self.calibration_label = QLabel("")
-        calib_font = QFont("Consolas", 10)
+        calib_font = QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_LARGE)
         calib_font.setBold(True)
         self.calibration_label.setFont(calib_font)
         self.calibration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -89,7 +102,8 @@ class SimulationControlModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update simulation time display, button states, and calibration timer."""
         if 'simulation_time' in state:
             self.time_label.setText(f"Time: {format_time(state['simulation_time'])}")
 
@@ -115,13 +129,25 @@ class SimulationControlModule(GUIModule):
 class ControllerModule(GUIModule):
     """Controller enable/disable and parameter tuning."""
 
-    def __init__(self, parent, colors, callbacks, controller_config, controller_widgets):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 controller_config: Any, controller_widgets: Dict[str, Any]) -> None:
+        """
+        Initialize controller module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            controller_config: Controller configuration object
+            controller_widgets: Dict containing parameter slider widgets
+        """
         super().__init__(parent, colors, callbacks)
         self.controller_config = controller_config
         self.controller_widgets = controller_widgets
         self.controller_enabled = callbacks.get('controller_enabled_var')
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create controller widget with enable toggle and parameter sliders."""
         controller_name = self.controller_config.get_controller_name()
         group = QGroupBox(f"{controller_name} Ball Balancing")
         layout = QVBoxLayout()
@@ -134,7 +160,7 @@ class ControllerModule(GUIModule):
         enable_layout.addWidget(self.enable_checkbox)
 
         self.status_label = QLabel("[OFF]")
-        font = QFont("Segoe UI", 10)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE)
         self.status_label.setFont(font)
         self.status_label.setStyleSheet(f"color: {self.colors['border']};")
         enable_layout.addWidget(self.status_label)
@@ -156,7 +182,7 @@ class ControllerModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _build_param_sliders(self):
+    def _build_param_sliders(self) -> None:
         """Build parameter sliders in the params_container."""
         if 'param_definitions' in self.controller_widgets:
             param_definitions = self.controller_widgets['param_definitions']
@@ -182,13 +208,13 @@ class ControllerModule(GUIModule):
 
                 self.controller_config.default_scalar_idx = old_idx
 
-    def _on_enable_toggle(self):
+    def _on_enable_toggle(self) -> None:
         """Handle enable checkbox toggle - update state then call callback."""
         self.controller_enabled = self.enable_checkbox.isChecked()
         if self.callbacks.get('toggle_controller'):
             self.callbacks['toggle_controller']()
 
-    def rebuild_params(self, param_definitions, controller_config):
+    def rebuild_params(self, param_definitions: Any, controller_config: Any) -> None:
         """Rebuild parameter sliders for new controller type."""
         self.controller_config = controller_config
         self.controller_widgets['param_definitions'] = param_definitions
@@ -220,7 +246,8 @@ class ControllerModule(GUIModule):
         # Rebuild parameter sliders
         self._build_param_sliders()
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update controller enable status and status indicator display."""
         if 'controller_enabled' in state:
             enabled = state['controller_enabled']
             # Update checkbox if state changed externally (block signals to prevent double-toggle)
@@ -238,13 +265,24 @@ class ControllerModule(GUIModule):
 class TrajectoryPatternModule(GUIModule):
     """Trajectory pattern selection with dynamic parameter controls."""
 
-    def __init__(self, parent, colors, callbacks, pattern_var):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 pattern_var: str) -> None:
+        """
+        Initialize trajectory pattern module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            pattern_var: Initial pattern selection
+        """
         super().__init__(parent, colors, callbacks)
         self.pattern_var = pattern_var
-        self.param_widgets = {}
-        self.params_layout = None
+        self.param_widgets: Dict[str, Any] = {}
+        self.params_layout: Optional[QVBoxLayout] = None
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create trajectory pattern widget with pattern selector and dynamic parameter sliders."""
         group = QGroupBox("Trajectory Pattern")
         layout = QVBoxLayout()
 
@@ -260,14 +298,14 @@ class TrajectoryPatternModule(GUIModule):
 
         reset_btn = QPushButton("Reset")
         reset_btn.clicked.connect(self.callbacks.get('pattern_reset'))
-        reset_btn.setMinimumWidth(80)
+        reset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_SMALL)
         selector_layout.addWidget(reset_btn)
         selector_layout.addStretch()
 
         layout.addLayout(selector_layout)
 
         self.info_label = QLabel("Tracking: Center (0, 0)")
-        font = QFont("Consolas", 8)
+        font = QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL)
         self.info_label.setFont(font)
         self.info_label.setStyleSheet(f"color: {self.colors['success']};")
         layout.addWidget(self.info_label)
@@ -284,13 +322,14 @@ class TrajectoryPatternModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_pattern_change(self, pattern):
+    def _on_pattern_change(self, pattern: str) -> None:
+        """Handle pattern selection change and rebuild parameter sliders."""
         self.pattern_var = pattern
         self._update_pattern_params()
         if self.callbacks.get('pattern_change'):
             self.callbacks['pattern_change'](pattern)
 
-    def _update_pattern_params(self):
+    def _update_pattern_params(self) -> None:
         """Update parameter sliders based on selected pattern."""
         # Clear existing widgets
         while self.params_layout.count():
@@ -322,7 +361,7 @@ class TrajectoryPatternModule(GUIModule):
 
         if not params:
             no_params_label = QLabel("No adjustable parameters")
-            font = QFont("Segoe UI", 8)
+            font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_SMALL)
             font.setItalic(True)
             no_params_label.setFont(font)
             no_params_label.setStyleSheet(f"color: {self.colors['border']};")
@@ -332,13 +371,15 @@ class TrajectoryPatternModule(GUIModule):
         for param_name, label, min_val, max_val, default, resolution in params:
             self._create_param_slider(param_name, label, min_val, max_val, default, resolution)
 
-    def _create_param_slider(self, param_name, label, min_val, max_val, default, resolution):
+    def _create_param_slider(self, param_name: str, label: str, min_val: float, max_val: float,
+                             default: float, resolution: float) -> None:
+        """Create a parameter slider for pattern configuration."""
         param_widget = QWidget()
         grid = QGridLayout()
         grid.setContentsMargins(0, 3, 0, 3)
 
         label_widget = QLabel(label)
-        label_widget.setFont(QFont("Segoe UI", 9))
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
         grid.addWidget(label_widget, 0, 0)
 
         slider = QSlider(Qt.Orientation.Horizontal)
@@ -348,8 +389,8 @@ class TrajectoryPatternModule(GUIModule):
         grid.addWidget(slider, 0, 1)
 
         value_label = QLabel(f"{default:.1f}")
-        value_label.setFont(QFont("Consolas", 9))
-        value_label.setMinimumWidth(60)
+        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
+        value_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_SMALL)
         grid.addWidget(value_label, 0, 2)
 
         def on_change(val):
@@ -371,7 +412,8 @@ class TrajectoryPatternModule(GUIModule):
             'resolution': resolution
         }
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update trajectory pattern info label with current target position."""
         if 'pattern_info' in state:
             self.info_label.setText(state['pattern_info'])
 
@@ -379,18 +421,19 @@ class TrajectoryPatternModule(GUIModule):
 class BallControlModule(GUIModule):
     """Ball reset and push buttons."""
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create ball control widget with reset and push buttons."""
         group = QGroupBox("Ball Control")
         layout = QHBoxLayout()
 
         reset_btn = QPushButton("Reset Ball")
         reset_btn.clicked.connect(self.callbacks.get('reset_ball'))
-        reset_btn.setMinimumWidth(120)
+        reset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         layout.addWidget(reset_btn)
 
         push_btn = QPushButton("Push Ball")
         push_btn.clicked.connect(self.callbacks.get('push_ball'))
-        push_btn.setMinimumWidth(120)
+        push_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         layout.addWidget(push_btn)
 
         group.setLayout(layout)
@@ -401,23 +444,25 @@ class BallControlModule(GUIModule):
 class BallStateModule(GUIModule):
     """Ball position and velocity display."""
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create ball state widget with position and velocity labels."""
         group = QGroupBox("Ball State")
         layout = QVBoxLayout()
 
         self.pos_label = QLabel("Position: (0.0, 0.0) mm")
-        self.pos_label.setFont(QFont("Consolas", 9))
+        self.pos_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.pos_label)
 
         self.vel_label = QLabel("Velocity: (0.0, 0.0) mm/s")
-        self.vel_label.setFont(QFont("Consolas", 9))
+        self.vel_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.vel_label)
 
         group.setLayout(layout)
         self.widget = group
         return self.widget
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update ball position and velocity display."""
         if 'ball_pos' in state:
             self.pos_label.setText(f"Position: {format_vector_2d(state['ball_pos'])}")
         if 'ball_vel' in state:
@@ -433,11 +478,22 @@ class BallStateModule(GUIModule):
 class ConfigurationModule(GUIModule):
     """Configuration options."""
 
-    def __init__(self, parent, colors, callbacks, use_offset_var):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 use_offset_var: bool) -> None:
+        """
+        Initialize configuration module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            use_offset_var: Initial state of offset checkbox
+        """
         super().__init__(parent, colors, callbacks)
         self.use_offset_var = use_offset_var
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create configuration widget with top surface offset checkbox."""
         group = QGroupBox("Configuration")
         layout = QVBoxLayout()
 
@@ -450,7 +506,7 @@ class ConfigurationModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_offset_toggle(self):
+    def _on_offset_toggle(self) -> None:
         """Handle offset checkbox toggle."""
         self.use_offset_var = self.offset_checkbox.isChecked()
         if self.callbacks.get('toggle_offset'):
@@ -460,13 +516,24 @@ class ConfigurationModule(GUIModule):
 class ManualPoseControlModule(GUIModule):
     """6 DOF manual control sliders."""
 
-    def __init__(self, parent, colors, callbacks, dof_config):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 dof_config: Dict[str, Tuple[float, float, float, float, str]]) -> None:
+        """
+        Initialize manual pose control module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            dof_config: Dict of DOF configs (min, max, resolution, default, label)
+        """
         super().__init__(parent, colors, callbacks)
         self.dof_config = dof_config
-        self.sliders = {}
-        self.value_labels = {}
+        self.sliders: Dict[str, QSlider] = {}
+        self.value_labels: Dict[str, QLabel] = {}
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create manual pose control widget with 6 DOF sliders and tilt indicator."""
         group = QGroupBox("Manual Pose Control (6 DOF)")
         main_layout = QVBoxLayout()
 
@@ -474,7 +541,7 @@ class ManualPoseControlModule(GUIModule):
         home_btn_layout = QHBoxLayout()
         home_btn = QPushButton("Home Position")
         home_btn.clicked.connect(self.callbacks.get('go_home'))
-        home_btn.setMinimumWidth(120)
+        home_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         home_btn_layout.addWidget(home_btn)
         home_btn_layout.addStretch()
         main_layout.addLayout(home_btn_layout)
@@ -484,7 +551,7 @@ class ManualPoseControlModule(GUIModule):
 
         for idx, (dof, (min_val, max_val, res, default, label)) in enumerate(self.dof_config.items()):
             label_widget = QLabel(label)
-            label_widget.setFont(QFont("Segoe UI", 9))
+            label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
             grid.addWidget(label_widget, idx, 0)
 
             slider = QSlider(Qt.Orientation.Horizontal)
@@ -494,15 +561,15 @@ class ManualPoseControlModule(GUIModule):
             grid.addWidget(slider, idx, 1)
 
             value_label = QLabel(f"{default:.2f}")
-            value_label.setFont(QFont("Consolas", 9))
-            value_label.setMinimumWidth(80)
+            value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
+            value_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_LARGE)
             grid.addWidget(value_label, idx, 2)
 
-            def on_change(val, d=dof, r=res):
-                value = val * r
-                self.value_labels[d].setText(f"{value:.2f}")
+            def on_change(val, dof_name=dof, resolution=res):
+                value = val * resolution
+                self.value_labels[dof_name].setText(f"{value:.2f}")
                 if self.callbacks.get('slider_change'):
-                    self.callbacks['slider_change'](d, value)
+                    self.callbacks['slider_change'](dof_name, value)
 
             slider.valueChanged.connect(on_change)
             self.sliders[dof] = slider
@@ -514,7 +581,7 @@ class ManualPoseControlModule(GUIModule):
         tilt_layout = QHBoxLayout()
         tilt_layout.addWidget(QLabel("Tilt Vector:"))
         self.tilt_magnitude_label = QLabel("0.00° (0.0%)")
-        self.tilt_magnitude_label.setFont(QFont("Consolas", 9))
+        self.tilt_magnitude_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         self.tilt_magnitude_label.setStyleSheet(f"color: {self.colors['success']};")
         tilt_layout.addWidget(self.tilt_magnitude_label)
         tilt_layout.addStretch()
@@ -526,7 +593,8 @@ class ManualPoseControlModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update DOF slider positions and tilt magnitude indicator."""
         if 'dof_values' in state:
             for dof, val in state['dof_values'].items():
                 if dof in self.value_labels:
@@ -545,7 +613,7 @@ class ManualPoseControlModule(GUIModule):
             if percent > 80:
                 color = self.colors['warning']
             elif percent > 60:
-                color = '#ffa500'
+                color = GUI_COLOR_ORANGE
             else:
                 color = self.colors['success']
 
@@ -556,11 +624,22 @@ class ManualPoseControlModule(GUIModule):
 class ServoAnglesModule(GUIModule):
     """Display commanded and actual servo angles."""
 
-    def __init__(self, parent, colors, callbacks, show_actual=True):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 show_actual: bool = True) -> None:
+        """
+        Initialize servo angles module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            show_actual: Whether to show actual angles (for hardware mode)
+        """
         super().__init__(parent, colors, callbacks)
         self.show_actual = show_actual
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create servo angles widget showing commanded and optionally actual servo angles."""
         container = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -571,7 +650,7 @@ class ServoAnglesModule(GUIModule):
         self.cmd_labels = []
         for i in range(6):
             label = QLabel(f"S{i + 1}: 0.00°")
-            label.setFont(QFont("Consolas", 9))
+            label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
             cmd_grid.addWidget(label, i // 3, i % 3)
             self.cmd_labels.append(label)
 
@@ -585,7 +664,7 @@ class ServoAnglesModule(GUIModule):
             self.actual_labels = []
             for i in range(6):
                 label = QLabel(f"S{i + 1}: 0.00°")
-                label.setFont(QFont("Consolas", 9))
+                label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
                 actual_grid.addWidget(label, i // 3, i % 3)
                 self.actual_labels.append(label)
 
@@ -596,7 +675,8 @@ class ServoAnglesModule(GUIModule):
         self.widget = container
         return self.widget
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update commanded and actual servo angle displays."""
         if 'cmd_angles' in state:
             for i, angle in enumerate(state['cmd_angles']):
                 self.cmd_labels[i].setText(f"S{i + 1}: {angle:6.2f}°")
@@ -609,66 +689,80 @@ class ServoAnglesModule(GUIModule):
 class PlatformPoseModule(GUIModule):
     """Display platform pose from forward kinematics."""
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create platform pose widget showing translation and rotation."""
         group = QGroupBox("Platform Pose (FK)")
         layout = QVBoxLayout()
 
         self.pos_label = QLabel("X: 0.00  Y: 0.00  Z: 0.00 mm")
-        self.pos_label.setFont(QFont("Consolas", 9))
+        self.pos_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.pos_label)
 
         self.rot_label = QLabel("Roll: 0.00  Pitch: 0.00  Yaw: 0.00°")
-        self.rot_label.setFont(QFont("Consolas", 9))
+        self.rot_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.rot_label)
 
         group.setLayout(layout)
         self.widget = group
         return self.widget
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update platform translation and rotation from FK."""
         if 'fk_translation' in state:
-            t = state['fk_translation']
-            self.pos_label.setText(f"X: {t[0]:6.2f}  Y: {t[1]:6.2f}  Z: {t[2]:6.2f} mm")
+            translation = state['fk_translation']
+            self.pos_label.setText(f"X: {translation[0]:6.2f}  Y: {translation[1]:6.2f}  Z: {translation[2]:6.2f} mm")
 
         if 'fk_rotation' in state:
-            r = state['fk_rotation']
-            self.rot_label.setText(f"Roll: {r[0]:6.2f}  Pitch: {r[1]:6.2f}  Yaw: {r[2]:6.2f}°")
+            rotation = state['fk_rotation']
+            self.rot_label.setText(f"Roll: {rotation[0]:6.2f}  Pitch: {rotation[1]:6.2f}  Yaw: {rotation[2]:6.2f}°")
 
 
 class ControllerOutputModule(GUIModule):
     """Display controller output and error."""
 
-    def __init__(self, parent, colors, callbacks, controller_name):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 controller_name: str) -> None:
+        """
+        Initialize controller output module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            controller_name: Name of controller (PID/LQR)
+        """
         super().__init__(parent, colors, callbacks)
         self.controller_name = controller_name
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create controller output widget showing tilt output, magnitude, and error."""
         group = QGroupBox(f"{self.controller_name} Output")
         layout = QVBoxLayout()
 
         self.output_label = QLabel("Tilt: rx=0.00°  ry=0.00°")
-        self.output_label.setFont(QFont("Consolas", 9))
+        self.output_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.output_label)
 
         self.magnitude_label = QLabel("Magnitude: 0.00° (0%)")
-        self.magnitude_label.setFont(QFont("Consolas", 9))
+        self.magnitude_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.magnitude_label)
 
         self.error_label = QLabel("Error: (0.0, 0.0) mm")
-        self.error_label.setFont(QFont("Consolas", 9))
+        self.error_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.error_label)
 
         group.setLayout(layout)
         self.widget = group
         return self.widget
 
-    def set_controller_name(self, new_name):
+    def set_controller_name(self, new_name: str) -> None:
         """Update controller name in the group box title."""
         self.controller_name = new_name
         if hasattr(self.widget, 'setTitle'):
             self.widget.setTitle(f"{new_name} Output")
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update controller output tilt angles, magnitude, and error display."""
         if 'controller_output' in state:
             rx, ry = state['controller_output']
             self.output_label.setText(f"Tilt: rx={rx:.2f}°  ry={ry:.2f}°")
@@ -685,18 +779,29 @@ class ControllerOutputModule(GUIModule):
 class DebugLogModule(GUIModule):
     """Debug log display."""
 
-    def __init__(self, parent, colors, callbacks, height=10):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 height: int = 10) -> None:
+        """
+        Initialize debug log module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            height: Height multiplier for log text area
+        """
         super().__init__(parent, colors, callbacks)
         self.height = height
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create debug log widget with scrollable text area."""
         group = QGroupBox("Debug Log")
         layout = QVBoxLayout()
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 8))
-        self.log_text.setMinimumHeight(self.height * 20)
+        self.log_text.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
+        self.log_text.setMinimumHeight(self.height * GUI_LOG_HEIGHT_MULTIPLIER)
         self.log_text.setStyleSheet(f"""
             QTextEdit {{
                 background-color: {self.colors['widget_bg']};
@@ -710,7 +815,14 @@ class DebugLogModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def log(self, message, timestamp=None):
+    def log(self, message: str, timestamp: Optional[float] = None) -> None:
+        """
+        Append a message to the debug log.
+
+        Args:
+            message: Log message text
+            timestamp: Optional timestamp to prepend
+        """
         if timestamp is not None:
             msg = f"[{format_time(timestamp)}] {message}"
         else:
@@ -721,14 +833,26 @@ class DebugLogModule(GUIModule):
 class SerialConnectionModule(GUIModule):
     """Serial port connection for hardware."""
 
-    def __init__(self, parent, colors, callbacks, port_var, connected_var=False):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 port_var: str, connected_var: bool = False) -> None:
+        """
+        Initialize serial connection module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            port_var: Initial selected port
+            connected_var: Initial connection status
+        """
         super().__init__(parent, colors, callbacks)
         self.port_var = port_var
         self.connected_var = connected_var
-        self.port_combo = None
-        self.port_status_label = None
+        self.port_combo: Optional[QComboBox] = None
+        self.port_status_label: Optional[QLabel] = None
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create serial connection widget with port selector and connect/disconnect buttons."""
         group = QGroupBox("Serial Connection")
         layout = QVBoxLayout()
 
@@ -740,14 +864,14 @@ class SerialConnectionModule(GUIModule):
 
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._refresh_ports)
-        refresh_btn.setMinimumWidth(80)
+        refresh_btn.setMinimumWidth(GUI_BUTTON_WIDTH_SMALL)
         port_layout.addWidget(refresh_btn)
         port_layout.addStretch()
 
         layout.addLayout(port_layout)
 
         self.port_status_label = QLabel("")
-        self.port_status_label.setFont(QFont("Consolas", 8))
+        self.port_status_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.port_status_label.setStyleSheet(f"color: {self.colors['fg']};")
         layout.addWidget(self.port_status_label)
 
@@ -755,13 +879,13 @@ class SerialConnectionModule(GUIModule):
 
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.callbacks.get('connect'))
-        self.connect_btn.setMinimumWidth(100)
+        self.connect_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
         btn_layout.addWidget(self.connect_btn)
 
         self.disconnect_btn = QPushButton("Disconnect")
         self.disconnect_btn.clicked.connect(self.callbacks.get('disconnect'))
         self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.setMinimumWidth(100)
+        self.disconnect_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
         btn_layout.addWidget(self.disconnect_btn)
 
         layout.addLayout(btn_layout)
@@ -780,7 +904,8 @@ class SerialConnectionModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _refresh_ports(self):
+    def _refresh_ports(self) -> None:
+        """Scan for available serial ports and update port selector dropdown."""
         try:
             ports = list(serial.tools.list_ports.comports())
             port_names = [port.device for port in ports]
@@ -802,7 +927,8 @@ class SerialConnectionModule(GUIModule):
             self.port_status_label.setStyleSheet(f"color: {self.colors['warning']};")
             self.connect_btn.setEnabled(False)
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update connection status and button states."""
         if 'connected' in state:
             if state['connected']:
                 self.status_label.setText("Connected")
@@ -819,23 +945,24 @@ class SerialConnectionModule(GUIModule):
 class PerformanceStatsModule(GUIModule):
     """Performance statistics for hardware mode."""
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create performance statistics widget showing control loop frequency and IK cache stats."""
         self.group = QGroupBox("Hardware Mode")
         layout = QVBoxLayout()
 
         self.fps_label = QLabel("Control Loop: 0 Hz")
-        font = QFont("Consolas", 10)
+        font = QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_LARGE)
         font.setBold(True)
         self.fps_label.setFont(font)
         self.fps_label.setStyleSheet(f"color: {self.colors['success']};")
         layout.addWidget(self.fps_label)
 
         self.cache_label = QLabel("IK Cache: 0.0%")
-        self.cache_label.setFont(QFont("Consolas", 9))
+        self.cache_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.cache_label)
 
         self.timeout_label = QLabel("IK Timeouts: 0")
-        self.timeout_label.setFont(QFont("Consolas", 9))
+        self.timeout_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(self.timeout_label)
 
         stats_btn = QPushButton("Show Statistics")
@@ -846,7 +973,8 @@ class PerformanceStatsModule(GUIModule):
         self.widget = self.group
         return self.widget
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update control loop frequency, IK cache hit rate, and timeout count."""
         # Accept both 'frequency' and 'fps' keys
         freq = state.get('frequency', state.get('fps', 0))
         if freq > 0:
@@ -863,14 +991,25 @@ class PerformanceStatsModule(GUIModule):
 class Pixy2CameraModule(GUIModule):
     """Pixy2 camera noise model configuration and control."""
 
-    def __init__(self, parent, colors, callbacks, camera=None):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 camera: Optional[Any] = None) -> None:
+        """
+        Initialize Pixy2 camera module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            camera: Optional Pixy2Camera instance to control
+        """
         super().__init__(parent, colors, callbacks)
         self.camera = camera
-        self.sliders = {}
-        self.value_labels = {}
+        self.sliders: Dict[str, QSlider] = {}
+        self.value_labels: Dict[str, QLabel] = {}
         self.camera_enabled = True
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create Pixy2 camera configuration widget with noise parameters and statistics."""
         group = QGroupBox("Pixy2 Camera Model")
         layout = QVBoxLayout()
 
@@ -883,7 +1022,7 @@ class Pixy2CameraModule(GUIModule):
         enable_layout.addWidget(self.enable_checkbox)
 
         self.status_indicator = QLabel("[ON]")
-        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.status_indicator.setStyleSheet(f"color: {self.colors['success']};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -897,7 +1036,7 @@ class Pixy2CameraModule(GUIModule):
         self._create_parameter_row(layout, "Sample Rate:", *Pixy2CameraConfig.SAMPLE_RATE_RANGE, Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ, 0.1, 'sample_rate', 'Hz', "{:.1f}")
 
         info_label = QLabel("(0 Hz = sample every frame)")
-        font = QFont("Segoe UI", 7)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_TINY)
         font.setItalic(True)
         info_label.setFont(font)
         info_label.setStyleSheet(f"color: {self.colors['border']};")
@@ -906,21 +1045,21 @@ class Pixy2CameraModule(GUIModule):
         # Camera statistics
         stats_layout = QVBoxLayout()
         stats_label = QLabel("Camera Stats:")
-        font = QFont("Segoe UI", 9)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL)
         font.setBold(True)
         stats_label.setFont(font)
         stats_layout.addWidget(stats_label)
 
         self.measurement_label = QLabel("Raw: (0.0, 0.0) mm")
-        self.measurement_label.setFont(QFont("Consolas", 8))
+        self.measurement_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         stats_layout.addWidget(self.measurement_label)
 
         self.quantized_label = QLabel("Quantized: (0.0, 0.0) mm")
-        self.quantized_label.setFont(QFont("Consolas", 8))
+        self.quantized_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         stats_layout.addWidget(self.quantized_label)
 
         self.sample_status_label = QLabel("Last sample: never")
-        self.sample_status_label.setFont(QFont("Consolas", 8))
+        self.sample_status_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         stats_layout.addWidget(self.sample_status_label)
 
         layout.addLayout(stats_layout)
@@ -930,18 +1069,18 @@ class Pixy2CameraModule(GUIModule):
 
         reset_btn = QPushButton("Reset Camera")
         reset_btn.clicked.connect(self._on_reset_camera)
-        reset_btn.setMinimumWidth(120)
+        reset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         btn_layout.addWidget(reset_btn)
 
         preset_btn = QPushButton("Preset: Real")
         preset_btn.clicked.connect(self._load_real_preset)
-        preset_btn.setMinimumWidth(120)
+        preset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         btn_layout.addWidget(preset_btn)
 
         layout.addLayout(btn_layout)
 
         preset_info = QLabel("Real preset: measured values from actual Pixy2")
-        font = QFont("Segoe UI", 7)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_TINY)
         font.setItalic(True)
         preset_info.setFont(font)
         preset_info.setStyleSheet(f"color: {self.colors['border']};")
@@ -951,12 +1090,14 @@ class Pixy2CameraModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _create_parameter_row(self, parent_layout, label, min_val, max_val, default,
-                              resolution, param_name, unit='', format_str="{:.2f}"):
+    def _create_parameter_row(self, parent_layout: QVBoxLayout, label: str, min_val: float,
+                              max_val: float, default: float, resolution: float,
+                              param_name: str, unit: str = '', format_str: str = "{:.2f}") -> None:
+        """Create a parameter slider row with label, slider, and value display."""
         grid = QGridLayout()
 
         label_widget = QLabel(label)
-        label_widget.setFont(QFont("Segoe UI", 9))
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
         grid.addWidget(label_widget, 0, 0)
 
         slider = QSlider(Qt.Orientation.Horizontal)
@@ -967,26 +1108,27 @@ class Pixy2CameraModule(GUIModule):
 
         value_text = format_str.format(default) + (f" {unit}" if unit else "")
         value_label = QLabel(value_text)
-        value_label.setFont(QFont("Consolas", 9))
+        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         value_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        value_label.setMinimumWidth(80)
+        value_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_LARGE)
         grid.addWidget(value_label, 0, 2)
 
         self.sliders[param_name] = slider
         self.value_labels[param_name] = value_label
 
-        def on_change(val, pn=param_name, r=resolution, fs=format_str, u=unit):
-            value = val * r
-            value_text = fs.format(value) + (f" {u}" if u else "")
-            self.value_labels[pn].setText(value_text)
-            self._on_param_change(pn, value)
+        def on_change(val, param=param_name, res=resolution, fmt=format_str, unit_str=unit):
+            value = val * res
+            value_text = fmt.format(value) + (f" {unit_str}" if unit_str else "")
+            self.value_labels[param].setText(value_text)
+            self._on_param_change(param, value)
 
         slider.valueChanged.connect(on_change)
         grid.setColumnStretch(1, 1)
 
         parent_layout.addLayout(grid)
 
-    def _on_enable_toggle(self):
+    def _on_enable_toggle(self) -> None:
+        """Handle camera noise enable/disable toggle."""
         enabled = self.enable_checkbox.isChecked()
         self.camera_enabled = enabled
 
@@ -1004,7 +1146,8 @@ class Pixy2CameraModule(GUIModule):
         if self.callbacks.get('camera_enable_change'):
             self.callbacks['camera_enable_change'](enabled)
 
-    def _on_param_change(self, param_name, value):
+    def _on_param_change(self, param_name: str, value: float) -> None:
+        """Apply parameter change to camera model."""
         if not self.camera or not self.camera_enabled:
             return
 
@@ -1020,14 +1163,16 @@ class Pixy2CameraModule(GUIModule):
         if self.callbacks.get('camera_param_change'):
             self.callbacks['camera_param_change'](param_name, value)
 
-    def _on_reset_camera(self):
+    def _on_reset_camera(self) -> None:
+        """Reset camera to default state."""
         if self.camera:
             self.camera.reset()
 
         if self.callbacks.get('camera_reset'):
             self.callbacks['camera_reset']()
 
-    def _load_real_preset(self):
+    def _load_real_preset(self) -> None:
+        """Load measured values from actual Pixy2 hardware."""
         presets = {
             'pixel_size': 1.4,
             'noise_std': 0.4,
@@ -1055,7 +1200,8 @@ class Pixy2CameraModule(GUIModule):
         if self.callbacks.get('log'):
             self.callbacks['log']("Loaded real Pixy2 camera preset")
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update camera display with current measurements and status."""
         if 'camera_raw_measurement' in state:
             x, y = state['camera_raw_measurement']
             if x is not None and y is not None:
@@ -1075,14 +1221,25 @@ class Pixy2CameraModule(GUIModule):
 class KalmanFilterModule(GUIModule):
     """Kalman filter configuration and monitoring."""
 
-    def __init__(self, parent, colors, callbacks, kalman_filter=None):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 kalman_filter: Optional[Any] = None) -> None:
+        """
+        Initialize Kalman filter module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            kalman_filter: Optional KalmanFilter instance to monitor
+        """
         super().__init__(parent, colors, callbacks)
         self.kalman_filter = kalman_filter
-        self.sliders = {}
-        self.value_labels = {}
+        self.sliders: Dict[str, QSlider] = {}
+        self.value_labels: Dict[str, QLabel] = {}
         self.filter_enabled = False
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create Kalman filter control panel with parameter sliders and state display."""
         group = QGroupBox("Kalman Filter")
         layout = QVBoxLayout()
 
@@ -1095,7 +1252,7 @@ class KalmanFilterModule(GUIModule):
         enable_layout.addWidget(self.enable_checkbox)
 
         self.status_indicator = QLabel("[OFF]")
-        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -1109,28 +1266,28 @@ class KalmanFilterModule(GUIModule):
         # Filter state display
         state_layout = QVBoxLayout()
         state_label = QLabel("Filter State:")
-        font = QFont("Segoe UI", 9)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL)
         font.setBold(True)
         state_label.setFont(font)
         state_layout.addWidget(state_label)
 
         self.position_label = QLabel("Position: (0.0, 0.0) mm")
-        self.position_label.setFont(QFont("Consolas", 8))
+        self.position_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         state_layout.addWidget(self.position_label)
 
         self.velocity_label = QLabel("Velocity: (0.0, 0.0) mm/s")
-        self.velocity_label.setFont(QFont("Consolas", 8))
+        self.velocity_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         state_layout.addWidget(self.velocity_label)
 
         self.uncertainty_label = QLabel("Uncertainty: ±0.0 mm")
-        self.uncertainty_label.setFont(QFont("Consolas", 8))
+        self.uncertainty_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         state_layout.addWidget(self.uncertainty_label)
 
         layout.addLayout(state_layout)
 
         # Statistics
         self.stats_label = QLabel("Updates: 0/0 (0.0%)")
-        self.stats_label.setFont(QFont("Consolas", 8))
+        self.stats_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.stats_label.setStyleSheet(f"color: {self.colors['border']};")
         layout.addWidget(self.stats_label)
 
@@ -1139,12 +1296,12 @@ class KalmanFilterModule(GUIModule):
 
         reset_btn = QPushButton("Reset Filter")
         reset_btn.clicked.connect(self._on_reset_filter)
-        reset_btn.setMinimumWidth(120)
+        reset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         btn_layout.addWidget(reset_btn)
 
         details_btn = QPushButton("Show Details")
         details_btn.clicked.connect(self._on_show_details)
-        details_btn.setMinimumWidth(120)
+        details_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
         btn_layout.addWidget(details_btn)
 
         layout.addLayout(btn_layout)
@@ -1153,40 +1310,43 @@ class KalmanFilterModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _create_parameter_slider(self, parent_layout, label, min_val, max_val, default, param_name):
+    def _create_parameter_slider(self, parent_layout: QVBoxLayout, label: str, min_val: float,
+                                  max_val: float, default: float, param_name: str) -> None:
+        """Create a parameter slider for filter tuning."""
         grid = QGridLayout()
 
         label_widget = QLabel(label)
-        label_widget.setFont(QFont("Segoe UI", 9))
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
         grid.addWidget(label_widget, 0, 0)
 
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setMinimum(int(min_val * 100))
-        slider.setMaximum(int(max_val * 100))
-        slider.setValue(int(default * 100))
+        slider.setMinimum(int(min_val * GUI_SLIDER_SCALE_COARSE))
+        slider.setMaximum(int(max_val * GUI_SLIDER_SCALE_COARSE))
+        slider.setValue(int(default * GUI_SLIDER_SCALE_COARSE))
         slider.setEnabled(False)
         grid.addWidget(slider, 0, 1)
 
         value_label = QLabel(f"{default:.2f}")
-        value_label.setFont(QFont("Consolas", 9))
+        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         value_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        value_label.setMinimumWidth(60)
+        value_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_SMALL)
         grid.addWidget(value_label, 0, 2)
 
         self.sliders[param_name] = slider
         self.value_labels[param_name] = value_label
 
-        def on_change(val, pn=param_name):
+        def on_change(val, param=param_name):
             value = val / 100.0
-            self.value_labels[pn].setText(f"{value:.2f}")
-            self._on_param_change(pn, value)
+            self.value_labels[param].setText(f"{value:.2f}")
+            self._on_param_change(param, value)
 
         slider.valueChanged.connect(on_change)
         grid.setColumnStretch(1, 1)
 
         parent_layout.addLayout(grid)
 
-    def _on_enable_toggle(self):
+    def _on_enable_toggle(self) -> None:
+        """Handle Kalman filter enable/disable toggle."""
         enabled = self.enable_checkbox.isChecked()
         self.filter_enabled = enabled
 
@@ -1204,7 +1364,8 @@ class KalmanFilterModule(GUIModule):
         if self.callbacks.get('kalman_enable_change'):
             self.callbacks['kalman_enable_change'](enabled)
 
-    def _on_param_change(self, param_name, value):
+    def _on_param_change(self, param_name: str, value: float) -> None:
+        """Apply parameter change to Kalman filter."""
         if not self.kalman_filter or not self.filter_enabled:
             return
 
@@ -1216,14 +1377,16 @@ class KalmanFilterModule(GUIModule):
         if self.callbacks.get('kalman_param_change'):
             self.callbacks['kalman_param_change'](param_name, value)
 
-    def _on_reset_filter(self):
+    def _on_reset_filter(self) -> None:
+        """Reset Kalman filter to initial state."""
         if self.kalman_filter:
             self.kalman_filter.reset()
 
         if self.callbacks.get('kalman_reset'):
             self.callbacks['kalman_reset']()
 
-    def _on_show_details(self):
+    def _on_show_details(self) -> None:
+        """Display detailed Kalman filter statistics in a message box."""
         if not self.kalman_filter:
             return
 
@@ -1258,7 +1421,8 @@ class KalmanFilterModule(GUIModule):
         msg_box.setText(details)
         msg_box.exec()
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update Kalman filter display with current state and statistics."""
         if 'kalman_position' in state:
             pos = state['kalman_position']
             self.position_label.setText(f"Position: ({pos[0]:.2f}, {pos[1]:.2f}) mm")
@@ -1283,12 +1447,24 @@ class KalmanFilterModule(GUIModule):
 class PlotControlModule(GUIModule):
     """Control plot updates and refresh rate."""
 
-    def __init__(self, parent, colors, callbacks, plot_enabled_var, plot_rate_var):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 plot_enabled_var: bool, plot_rate_var: int) -> None:
+        """
+        Initialize plot control module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            plot_enabled_var: Initial plot enabled state
+            plot_rate_var: Initial plot refresh rate in Hz
+        """
         super().__init__(parent, colors, callbacks)
         self.plot_enabled_var = plot_enabled_var
         self.plot_rate_var = plot_rate_var
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create plot control panel with enable toggle and refresh rate slider."""
         group = QGroupBox("Plot Control")
         layout = QVBoxLayout()
 
@@ -1303,7 +1479,7 @@ class PlotControlModule(GUIModule):
         status_text = "[ON]" if self.plot_enabled_var else "[OFF]"
         color = self.colors['success'] if self.plot_enabled_var else self.colors['border']
         self.status_indicator = QLabel(status_text)
-        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.status_indicator.setStyleSheet(f"color: {color};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -1323,23 +1499,23 @@ class PlotControlModule(GUIModule):
         rate_grid.addWidget(self.rate_slider, 0, 1)
 
         self.rate_label = QLabel(f"{self.plot_rate_var} Hz")
-        self.rate_label.setFont(QFont("Consolas", 9))
+        self.rate_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         self.rate_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        self.rate_label.setMinimumWidth(70)
+        self.rate_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_MEDIUM)
         rate_grid.addWidget(self.rate_label, 0, 2)
 
         rate_grid.setColumnStretch(1, 1)
         layout.addLayout(rate_grid)
 
         info_label = QLabel("Lower rate = better control performance")
-        font = QFont("Segoe UI", 7)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_TINY)
         font.setItalic(True)
         info_label.setFont(font)
         info_label.setStyleSheet(f"color: {self.colors['border']};")
         layout.addWidget(info_label)
 
         self.perf_label = QLabel("")
-        self.perf_label.setFont(QFont("Consolas", 8))
+        self.perf_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.perf_label.setStyleSheet(f"color: {self.colors['border']};")
         layout.addWidget(self.perf_label)
 
@@ -1347,7 +1523,8 @@ class PlotControlModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_enable_toggle(self):
+    def _on_enable_toggle(self) -> None:
+        """Handle plot enable/disable toggle."""
         enabled = self.enable_checkbox.isChecked()
         self.plot_enabled_var = enabled
         status_text = "[ON]" if enabled else "[OFF]"
@@ -1358,13 +1535,15 @@ class PlotControlModule(GUIModule):
         if self.callbacks.get('plot_enable_change'):
             self.callbacks['plot_enable_change'](enabled)
 
-    def _on_rate_change(self, value):
+    def _on_rate_change(self, value: int) -> None:
+        """Handle plot refresh rate change."""
         self.plot_rate_var = value
         self.rate_label.setText(f"{value} Hz")
         if self.callbacks.get('plot_rate_change'):
             self.callbacks['plot_rate_change'](value)
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update plot performance display with frame drop statistics."""
         if 'plot_drops' in state:
             drops = state['plot_drops']
             if drops > 0:
@@ -1378,25 +1557,36 @@ class PlotControlModule(GUIModule):
 class ModeSelectionModule(GUIModule):
     """Real/Simulation mode toggle selector."""
 
-    def __init__(self, parent, colors, callbacks, current_mode='sim'):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 current_mode: str = 'sim') -> None:
+        """
+        Initialize mode selection module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            current_mode: Initial operation mode ('sim' or 'real')
+        """
         super().__init__(parent, colors, callbacks)
         self.current_mode = current_mode
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create operation mode selector with Simulation/Real Hardware buttons."""
         group = QGroupBox("Operation Mode")
         layout = QHBoxLayout()
 
         self.sim_btn = QPushButton("Simulation")
         self.sim_btn.setCheckable(True)
-        self.sim_btn.setMinimumWidth(120)
-        self.sim_btn.setMinimumHeight(40)
+        self.sim_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
+        self.sim_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_LARGE)
         self.sim_btn.clicked.connect(lambda: self._on_mode_select('sim'))
         layout.addWidget(self.sim_btn)
 
         self.real_btn = QPushButton("Real Hardware")
         self.real_btn.setCheckable(True)
-        self.real_btn.setMinimumWidth(120)
-        self.real_btn.setMinimumHeight(40)
+        self.real_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
+        self.real_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_LARGE)
         self.real_btn.clicked.connect(lambda: self._on_mode_select('real'))
         layout.addWidget(self.real_btn)
 
@@ -1410,7 +1600,8 @@ class ModeSelectionModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_mode_select(self, mode):
+    def _on_mode_select(self, mode: str) -> None:
+        """Handle mode selection change."""
         if mode == self.current_mode:
             return
 
@@ -1427,11 +1618,22 @@ class ModeSelectionModule(GUIModule):
 class ControllerSelectionModule(GUIModule):
     """PID/LQR/Manual controller toggle selector."""
 
-    def __init__(self, parent, colors, callbacks, current_controller='PID'):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 current_controller: str = 'PID') -> None:
+        """
+        Initialize controller selection module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            current_controller: Initial controller type ('PID', 'LQR', or 'Manual')
+        """
         super().__init__(parent, colors, callbacks)
         self.current_controller = current_controller
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create controller selection panel with PID/LQR/Manual buttons."""
         container = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1441,22 +1643,22 @@ class ControllerSelectionModule(GUIModule):
 
         self.pid_btn = QPushButton("PID")
         self.pid_btn.setCheckable(True)
-        self.pid_btn.setMinimumWidth(90)
-        self.pid_btn.setMinimumHeight(35)
+        self.pid_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
+        self.pid_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.pid_btn.clicked.connect(lambda: self._on_controller_select('PID'))
         btn_layout.addWidget(self.pid_btn)
 
         self.lqr_btn = QPushButton("LQR")
         self.lqr_btn.setCheckable(True)
-        self.lqr_btn.setMinimumWidth(90)
-        self.lqr_btn.setMinimumHeight(35)
+        self.lqr_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
+        self.lqr_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.lqr_btn.clicked.connect(lambda: self._on_controller_select('LQR'))
         btn_layout.addWidget(self.lqr_btn)
 
         self.manual_btn = QPushButton("Manual")
         self.manual_btn.setCheckable(True)
-        self.manual_btn.setMinimumWidth(90)
-        self.manual_btn.setMinimumHeight(35)
+        self.manual_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
+        self.manual_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.manual_btn.clicked.connect(lambda: self._on_controller_select('Manual'))
         btn_layout.addWidget(self.manual_btn)
 
@@ -1476,7 +1678,8 @@ class ControllerSelectionModule(GUIModule):
         self.widget = container
         return self.widget
 
-    def _on_controller_select(self, controller):
+    def _on_controller_select(self, controller: str) -> None:
+        """Handle controller type selection change."""
         if controller == self.current_controller:
             return
 
@@ -1494,13 +1697,26 @@ class ControllerSelectionModule(GUIModule):
 class ControlFrequencyModule(GUIModule):
     """Control loop frequency adjustment (hardware only)."""
 
-    def __init__(self, parent, colors, callbacks, frequency_var, min_freq=50, max_freq=500):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 frequency_var: int, min_freq: int = 50, max_freq: int = 500) -> None:
+        """
+        Initialize control frequency module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            frequency_var: Initial control frequency in Hz
+            min_freq: Minimum allowed frequency
+            max_freq: Maximum allowed frequency
+        """
         super().__init__(parent, colors, callbacks)
         self.frequency_var = frequency_var
         self.min_freq = min_freq
         self.max_freq = max_freq
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create control frequency panel with slider and diagnostic info."""
         group = QGroupBox("Control Frequency")
         layout = QVBoxLayout()
 
@@ -1518,9 +1734,11 @@ class ControlFrequencyModule(GUIModule):
         freq_grid.addWidget(self.freq_slider, 0, 1)
 
         self.freq_label = QLabel(f"{self.frequency_var} Hz")
-        self.freq_label.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        freq_font = QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_LARGE)
+        freq_font.setBold(True)
+        self.freq_label.setFont(freq_font)
         self.freq_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        self.freq_label.setMinimumWidth(80)
+        self.freq_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_LARGE)
         freq_grid.addWidget(self.freq_label, 0, 2)
 
         freq_grid.setColumnStretch(1, 1)
@@ -1529,19 +1747,19 @@ class ControlFrequencyModule(GUIModule):
         # Info labels
         info_layout = QVBoxLayout()
         self.period_label = QLabel(f"Period: {1000.0/self.frequency_var:.2f} ms")
-        self.period_label.setFont(QFont("Consolas", 8))
+        self.period_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.period_label.setStyleSheet(f"color: {self.colors['fg']};")
         info_layout.addWidget(self.period_label)
 
         self.camera_ratio_label = QLabel(f"Camera ratio: {self.frequency_var/50:.1f}× (50Hz)")
-        self.camera_ratio_label.setFont(QFont("Consolas", 8))
+        self.camera_ratio_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.camera_ratio_label.setStyleSheet(f"color: {self.colors['fg']};")
         info_layout.addWidget(self.camera_ratio_label)
 
         layout.addLayout(info_layout)
 
         warning_label = QLabel("Higher frequencies increase CPU load")
-        warning_label.setFont(QFont("Segoe UI", 8))
+        warning_label.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_SMALL))
         warning_label.setStyleSheet(f"color: {self.colors['warning']};")
         layout.addWidget(warning_label)
 
@@ -1549,7 +1767,8 @@ class ControlFrequencyModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_freq_change(self, value):
+    def _on_freq_change(self, value: int) -> None:
+        """Handle control frequency change and update diagnostic labels."""
         self.frequency_var = value
         self.freq_label.setText(f"{value} Hz")
         self.period_label.setText(f"Period: {1000.0/value:.2f} ms")
@@ -1558,7 +1777,8 @@ class ControlFrequencyModule(GUIModule):
         if self.callbacks.get('frequency_change'):
             self.callbacks['frequency_change'](value)
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update frequency display with actual measured frequency."""
         if 'actual_frequency' in state:
             actual = state['actual_frequency']
             if abs(actual - self.frequency_var) > 5:
@@ -1570,13 +1790,24 @@ class ControlFrequencyModule(GUIModule):
 class IMUKalmanParametersModule(GUIModule):
     """IMU Kalman filter parameters for orientation tracking."""
 
-    def __init__(self, parent, colors, callbacks, orientation_kalman=None):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 orientation_kalman: Optional[Any] = None) -> None:
+        """
+        Initialize IMU Kalman parameters module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            orientation_kalman: Optional orientation Kalman filter instance
+        """
         super().__init__(parent, colors, callbacks)
         self.orientation_kalman = orientation_kalman
-        self.sliders = {}
-        self.value_labels = {}
+        self.sliders: Dict[str, QSlider] = {}
+        self.value_labels: Dict[str, QLabel] = {}
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create IMU Kalman filter configuration panel with noise parameters."""
         group = QGroupBox("IMU Kalman Filter Parameters")
         layout = QVBoxLayout()
 
@@ -1589,7 +1820,7 @@ class IMUKalmanParametersModule(GUIModule):
         enable_layout.addWidget(self.enable_checkbox)
 
         self.status_indicator = QLabel("[OFF]")
-        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -1608,17 +1839,17 @@ class IMUKalmanParametersModule(GUIModule):
         # Current orientation display
         state_layout = QVBoxLayout()
         state_label = QLabel("IMU Orientation:")
-        font = QFont("Segoe UI", 9)
+        font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL)
         font.setBold(True)
         state_label.setFont(font)
         state_layout.addWidget(state_label)
 
         self.orientation_label = QLabel("RX: 0.0°, RY: 0.0°")
-        self.orientation_label.setFont(QFont("Consolas", 9))
+        self.orientation_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         state_layout.addWidget(self.orientation_label)
 
         self.bias_label = QLabel("Bias: (0.00, 0.00) rad/s")
-        self.bias_label.setFont(QFont("Consolas", 8))
+        self.bias_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.bias_label.setStyleSheet(f"color: {self.colors['border']};")
         state_layout.addWidget(self.bias_label)
 
@@ -1628,48 +1859,51 @@ class IMUKalmanParametersModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _create_parameter_slider(self, parent_layout, label, min_val, max_val, default, param_name):
+    def _create_parameter_slider(self, parent_layout: QVBoxLayout, label: str, min_val: float,
+                                  max_val: float, default: float, param_name: str) -> None:
+        """Create a parameter slider with automatic scale selection."""
         grid = QGridLayout()
 
         label_widget = QLabel(label)
-        label_widget.setFont(QFont("Segoe UI", 9))
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
         grid.addWidget(label_widget, 0, 0)
 
         slider = QSlider(Qt.Orientation.Horizontal)
         # Use logarithmic scale for very small values
         if max_val < 1.0:
-            slider.setMinimum(int(min_val * 10000))
-            slider.setMaximum(int(max_val * 10000))
-            slider.setValue(int(default * 10000))
+            slider.setMinimum(int(min_val * GUI_SLIDER_SCALE_FINE))
+            slider.setMaximum(int(max_val * GUI_SLIDER_SCALE_FINE))
+            slider.setValue(int(default * GUI_SLIDER_SCALE_FINE))
         else:
-            slider.setMinimum(int(min_val * 100))
-            slider.setMaximum(int(max_val * 100))
-            slider.setValue(int(default * 100))
+            slider.setMinimum(int(min_val * GUI_SLIDER_SCALE_COARSE))
+            slider.setMaximum(int(max_val * GUI_SLIDER_SCALE_COARSE))
+            slider.setValue(int(default * GUI_SLIDER_SCALE_COARSE))
         grid.addWidget(slider, 0, 1)
 
         value_label = QLabel(f"{default:.4f}")
-        value_label.setFont(QFont("Consolas", 9))
+        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         value_label.setStyleSheet(f"color: {self.colors['highlight']};")
-        value_label.setMinimumWidth(70)
+        value_label.setMinimumWidth(GUI_VALUE_LABEL_WIDTH_MEDIUM)
         grid.addWidget(value_label, 0, 2)
 
         self.sliders[param_name] = slider
         self.value_labels[param_name] = value_label
 
-        def on_change(val, pn=param_name):
+        def on_change(val, param=param_name):
             if max_val < 1.0:
-                value = val / 10000.0
+                value = val / GUI_SLIDER_SCALE_FINE
             else:
-                value = val / 100.0
-            self.value_labels[pn].setText(f"{value:.4f}")
-            self._on_param_change(pn, value)
+                value = val / GUI_SLIDER_SCALE_COARSE
+            self.value_labels[param].setText(f"{value:.4f}")
+            self._on_param_change(param, value)
 
         slider.valueChanged.connect(on_change)
         grid.setColumnStretch(1, 1)
 
         parent_layout.addLayout(grid)
 
-    def _on_enable_toggle(self):
+    def _on_enable_toggle(self) -> None:
+        """Handle IMU tilt correction enable/disable toggle."""
         enabled = self.enable_checkbox.isChecked()
 
         if enabled:
@@ -1682,11 +1916,13 @@ class IMUKalmanParametersModule(GUIModule):
         if self.callbacks.get('imu_tilt_correction_toggle'):
             self.callbacks['imu_tilt_correction_toggle'](enabled)
 
-    def _on_param_change(self, param_name, value):
+    def _on_param_change(self, param_name: str, value: float) -> None:
+        """Apply IMU Kalman parameter change."""
         if self.callbacks.get('imu_kalman_param_change'):
             self.callbacks['imu_kalman_param_change'](param_name, value)
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update IMU orientation and bias display."""
         if 'imu_orientation' in state:
             rx, ry = state['imu_orientation']
             self.orientation_label.setText(f"RX: {rx:.2f}°, RY: {ry:.2f}°")
@@ -1699,10 +1935,19 @@ class IMUKalmanParametersModule(GUIModule):
 class IMUMotionDetectionModule(GUIModule):
     """IMU motion detection and magnetometer controls."""
 
-    def __init__(self, parent, colors, callbacks):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any]) -> None:
+        """
+        Initialize IMU motion detection module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+        """
         super().__init__(parent, colors, callbacks)
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create IMU motion detection panel with thresholds and magnetometer controls."""
         group = QGroupBox("IMU Motion Detection")
         layout = QVBoxLayout()
 
@@ -1715,7 +1960,7 @@ class IMUMotionDetectionModule(GUIModule):
         detection_layout.addWidget(self.detection_checkbox)
 
         self.detection_status = QLabel("[OFF]")
-        self.detection_status.setFont(QFont("Segoe UI", 10))
+        self.detection_status.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.detection_status.setStyleSheet(f"color: {self.colors['border']};")
         detection_layout.addWidget(self.detection_status)
         detection_layout.addStretch()
@@ -1735,7 +1980,7 @@ class IMUMotionDetectionModule(GUIModule):
         mag_layout.addWidget(self.mag_checkbox)
 
         self.mag_status = QLabel("[OFF]")
-        self.mag_status.setFont(QFont("Segoe UI", 10))
+        self.mag_status.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.mag_status.setStyleSheet(f"color: {self.colors['border']};")
         mag_layout.addWidget(self.mag_status)
         mag_layout.addStretch()
@@ -1744,12 +1989,12 @@ class IMUMotionDetectionModule(GUIModule):
 
         # Statistics
         self.stats_label = QLabel("Rejected: 0 / 0 (0.0%)")
-        self.stats_label.setFont(QFont("Consolas", 8))
+        self.stats_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.stats_label.setStyleSheet(f"color: {self.colors['border']};")
         layout.addWidget(self.stats_label)
 
         self.mag_stats_label = QLabel("Mag updates: 0")
-        self.mag_stats_label.setFont(QFont("Consolas", 8))
+        self.mag_stats_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         self.mag_stats_label.setStyleSheet(f"color: {self.colors['border']};")
         layout.addWidget(self.mag_stats_label)
 
@@ -1757,37 +2002,40 @@ class IMUMotionDetectionModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _create_parameter_slider(self, parent_layout, label, min_val, max_val, default, param_name):
+    def _create_parameter_slider(self, parent_layout: QVBoxLayout, label: str, min_val: float,
+                                  max_val: float, default: float, param_name: str) -> None:
+        """Create a threshold parameter slider."""
         grid = QGridLayout()
 
         label_widget = QLabel(label)
-        label_widget.setFont(QFont("Segoe UI", 9))
+        label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
         grid.addWidget(label_widget, 0, 0)
 
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setMinimum(int(min_val * 100))
-        slider.setMaximum(int(max_val * 100))
-        slider.setValue(int(default * 100))
+        slider.setMinimum(int(min_val * GUI_SLIDER_SCALE_COARSE))
+        slider.setMaximum(int(max_val * GUI_SLIDER_SCALE_COARSE))
+        slider.setValue(int(default * GUI_SLIDER_SCALE_COARSE))
         grid.addWidget(slider, 0, 1)
 
         value_label = QLabel(f"{default:.2f}")
-        value_label.setFont(QFont("Consolas", 9))
+        value_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         value_label.setStyleSheet(f"color: {self.colors['highlight']};")
         value_label.setMinimumWidth(60)
         grid.addWidget(value_label, 0, 2)
 
-        def on_change(val, pn=param_name):
+        def on_change(val, param=param_name):
             value = val / 100.0
             value_label.setText(f"{value:.2f}")
             if self.callbacks.get('imu_motion_param_change'):
-                self.callbacks['imu_motion_param_change'](pn, value)
+                self.callbacks['imu_motion_param_change'](param, value)
 
         slider.valueChanged.connect(on_change)
         grid.setColumnStretch(1, 1)
 
         parent_layout.addLayout(grid)
 
-    def _on_detection_toggle(self):
+    def _on_detection_toggle(self) -> None:
+        """Handle motion detection enable/disable toggle."""
         enabled = self.detection_checkbox.isChecked()
 
         if enabled:
@@ -1800,7 +2048,8 @@ class IMUMotionDetectionModule(GUIModule):
         if self.callbacks.get('imu_detection_toggle'):
             self.callbacks['imu_detection_toggle'](enabled)
 
-    def _on_mag_toggle(self):
+    def _on_mag_toggle(self) -> None:
+        """Handle magnetometer backup enable/disable toggle."""
         enabled = self.mag_checkbox.isChecked()
 
         if enabled:
@@ -1813,7 +2062,8 @@ class IMUMotionDetectionModule(GUIModule):
         if self.callbacks.get('imu_mag_toggle'):
             self.callbacks['imu_mag_toggle'](enabled)
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update motion detection statistics and magnetometer update count."""
         if 'imu_rejection_stats' in state:
             rejected, total = state['imu_rejection_stats']
             if total > 0:
@@ -1830,11 +2080,20 @@ class IMUMotionDetectionModule(GUIModule):
 class IKZOptimizationModule(GUIModule):
     """IK Z offset optimization control."""
 
-    def __init__(self, parent, colors, callbacks):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any]) -> None:
+        """
+        Initialize IK Z optimization module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+        """
         super().__init__(parent, colors, callbacks)
         self.enabled = False
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create Z optimization control panel with status display."""
         group = QGroupBox("IK Z Optimization")
         layout = QVBoxLayout()
 
@@ -1847,7 +2106,7 @@ class IKZOptimizationModule(GUIModule):
         enable_layout.addWidget(self.enable_checkbox)
 
         self.status_indicator = QLabel("[OFF]")
-        self.status_indicator.setFont(QFont("Segoe UI", 10))
+        self.status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
         self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
@@ -1859,7 +2118,7 @@ class IKZOptimizationModule(GUIModule):
             "Dynamically adjusts Z height to balance servo angles around neutral (0°).\n"
             "Keeps servos centered and maximizes available range."
         )
-        description.setFont(QFont("Segoe UI", 8))
+        description.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_SMALL))
         description.setStyleSheet(f"color: {self.colors['border']};")
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -1868,15 +2127,15 @@ class IKZOptimizationModule(GUIModule):
         stats_layout = QVBoxLayout()
 
         self.z_offset_label = QLabel("Z Offset: 0.0 mm")
-        self.z_offset_label.setFont(QFont("Consolas", 8))
+        self.z_offset_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         stats_layout.addWidget(self.z_offset_label)
 
         self.servo_balance_label = QLabel("Servo Balance: Max=0.0°, Min=0.0°")
-        self.servo_balance_label.setFont(QFont("Consolas", 8))
+        self.servo_balance_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         stats_layout.addWidget(self.servo_balance_label)
 
         self.imbalance_label = QLabel("Imbalance: 0.0°")
-        self.imbalance_label.setFont(QFont("Consolas", 8))
+        self.imbalance_label.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_SMALL))
         stats_layout.addWidget(self.imbalance_label)
 
         layout.addLayout(stats_layout)
@@ -1885,7 +2144,8 @@ class IKZOptimizationModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_enable_toggle(self, state):
+    def _on_enable_toggle(self, state: int) -> None:
+        """Handle Z optimization enable/disable toggle."""
         self.enabled = state == Qt.CheckState.Checked.value
         if self.enabled:
             self.status_indicator.setText("[ON]")
@@ -1897,7 +2157,8 @@ class IKZOptimizationModule(GUIModule):
         if 'z_optimization_toggle' in self.callbacks:
             self.callbacks['z_optimization_toggle'](self.enabled)
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
+        """Update Z offset and servo balance statistics."""
         if not hasattr(self, 'widget'):
             return
 
@@ -1926,12 +2187,23 @@ class IKZOptimizationModule(GUIModule):
 class PerformanceDataCollectionModule(GUIModule):
     """Performance data collection for PID vs LQR comparison."""
 
-    def __init__(self, parent, colors, callbacks, controller_type='PID'):
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
+                 controller_type: str = 'PID') -> None:
+        """
+        Initialize performance data collection module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            controller_type: Current controller type ('PID' or 'LQR')
+        """
         super().__init__(parent, colors, callbacks)
         self.controller_type = controller_type
         self.recording = False
 
-    def create(self):
+    def create(self) -> QWidget:
+        """Create performance data collection panel with recording controls."""
         group = QGroupBox("Performance Data Collection")
         layout = QVBoxLayout()
 
@@ -1986,19 +2258,19 @@ class PerformanceDataCollectionModule(GUIModule):
         self.widget = group
         return self.widget
 
-    def _on_start_recording(self):
+    def _on_start_recording(self) -> None:
         """Handle start recording button click."""
         callback = self.callbacks.get('start_recording')
         if callback:
             callback()
 
-    def _on_stop_recording(self):
+    def _on_stop_recording(self) -> None:
         """Handle stop recording button click."""
         callback = self.callbacks.get('stop_recording')
         if callback:
             callback()
 
-    def update(self, state):
+    def update(self, state: Dict[str, Any]) -> None:
         """Update module display with current state."""
         recording = state.get('recording', False)
 

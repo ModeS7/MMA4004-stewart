@@ -12,6 +12,7 @@ Centralized configuration for all system parameters:
 - Performance optimization
 """
 
+from typing import Dict, Any, Tuple
 import numpy as np
 
 # ============================================================================
@@ -23,8 +24,80 @@ PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger plat
 # PHYSICAL CONSTANTS AND LIMITS
 # ============================================================================
 
-MAX_TILT_ANGLE_DEG = 15.0  # Maximum platform tilt magnitude (degrees)
+MAX_TILT_ANGLE_DEG = 15.0  # Maximum platform tilt magnitude (degrees) - general reference
+MAX_CONTROLLER_OUTPUT_DEG = 15.0  # Maximum controller output tilt (degrees)
+MAX_IMU_CORRECTION_DEG = 15.0  # Maximum IMU-based tilt correction (degrees)
 MAX_SERVO_ANGLE_DEG = 70.0  # Maximum individual servo angle (degrees)
+
+# Control algorithm constants
+PID_INTEGRAL_LIMIT_DEG = 100.0  # Maximum integral windup limit (degrees)
+MAX_CALIBRATION_TILT_DEG = 5.0  # Maximum acceptable platform tilt during IMU calibration (degrees)
+
+# Numerical stability constants
+GIMBAL_LOCK_THRESHOLD = 0.01  # Minimum cos(theta) value to avoid gimbal lock singularity
+DIVISION_BY_ZERO_EPSILON = 1e-9  # Small epsilon to prevent division by zero
+
+# Kalman filter parameters
+KALMAN_POSITION_PROCESS_NOISE = 0.0001  # Position process noise (m²)
+KALMAN_VELOCITY_PROCESS_NOISE = 0.001  # Velocity process noise (m²/s²)
+
+# Camera model parameters
+CAMERA_PIXEL_SIZE_M = 0.0014  # Camera pixel size (meters) - 1.4mm
+
+# Stewart Platform IK constants
+IK_TAU_EPSILON = 1e-6  # Servo time constant threshold (seconds)
+IK_SQRT_TERM_EPSILON = 1e-6  # Minimum sqrt term for IK calculation
+IK_DAMPING_INITIAL = 0.01  # Initial damping factor for Levenberg-Marquardt
+IK_DAMPING_MAX = 1.0  # Maximum damping factor before giving up
+IK_JACOBIAN_DELTA = 0.01  # Delta for numerical Jacobian calculation (mm/deg)
+IK_Z_MIN_MM = 0.0  # Minimum platform Z height (mm)
+IK_Z_MAX_MM = 300.0  # Maximum platform Z height (mm)
+IK_MAX_ROLL_PITCH_DEG = 60.0  # Maximum roll/pitch angle (degrees)
+IK_MAX_YAW_DEG = 120.0  # Maximum yaw angle (degrees)
+IK_PENALTY_VALUE = 1e6  # Penalty value for invalid IK solutions
+IK_VALID_THRESHOLD = 1e5  # Threshold for valid IK solution detection
+IK_Z_SAMPLES_STANDARD = 41  # Number of Z samples for standard search
+IK_Z_SAMPLES_EXTENDED = 31  # Number of Z samples for extended search
+IK_Z_SEARCH_MIN_MM = 100.0  # Minimum Z for extended search (mm)
+IK_Z_SEARCH_EXTEND_MM = 150.0  # Z extension for extended search (mm)
+
+# Ball physics constants
+BALL_GEFF_MIN_FACTOR = 0.1  # Minimum effective gravity factor
+BALL_GEFF_MAX_FACTOR = 2.0  # Maximum effective gravity factor
+
+# GUI layout constants
+GUI_MAIN_LAYOUT_MARGIN = 5  # Main layout margin in pixels
+GUI_MAIN_LAYOUT_SPACING = 5  # Main layout spacing between elements
+GUI_COLUMN_SPACING = 10  # Spacing between modules in column
+GUI_SCROLLABLE_OUTER_SPACING = 0  # Outer layout spacing for scrollable column
+
+# GUI font constants
+GUI_FONT_MONOSPACE = "Consolas"  # Monospace font for numbers/data
+GUI_FONT_SANS = "Segoe UI"  # Sans-serif font for labels/text
+GUI_FONT_SIZE_TINY = 7  # Tiny font size (info labels)
+GUI_FONT_SIZE_SMALL = 8  # Small font size (debug, stats)
+GUI_FONT_SIZE_NORMAL = 9  # Normal font size (labels, values)
+GUI_FONT_SIZE_LARGE = 10  # Large font size (headings, status)
+
+# GUI widget dimension constants
+GUI_BUTTON_WIDTH_SMALL = 80  # Small button width (Reset, Refresh)
+GUI_BUTTON_WIDTH_MEDIUM = 100  # Medium button width (Start, Stop)
+GUI_BUTTON_WIDTH_LARGE = 120  # Large button width (Reset Ball, Home)
+GUI_BUTTON_HEIGHT_NORMAL = 35  # Normal button height
+GUI_BUTTON_HEIGHT_LARGE = 40  # Large button height (mode selection)
+GUI_VALUE_LABEL_WIDTH_SMALL = 60  # Small value label width
+GUI_VALUE_LABEL_WIDTH_MEDIUM = 70  # Medium value label width
+GUI_VALUE_LABEL_WIDTH_LARGE = 80  # Large value label width
+
+# GUI slider constants
+GUI_SLIDER_SCALE_COARSE = 100  # Coarse slider resolution (×100)
+GUI_SLIDER_SCALE_FINE = 10000  # Fine slider resolution (×10000)
+
+# GUI color constants (supplemental to color scheme)
+GUI_COLOR_ORANGE = '#ffa500'  # Orange warning color
+
+# GUI misc constants
+GUI_LOG_HEIGHT_MULTIPLIER = 20  # Log text edit height = lines × multiplier
 
 # Platform boundaries (version-dependent)
 if PLATFORM_VERSION == 'V1':
@@ -139,6 +212,9 @@ class GUIConfig:
     MAX_PLOT_RATE_HZ = 100  # Maximum plot refresh rate
     DEFAULT_PLOT_ENABLED = True  # Plot updates enabled by default
 
+    # Layout settings
+    MINIMAL_CONTROLLER_COLUMN_WIDTH = 350  # Width of control column in minimal controller (pixels)
+
 
 class SimulationConfig:
     """Configuration for simulation mode."""
@@ -189,7 +265,7 @@ class PIDConfig:
     }
 
     # Controller limits
-    OUTPUT_LIMIT = MAX_TILT_ANGLE_DEG  # Maximum controller output (degrees)
+    OUTPUT_LIMIT = MAX_CONTROLLER_OUTPUT_DEG  # Maximum controller output (degrees)
     INTEGRAL_LIMIT = 100.0  # Anti-windup limit for integral term
 
     # Derivative filtering
@@ -220,7 +296,7 @@ class LQRConfig:
     }
 
     # Controller limits
-    OUTPUT_LIMIT = MAX_TILT_ANGLE_DEG  # Maximum controller output (degrees)
+    OUTPUT_LIMIT = MAX_CONTROLLER_OUTPUT_DEG  # Maximum controller output (degrees)
 
 class TrajectoryPatternConfig:
     """Trajectory pattern parameters for target tracking."""
@@ -471,6 +547,10 @@ class PerformanceConfig:
     IK_PREWARM_TILT_RANGE = (-15, 16)  # Tilt angles to pre-compute (degrees)
     IK_PREWARM_TILT_STEP = 2  # Step size for pre-warming (degrees)
 
+    # Data collection settings
+    CSV_FLUSH_INTERVAL_SAMPLES = 100  # Flush CSV file every N samples
+    LOOP_TIME_HISTORY_LIMIT = 1000  # Maximum loop time samples to store
+
     # Thread priorities (Windows)
     THREAD_PRIORITY_IDLE = -15
     THREAD_PRIORITY_LOWEST = -2
@@ -569,18 +649,46 @@ class VisualizationConfig:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def format_vector_2d(vec, units="mm", decimals=1):
-    """Format 2D vector for display."""
+def format_vector_2d(vec: Tuple[float, ...], units: str = "mm", decimals: int = 1) -> str:
+    """Format 2D vector for display.
+
+    Args:
+        vec: 2D vector (x, y) to format.
+        units: Unit label to append (default: "mm").
+        decimals: Number of decimal places (default: 1).
+
+    Returns:
+        Formatted string representation of the vector.
+    """
     return f"({vec[0]:.{decimals}f}, {vec[1]:.{decimals}f}) {units}"
 
 
-def format_time(seconds, decimals=2):
-    """Format time with consistent precision."""
+def format_time(seconds: float, decimals: int = 2) -> str:
+    """Format time with consistent precision.
+
+    Args:
+        seconds: Time value in seconds.
+        decimals: Number of decimal places (default: 2).
+
+    Returns:
+        Formatted time string with 's' suffix.
+    """
     return f"{seconds:.{decimals}f}s"
 
 
-def format_error_context(sim_time, ball_pos, ball_vel, error_msg):
-    """Format error message with full context."""
+def format_error_context(sim_time: float, ball_pos: Tuple[float, ...],
+                         ball_vel: Tuple[float, ...], error_msg: str) -> str:
+    """Format error message with full context.
+
+    Args:
+        sim_time: Simulation time in seconds.
+        ball_pos: Ball position vector (x, y, ...).
+        ball_vel: Ball velocity vector (vx, vy, ...).
+        error_msg: Error message to display.
+
+    Returns:
+        Formatted error message with time and ball state.
+    """
     return (
         f"Error at t={format_time(sim_time)}: {error_msg}\n"
         f"Ball state: pos={format_vector_2d(ball_pos[:2])}, "
@@ -591,16 +699,19 @@ def format_error_context(sim_time, ball_pos, ball_vel, error_msg):
 # CONFIGURATION UTILITY FUNCTIONS
 # ============================================================================
 
-def get_controller_defaults(controller_type='PID', mode='simulation'):
-    """
-    Get default controller parameters.
+def get_controller_defaults(controller_type: str = 'PID', mode: str = 'simulation') -> Dict[str, Any]:
+    """Get default controller parameters.
 
     Args:
-        controller_type: 'PID' or 'LQR'
-        mode: 'simulation' or 'hardware'
+        controller_type: Controller type ('PID' or 'LQR', default: 'PID').
+        mode: Operation mode ('simulation' or 'hardware', default: 'simulation').
 
     Returns:
-        Dictionary of default parameters
+        Dictionary of default controller parameters including gains/weights,
+        scalar indices, scalar values, and limits.
+
+    Raises:
+        ValueError: If controller_type is not 'PID' or 'LQR'.
     """
     if controller_type.upper() == 'PID':
         if mode == 'simulation':

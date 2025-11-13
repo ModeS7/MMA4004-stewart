@@ -17,6 +17,7 @@ import time
 import csv
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
@@ -28,15 +29,21 @@ from setup.base_hardware import HardwareControllerBase, SerialController
 from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.control_core import IMUControllerMixin, LQRController, clip_tilt_vector
-from core.utils import (IKZOptimizationConfig, MAX_TILT_ANGLE_DEG,
+from core.utils import (IKZOptimizationConfig, MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG,
                          Pixy2CameraConfig, BallPhysicsConfig, HardwareConnectionConfig, GUIConfig,
-                         VisualizationConfig, ControlLoopConfig)
+                         VisualizationConfig, ControlLoopConfig, GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL,
+                         PerformanceConfig)
 
 
 class StewartController(IMUControllerMixin, HardwareControllerBase):
     """Stewart Platform controller with full feature set."""
 
-    def __init__(self, app):
+    def __init__(self, app: QApplication) -> None:
+        """Initialize the Stewart Platform controller.
+
+        Args:
+            app: The QApplication instance for the GUI.
+        """
         # Mode selection
         self.operation_mode = 'real'  # 'sim' or 'real'
         self.controller_type_selection = 'LQR'  # 'PID', 'LQR', or 'Manual'
@@ -74,11 +81,21 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Override window title
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}]")
 
-    def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
+    def _update_controller(self, ball_pos_mm: Tuple[float, float], ball_vel_mm_s: Tuple[float, float],
+                           target_pos_mm: Tuple[float, float], dt: float) -> Optional[Tuple[float, float]]:
         """Update controller and return control output.
 
         In simulation mode, applies Kalman filtering when enabled for improved
         state estimation. Returns platform tilt angles (rx, ry) in degrees.
+
+        Args:
+            ball_pos_mm: Ball position in millimeters (x, y).
+            ball_vel_mm_s: Ball velocity in mm/s (vx, vy).
+            target_pos_mm: Target position in millimeters (x, y).
+            dt: Time step in seconds.
+
+        Returns:
+            Tuple of (rx, ry) tilt angles in degrees, or None if controller unavailable.
         """
         if self.controller is None:
             return None
@@ -99,8 +116,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
                 self.kalman_filter.predict([rx_deg, ry_deg])
 
-                # Kalman update step (with camera measurement)
-                self.kalman_filter.update(ball_pos_mm, self.simulation_time)
+                # Kalman update step (with camera measurement) - convert mm to meters
+                ball_pos_m = [ball_pos_mm[0] / 1000.0, ball_pos_mm[1] / 1000.0]
+                self.kalman_filter.update(ball_pos_m, self.simulation_time)
 
                 # Get filtered estimates
                 filtered_x, filtered_y = self.kalman_filter.get_position_mm()
@@ -127,8 +145,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         return rx, ry
 
-    def _create_callbacks(self):
-        """Create callback dictionary with all features."""
+    def _create_callbacks(self) -> Dict[str, Any]:
+        """Create callback dictionary with all features.
+
+        Returns:
+            Dictionary mapping callback names to callable functions.
+        """
         callbacks = super()._create_callbacks()
 
         # Add mode/controller switching
@@ -185,8 +207,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         return callbacks
 
-    def get_layout_config(self):
-        """Return layout configuration based on mode and controller."""
+    def get_layout_config(self) -> Dict[str, Any]:
+        """Return layout configuration based on mode and controller.
+
+        Returns:
+            Dictionary containing the layout configuration for the GUI.
+        """
         # Always scrollable columns
         layout = create_standard_layout(scrollable_columns=True, include_plot=True)
 
@@ -288,7 +314,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         return layout
 
-    def _build_modular_gui(self):
+    def _build_modular_gui(self) -> None:
         """Override to add mode/controller selector modules and build GUI."""
         # Create extended module registry with our new modules
         module_registry = {
@@ -329,7 +355,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Add controller-specific widgets
         self._add_controller_specific_widgets()
 
-    def _add_controller_specific_widgets(self):
+    def _add_controller_specific_widgets(self) -> None:
         """Add controller-specific widgets (PID Kalman derivative, LQR gain matrix)."""
         if self.controller_type_selection == 'PID' and 'controller' in self.gui_modules:
             # Add "Use Kalman Velocity for Derivative" checkbox
@@ -373,7 +399,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     # Hardware-specific methods
     # ============================================================================
 
-    def connect_serial(self):
+    def connect_serial(self) -> None:
         """Establish serial connection to hardware."""
         if self.connected and self.serial_controller is not None:
             self.log("Connection already established")
@@ -417,7 +443,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             QMessageBox.critical(self, "Error", message)
             self.log(f"Error: {message}")
 
-    def disconnect_serial(self):
+    def disconnect_serial(self) -> None:
         """Disconnect from hardware."""
         if self.simulation_running:
             self.stop_simulation()
@@ -435,8 +461,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         self.log("Disconnected")
 
-    def on_frequency_change(self, frequency):
-        """Handle control frequency change."""
+    def on_frequency_change(self, frequency: int) -> None:
+        """Handle control frequency change.
+
+        Args:
+            frequency: New control frequency in Hz.
+        """
         self.control_frequency = frequency
         self.control_interval = 1.0 / frequency
 
@@ -448,19 +478,27 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}] @ {frequency}Hz")
         self.log(f"Control frequency: {frequency}Hz")
 
-    def on_plot_enable_change(self, enabled):
-        """Handle plot enable/disable."""
+    def on_plot_enable_change(self, enabled: bool) -> None:
+        """Handle plot enable/disable.
+
+        Args:
+            enabled: True to enable plot updates, False to disable.
+        """
         self.plot_enabled = enabled
         status = "ENABLED" if enabled else "DISABLED"
         self.log(f"Plot updates: {status}")
 
-    def on_plot_rate_change(self, rate):
-        """Handle plot refresh rate change."""
+    def on_plot_rate_change(self, rate: int) -> None:
+        """Handle plot refresh rate change.
+
+        Args:
+            rate: New plot refresh rate in Hz.
+        """
         self.plot_rate_hz = rate
         self.log(f"Plot refresh rate: {rate} Hz")
 
-    def show_timing_stats(self):
-        """Show performance timing statistics."""
+    def show_timing_stats(self) -> None:
+        """Show performance timing statistics dialog."""
         if not hasattr(self, 'performance_data') or not self.performance_data:
             QMessageBox.information(self, "Performance Stats", "No data available. Start the controller first.")
             return
@@ -509,7 +547,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         text_edit = QTextEdit()
         text_edit.setPlainText(stats_text)
         text_edit.setReadOnly(True)
-        text_edit.setFont(QFont("Consolas", 10))
+        text_edit.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(text_edit)
 
         close_btn = QPushButton("Close")
@@ -523,8 +561,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     # PID-specific methods
     # ============================================================================
 
-    def on_kalman_derivative_toggle(self):
-        """Toggle Kalman derivative option for PID."""
+    def on_kalman_derivative_toggle(self) -> None:
+        """Toggle Kalman derivative option for PID controller."""
         self.use_kalman_derivative = not self.use_kalman_derivative
 
         if hasattr(self, 'derivative_status'):
@@ -542,8 +580,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     # LQR-specific methods
     # ============================================================================
 
-    def show_gain_matrix(self):
-        """Show LQR gain matrix dialog."""
+    def show_gain_matrix(self) -> None:
+        """Show LQR gain matrix in a dialog window."""
         if not hasattr(self, 'controller') or self.controller is None:
             QMessageBox.warning(self, "Gain Matrix", "Controller not initialized")
             return
@@ -577,7 +615,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         text_edit = QTextEdit()
         text_edit.setPlainText(gain_text)
         text_edit.setReadOnly(True)
-        text_edit.setFont(QFont("Consolas", 10))
+        text_edit.setFont(QFont(GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL))
         layout.addWidget(text_edit)
 
         close_btn = QPushButton("Close")
@@ -591,8 +629,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     # Controller parameter methods
     # ============================================================================
 
-    def on_controller_param_change(self):
-        """Update controller when parameters change."""
+    def on_controller_param_change(self) -> None:
+        """Update controller when parameters change via GUI sliders."""
         if self.controller is None:
             return
 
@@ -623,8 +661,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     # Mode switching
     # ============================================================================
 
-    def on_mode_change(self, mode):
-        """Handle mode change between sim and real."""
+    def on_mode_change(self, mode: str) -> None:
+        """Handle mode change between simulation and hardware.
+
+        Args:
+            mode: New operation mode ('sim' or 'real').
+        """
         if mode == self.operation_mode:
             return
 
@@ -655,8 +697,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Update window title
         self.setWindowTitle(f"Stewart Platform - {self.controller_type_selection} [{self.operation_mode.upper()}]")
 
-    def on_controller_type_change(self, controller_type):
-        """Handle controller type change between PID/LQR/Manual."""
+    def on_controller_type_change(self, controller_type: str) -> None:
+        """Handle controller type change.
+
+        Args:
+            controller_type: New controller type ('PID', 'LQR', or 'Manual').
+        """
         if controller_type == self.controller_type_selection:
             return
 
@@ -687,8 +733,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     # Kalman filter methods
     # ============================================================================
 
-    def on_kalman_enable_change(self, enabled):
-        """Handle Kalman filter enable/disable."""
+    def on_kalman_enable_change(self, enabled: bool) -> None:
+        """Handle Kalman filter enable/disable.
+
+        Args:
+            enabled: True to enable Kalman filter, False to disable.
+        """
         self.kalman_enabled = enabled
         if enabled:
             self.kalman_filter.reset(self.ball_pos_mm)
@@ -698,8 +748,13 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 self.use_kalman_derivative = False
         self.log(f"Kalman filter: {'ENABLED' if enabled else 'DISABLED'}")
 
-    def on_kalman_param_change(self, param_name, value):
-        """Handle Kalman parameter change."""
+    def on_kalman_param_change(self, param_name: str, value: float) -> None:
+        """Handle Kalman filter parameter change.
+
+        Args:
+            param_name: Name of the parameter being changed.
+            value: New parameter value.
+        """
         param_labels = {
             'process_noise': 'Process noise',
             'measurement_noise': 'Measurement noise'
@@ -707,13 +762,13 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         label = param_labels.get(param_name, param_name)
         self.log(f"Kalman {label}: {value:.2f}")
 
-    def on_kalman_reset(self):
-        """Handle Kalman filter reset."""
+    def on_kalman_reset(self) -> None:
+        """Reset Kalman filter to current ball position."""
         self.kalman_filter.reset(self.ball_pos_mm)
         self.log("Kalman filter reset")
 
-    def start_recording(self):
-        """Start recording performance data to CSV."""
+    def start_recording(self) -> None:
+        """Start recording performance data to CSV file."""
         if self.recording:
             self.log("Already recording!")
             return
@@ -745,9 +800,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         except Exception as e:
             self.log(f"ERROR: Failed to start recording: {e}")
 
-    def stop_recording(self):
-        """Stop recording performance data."""
-        self.log("Stop recording called")  # Debug
+    def stop_recording(self) -> None:
+        """Stop recording performance data and close CSV file."""
         if not self.recording:
             self.log("Not currently recording")
             return
@@ -769,7 +823,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         except Exception as e:
             self.log(f"ERROR: Failed to stop recording: {e}")
 
-    def _control_thread_func(self):
+    def _control_thread_func(self) -> None:
         """Hardware control thread with IMU integration."""
         self.log("Control thread started")
 
@@ -794,10 +848,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 pixy_y = ball_data['y']
 
                 # Camera dimensions: 316×208 pixels, origin at top-left
-                CAMERA_HEIGHT_PIXELS = 208.0
-
                 ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
-                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
+                ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
@@ -825,7 +877,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
                 # Update step (only when ball is detected)
                 if ball_data is not None and self.ball_detected:
-                    self.kalman_filter.update(self.ball_pos_mm, self.simulation_time)
+                    # Convert mm to meters for Kalman filter
+                    ball_pos_m = [self.ball_pos_mm[0] / 1000.0, self.ball_pos_mm[1] / 1000.0]
+                    self.kalman_filter.update(ball_pos_m, self.simulation_time)
 
                 # Get filtered estimates
                 filtered_x, filtered_y = self.kalman_filter.get_position_mm()
@@ -850,7 +904,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
                 if control_output is not None:
                     rx_ctrl, ry_ctrl = control_output
-                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, 15.0)
+                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, MAX_CONTROLLER_OUTPUT_DEG)
 
                     # Store controller output (gravity-relative) for Kalman physics prediction
                     self.prev_effective_angles['rx'] = rx_ctrl
@@ -943,8 +997,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                             })
                             self.sample_count += 1
 
-                            # Flush every 100 samples to ensure data is written
-                            if self.sample_count % 100 == 0:
+                            # Flush periodically to ensure data is written
+                            if self.sample_count % PerformanceConfig.CSV_FLUSH_INTERVAL_SAMPLES == 0:
                                 self.csv_file.flush()
                         except Exception as e:
                             self.log(f"CSV write error: {e}")
@@ -1006,7 +1060,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
             # Track performance
             loop_time = (time.perf_counter() - loop_start) * 1000
-            if len(self.performance_data['loop_times']) < 1000:
+            if len(self.performance_data['loop_times']) < PerformanceConfig.LOOP_TIME_HISTORY_LIMIT:
                 self.performance_data['loop_times'].append(loop_time)
 
             # Timing control
@@ -1016,7 +1070,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
             self.simulation_time += self.control_interval
 
-    def _gui_update_loop(self):
+    def _gui_update_loop(self) -> None:
         """Update GUI at lower rate while control thread runs."""
         if not self.simulation_running:
             return
@@ -1038,8 +1092,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Schedule next update
         QTimer.singleShot(plot_interval_ms, self._gui_update_loop)
 
-    def _create_plot(self, parent):
-        """Override to add ball trail plot item."""
+    def _create_plot(self, parent: QWidget) -> None:
+        """Override to add ball trail plot item.
+
+        Args:
+            parent: Parent widget to contain the plot.
+        """
         # Call parent to create standard plot
         super()._create_plot(parent)
 
@@ -1047,8 +1105,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         plot_item = self.plot_widget.getPlotItem()
         self.ball_trail = plot_item.plot([], [], pen=pg.mkPen(color='#ff8888', width=2, style=Qt.PenStyle.DashLine))
 
-    def update_gui_modules(self):
-        """Override to provide hardware-specific state."""
+    def update_gui_modules(self) -> None:
+        """Override to provide hardware-specific state to GUI modules."""
         if self.operation_mode == 'real':
             # Hardware mode: use actual hardware state
             ball_x_mm = self.ball_pos[0, 0].item() * 1000
@@ -1203,8 +1261,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                     self.gui_modules['kalman_filter'].update(kalman_state)
 
 
-def main():
-    """Launch controller application."""
+def main() -> None:
+    """Launch the Stewart Platform controller application."""
     app = QApplication(sys.argv)
     controller = StewartController(app)
     controller.show()

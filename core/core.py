@@ -8,20 +8,34 @@ Shared classes for Stewart platform simulation and control:
 - SimpleBallPhysics2D: 2D ball physics with rolling motion
 """
 
+import logging
+from typing import Optional, Tuple, Dict
 import numpy as np
 import torch
 from collections import deque
 
 from scipy.optimize import brentq, minimize_scalar
 
-from core.utils import (MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM,
-                         SimulationConfig)
+from core.utils import (
+    MAX_SERVO_ANGLE_DEG, PLATFORM_HALF_SIZE_MM, PLATFORM_RADIUS_MM,
+    SimulationConfig, DIVISION_BY_ZERO_EPSILON,
+    IK_TAU_EPSILON, IK_SQRT_TERM_EPSILON, IK_DAMPING_INITIAL, IK_DAMPING_MAX,
+    IK_JACOBIAN_DELTA, IK_Z_MIN_MM, IK_Z_MAX_MM, IK_MAX_ROLL_PITCH_DEG,
+    IK_MAX_YAW_DEG, IK_PENALTY_VALUE, IK_VALID_THRESHOLD,
+    IK_Z_SAMPLES_STANDARD, IK_Z_SAMPLES_EXTENDED,
+    IK_Z_SEARCH_MIN_MM, IK_Z_SEARCH_EXTEND_MM,
+    BALL_GEFF_MIN_FACTOR, BALL_GEFF_MAX_FACTOR
+)
+
+# Set up logger for this module
+logger = logging.getLogger(__name__)
 
 
 class FirstOrderServo:
     """First-order servo model with command delay."""
 
-    def __init__(self, K=1.0, tau=0.05, delay=0.0, max_velocity=SimulationConfig.DEFAULT_SERVO_MAX_VELOCITY):
+    def __init__(self, K: float = 1.0, tau: float = 0.05, delay: float = 0.0,
+                 max_velocity: float = SimulationConfig.DEFAULT_SERVO_MAX_VELOCITY) -> None:
         self.K = K
         self.tau = tau
         self.delay = delay
@@ -30,18 +44,18 @@ class FirstOrderServo:
         self.target_angle = 0.0
         self.command_queue = deque()
 
-    def send_command(self, angle, current_time):
+    def send_command(self, angle: float, current_time: float) -> None:
         delivery_time = current_time + self.delay
         self.command_queue.append((delivery_time, angle))
 
-    def update(self, dt, current_time):
+    def update(self, dt: float, current_time: float) -> None:
         while self.command_queue and self.command_queue[0][0] <= current_time:
             _, angle = self.command_queue.popleft()
             self.target_angle = angle
 
         # Compute ideal response using analytical solution
         # For τẏ + y = K·u, solution is: y(t+dt) = K·u + (y(t) - K·u)·e^(-dt/τ)
-        if self.tau > 1e-6:
+        if self.tau > IK_TAU_EPSILON:
             decay = np.exp(-dt / self.tau)
             steady_state = self.K * self.target_angle
             ideal_angle = steady_state + (self.current_angle - steady_state) * decay
@@ -59,10 +73,10 @@ class FirstOrderServo:
 
         self.current_angle += angle_change
 
-    def get_angle(self):
+    def get_angle(self) -> float:
         return self.current_angle
 
-    def reset(self):
+    def reset(self) -> None:
         self.current_angle = 0.0
         self.target_angle = 0.0
         self.command_queue.clear()
@@ -71,9 +85,9 @@ class FirstOrderServo:
 class StewartPlatformIK:
     """Stewart Platform inverse and forward kinematics."""
 
-    def __init__(self, horn_length=31.75, rod_length=145.0, base=73.025,
-                 base_anchors=36.8893, platform=67.775, platform_anchors=12.7,
-                 top_surface_offset=26.0):
+    def __init__(self, horn_length: float = 31.75, rod_length: float = 145.0, base: float = 73.025,
+                 base_anchors: float = 36.8893, platform: float = 67.775, platform_anchors: float = 12.7,
+                 top_surface_offset: float = 26.0) -> None:
         self.horn_length = horn_length
         self.rod_length = rod_length
         self.base = base
@@ -103,6 +117,17 @@ class StewartPlatformIK:
         self.home_height_top_surface = self.home_height + self.top_surface_offset
 
     def calculate_home_coordinates(self, l, d, phi):
+        """
+        Calculate anchor point coordinates for platform or base.
+
+        Args:
+            l: Radius of the main circle (mm)
+            d: Offset distance from main circle to anchor points (mm)
+            phi: Array of angular positions for anchor pairs (radians)
+
+        Returns:
+            (6, 3) array of anchor coordinates [x, y, z] in mm
+        """
         angles = np.array([-np.pi / 2, np.pi / 2])
         xy = np.zeros((6, 3))
         for i in range(len(phi)):
@@ -113,6 +138,15 @@ class StewartPlatformIK:
         return xy
 
     def _calculate_beta_angles(self):
+        """
+        Calculate servo horn orientation angles (beta) for each servo.
+
+        Beta angles define the direction each servo horn extends from its base anchor.
+        These are fixed geometric properties of the Stewart platform design.
+
+        Returns:
+            Array of 6 beta angles in radians
+        """
         beta_angles = np.zeros(6)
         beta_angles[0] = 0
         beta_angles[1] = np.pi
@@ -128,12 +162,18 @@ class StewartPlatformIK:
         beta_angles[4] = angle_54 + np.pi
         return beta_angles
 
-    def update_offset(self, new_offset):
+    def update_offset(self, new_offset: float) -> None:
+        """
+        Update the top surface offset (distance from platform anchors to ball surface).
+
+        Args:
+            new_offset: New offset value in mm
+        """
         self.top_surface_offset = new_offset
         self.home_height_top_surface = self.home_height + self.top_surface_offset
 
     def calculate_servo_angles(self, translation: np.ndarray, rotation: np.ndarray,
-                               use_top_surface_offset: bool = True):
+                               use_top_surface_offset: bool = True) -> Optional[np.ndarray]:
         quat = self._euler_to_quaternion(np.radians(rotation))
 
         if use_top_surface_offset:
@@ -157,7 +197,7 @@ class StewartPlatformIK:
             g_k = leg_length_sq - (self.rod_length ** 2 - self.horn_length ** 2)
 
             sqrt_term = e_k ** 2 + f_k ** 2
-            if sqrt_term < 1e-6:
+            if sqrt_term < IK_SQRT_TERM_EPSILON:
                 return None
 
             ratio = g_k / np.sqrt(sqrt_term)
@@ -173,10 +213,10 @@ class StewartPlatformIK:
         return -angles
 
     def calculate_forward_kinematics(self, servo_angles: np.ndarray,
-                                     initial_guess: tuple = None,
+                                     initial_guess: Optional[tuple] = None,
                                      use_top_surface_offset: bool = True,
                                      max_iterations: int = 50,
-                                     tolerance: float = 1e-6):
+                                     tolerance: float = 1e-6) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], bool, int]:
         if initial_guess is None:
             if use_top_surface_offset:
                 translation = np.array([0.0, 0.0, self.home_height_top_surface])
@@ -189,7 +229,7 @@ class StewartPlatformIK:
             rotation = np.array(rotation, dtype=float)
 
         target_angles = servo_angles
-        damping = 0.01
+        damping = IK_DAMPING_INITIAL
 
         for iteration in range(max_iterations):
             calculated_angles = self.calculate_servo_angles(
@@ -205,7 +245,7 @@ class StewartPlatformIK:
             if error_magnitude < tolerance:
                 return translation.copy(), rotation.copy(), True, iteration
 
-            delta = 0.01
+            delta = IK_JACOBIAN_DELTA
             jacobian = np.zeros((6, 6))
 
             for i in range(3):
@@ -234,7 +274,7 @@ class StewartPlatformIK:
                 pose_update = np.linalg.solve(JTJ_damped, JT_error)
             except np.linalg.LinAlgError:
                 damping *= 10
-                if damping > 1.0:
+                if damping > IK_DAMPING_MAX:
                     return None, None, False, iteration
                 continue
 
@@ -243,16 +283,25 @@ class StewartPlatformIK:
 
             if np.linalg.norm(translation[:2]) > PLATFORM_HALF_SIZE_MM:
                 return None, None, False, iteration
-            if translation[2] < 0 or translation[2] > 300:
+            if translation[2] < IK_Z_MIN_MM or translation[2] > IK_Z_MAX_MM:
                 return None, None, False, iteration
-            if abs(rotation[0]) > 60 or abs(rotation[1]) > 60:  # Check roll/pitch
-                return None
-            if abs(rotation[2]) > 120:  # Separate yaw check
-                return None
+            if abs(rotation[0]) > IK_MAX_ROLL_PITCH_DEG or abs(rotation[1]) > IK_MAX_ROLL_PITCH_DEG:  # Check roll/pitch
+                return None, None, False, iteration
+            if abs(rotation[2]) > IK_MAX_YAW_DEG:  # Separate yaw check
+                return None, None, False, iteration
 
         return None, None, False, max_iterations
 
     def _euler_to_quaternion(self, euler: np.ndarray) -> np.ndarray:
+        """
+        Convert Euler angles (ZYX convention) to quaternion.
+
+        Args:
+            euler: [rx, ry, rz] Euler angles in radians (roll, pitch, yaw)
+
+        Returns:
+            Quaternion [w, x, y, z] representing the same rotation
+        """
         rx, ry, rz = euler
         cy = np.cos(rz * 0.5)
         sy = np.sin(rz * 0.5)
@@ -268,6 +317,18 @@ class StewartPlatformIK:
         ])
 
     def _rotate_vector(self, v: np.ndarray, q: np.ndarray) -> np.ndarray:
+        """
+        Rotate a 3D vector using a quaternion.
+
+        Uses the formula: v' = q * v * q^(-1) in quaternion multiplication.
+
+        Args:
+            v: 3D vector [x, y, z] to rotate
+            q: Quaternion [w, x, y, z] representing rotation
+
+        Returns:
+            Rotated vector [x', y', z']
+        """
         w, x, y, z = q
         vx, vy, vz = v
         return np.array([
@@ -282,7 +343,7 @@ class StewartPlatformIK:
                           max_iterations: int = 20,
                           tolerance: float = 0.1,
                           verbose: bool = False,
-                          ik_cache=None) -> tuple:
+                          ik_cache=None) -> Tuple[np.ndarray, Optional[np.ndarray], bool]:
         """
         Dynamically adjust Z position to balance servo angles around neutral (0°).
 
@@ -335,7 +396,7 @@ class StewartPlatformIK:
 
             if angles is None:
                 # Return penalty value indicating IK failure direction
-                return 1e6 if z > z_initial else -1e6
+                return IK_PENALTY_VALUE if z > z_initial else -IK_PENALTY_VALUE
 
             max_angle = np.max(angles)
             min_angle = np.min(angles)
@@ -348,19 +409,19 @@ class StewartPlatformIK:
                 best_angles = angles.copy()
 
             if verbose and samples_evaluated <= 5:
-                print(f"  Sample {samples_evaluated}: z={z:.1f}mm, imbalance={imbalance:.2f}°")
+                logger.debug(f"  Sample {samples_evaluated}: z={z:.1f}mm, imbalance={imbalance:.2f}°")
 
             return imbalance
 
         # Identify valid Z range through dense sampling
         # Dense sampling ensures narrow valid ranges are detected at extreme angles
-        z_samples = np.linspace(z_min, z_max, 41)
+        z_samples = np.linspace(z_min, z_max, IK_Z_SAMPLES_STANDARD)
         valid_z = []
         valid_imbalances = []
 
         for z_test in z_samples:
             imb_test = imbalance_at_z(z_test)
-            if abs(imb_test) < 1e5:  # Valid IK solution exists
+            if abs(imb_test) < IK_VALID_THRESHOLD:  # Valid IK solution exists
                 valid_z.append(z_test)
                 valid_imbalances.append(imb_test)
 
@@ -369,20 +430,20 @@ class StewartPlatformIK:
             if best_angles is not None:
                 # Return single valid solution found
                 if verbose:
-                    print(f"  Only {len(valid_z)} valid Z found - using best: z={best_z:.1f}mm")
+                    logger.debug(f"  Only {len(valid_z)} valid Z found - using best: z={best_z:.1f}mm")
                 return np.array([x, y, best_z]), best_angles, True
 
             # Extend search to full mechanical range
             if verbose:
-                print(f"  No valid Z found in range [{z_min:.1f}, {z_max:.1f}]mm")
-                print(f"  Expanding search to full mechanical range")
+                logger.debug(f"  No valid Z found in range [{z_min:.1f}, {z_max:.1f}]mm")
+                logger.debug(f"  Expanding search to full mechanical range")
 
-            # Search full mechanical range (100mm to 300mm)
-            z_extreme_min = max(100.0, z_initial - 150.0)
-            z_extreme_max = min(300.0, z_initial + 150.0)
+            # Search full mechanical range
+            z_extreme_min = max(IK_Z_SEARCH_MIN_MM, z_initial - IK_Z_SEARCH_EXTEND_MM)
+            z_extreme_max = min(IK_Z_MAX_MM, z_initial + IK_Z_SEARCH_EXTEND_MM)
 
             # Coarse sampling across extended range
-            z_extreme_samples = np.linspace(z_extreme_min, z_extreme_max, 31)
+            z_extreme_samples = np.linspace(z_extreme_min, z_extreme_max, IK_Z_SAMPLES_EXTENDED)
 
             for z_test in z_extreme_samples:
                 trans_test = np.array([x, y, z_test])
@@ -406,13 +467,13 @@ class StewartPlatformIK:
                     imbalance = max_angle + min_angle
 
                     if verbose:
-                        print(f"  Extended search successful: z={z_test:.1f}mm, imbalance={imbalance:.2f}° ({samples_evaluated} samples)")
+                        logger.debug(f"  Extended search successful: z={z_test:.1f}mm, imbalance={imbalance:.2f}° ({samples_evaluated} samples)")
 
                     return trans_test, angles_test, True
 
             # Extended range search unsuccessful
             if verbose:
-                print(f"  Extended search failed: no valid Z in [{z_extreme_min:.1f}, {z_extreme_max:.1f}]mm ({samples_evaluated} samples)")
+                logger.debug(f"  Extended search failed: no valid Z in [{z_extreme_min:.1f}, {z_extreme_max:.1f}]mm ({samples_evaluated} samples)")
             return translation, None, False
 
         # Refine search to valid Z region
@@ -422,12 +483,12 @@ class StewartPlatformIK:
         imb_max = valid_imbalances[-1]
 
         if verbose:
-            print(f"  Valid range: [{z_min:.1f}, {z_max:.1f}]mm ({len(valid_z)}/41 samples)")
-            print(f"  Imbalance at bounds: [{imb_min:.2f}°, {imb_max:.2f}°]")
+            logger.debug(f"  Valid range: [{z_min:.1f}, {z_max:.1f}]mm ({len(valid_z)}/41 samples)")
+            logger.debug(f"  Imbalance at bounds: [{imb_min:.2f}°, {imb_max:.2f}°]")
 
         # Check for zero crossing within valid solutions
         has_valid_sign_change = (
-            abs(imb_min) < 1e5 and abs(imb_max) < 1e5 and  # Both values are valid
+            abs(imb_min) < IK_VALID_THRESHOLD and abs(imb_max) < IK_VALID_THRESHOLD and  # Both values are valid
             imb_min * imb_max < 0  # Opposite signs indicate zero crossing
         )
 
@@ -441,14 +502,14 @@ class StewartPlatformIK:
                 if angles_opt is not None:
                     if verbose:
                         final_imb = np.max(angles_opt) + np.min(angles_opt)
-                        print(f"  Brent converged: z={z_opt:.1f}mm, imbalance={final_imb:.4f}° ({samples_evaluated} samples)")
+                        logger.debug(f"  Brent converged: z={z_opt:.1f}mm, imbalance={final_imb:.4f}° ({samples_evaluated} samples)")
                     return trans_opt, angles_opt, True
             except (ValueError, RuntimeError) as e:
                 if verbose:
-                    print(f"  Brent failed: {e}")
+                    logger.debug(f"  Brent failed: {e}")
         else:
             if verbose:
-                print(f"  No sign change - using minimize_scalar")
+                logger.debug(f"  No sign change - using minimize_scalar")
 
             # Apply minimization without zero crossing
             result = minimize_scalar(
@@ -466,19 +527,19 @@ class StewartPlatformIK:
                 if angles_opt is not None:
                     if verbose:
                         final_imb = np.max(angles_opt) + np.min(angles_opt)
-                        print(f"  Minimizer converged: z={z_opt:.1f}mm, imbalance={final_imb:.2f}° ({samples_evaluated} samples)")
+                        logger.debug(f"  Minimizer converged: z={z_opt:.1f}mm, imbalance={final_imb:.2f}° ({samples_evaluated} samples)")
                     return trans_opt, angles_opt, True
 
         # Return best solution from sampling
         if best_angles is not None:
             trans_best = np.array([x, y, best_z])
             if verbose:
-                print(f"  Using best: z={best_z:.1f}mm, imbalance={best_imbalance:.2f}° ({samples_evaluated} samples)")
+                logger.debug(f"  Using best: z={best_z:.1f}mm, imbalance={best_imbalance:.2f}° ({samples_evaluated} samples)")
             return trans_best, best_angles, True
 
         # Fallback case: valid Z range found but optimization failed
         if verbose:
-            print(f"  Warning: no valid solution after finding {len(valid_z)} valid Z values")
+            logger.debug(f"  Warning: no valid solution after finding {len(valid_z)} valid Z values")
         return translation, None, False
 
 
@@ -495,13 +556,13 @@ class SimpleBallPhysics2D:
     """
 
     def __init__(self,
-                 ball_radius=0.02,
-                 ball_mass=0.0027,
-                 gravity=9.81,
-                 rolling_friction=0.0225,
-                 sphere_type='hollow',
-                 air_density=1.225,
-                 drag_coefficient=0.47):
+                 ball_radius: float = 0.02,
+                 ball_mass: float = 0.0027,
+                 gravity: float = 9.81,
+                 rolling_friction: float = 0.0225,
+                 sphere_type: str = 'hollow',
+                 air_density: float = 1.225,
+                 drag_coefficient: float = 0.47) -> None:
         self.radius = ball_radius
         self.mass = ball_mass
         self.g = gravity
@@ -515,7 +576,7 @@ class SimpleBallPhysics2D:
 
         self.update_sphere_type(sphere_type)
 
-    def update_sphere_type(self, sphere_type):
+    def update_sphere_type(self, sphere_type: str) -> None:
         """Update moment of inertia based on sphere type."""
         self.sphere_type = sphere_type
 
@@ -605,50 +666,64 @@ class SimpleBallPhysics2D:
         """Compute accelerations for rolling ball on tilted surface."""
         batch_size = xy_pos.shape[0]
 
-        rx = torch.deg2rad(platform_pose[:, 3])
-        ry = torch.deg2rad(platform_pose[:, 4])
+        # Extract platform orientation
+        rx = torch.deg2rad(platform_pose[:, 3])  # Roll angle (rotation about X)
+        ry = torch.deg2rad(platform_pose[:, 4])  # Pitch angle (rotation about Y)
 
         ball_x = xy_pos[:, 0]
         ball_y = xy_pos[:, 1]
 
+        # Start with standard gravity
         g_eff = self.g
 
+        # Account for platform angular acceleration (creates fictitious forces)
         if platform_angular_accel is not None:
             alpha_rx_rad = platform_angular_accel['rx'] * (np.pi / 180.0)
             alpha_ry_rad = platform_angular_accel['ry'] * (np.pi / 180.0)
 
+            # Fictitious vertical acceleration due to platform rotation
+            # a_z = r × α (cross product of position and angular acceleration)
             a_z_platform = ball_x * alpha_ry_rad - ball_y * alpha_rx_rad
             g_eff = self.g - a_z_platform
-            g_eff = torch.clamp(g_eff, 0.1 * self.g, 2.0 * self.g)
+            # Clamp to reasonable range to prevent numerical instability
+            g_eff = torch.clamp(g_eff, BALL_GEFF_MIN_FACTOR * self.g, BALL_GEFF_MAX_FACTOR * self.g)
 
         cos_rx = torch.cos(rx)
         cos_ry = torch.cos(ry)
         sin_rx = torch.sin(rx)
         sin_ry = torch.sin(ry)
 
-        # Gravity vector in tilted frame
-        gx = g_eff * sin_ry * cos_ry * cos_rx
-        gy = -g_eff * sin_rx * cos_rx * cos_ry
+        # Project gravity onto tilted surface to get downslope acceleration
+        # For a tilted plane, gravity component along surface = g * sin(θ) * cos(φ)
+        # where θ is tilt angle and φ is perpendicular tilt
+        gx = g_eff * sin_ry * cos_ry * cos_rx  # X-direction component
+        gy = -g_eff * sin_rx * cos_rx * cos_ry  # Y-direction component
 
+        # Apply rolling ball dynamics: a = F/(m·mass_factor)
+        # mass_factor accounts for rotational inertia (1 + I/(m·r²))
         ax = gx / self.mass_factor
         ay = gy / self.mass_factor
 
         accel_linear = torch.stack([ax, ay], dim=1)
 
         vel_magnitude = torch.norm(xy_vel, dim=1, keepdim=True)
-        rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + 1e-8)
+        # Rolling resistance: F_roll = μ_roll * N * v_hat (opposes motion)
+        rolling_resistance = -self.mu_roll * g_eff * xy_vel / (vel_magnitude + DIVISION_BY_ZERO_EPSILON)
 
-        # Air resistance (quadratic drag)
-        # F_drag = -1/2 * ρ * C_d * A * v² * v_hat
-        # a_drag = F_drag / m
+        # Air resistance (quadratic drag): F_drag = -½ρC_dAv²v̂
+        # Increases with v² (dominant at high speeds)
         vel_squared = vel_magnitude ** 2
         drag_magnitude = 0.5 * self.air_density * self.drag_coefficient * self.cross_section_area * vel_squared / self.mass
-        air_resistance = -drag_magnitude * xy_vel / (vel_magnitude + 1e-8)
+        air_resistance = -drag_magnitude * xy_vel / (vel_magnitude + DIVISION_BY_ZERO_EPSILON)
 
+        # Total linear acceleration
         accel_linear = accel_linear + rolling_resistance + air_resistance
 
+        # Angular acceleration from rolling constraint: α = a/r
+        # For rolling without slipping: v = ω × r, so a = α × r
         accel_angular = accel_linear / self.radius
 
+        # Angular damping (energy dissipation in rotation)
         omega_damping = -self.mu_roll * xy_omega
         accel_angular = accel_angular + omega_damping
 
@@ -670,7 +745,7 @@ class SimpleBallPhysics2D:
 
         return height
 
-    def set_air_resistance(self, air_density=None, drag_coefficient=None):
+    def set_air_resistance(self, air_density: Optional[float] = None, drag_coefficient: Optional[float] = None) -> None:
         """
         Update air resistance parameters.
 
@@ -735,19 +810,29 @@ class TrajectoryPattern:
 class CirclePattern(TrajectoryPattern):
     """Circular trajectory pattern."""
 
-    def __init__(self, radius=50.0, period=10.0, clockwise=True):
+    def __init__(self, radius: float = 50.0, period: float = 10.0, clockwise: bool = True) -> None:
+        """
+        Create a circular trajectory pattern.
+
+        Args:
+            radius: Circle radius in mm
+            period: Time to complete one circle in seconds
+            clockwise: True for clockwise motion, False for counter-clockwise
+        """
         self.radius = radius
         self.period = period
         self.omega = 2 * np.pi / period
         self.direction = -1 if clockwise else 1
 
-    def get_position(self, t):
+    def get_position(self, t: float) -> Tuple[float, float]:
+        """Get (x, y) position in mm at time t."""
         angle = self.direction * self.omega * t
         x = self.radius * np.cos(angle)
         y = self.radius * np.sin(angle)
         return x, y
 
-    def get_velocity(self, t):
+    def get_velocity(self, t: float) -> Tuple[float, float]:
+        """Get (vx, vy) velocity in mm/s at time t."""
         angle = self.direction * self.omega * t
         vx = -self.direction * self.radius * self.omega * np.sin(angle)
         vy = self.direction * self.radius * self.omega * np.cos(angle)
@@ -757,89 +842,121 @@ class CirclePattern(TrajectoryPattern):
 class FigureEightPattern(TrajectoryPattern):
     """Figure-8 (lemniscate) trajectory pattern."""
 
-    def __init__(self, width=60.0, height=40.0, period=12.0):
-        self.a = width / 2.0
-        self.b = height / 2.0
+    def __init__(self, width: float = 60.0, height: float = 40.0, period: float = 12.0) -> None:
+        """
+        Create a figure-8 (lemniscate) trajectory pattern.
+
+        Args:
+            width: Pattern width in mm
+            height: Pattern height in mm
+            period: Time to complete one figure-8 in seconds
+        """
+        self.period = period
+        self.a = width / 2.0  # Semi-width
+        self.b = height / 2.0  # Semi-height
         self.omega = 2 * np.pi / period
 
-    def get_position(self, t):
+    def get_position(self, t: float) -> Tuple[float, float]:
+        """Get (x, y) position in mm at time t."""
         angle = self.omega * t
         x = self.a * np.cos(angle)
-        y = self.b * np.sin(angle) * np.cos(angle)
+        y = self.b * np.sin(angle) * np.cos(angle)  # Lemniscate formula
         return x, y
 
-    def get_velocity(self, t):
+    def get_velocity(self, t: float) -> Tuple[float, float]:
+        """Get (vx, vy) velocity in mm/s at time t."""
         angle = self.omega * t
         vx = -self.a * self.omega * np.sin(angle)
-        vy = self.b * self.omega * np.cos(2 * angle)
+        vy = self.b * self.omega * np.cos(2 * angle)  # Derivative of lemniscate
         return vx, vy
 
 
 class StarPattern(TrajectoryPattern):
-    """Five-pointed star trajectory pattern."""
+    """Five-pointed star with instant jumps between corners."""
 
-    def __init__(self, radius=60.0, period=15.0):
+    def __init__(self, radius: float = 60.0, period: float = 15.0, dwell_time: float = 0.5) -> None:
+        """
+        Create a star pattern where target instantly jumps between star points.
+
+        The ball jumps to corners in order: 1→3→5→2→4→1, creating a star pattern.
+        Stays at each corner for period/5 seconds before jumping to the next.
+
+        Args:
+            radius: Distance from center to star points in mm
+            period: Time to complete one full star cycle in seconds
+            dwell_time: Time to stay at each corner before jumping (seconds) - deprecated, not used
+        """
         self.radius = radius
         self.period = period
+        self.dwell_time = dwell_time
         self.num_vertices = 5
-        self.visit_order = [0, 2, 4, 1, 3, 0]
+        self.visit_order = [0, 2, 4, 1, 3]  # Jump order: point 1→3→5→2→4
         self.vertex_positions = self._compute_vertex_positions()
         self.path_positions = [self.vertex_positions[i] for i in self.visit_order]
 
-    def _compute_vertex_positions(self):
-        """Compute (x, y) positions of 5 vertices around circle."""
+    def _compute_vertex_positions(self) -> list:
+        """
+        Compute (x, y) positions of 5 vertices around circle.
+
+        Vertices are evenly spaced at 72° intervals (360°/5).
+        Starting from top (90°) going counter-clockwise.
+        """
         positions = []
         for i in range(self.num_vertices):
-            angle = np.pi / 2 - i * (2 * np.pi / self.num_vertices)
+            angle = np.pi / 2 - i * (2 * np.pi / self.num_vertices)  # Start at top, go CCW
             x = self.radius * np.cos(angle)
             y = self.radius * np.sin(angle)
             positions.append((x, y))
         return positions
 
-    def get_position(self, t):
-        t_norm = (t % self.period) / self.period
-        num_segments = len(self.path_positions) - 1
-        segment_idx = min(int(t_norm * num_segments), num_segments - 1)
-        segment_progress = (t_norm * num_segments) % 1.0
+    def get_position(self, t: float) -> Tuple[float, float]:
+        """
+        Get (x, y) position in mm at time t (instant jump between corners).
 
-        current_pos = self.path_positions[segment_idx]
-        next_pos = self.path_positions[segment_idx + 1]
+        The target stays at each corner, then instantly jumps to next corner.
+        """
+        t_in_cycle = t % self.period
 
-        x = current_pos[0] + segment_progress * (next_pos[0] - current_pos[0])
-        y = current_pos[1] + segment_progress * (next_pos[1] - current_pos[1])
+        # Determine which corner we're at based on time
+        time_per_point = self.period / len(self.path_positions)
+        point_idx = int(t_in_cycle / time_per_point)
+        point_idx = min(point_idx, len(self.path_positions) - 1)
 
-        return x, y
+        # Return the corner position (no interpolation - instant jump)
+        return self.path_positions[point_idx]
 
-    def get_velocity(self, t):
-        t_norm = (t % self.period) / self.period
-        num_segments = len(self.path_positions) - 1
-        segment_idx = min(int(t_norm * num_segments), num_segments - 1)
+    def get_velocity(self, t: float) -> Tuple[float, float]:
+        """
+        Get (vx, vy) velocity in mm/s at time t.
 
-        current_pos = self.path_positions[segment_idx]
-        next_pos = self.path_positions[segment_idx + 1]
-
-        dx = next_pos[0] - current_pos[0]
-        dy = next_pos[1] - current_pos[1]
-
-        segment_time = self.period / num_segments
-
-        vx = dx / segment_time
-        vy = dy / segment_time
-
-        return vx, vy
+        Velocity is zero when dwelling at a corner, and infinite (approximated as zero)
+        during the instant jump. For practical purposes, returns zero velocity.
+        """
+        # Since we instantly jump between points, velocity is effectively zero
+        # (infinite during jump, zero while dwelling)
+        return 0.0, 0.0
 
 
 class StaticPattern(TrajectoryPattern):
     """Static position (no movement)."""
 
-    def __init__(self, x=0.0, y=0.0):
+    def __init__(self, x: float = 0.0, y: float = 0.0) -> None:
+        """
+        Create a static position pattern (ball stays at fixed location).
+
+        Args:
+            x: X position in mm
+            y: Y position in mm
+        """
         self.x = x
         self.y = y
 
-    def get_position(self, t):
+    def get_position(self, t: float) -> Tuple[float, float]:
+        """Get (x, y) position in mm (constant regardless of time)."""
         return self.x, self.y
 
-    def get_velocity(self, t):
+    def get_velocity(self, t: float) -> Tuple[float, float]:
+        """Get (vx, vy) velocity in mm/s (always zero)."""
         return 0.0, 0.0
 
 
@@ -847,7 +964,7 @@ class PatternFactory:
     """Factory for creating trajectory patterns."""
 
     @staticmethod
-    def create(pattern_type, **kwargs):
+    def create(pattern_type: str, **kwargs) -> TrajectoryPattern:
         """
         Create a trajectory pattern.
 
@@ -857,6 +974,10 @@ class PatternFactory:
 
         Returns:
             TrajectoryPattern instance
+
+        Example:
+            >>> circle = PatternFactory.create('circle', radius=50.0, period=10.0)
+            >>> star = PatternFactory.create('star', radius=60.0, period=15.0)
         """
         patterns = {
             'static': StaticPattern,
@@ -1003,29 +1124,29 @@ class Pixy2Camera:
 
         return measured, detected
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset camera state (timing and cached measurements)."""
         self.last_sample_time = -float('inf')
         self.cached_measurement = (None, None)
         self.cached_detected = False
 
-    def set_sample_rate(self, sample_rate_hz):
+    def set_sample_rate(self, sample_rate_hz: float) -> None:
         """Update camera sample rate on the fly."""
         if sample_rate_hz > 0:
             self.sample_period = 1.0 / sample_rate_hz
         else:
             self.sample_period = 0.0
 
-    def get_sample_rate(self):
+    def get_sample_rate(self) -> float:
         """Get current sample rate in Hz."""
         if self.sample_period > 0:
             return 1.0 / self.sample_period
         return float('inf')
 
-    def set_noise_level(self, subpixel_noise_std):
+    def set_noise_level(self, subpixel_noise_std: float) -> None:
         """Update noise level on the fly."""
         self.subpixel_noise_std = subpixel_noise_std
 
-    def get_noise_level(self):
+    def get_noise_level(self) -> float:
         """Get current noise standard deviation."""
         return self.subpixel_noise_std

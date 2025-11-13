@@ -9,6 +9,7 @@ Supports PID/LQR control in simulation and hardware modes.
 import sys
 import gc
 import time
+from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox
@@ -18,13 +19,19 @@ from setup.base_hardware import HardwareControllerBase, SerialController
 from gui import gui_modules as gm
 from gui.gui_builder import GUIBuilder
 from core.control_core import IMUControllerMixin, clip_tilt_vector
-from core.utils import MAX_TILT_ANGLE_DEG, Pixy2CameraConfig, BallPhysicsConfig, HardwareConnectionConfig, GUIConfig, VisualizationConfig
+from core.utils import (MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG, Pixy2CameraConfig,
+                        HardwareConnectionConfig, GUIConfig, VisualizationConfig)
 
 
 class MinimalController(IMUControllerMixin, HardwareControllerBase):
     """Lightweight controller with minimal GUI for rapid development."""
 
-    def __init__(self, app):
+    def __init__(self, app: QApplication) -> None:
+        """Initialize the Minimal Stewart Platform controller.
+
+        Args:
+            app: The QApplication instance for the GUI.
+        """
         # Mode selection
         self.operation_mode = 'sim'  # 'sim' or 'real'
         self.controller_type_selection = 'Manual'  # 'PID', 'LQR', or 'Manual'
@@ -50,11 +57,21 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
         # Window title
         self.setWindowTitle("Stewart Platform - Minimal Controller")
 
-    def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
+    def _update_controller(self, ball_pos_mm: Tuple[float, float], ball_vel_mm_s: Tuple[float, float],
+                           target_pos_mm: Tuple[float, float], dt: float) -> Optional[Tuple[float, float]]:
         """Update controller and return control output.
 
         In simulation mode, applies Kalman filtering when enabled for improved
         state estimation. Returns platform tilt angles (rx, ry) in degrees.
+
+        Args:
+            ball_pos_mm: Ball position in millimeters (x, y).
+            ball_vel_mm_s: Ball velocity in mm/s (vx, vy).
+            target_pos_mm: Target position in millimeters (x, y).
+            dt: Time step in seconds.
+
+        Returns:
+            Tuple of (rx, ry) tilt angles in degrees, or None if controller unavailable.
         """
         if self.controller is None:
             return None
@@ -75,8 +92,9 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
                 self.kalman_filter.predict([rx_deg, ry_deg])
 
-                # Kalman update step (with camera measurement)
-                self.kalman_filter.update(ball_pos_mm, self.simulation_time)
+                # Kalman update step (with camera measurement) - convert mm to meters
+                ball_pos_m = [ball_pos_mm[0] / 1000.0, ball_pos_mm[1] / 1000.0]
+                self.kalman_filter.update(ball_pos_m, self.simulation_time)
 
                 # Get filtered estimates
                 filtered_x, filtered_y = self.kalman_filter.get_position_mm()
@@ -103,13 +121,17 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         return rx, ry
 
-    def get_layout_config(self):
-        """Return minimal layout configuration."""
+    def get_layout_config(self) -> Dict[str, Any]:
+        """Return minimal layout configuration.
+
+        Returns:
+            Dictionary containing the layout configuration for the GUI.
+        """
         # Custom layout with narrow left column for controls, plot takes remaining space
         layout = {
             'columns': [
                 {
-                    'width': 350,  # Narrower control column
+                    'width': GUIConfig.MINIMAL_CONTROLLER_COLUMN_WIDTH,
                     'scrollable': True,
                     'modules': []
                 }
@@ -154,8 +176,12 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         return layout
 
-    def _create_callbacks(self):
-        """Create callback dictionary."""
+    def _create_callbacks(self) -> Dict[str, Any]:
+        """Create callback dictionary.
+
+        Returns:
+            Dictionary mapping callback names to callable functions.
+        """
         callbacks = super()._create_callbacks()
 
         callbacks.update({
@@ -171,7 +197,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         return callbacks
 
-    def _build_modular_gui(self):
+    def _build_modular_gui(self) -> None:
         """Build GUI using modular system."""
         module_registry = {
             'mode_selector': gm.ModeSelectionModule,
@@ -195,8 +221,12 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         self.update_gui_modules()
 
-    def on_mode_change(self, mode):
-        """Handle mode change between sim and real."""
+    def on_mode_change(self, mode: str) -> None:
+        """Handle mode change between simulation and hardware.
+
+        Args:
+            mode: New operation mode ('sim' or 'real').
+        """
         if mode == self.operation_mode:
             return
 
@@ -227,8 +257,12 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
         # Update window title
         self.setWindowTitle(f"Stewart Platform - Minimal Controller [{mode.upper()}]")
 
-    def on_controller_type_change(self, controller_type):
-        """Handle controller type change between PID/LQR/Manual."""
+    def on_controller_type_change(self, controller_type: str) -> None:
+        """Handle controller type change.
+
+        Args:
+            controller_type: New controller type ('PID', 'LQR', or 'Manual').
+        """
         if controller_type == self.controller_type_selection:
             return
 
@@ -252,8 +286,8 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         self._initialize_controller()
 
-    def on_controller_param_change(self):
-        """Update controller when parameters change."""
+    def on_controller_param_change(self) -> None:
+        """Update controller when parameters change via GUI sliders."""
         if self.controller is None:
             return
 
@@ -280,7 +314,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
             if self.controller_enabled:
                 self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
 
-    def _rebuild_gui(self):
+    def _rebuild_gui(self) -> None:
         """Rebuild GUI after mode/controller change."""
         # Clear old GUI
         if hasattr(self, 'gui_modules'):
@@ -288,7 +322,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
                 if module and hasattr(module, 'widget'):
                     try:
                         module.widget.deleteLater()
-                    except:
+                    except Exception:
                         pass
 
         old_central = self.central_widget
@@ -303,7 +337,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         QApplication.processEvents()
 
-    def _control_thread_func(self):
+    def _control_thread_func(self) -> None:
         """Hardware control thread with IMU integration."""
         while self.simulation_running:
             loop_start = time.perf_counter()
@@ -326,10 +360,8 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
                 pixy_y = ball_data['y']
 
                 # Camera dimensions: 316×208 pixels, origin at top-left
-                CAMERA_HEIGHT_PIXELS = 208.0
-
                 ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
-                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
+                ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
@@ -357,7 +389,9 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
                 # Update step (only when ball is detected)
                 if ball_data is not None and self.ball_detected:
-                    self.kalman_filter.update(self.ball_pos_mm, self.simulation_time)
+                    # Convert mm to meters for Kalman filter
+                    ball_pos_m = [self.ball_pos_mm[0] / 1000.0, self.ball_pos_mm[1] / 1000.0]
+                    self.kalman_filter.update(ball_pos_m, self.simulation_time)
 
                 # Get filtered estimates
                 filtered_x, filtered_y = self.kalman_filter.get_position_mm()
@@ -382,7 +416,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
                 if control_output is not None:
                     rx_ctrl, ry_ctrl = control_output
-                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, 15.0)
+                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, MAX_CONTROLLER_OUTPUT_DEG)
 
                     # Store controller output (gravity-relative) for Kalman physics prediction
                     self.prev_effective_angles['rx'] = rx_ctrl
@@ -445,8 +479,8 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
             self.simulation_time += self.control_interval
 
-    def _gui_update_loop(self):
-        """Update GUI at 10 Hz while control thread is active."""
+    def _gui_update_loop(self) -> None:
+        """Update GUI while control thread is active."""
         if not self.simulation_running:
             return
 
@@ -463,8 +497,12 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
         # Schedule next update
         QTimer.singleShot(GUIConfig.PLOT_DISABLED_INTERVAL_MS, self._gui_update_loop)
 
-    def _create_plot(self, parent):
-        """Override to add ball trail plot item."""
+    def _create_plot(self, parent: QWidget) -> None:
+        """Override to add ball trail plot item.
+
+        Args:
+            parent: Parent widget to contain the plot.
+        """
         # Call parent to create standard plot
         super()._create_plot(parent)
 
@@ -472,7 +510,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
         plot_item = self.plot_widget.getPlotItem()
         self.ball_trail = plot_item.plot([], [], pen=pg.mkPen(color='#ff8888', width=2, style=Qt.PenStyle.DashLine))
 
-    def connect_serial(self):
+    def connect_serial(self) -> None:
         """Establish serial connection to hardware."""
         if self.connected and self.serial_controller is not None:
             self.log("Connection already established")
@@ -516,7 +554,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
             QMessageBox.critical(self, "Error", message)
             self.log(f"Error: {message}")
 
-    def disconnect_serial(self):
+    def disconnect_serial(self) -> None:
         """Disconnect from serial hardware."""
         if self.simulation_running:
             self.stop_simulation()
@@ -534,7 +572,7 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
 
         self.log("Disconnected")
 
-    def update_gui_modules(self):
+    def update_gui_modules(self) -> None:
         """Override to provide hardware-specific state in real mode."""
         if self.operation_mode == 'real':
             # Hardware mode: use actual hardware state
@@ -643,8 +681,8 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
                     self.gui_modules['kalman_filter'].update(kalman_state)
 
 
-def main():
-    """Launch minimal controller application."""
+def main() -> None:
+    """Launch the Minimal Stewart Platform controller application."""
     app = QApplication(sys.argv)
     controller = MinimalController(app)
     controller.show()

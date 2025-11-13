@@ -10,6 +10,7 @@ and MinimalController (min_c.py) while allowing each to have unique GUIs.
 """
 
 import gc
+import logging
 import numpy as np
 import time
 import threading
@@ -17,6 +18,7 @@ import serial
 from queue import Queue, Empty
 import sys
 import ctypes
+from typing import Dict, Any, Optional, Tuple, List
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QWidget, QApplication
@@ -25,8 +27,7 @@ from setup.base_simulator import BaseStewartSimulator, ControllerConfig
 from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
 from core.utils import (ControlLoopConfig, Pixy2CameraConfig, BallPhysicsConfig,
                          VisualizationConfig, HardwareConnectionConfig, PIDConfig,
-                         PerformanceConfig, IKZOptimizationConfig, get_controller_defaults,
-                         SerialConfig)
+                         PerformanceConfig, get_controller_defaults, SerialConfig)
 
 # Thread priority constants
 THREAD_PRIORITY_IDLE = -15
@@ -45,12 +46,18 @@ THREAD_PRIORITY_TIME_CRITICAL = 15
 class WindowsTimerManager:
     """Windows multimedia timer resolution manager."""
 
-    def __init__(self):
-        self.timer_set = False
-        self.is_windows = sys.platform.startswith('win')
+    def __init__(self) -> None:
+        """Initialize Windows timer manager."""
+        self.timer_set: bool = False
+        self.is_windows: bool = sys.platform.startswith('win')
 
-    def set_high_resolution(self):
-        """Set Windows timer to high resolution."""
+    def set_high_resolution(self) -> Tuple[bool, str]:
+        """
+        Set Windows timer to high resolution (1ms).
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         if not self.is_windows:
             return False, "Not Windows - timer not set"
 
@@ -65,23 +72,24 @@ class WindowsTimerManager:
         except Exception as e:
             return False, f"Timer error: {str(e)}"
 
-    def restore_default(self):
+    def restore_default(self) -> None:
         """Restore default timer resolution."""
         if self.timer_set:
             try:
                 timeEndPeriod = ctypes.windll.winmm.timeEndPeriod
                 timeEndPeriod(1)
                 self.timer_set = False
-            except:
+            except Exception:
                 pass
 
 
 class ThreadPriorityManager:
     """Windows thread priority manager."""
 
-    def __init__(self):
-        self.is_windows = sys.platform.startswith('win')
-        self.kernel32 = None
+    def __init__(self) -> None:
+        """Initialize thread priority manager."""
+        self.is_windows: bool = sys.platform.startswith('win')
+        self.kernel32: Optional[Any] = None
 
         if self.is_windows:
             try:
@@ -89,7 +97,7 @@ class ThreadPriorityManager:
             except (AttributeError, OSError):
                 self.is_windows = False
 
-    def set_thread_priority(self, thread_id, priority=THREAD_PRIORITY_ABOVE_NORMAL):
+    def set_thread_priority(self, thread_id: int, priority: int = THREAD_PRIORITY_ABOVE_NORMAL) -> bool:
         """
         Set thread priority on Windows.
 
@@ -119,18 +127,44 @@ class ThreadPriorityManager:
 class IKCache:
     """Cache IK results with coarse resolution for higher hit rate."""
 
-    def __init__(self, max_size=5000):
-        self.cache = {}
-        self.max_size = max_size
-        self.hits = 0
-        self.misses = 0
+    def __init__(self, max_size: int = 5000) -> None:
+        """
+        Initialize IK cache.
 
-    def get_key(self, translation, rotation):
+        Args:
+            max_size: Maximum number of cached entries
+        """
+        self.cache: Dict[Tuple[Tuple[float, ...], Tuple[float, ...]], np.ndarray] = {}
+        self.max_size: int = max_size
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def get_key(self, translation: np.ndarray, rotation: np.ndarray) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+        """
+        Generate cache key from translation and rotation (rounded to integer degrees/mm).
+
+        Args:
+            translation: Translation vector [x, y, z]
+            rotation: Rotation vector [rx, ry, rz]
+
+        Returns:
+            Tuple key for cache lookup
+        """
         t_key = tuple(np.round(translation, 0))
         r_key = tuple(np.round(rotation, 0))
         return (t_key, r_key)
 
-    def get(self, translation, rotation):
+    def get(self, translation: np.ndarray, rotation: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Retrieve cached servo angles for given pose.
+
+        Args:
+            translation: Translation vector
+            rotation: Rotation vector
+
+        Returns:
+            Cached servo angles or None if not found
+        """
         key = self.get_key(translation, rotation)
         if key in self.cache:
             self.hits += 1
@@ -138,17 +172,32 @@ class IKCache:
         self.misses += 1
         return None
 
-    def put(self, translation, rotation, angles):
+    def put(self, translation: np.ndarray, rotation: np.ndarray, angles: np.ndarray) -> None:
+        """
+        Store servo angles in cache.
+
+        Args:
+            translation: Translation vector
+            rotation: Rotation vector
+            angles: Servo angles to cache
+        """
         if len(self.cache) >= self.max_size:
             self.cache.pop(next(iter(self.cache)))
         key = self.get_key(translation, rotation)
         self.cache[key] = angles.copy()
 
-    def get_hit_rate(self):
+    def get_hit_rate(self) -> float:
+        """
+        Calculate cache hit rate.
+
+        Returns:
+            Hit rate (0.0 to 1.0)
+        """
         total = self.hits + self.misses
         return self.hits / total if total > 0 else 0.0
 
-    def clear(self):
+    def clear(self) -> None:
+        """Clear cache and reset statistics."""
         self.cache.clear()
         self.hits = 0
         self.misses = 0
@@ -157,30 +206,43 @@ class IKCache:
 class SerialController:
     """Serial communication with hardware."""
 
-    def __init__(self, port, baudrate=SerialConfig.USB_BAUD_RATE):
-        self.port = port
-        self.baudrate = baudrate
-        self.serial = None
-        self.connected = False
-        self.read_thread = None
-        self.write_thread = None
-        self.running = False
+    def __init__(self, port: str, baudrate: int = SerialConfig.USB_BAUD_RATE) -> None:
+        """
+        Initialize serial controller.
 
-        self.ball_data_queue = Queue(maxsize=SerialConfig.BALL_DATA_QUEUE_SIZE)
-        self.command_queue = Queue(maxsize=SerialConfig.COMMAND_QUEUE_SIZE)
-        self.last_command_time = 0
+        Args:
+            port: Serial port name (e.g., 'COM3')
+            baudrate: Communication baud rate
+        """
+        self.port: str = port
+        self.baudrate: int = baudrate
+        self.serial: Optional[serial.Serial] = None
+        self.connected: bool = False
+        self.read_thread: Optional[threading.Thread] = None
+        self.write_thread: Optional[threading.Thread] = None
+        self.running: bool = False
+
+        self.ball_data_queue: Queue = Queue(maxsize=SerialConfig.BALL_DATA_QUEUE_SIZE)
+        self.command_queue: Queue = Queue(maxsize=SerialConfig.COMMAND_QUEUE_SIZE)
+        self.last_command_time: float = 0.0
 
         # IMU data queues
-        self.gyro_queue = Queue(maxsize=SerialConfig.IMU_GYRO_QUEUE_SIZE)
-        self.accel_queue = Queue(maxsize=SerialConfig.IMU_ACCEL_QUEUE_SIZE)
-        self.mag_queue = Queue(maxsize=SerialConfig.IMU_MAG_QUEUE_SIZE)
+        self.gyro_queue: Queue = Queue(maxsize=SerialConfig.IMU_GYRO_QUEUE_SIZE)
+        self.accel_queue: Queue = Queue(maxsize=SerialConfig.IMU_ACCEL_QUEUE_SIZE)
+        self.mag_queue: Queue = Queue(maxsize=SerialConfig.IMU_MAG_QUEUE_SIZE)
 
         # IMU statistics
-        self.gyro_count = 0
-        self.accel_count = 0
-        self.mag_count = 0
+        self.gyro_count: int = 0
+        self.accel_count: int = 0
+        self.mag_count: int = 0
 
-    def connect(self):
+    def connect(self) -> Tuple[bool, str]:
+        """
+        Connect to serial port and start communication threads.
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         try:
             self.serial = serial.Serial(self.port, self.baudrate,
                                         timeout=SerialConfig.READ_TIMEOUT_S,
@@ -203,7 +265,8 @@ class SerialController:
             self.connected = False
             return False, f"Connection failed: {str(e)}"
 
-    def disconnect(self):
+    def disconnect(self) -> None:
+        """Disconnect from serial port and stop communication threads."""
         self.running = False
 
         if self.read_thread:
@@ -215,7 +278,8 @@ class SerialController:
             self.serial.close()
         self.connected = False
 
-    def _read_loop(self):
+    def _read_loop(self) -> None:
+        """Serial read thread - continuously read and parse incoming data."""
         buffer = ""
 
         while self.running and self.serial and self.serial.is_open:
@@ -253,13 +317,13 @@ class SerialController:
                                 pass
 
                         elif line.startswith("A:"):
-                            # Accelerometer data: A:timestamp_us,ax,ay,az
+                            # Accelerometer data: A:timestamp_us,accel_x,accel_y,accel_z
                             try:
                                 parts = line[2:].split(',')
                                 if len(parts) == 4:
                                     timestamp_us = int(parts[0])
-                                    ax, ay, az = int(parts[1]), int(parts[2]), int(parts[3])
-                                    accel_data = np.array([ax, ay, az])
+                                    accel_x, accel_y, accel_z = int(parts[1]), int(parts[2]), int(parts[3])
+                                    accel_data = np.array([accel_x, accel_y, accel_z])
 
                                     if not self.accel_queue.full():
                                         self.accel_queue.put((timestamp_us, accel_data))
@@ -268,13 +332,13 @@ class SerialController:
                                 pass
 
                         elif line.startswith("G:"):
-                            # Gyroscope data: G:timestamp_us,gx,gy,gz
+                            # Gyroscope data: G:timestamp_us,gyro_x,gyro_y,gyro_z
                             try:
                                 parts = line[2:].split(',')
                                 if len(parts) == 4:
                                     timestamp_us = int(parts[0])
-                                    gx, gy, gz = int(parts[1]), int(parts[2]), int(parts[3])
-                                    gyro_data = np.array([gx, gy, gz])
+                                    gyro_x, gyro_y, gyro_z = int(parts[1]), int(parts[2]), int(parts[3])
+                                    gyro_data = np.array([gyro_x, gyro_y, gyro_z])
 
                                     if not self.gyro_queue.full():
                                         self.gyro_queue.put((timestamp_us, gyro_data))
@@ -283,13 +347,13 @@ class SerialController:
                                 pass
 
                         elif line.startswith("M:"):
-                            # Magnetometer data: M:timestamp_us,mx,my,mz
+                            # Magnetometer data: M:timestamp_us,mag_x,mag_y,mag_z
                             try:
                                 parts = line[2:].split(',')
                                 if len(parts) == 4:
                                     timestamp_us = int(parts[0])
-                                    mx, my, mz = int(parts[1]), int(parts[2]), int(parts[3])
-                                    mag_data = np.array([mx, my, mz])
+                                    mag_x, mag_y, mag_z = int(parts[1]), int(parts[2]), int(parts[3])
+                                    mag_data = np.array([mag_x, mag_y, mag_z])
 
                                     if not self.mag_queue.full():
                                         self.mag_queue.put((timestamp_us, mag_data))
@@ -301,10 +365,11 @@ class SerialController:
 
             except Exception as e:
                 if self.running:
-                    print(f"Serial read failed: {e}")
+                    logging.error(f"Serial read failed: {e}")
                 time.sleep(0.1)
 
-    def _write_loop(self):
+    def _write_loop(self) -> None:
+        """Serial write thread - send queued commands to hardware."""
         error_count = 0
         max_errors = 5
 
@@ -336,8 +401,16 @@ class SerialController:
                     error_count += 1
                 time.sleep(0.1)
 
-    def send_servo_angles(self, angles):
-        """Queue servo angles (no rate limiting for high-frequency control)."""
+    def send_servo_angles(self, angles: np.ndarray) -> bool:
+        """
+        Queue servo angles for sending to hardware (no rate limiting).
+
+        Args:
+            angles: Array of 6 servo angles in degrees
+
+        Returns:
+            True if queued successfully, False otherwise
+        """
         if not self.connected:
             return False
 
@@ -348,17 +421,26 @@ class SerialController:
             if self.command_queue.qsize() >= SerialConfig.COMMAND_QUEUE_SIZE:
                 try:
                     self.command_queue.get_nowait()  # Remove oldest
-                except:
+                except Empty:
                     pass
 
             self.command_queue.put_nowait(command)
             self.last_command_time = time.time()
             return True
         except Exception as e:
-            print(f"Command queue failed: {e}")
+            logging.error(f"Command queue failed: {e}")
             return False
 
-    def send_command(self, cmd):
+    def send_command(self, cmd: str) -> bool:
+        """
+        Send a command to hardware.
+
+        Args:
+            cmd: Command string
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
         if not self.connected:
             return False
         try:
@@ -366,16 +448,24 @@ class SerialController:
                 return False
             self.command_queue.put_nowait(cmd + '\n')
             return True
-        except:
+        except Exception:
             return False
 
-    def set_servo_speed(self, speed):
+    def set_servo_speed(self, speed: int) -> bool:
+        """Set servo speed parameter."""
         return self.send_command(f'SPD:{speed}')
 
-    def set_servo_acceleration(self, accel):
+    def set_servo_acceleration(self, accel: int) -> bool:
+        """Set servo acceleration parameter."""
         return self.send_command(f'ACC:{accel}')
 
-    def get_latest_ball_data(self):
+    def get_latest_ball_data(self) -> Optional[Dict[str, Any]]:
+        """
+        Get most recent ball position data from camera.
+
+        Returns:
+            Dictionary with ball data or None if no data available
+        """
         try:
             data = None
             while not self.ball_data_queue.empty():
@@ -384,8 +474,13 @@ class SerialController:
         except Empty:
             return None
 
-    def get_imu_data_batch(self):
-        """Get all available IMU data from queues for calibration."""
+    def get_imu_data_batch(self) -> Tuple[List, List, List]:
+        """
+        Get all available IMU data from queues for calibration.
+
+        Returns:
+            Tuple of (gyro_batch, accel_batch, mag_batch)
+        """
         gyro_batch = []
         accel_batch = []
         mag_batch = []
@@ -410,8 +505,13 @@ class SerialController:
 
         return gyro_batch, accel_batch, mag_batch
 
-    def get_single_imu_sample(self):
-        """Get one sample from each IMU sensor (for real-time processing)."""
+    def get_single_imu_sample(self) -> Tuple[Optional[Tuple], Optional[Tuple], Optional[Tuple]]:
+        """
+        Get one sample from each IMU sensor (for real-time processing).
+
+        Returns:
+            Tuple of (gyro_data, accel_data, mag_data), each can be None
+        """
         gyro_data = None
         accel_data = None
         mag_data = None
@@ -441,16 +541,19 @@ class SerialController:
 class HardwareControllerConfig(ControllerConfig):
     """Hardware PID controller configuration with derivative filtering."""
 
-    def __init__(self):
-        self.scalar_values = [0.0000001, 0.000001, 0.00001, 0.0001,
+    def __init__(self) -> None:
+        """Initialize hardware PID controller configuration."""
+        self.scalar_values: List[float] = [0.0000001, 0.000001, 0.00001, 0.0001,
                               0.001, 0.01, 0.1, 1.0, 10.0]
-        self.default_gains = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
-        self.default_scalar_idx = 3
+        self.default_gains: Dict[str, float] = {'kp': 3.0, 'ki': 1.0, 'kd': 3.0}
+        self.default_scalar_idx: int = 3
 
     def get_controller_name(self) -> str:
+        """Get controller name."""
         return "PID (Hardware)"
 
-    def create_controller(self, **kwargs):
+    def create_controller(self, **kwargs) -> PIDController:
+        """Create PID controller instance with hardware-specific parameters."""
         return PIDController(
             kp=kwargs.get('kp', 0.0003),
             ki=kwargs.get('ki', 0.0001),
@@ -459,14 +562,15 @@ class HardwareControllerConfig(ControllerConfig):
             derivative_filter_alpha=kwargs.get('derivative_filter_alpha', PIDConfig.HW_DERIVATIVE_FILTER_ALPHA)
         )
 
-    def get_scalar_values(self) -> list:
+    def get_scalar_values(self) -> List[float]:
+        """Get list of scalar values for parameter adjustment."""
         return self.scalar_values
 
 
 class LQRControllerConfig(ControllerConfig):
     """LQR controller configuration for both simulation and hardware modes."""
 
-    def __init__(self, mode='simulation'):
+    def __init__(self, mode: str = 'simulation') -> None:
         """
         Initialize LQR configuration.
 
@@ -474,18 +578,20 @@ class LQRControllerConfig(ControllerConfig):
             mode: 'simulation' or 'hardware'
         """
         config = get_controller_defaults('LQR', mode)
-        self.scalar_values = config['scalar_values']
-        self.default_weights = config['weights']
-        self.default_scalar_indices = config['scalar_indices']
-        self.output_limit = config['output_limit']
-        self.ball_physics_params = BallPhysicsConfig.as_dict()
-        self.controller_ref = None
-        self.mode = mode
+        self.scalar_values: List[float] = config['scalar_values']
+        self.default_weights: Dict[str, float] = config['weights']
+        self.default_scalar_indices: Dict[str, int] = config['scalar_indices']
+        self.output_limit: float = config['output_limit']
+        self.ball_physics_params: Dict[str, float] = BallPhysicsConfig.as_dict()
+        self.controller_ref: Optional[Any] = None
+        self.mode: str = mode
 
     def get_controller_name(self) -> str:
+        """Get controller name."""
         return "LQR"
 
-    def create_controller(self, **kwargs):
+    def create_controller(self, **kwargs) -> LQRController:
+        """Create LQR controller instance."""
         return LQRController(
             Q_pos=kwargs.get('Q_pos', self.default_weights['Q_pos']),
             Q_vel=kwargs.get('Q_vel', self.default_weights['Q_vel']),
@@ -494,7 +600,8 @@ class LQRControllerConfig(ControllerConfig):
             ball_physics_params=self.ball_physics_params
         )
 
-    def get_scalar_values(self) -> list:
+    def get_scalar_values(self) -> List[float]:
+        """Get list of scalar values for parameter adjustment."""
         return self.scalar_values
 
 
@@ -519,7 +626,7 @@ class HardwareControllerBase(BaseStewartSimulator):
     - Controller-specific widgets (if any)
     """
 
-    def __init__(self, app, controller_config):
+    def __init__(self, app: QApplication, controller_config: ControllerConfig) -> None:
         """Initialize hardware controller base.
 
         Args:
@@ -527,54 +634,54 @@ class HardwareControllerBase(BaseStewartSimulator):
             controller_config: ControllerConfig instance for this controller type
         """
         # Hardware components
-        self.serial_controller = None
-        self.connected = False
-        self.port_var = ''
-        self.ik_cache = None
-        self.timer_manager = WindowsTimerManager()
-        self.priority_manager = ThreadPriorityManager()
-        self.control_frequency = ControlLoopConfig.DEFAULT_FREQUENCY_HZ
-        self.control_interval = 1.0 / ControlLoopConfig.DEFAULT_FREQUENCY_HZ
-        self.use_kalman_derivative = False
+        self.serial_controller: Optional[SerialController] = None
+        self.connected: bool = False
+        self.port_var: str = ''
+        self.ik_cache: Optional[IKCache] = None
+        self.timer_manager: WindowsTimerManager = WindowsTimerManager()
+        self.priority_manager: ThreadPriorityManager = ThreadPriorityManager()
+        self.control_frequency: int = ControlLoopConfig.DEFAULT_FREQUENCY_HZ
+        self.control_interval: float = 1.0 / ControlLoopConfig.DEFAULT_FREQUENCY_HZ
+        self.use_kalman_derivative: bool = False
 
         # Camera calibration parameters (pixels to mm conversion)
-        self.pixy_width_mm = Pixy2CameraConfig.FOV_WIDTH_MM
-        self.pixy_height_mm = Pixy2CameraConfig.FOV_HEIGHT_MM
-        self.pixels_to_mm_x = Pixy2CameraConfig.PIXELS_TO_MM_X
-        self.pixels_to_mm_y = Pixy2CameraConfig.PIXELS_TO_MM_Y
-        self.last_ball_update = 0.0
-        self.ball_pos_mm = np.array([0.0, 0.0])
-        self.ball_detected = False
+        self.pixy_width_mm: float = Pixy2CameraConfig.FOV_WIDTH_MM
+        self.pixy_height_mm: float = Pixy2CameraConfig.FOV_HEIGHT_MM
+        self.pixels_to_mm_x: float = Pixy2CameraConfig.PIXELS_TO_MM_X
+        self.pixels_to_mm_y: float = Pixy2CameraConfig.PIXELS_TO_MM_Y
+        self.last_ball_update: float = 0.0
+        self.ball_pos_mm: np.ndarray = np.array([0.0, 0.0])
+        self.ball_detected: bool = False
 
         # Performance tracking
-        self.performance_data = {
+        self.performance_data: Dict[str, List[float]] = {
             'loop_times': [],
             'ik_times': [],
             'serial_times': []
         }
 
         # Initialize Kalman filter (required before super().__init__)
-        self.kalman_filter = KalmanFilter(
+        self.kalman_filter: KalmanFilter = KalmanFilter(
             process_noise_scale=1.0,
             measurement_noise_scale=1.0,
             ball_physics_params=BallPhysicsConfig.as_dict(),
             dt=self.control_interval
         )
-        self.kalman_enabled = True
+        self.kalman_enabled: bool = True
 
         # Ball position trail visualization
-        self.ball_history_x = []
-        self.ball_history_y = []
-        self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
+        self.ball_history_x: List[float] = []
+        self.ball_history_y: List[float] = []
+        self.max_history: int = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
 
         # Call parent constructor
         super().__init__(app, controller_config)
 
-    def _get_controller_type(self):
+    def _get_controller_type(self) -> str:
         """Override to return selected controller type."""
         return self.controller_type_selection
 
-    def _create_controller_config(self):
+    def _create_controller_config(self) -> ControllerConfig:
         """Create appropriate controller config based on mode and controller type."""
         if self.controller_type_selection == 'PID':
             return HardwareControllerConfig()
@@ -587,7 +694,7 @@ class HardwareControllerBase(BaseStewartSimulator):
             # Manual mode uses default configuration
             return HardwareControllerConfig()
 
-    def _initialize_controller(self):
+    def _initialize_controller(self) -> None:
         """Initialize controller based on current type."""
         if self.controller_type_selection == 'Manual':
             self.controller = None
@@ -689,7 +796,7 @@ class HardwareControllerBase(BaseStewartSimulator):
     # HARDWARE COMMUNICATION
     # ============================================================================
 
-    def connect_serial(self):
+    def connect_serial(self) -> None:
         """Connect to hardware via serial port."""
         port = self.port_var
 
@@ -728,7 +835,7 @@ class HardwareControllerBase(BaseStewartSimulator):
             if hasattr(self, 'gui_modules') and 'serial_connection' in self.gui_modules:
                 self.gui_modules['serial_connection'].update({'connected': False})
 
-    def disconnect_serial(self):
+    def disconnect_serial(self) -> None:
         """Disconnect from hardware."""
         if not self.connected:
             return
@@ -745,7 +852,7 @@ class HardwareControllerBase(BaseStewartSimulator):
 
         self.log("Disconnected")
 
-    def initialize_ik_cache(self):
+    def initialize_ik_cache(self) -> None:
         """Pre-compute common inverse kinematics solutions."""
         if not hasattr(self, 'ik_cache') or self.ik_cache is None:
             self.ik_cache = IKCache(max_size=PerformanceConfig.IK_CACHE_SIZE)
@@ -824,11 +931,9 @@ class HardwareControllerBase(BaseStewartSimulator):
                 pixy_x = ball_data['x']
                 pixy_y = ball_data['y']
 
-                # Camera dimensions: 316×208 pixels, origin at top-left
-                CAMERA_HEIGHT_PIXELS = 208.0
-
+                # Camera coordinate conversion (origin at top-left, convert to center-origin)
                 ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
-                ball_y_mm = (CAMERA_HEIGHT_PIXELS - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
+                ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
@@ -854,7 +959,9 @@ class HardwareControllerBase(BaseStewartSimulator):
 
                 # Update step (only if we have a recent ball measurement)
                 if ball_data is not None and self.ball_detected:
-                    self.kalman_filter.update(self.ball_pos_mm, self.simulation_time)
+                    # Convert mm to meters for Kalman filter
+                    ball_pos_m = [self.ball_pos_mm[0] / 1000.0, self.ball_pos_mm[1] / 1000.0]
+                    self.kalman_filter.update(ball_pos_m, self.simulation_time)
 
                 # Extract Kalman state
                 ball_pos_filtered = self.kalman_filter.get_position_mm()
@@ -1058,7 +1165,7 @@ class HardwareControllerBase(BaseStewartSimulator):
                 if module and hasattr(module, 'widget'):
                     try:
                         module.widget.deleteLater()
-                    except:
+                    except Exception:
                         pass
 
         # Replace central widget

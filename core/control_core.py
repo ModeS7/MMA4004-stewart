@@ -9,13 +9,22 @@ Controllers:
 - OrientationKalmanFilter: EKF for IMU-based orientation estimation
 """
 import time
+import warnings
+from typing import Optional, Tuple
 import numpy as np
 from scipy import linalg
 
-from core.utils import MAX_TILT_ANGLE_DEG, IMUKalmanConfig, IMUCalibrationConfig
+from core.utils import (
+    MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG, MAX_IMU_CORRECTION_DEG,
+    IMUKalmanConfig, IMUCalibrationConfig,
+    PID_INTEGRAL_LIMIT_DEG, MAX_CALIBRATION_TILT_DEG,
+    GIMBAL_LOCK_THRESHOLD, DIVISION_BY_ZERO_EPSILON,
+    KALMAN_POSITION_PROCESS_NOISE, KALMAN_VELOCITY_PROCESS_NOISE,
+    CAMERA_PIXEL_SIZE_M
+)
 
 
-def clip_tilt_vector(rx, ry, max_magnitude=MAX_TILT_ANGLE_DEG):
+def clip_tilt_vector(rx: float, ry: float, max_magnitude: float = MAX_TILT_ANGLE_DEG) -> Tuple[float, float, float]:
     """
     Clip tilt vector to maximum magnitude while preserving direction.
 
@@ -47,9 +56,9 @@ class PIDController:
     Separate PID loops for X and Y axes with vector-based output limiting.
     """
 
-    def __init__(self, kp=1.0, ki=0.0, kd=0.5,
-                 output_limit=MAX_TILT_ANGLE_DEG,
-                 derivative_filter_alpha=0.0):
+    def __init__(self, kp: float = 1.0, ki: float = 0.0, kd: float = 0.5,
+                 output_limit: float = MAX_CONTROLLER_OUTPUT_DEG,
+                 derivative_filter_alpha: float = 0.0) -> None:
         """
         Args:
             kp: Proportional gain
@@ -72,9 +81,9 @@ class PIDController:
         self.prev_error_y = 0.0
         self.filtered_derivative_y = 0.0
 
-        self.integral_limit = 100.0
+        self.integral_limit = PID_INTEGRAL_LIMIT_DEG
 
-    def update(self, ball_pos_mm, target_pos_mm, dt):
+    def update(self, ball_pos_mm: Tuple[float, float], target_pos_mm: Tuple[float, float], dt: float) -> Tuple[float, float]:
         """
         Compute PID control output.
 
@@ -123,7 +132,7 @@ class PIDController:
 
         return self.kp * error + self.ki * integral + self.kd * derivative
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset PID state."""
         self.integral_x = 0.0
         self.prev_error_x = 0.0
@@ -132,7 +141,7 @@ class PIDController:
         self.prev_error_y = 0.0
         self.filtered_derivative_y = 0.0
 
-    def set_gains(self, kp, ki, kd):
+    def set_gains(self, kp: float, ki: float, kd: float) -> None:
         """Update PID gains."""
         self.kp = kp
         self.ki = ki
@@ -150,9 +159,9 @@ class LQRController:
     Control: [tilt_ry, tilt_rx]
     """
 
-    def __init__(self, Q_pos=1.0, Q_vel=1.0, R=0.01,
-                 output_limit=MAX_TILT_ANGLE_DEG,
-                 ball_physics_params=None):
+    def __init__(self, Q_pos: float = 1.0, Q_vel: float = 1.0, R: float = 0.01,
+                 output_limit: float = MAX_CONTROLLER_OUTPUT_DEG,
+                 ball_physics_params: Optional[dict] = None) -> None:
         """
         Args:
             Q_pos: Position error cost weight
@@ -205,20 +214,25 @@ class LQRController:
 
         try:
             P = linalg.solve_continuous_are(A, B, Q, R)
-            self.K = np.linalg.inv(R) @ B.T @ P
+            self.K = np.linalg.solve(R, B.T @ P)
 
+            # Verify closed-loop stability
             eig_vals = np.linalg.eigvals(A - B @ self.K)
             max_real = np.max(np.real(eig_vals))
 
             if max_real >= 0:
-                print(f"LQR eigenvalue check: max real part = {max_real:.4f}")
+                import warnings
+                warnings.warn(f"LQR: Closed-loop system may be unstable (max eigenvalue real part: {max_real:.4f})")
 
         except np.linalg.LinAlgError as e:
-            print(f"Riccati equation solver failed: {e}")
+            import warnings
+            warnings.warn(f"LQR: Riccati equation solver failed: {e}. Using fallback gains.")
+            # Fallback to simple proportional+derivative gains
             self.K = np.array([[1.0, 0.0, 1.0, 0.0],
                                [0.0, 1.0, 0.0, 1.0]])
 
-    def update(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm=(0.0, 0.0)):
+    def update(self, ball_pos_mm: Tuple[float, float], ball_vel_mm_s: Tuple[float, float],
+               target_pos_mm: Tuple[float, float] = (0.0, 0.0)) -> Tuple[float, float]:
         """
         Compute LQR control output.
 
@@ -241,11 +255,11 @@ class LQRController:
         rx, ry, _ = clip_tilt_vector(u[1], u[0], self.output_limit)
         return rx, ry
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset controller state (LQR is stateless)."""
         pass
 
-    def set_weights(self, Q_pos=None, Q_vel=None, R=None):
+    def set_weights(self, Q_pos: Optional[float] = None, Q_vel: Optional[float] = None, R: Optional[float] = None) -> None:
         """Update cost weights and recompute gain matrix."""
         if Q_pos is not None:
             self.Q_pos = Q_pos
@@ -256,7 +270,7 @@ class LQRController:
 
         self.compute_lqr_gain()
 
-    def get_weights(self):
+    def get_weights(self) -> dict:
         """Get current cost weights."""
         return {
             'Q_pos': self.Q_pos,
@@ -285,10 +299,10 @@ class KalmanFilter:
     """
 
     def __init__(self,
-                 process_noise_scale=1.0,
-                 measurement_noise_scale=1.0,
-                 ball_physics_params=None,
-                 dt=0.01):
+                 process_noise_scale: float = 1.0,
+                 measurement_noise_scale: float = 1.0,
+                 ball_physics_params: Optional[dict] = None,
+                 dt: float = 0.01) -> None:
         """
         Args:
             process_noise_scale: Scaling factor for process noise Q (tunable)
@@ -363,8 +377,8 @@ class KalmanFilter:
         # Process noise covariance Q
         # Accounts for modeling errors, unmodeled dynamics, disturbances
         # Use continuous white noise model
-        q_pos = 0.0001  # Position process noise (m²)
-        q_vel = 0.001  # Velocity process noise (m²/s²)
+        q_pos = KALMAN_POSITION_PROCESS_NOISE  # Position process noise (m²)
+        q_vel = KALMAN_VELOCITY_PROCESS_NOISE  # Velocity process noise (m²/s²)
 
         self.Q_base = np.array([
             [q_pos * dt ** 3 / 3, 0, q_pos * dt ** 2 / 2, 0],
@@ -378,7 +392,7 @@ class KalmanFilter:
         # - Pixel quantization: 1.4mm
         # - Sub-pixel noise: 0.4mm std
         # Combined uncertainty ≈ sqrt(1.4²/12 + 0.4²) ≈ 0.58mm
-        pixel_size = 0.0014  # 1.4mm in meters
+        pixel_size = CAMERA_PIXEL_SIZE_M  # 1.4mm in meters
         subpixel_noise = 0.0004  # 0.4mm in meters
 
         # Quantization noise variance (uniform distribution)
@@ -450,12 +464,12 @@ class KalmanFilter:
 
         return self.x.copy()
 
-    def update(self, measurement, current_time=None):
+    def update(self, measurement: Tuple[float, float], current_time: Optional[float] = None) -> np.ndarray:
         """
         Update step: correct prediction with measurement.
 
         Args:
-            measurement: [x, y] measured position in meters (or mm, will be converted)
+            measurement: [x, y] measured position in METERS (required)
             current_time: Current timestamp in seconds (optional, for statistics)
 
         Returns:
@@ -463,18 +477,14 @@ class KalmanFilter:
         """
         z = np.array(measurement)
 
-        # Convert mm to meters if needed
-        if np.abs(z[0]) > 1.0 or np.abs(z[1]) > 1.0:
-            z = z / 1000.0
-
         # Innovation: y = z - H*x
         y = z - self.H @ self.x
 
         # Innovation covariance: S = H*P*H' + R
         S = self.H @ self.P @ self.H.T + self.R
 
-        # Kalman gain: K = P*H' * inv(S)
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+        # Kalman gain: K = P*H' * inv(S) - using solve for numerical stability
+        K = np.linalg.solve(S, self.H @ self.P).T
 
         # State update: x = x + K*y
         self.x = self.x + K @ y
@@ -489,7 +499,7 @@ class KalmanFilter:
 
         return self.x.copy()
 
-    def get_state(self):
+    def get_state(self) -> Tuple[Tuple[float, float], Tuple[float, float], np.ndarray]:
         """
         Get current filter state.
 
@@ -539,7 +549,7 @@ class KalmanFilter:
         std_vy = np.sqrt(self.P[3, 3]) * 1000.0
         return std_vx, std_vy
 
-    def reset(self, initial_position=None):
+    def reset(self, initial_position: Optional[Tuple[float, float]] = None) -> None:
         """
         Reset filter state.
 
@@ -731,7 +741,12 @@ class OrientationKalmanFilter:
             expected_gravity = GRAVITY_MAGNITUDE
             gravity_error = abs(gravity_mag - expected_gravity)
             if gravity_error > 1.0:  # More than 1 m/s² error
-                print(f"WARNING: Measured gravity magnitude {gravity_mag:.2f} differs from expected {expected_gravity:.2f} by {gravity_error:.2f} m/s²")
+                warnings.warn(
+                    f"Measured gravity magnitude {gravity_mag:.2f} m/s² differs from expected "
+                    f"{expected_gravity:.2f} m/s² by {gravity_error:.2f} m/s². "
+                    f"Check IMU calibration or mounting orientation.",
+                    UserWarning
+                )
 
             roll0 = np.arctan2(ay, az)
             pitch0 = np.arctan2(-ax, np.sqrt(ay ** 2 + az ** 2))
@@ -743,7 +758,7 @@ class OrientationKalmanFilter:
             if self.enable_yaw_tracking and mag_raw is not None:
                 mag = apply_imu_transforms(mag_raw, self.accel_axis_flip, self.accel_rotation, scale=1.0)
                 mag = mag - self.mag_offset
-                mag_norm = mag / (np.linalg.norm(mag) + 1e-9)
+                mag_norm = mag / (np.linalg.norm(mag) + DIVISION_BY_ZERO_EPSILON)
 
                 # Tilt-compensated heading
                 mx, my, mz = mag_norm
@@ -768,6 +783,10 @@ class OrientationKalmanFilter:
             gyro_raw: Angular velocity measurement [LSB]
             dt: Time step [s]
         """
+        # Validate dt
+        if dt <= 0:
+            return  # Skip prediction for invalid timestep
+
         # Apply transformations and convert to rad/s
         gyro = apply_imu_transforms(gyro_raw, self.gyro_axis_flip, self.gyro_rotation, self.gyro_scale)
 
@@ -798,8 +817,8 @@ class OrientationKalmanFilter:
             tan_theta = np.tan(theta)
 
             # Avoid singularity at θ = ±90°
-            if abs(cos_theta) < 0.01:
-                cos_theta = np.sign(cos_theta) * 0.01
+            if abs(cos_theta) < GIMBAL_LOCK_THRESHOLD:
+                cos_theta = np.sign(cos_theta) * GIMBAL_LOCK_THRESHOLD
 
             M = np.array([
                 [1, sin_phi * tan_theta, cos_phi * tan_theta],
@@ -914,10 +933,6 @@ class OrientationKalmanFilter:
             theta = self.state[1]
             g = GRAVITY_MAGNITUDE
 
-            # Remove initial gravity offset if available
-            if self.initial_accel is not None:
-                accel = accel - self.initial_accel
-
             # Predicted gravity vector h_a(φ,θ) = Rot(φ,θ)·[0, 0, g]
             h_a = np.array([
                 -g * np.sin(theta),
@@ -941,9 +956,11 @@ class OrientationKalmanFilter:
 
             # Kalman update
             S = H @ self.P @ H.T + self.R_accel
-            K = self.P @ H.T @ np.linalg.inv(S)
+            K = np.linalg.solve(S, H @ self.P).T
             self.state = self.state + K @ z
-            self.P = (np.eye(6) - K @ H) @ self.P
+            # Covariance update using Joseph form for numerical stability
+            I_KH = np.eye(6) - K @ H
+            self.P = I_KH @ self.P @ I_KH.T + K @ self.R_accel @ K.T
 
             # Update magnetometer if available (for yaw)
             if mag_raw is not None:
@@ -974,9 +991,11 @@ class OrientationKalmanFilter:
 
             y = z - H @ self.state
             S = H @ self.P @ H.T + R
-            K = self.P @ H.T @ np.linalg.inv(S)
+            K = np.linalg.solve(S, H @ self.P).T
             self.state = self.state + K @ y
-            self.P = (np.eye(4) - K @ H) @ self.P
+            # Covariance update using Joseph form for numerical stability
+            I_KH = np.eye(4) - K @ H
+            self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
 
     def update_magnetometer_yaw(self, mag_raw):
         """Update yaw using magnetometer with tilt compensation.
@@ -1029,7 +1048,7 @@ class OrientationKalmanFilter:
         # Measurement Jacobian H = ∂ψ_mag/∂x
         # State: [φ, θ, ψ, bx, by, bz]
         # ψ_mag depends on φ and θ (not ψ or biases)
-        d = np.sqrt(n_y**2 + n_x**2) + 1e-9  # Avoid division by zero
+        d = np.sqrt(n_y**2 + n_x**2) + DIVISION_BY_ZERO_EPSILON  # Avoid division by zero
 
         # ∂ψ_mag/∂φ
         dn_y_dphi = -my * sin_phi + mz * cos_phi
@@ -1054,7 +1073,9 @@ class OrientationKalmanFilter:
 
         # State update
         self.state = self.state + K.flatten() * innov
-        self.P = (np.eye(6) - np.outer(K, H)) @ self.P
+        # Covariance update using Joseph form for numerical stability
+        I_KH = np.eye(6) - np.outer(K, H)
+        self.P = I_KH @ self.P @ I_KH.T + self.R_mag * np.outer(K, K)
 
         # Wrap yaw to [-π, π]
         self.state[2] = np.arctan2(np.sin(self.state[2]), np.cos(self.state[2]))
@@ -1100,9 +1121,11 @@ class OrientationKalmanFilter:
 
         y = z - H @ self.state
         S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ np.linalg.inv(S)
+        K = np.linalg.solve(S, H @ self.P).T
         self.state = self.state + K @ y
-        self.P = (np.eye(4) - K @ H) @ self.P
+        # Covariance update using Joseph form for numerical stability
+        I_KH = np.eye(4) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
 
         self.mag_update_count += 1
 
@@ -1328,8 +1351,8 @@ class IMUControllerMixin:
         # Apply sensor-specific transformations
         # LSM303 accelerometer: 1mg/LSB → m/s²
         accel_scale = 0.001 * 9.81
-        # L3GD20 gyroscope: 8.75 mdps/LSB → rad/s
-        gyro_scale = 0.00875 * np.pi / 180
+        # L3GD20 gyroscope: 8.75 mdps/LSB → rad/s (with calibration multiplier)
+        gyro_scale = 0.00875 * np.pi / 180 * self.orientation_kalman.gyro_scale_multiplier
 
         accel_mean = apply_imu_transforms(accel_mean_raw,
                                          self.orientation_kalman.accel_axis_flip,
@@ -1353,7 +1376,7 @@ class IMUControllerMixin:
         tilt_x_deg = np.degrees(tilt_x)
         tilt_y_deg = np.degrees(tilt_y)
 
-        if abs(tilt_x_deg) > 5 or abs(tilt_y_deg) > 5:
+        if abs(tilt_x_deg) > MAX_CALIBRATION_TILT_DEG or abs(tilt_y_deg) > MAX_CALIBRATION_TILT_DEG:
             self.log(f"Warning: Platform tilted during calibration - RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
         else:
             self.log(f"Platform level verified: RX={tilt_x_deg:.1f}°, RY={tilt_y_deg:.1f}°")
@@ -1465,7 +1488,7 @@ class IMUControllerMixin:
         ry_imu_comp = -self.current_ry_imu * self.imu_compensation_gain
 
         # Clip compensation to safe range
-        rx_imu_comp, ry_imu_comp, _ = clip_tilt_vector(rx_imu_comp, ry_imu_comp, 15.0)
+        rx_imu_comp, ry_imu_comp, _ = clip_tilt_vector(rx_imu_comp, ry_imu_comp, MAX_IMU_CORRECTION_DEG)
 
         # Combine controller output + IMU compensation
         rx_final = rx_ctrl + rx_imu_comp
