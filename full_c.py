@@ -265,7 +265,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         # Kalman filter
         left_modules.append({'type': 'kalman_filter',
-                           'args': {'kalman_filter': getattr(self, 'kalman_filter', None)}})
+                           'args': {'kalman_filter': getattr(self, 'kalman_filter', None),
+                                   'enabled': self.kalman_enabled}})
 
         # Hardware-only: IMU modules
         if self.operation_mode == 'real':
@@ -798,7 +799,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             self.csv_file = open(filename, 'w', newline='')
             self.csv_writer = csv.DictWriter(
                 self.csv_file,
-                fieldnames=['timestamp', 'elapsed_time', 'ball_x', 'ball_y',
+                fieldnames=['timestamp', 'elapsed_time', 'ball_x', 'ball_y', 'ball_detected',
+                           'kalman_x', 'kalman_y', 'kalman_vx', 'kalman_vy',
+                           'platform_rx', 'platform_ry',
                            'target_x', 'target_y', 'error_x', 'error_y', 'error_magnitude',
                            'controller_rx', 'controller_ry', 'tilt_magnitude', 'loop_time_ms']
             )
@@ -909,6 +912,10 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             target_x, target_y = self.current_pattern.get_position(pattern_time)
             target_pos_mm = (target_x, target_y)
 
+            # Initialize controller output values (for CSV recording)
+            rx_ctrl = 0.0
+            ry_ctrl = 0.0
+
             # Update controller if enabled and ball is detected
             if self.controller_enabled and self.controller is not None and self.ball_detected:
                 control_output = self._update_controller(
@@ -989,40 +996,6 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                         self.prev_platform_angles['rx'] = rx
                         self.prev_platform_angles['ry'] = ry
 
-                    # Record performance data if recording
-                    if self.recording and self.csv_writer:
-                        try:
-                            current_time = time.time()
-                            elapsed_time = current_time - self.recording_start_time
-
-                            error_x = ball_pos_mm[0] - target_pos_mm[0]
-                            error_y = ball_pos_mm[1] - target_pos_mm[1]
-                            error_magnitude = np.sqrt(error_x**2 + error_y**2)
-                            tilt_magnitude = np.sqrt(rx_ctrl**2 + ry_ctrl**2)
-
-                            self.csv_writer.writerow({
-                                'timestamp': datetime.fromtimestamp(current_time).strftime('%H:%M:%S.%f')[:-3],
-                                'elapsed_time': f'{elapsed_time:.3f}',
-                                'ball_x': f'{ball_pos_mm[0]:.3f}',
-                                'ball_y': f'{ball_pos_mm[1]:.3f}',
-                                'target_x': f'{target_pos_mm[0]:.3f}',
-                                'target_y': f'{target_pos_mm[1]:.3f}',
-                                'error_x': f'{error_x:.3f}',
-                                'error_y': f'{error_y:.3f}',
-                                'error_magnitude': f'{error_magnitude:.3f}',
-                                'controller_rx': f'{rx_ctrl:.3f}',
-                                'controller_ry': f'{ry_ctrl:.3f}',
-                                'tilt_magnitude': f'{tilt_magnitude:.3f}'
-                            })
-                            self.sample_count += 1
-
-                            # Flush periodically to ensure data is written
-                            if self.sample_count % PerformanceConfig.CSV_FLUSH_INTERVAL_SAMPLES == 0:
-                                self.csv_file.flush()
-                        except Exception as e:
-                            self.log(f"CSV write error: {e}")
-                            self.recording = False
-
             # Manual control when controller disabled
             elif not self.controller_enabled:
                 # Manual DOF values represent desired effective tilt (gravity-relative)
@@ -1082,6 +1055,70 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 if angles is not None:
                     self.serial_controller.send_servo_angles(angles)
                     self.last_cmd_angles = angles
+
+            # Record performance data if recording (regardless of controller state or ball detection)
+            if self.recording and self.csv_writer:
+                try:
+                    current_time = time.time()
+                    elapsed_time = current_time - self.recording_start_time
+
+                    # Use RAW camera measurements (unfiltered) for CSV recording
+                    raw_ball_x = self.ball_pos_mm[0]
+                    raw_ball_y = self.ball_pos_mm[1]
+
+                    # Get Kalman filter estimates if enabled (for offline comparison)
+                    if self.kalman_enabled:
+                        kalman_x, kalman_y = self.kalman_filter.get_position_mm()
+                        kalman_vx, kalman_vy = self.kalman_filter.get_velocity_mm_s()
+                    else:
+                        kalman_x, kalman_y = 0.0, 0.0
+                        kalman_vx, kalman_vy = 0.0, 0.0
+
+                    # Get actual platform angles sent to hardware (for Kalman prediction replay)
+                    platform_rx = self.dof_values['rx']
+                    platform_ry = self.dof_values['ry']
+
+                    # Calculate error from raw position
+                    error_x = raw_ball_x - target_pos_mm[0]
+                    error_y = raw_ball_y - target_pos_mm[1]
+                    error_magnitude = np.sqrt(error_x**2 + error_y**2)
+
+                    # Calculate tilt magnitude from controller output
+                    tilt_magnitude = np.sqrt(rx_ctrl**2 + ry_ctrl**2)
+
+                    # Calculate loop time before writing
+                    loop_time_current = (time.perf_counter() - loop_start) * 1000
+
+                    self.csv_writer.writerow({
+                        'timestamp': datetime.fromtimestamp(current_time).strftime('%H:%M:%S.%f')[:-3],
+                        'elapsed_time': f'{elapsed_time:.3f}',
+                        'ball_x': f'{raw_ball_x:.3f}',
+                        'ball_y': f'{raw_ball_y:.3f}',
+                        'ball_detected': self.ball_detected,
+                        'kalman_x': f'{kalman_x:.3f}',
+                        'kalman_y': f'{kalman_y:.3f}',
+                        'kalman_vx': f'{kalman_vx:.3f}',
+                        'kalman_vy': f'{kalman_vy:.3f}',
+                        'platform_rx': f'{platform_rx:.3f}',
+                        'platform_ry': f'{platform_ry:.3f}',
+                        'target_x': f'{target_pos_mm[0]:.3f}',
+                        'target_y': f'{target_pos_mm[1]:.3f}',
+                        'error_x': f'{error_x:.3f}',
+                        'error_y': f'{error_y:.3f}',
+                        'error_magnitude': f'{error_magnitude:.3f}',
+                        'controller_rx': f'{rx_ctrl:.3f}',
+                        'controller_ry': f'{ry_ctrl:.3f}',
+                        'tilt_magnitude': f'{tilt_magnitude:.3f}',
+                        'loop_time_ms': f'{loop_time_current:.3f}'
+                    })
+                    self.sample_count += 1
+
+                    # Flush periodically to ensure data is written
+                    if self.sample_count % PerformanceConfig.CSV_FLUSH_INTERVAL_SAMPLES == 0:
+                        self.csv_file.flush()
+                except Exception as e:
+                    self.log(f"CSV write error: {e}")
+                    self.recording = False
 
             # Track performance
             loop_time = (time.perf_counter() - loop_start) * 1000

@@ -20,7 +20,7 @@ from core.utils import (
     PID_INTEGRAL_LIMIT_DEG, MAX_CALIBRATION_TILT_DEG,
     GIMBAL_LOCK_THRESHOLD, DIVISION_BY_ZERO_EPSILON,
     KALMAN_POSITION_PROCESS_NOISE, KALMAN_VELOCITY_PROCESS_NOISE,
-    CAMERA_PIXEL_SIZE_M
+    CAMERA_PIXEL_SIZE_M, Pixy2CameraConfig
 )
 
 
@@ -388,12 +388,11 @@ class KalmanFilter:
         ])
 
         # Measurement noise covariance R
-        # Based on camera characteristics:
-        # - Pixel quantization: 1.4mm
-        # - Sub-pixel noise: 0.4mm std
-        # Combined uncertainty ≈ sqrt(1.4²/12 + 0.4²) ≈ 0.58mm
-        pixel_size = CAMERA_PIXEL_SIZE_M  # 1.4mm in meters
-        subpixel_noise = 0.0004  # 0.4mm in meters
+        # Based on camera characteristics (platform-specific):
+        # - Pixel quantization: uniform distribution over pixel size
+        # - Sub-pixel noise: Gaussian noise from camera
+        pixel_size = Pixy2CameraConfig.PIXEL_SIZE_MM / 1000.0  # Convert mm to meters
+        subpixel_noise = Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM / 1000.0  # Convert mm to meters
 
         # Quantization noise variance (uniform distribution)
         quantization_var = (pixel_size ** 2) / 12

@@ -409,7 +409,7 @@ class Pixy2CameraConfig:
     else:  # V2
         # V2 Camera (repositioned and recalibrated)
         PIXEL_SIZE_MM = 2.0  # Physical size of one pixel (mm)
-        SUBPIXEL_NOISE_STD_MM = 1.0  # Sub-pixel noise std dev (mm)
+        SUBPIXEL_NOISE_STD_MM = 2.5  # Sub-pixel noise std dev (mm) - measured from hardware
         FOV_WIDTH_MM = 558.0  # Physical width of camera view (mm) - calibrated
         FOV_HEIGHT_MM = 424.0  # Physical height of camera view (mm) - calibrated
         CENTER_X = 145.0  # Platform center X position offset (pixels + mm offset combined)
@@ -425,7 +425,7 @@ class Pixy2CameraConfig:
 
     # GUI slider ranges
     PIXEL_SIZE_RANGE = (0.5, 3.0)  # mm
-    NOISE_RANGE = (0.0, 2.0)  # mm (extended range for testing)  #1.0
+    NOISE_RANGE = (0.0, 4.0)  # mm (extended range for measured noise)
     DETECTION_RATE_RANGE = (0.90, 1.0)  # probability
     SAMPLE_RATE_RANGE = (0.0, 60.0)  # Hz (0 = every frame)
 

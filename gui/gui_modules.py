@@ -1222,7 +1222,7 @@ class KalmanFilterModule(GUIModule):
     """Kalman filter configuration and monitoring."""
 
     def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
-                 kalman_filter: Optional[Any] = None) -> None:
+                 kalman_filter: Optional[Any] = None, enabled: bool = False) -> None:
         """
         Initialize Kalman filter module.
 
@@ -1231,12 +1231,13 @@ class KalmanFilterModule(GUIModule):
             colors: Color scheme dict
             callbacks: Callback functions dict
             kalman_filter: Optional KalmanFilter instance to monitor
+            enabled: Initial enabled state
         """
         super().__init__(parent, colors, callbacks)
         self.kalman_filter = kalman_filter
         self.sliders: Dict[str, QSlider] = {}
         self.value_labels: Dict[str, QLabel] = {}
-        self.filter_enabled = False
+        self.filter_enabled = enabled
 
     def create(self) -> QWidget:
         """Create Kalman filter control panel with parameter sliders and state display."""
@@ -1247,13 +1248,15 @@ class KalmanFilterModule(GUIModule):
         enable_layout = QHBoxLayout()
 
         self.enable_checkbox = QCheckBox("Enable Kalman Filter")
-        self.enable_checkbox.setChecked(False)
+        self.enable_checkbox.setChecked(self.filter_enabled)
         self.enable_checkbox.stateChanged.connect(self._on_enable_toggle)
         enable_layout.addWidget(self.enable_checkbox)
 
-        self.status_indicator = QLabel("[OFF]")
+        status_text = "[ON]" if self.filter_enabled else "[OFF]"
+        status_color = self.colors['success'] if self.filter_enabled else self.colors['border']
+        self.status_indicator = QLabel(status_text)
         self.status_indicator.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_LARGE))
-        self.status_indicator.setStyleSheet(f"color: {self.colors['border']};")
+        self.status_indicator.setStyleSheet(f"color: {status_color};")
         enable_layout.addWidget(self.status_indicator)
         enable_layout.addStretch()
 
