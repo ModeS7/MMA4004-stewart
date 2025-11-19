@@ -302,13 +302,15 @@ class KalmanFilter:
                  process_noise_scale: float = 1.0,
                  measurement_noise_scale: float = 1.0,
                  ball_physics_params: Optional[dict] = None,
-                 dt: float = 0.01) -> None:
+                 dt: float = 0.01,
+                 include_damping: bool = True) -> None:
         """
         Args:
             process_noise_scale: Scaling factor for process noise Q (tunable)
             measurement_noise_scale: Scaling factor for measurement noise R (tunable)
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
             dt: Time step for prediction (control loop period)
+            include_damping: If True, include velocity-dependent damping (rolling friction)
         """
         # Default ball physics parameters
         if ball_physics_params is None:
@@ -321,6 +323,8 @@ class KalmanFilter:
 
         self.g = ball_physics_params['gravity']
         self.mass_factor = ball_physics_params['mass_factor']
+        self.mu_roll = ball_physics_params.get('rolling_friction', 0.01)
+        self.include_damping = include_damping
         self.dt = dt
 
         # Acceleration constant: a = k * tilt_angle
@@ -455,6 +459,19 @@ class KalmanFilter:
 
         # State prediction: x = A*x + B*u
         self.x = self.A @ self.x + self.B @ u
+
+        # Apply velocity-dependent damping (rolling friction)
+        if self.include_damping:
+            vx, vy = self.x[2], self.x[3]
+            vel_mag = np.sqrt(vx**2 + vy**2) + DIVISION_BY_ZERO_EPSILON
+
+            # Rolling friction: a_friction = -μ * g * v_hat
+            damping_accel_x = -self.mu_roll * self.g * (vx / vel_mag)
+            damping_accel_y = -self.mu_roll * self.g * (vy / vel_mag)
+
+            # Apply damping to velocity: dv = a_damping * dt
+            self.x[2] += damping_accel_x * self.dt
+            self.x[3] += damping_accel_y * self.dt
 
         # Covariance prediction: P = A*P*A' + Q
         self.P = self.A @ self.P @ self.A.T + self.Q
