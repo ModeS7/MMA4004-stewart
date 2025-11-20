@@ -22,7 +22,9 @@ from mpl_toolkits.mplot3d import Axes3D
 
 from .detector import BallDetector
 
-
+# ============================================================
+# SETTINGS - Edit these
+# ============================================================
 # Camera configuration
 CAMERA_INDEX = 0
 
@@ -34,6 +36,7 @@ CALIBRATION_DIRS = [
 
 # 3D plotting configuration
 MAX_POINTS = 100  # Maximum number of 3D points to keep in history
+# ============================================================
 
 
 def create_camera_capture(camera_index):

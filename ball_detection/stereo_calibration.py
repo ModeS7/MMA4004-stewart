@@ -8,8 +8,7 @@ Complete calibration pipeline:
 3. Save all parameters for later use
 
 Usage:
-    python stereo_calibration.py --calibrate-individual
-    python stereo_calibration.py --calibrate-stereo
+    Edit MODE setting below and run: python stereo_calibration.py
 """
 
 import cv2
@@ -17,16 +16,24 @@ import numpy as np
 import os
 from pathlib import Path
 from datetime import datetime
-import argparse
 
+# ============================================================
+# SETTINGS - Edit these
+# ============================================================
+# Calibration mode: "individual", "stereo", or "both"
+MODE = "both"  # "individual" = calibrate cameras separately, "stereo" = calibrate stereo pair, "both" = do both
 
-# Calibration configuration
+# Chessboard configuration
 CHESSBOARD_SIZE = (9, 6)  # Inner corners (columns, rows)
 SQUARE_SIZE = 25.0  # mm (adjust to your chessboard)
+
+# Camera configuration
 CAMERA_INDEX = 0
 
 # Storage (relative to this script's location)
 CALIBRATION_DIR = Path(__file__).parent / "calibrations"
+# ============================================================
+
 CALIBRATION_DIR.mkdir(exist_ok=True)
 
 
@@ -511,35 +518,41 @@ def calibrate_stereo():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stereo Camera Calibration")
-    parser.add_argument('--calibrate-individual', action='store_true',
-                        help='Calibrate both cameras individually')
-    parser.add_argument('--calibrate-stereo', action='store_true',
-                        help='Calibrate stereo pair')
-    parser.add_argument('--camera', type=int, default=0,
-                        help='Camera device index')
+    print("=" * 60)
+    print("STEREO CAMERA CALIBRATION")
+    print("=" * 60)
+    print(f"Mode: {MODE}")
+    print(f"Camera: {CAMERA_INDEX}")
+    print(f"Chessboard: {CHESSBOARD_SIZE[0]}x{CHESSBOARD_SIZE[1]}")
+    print(f"Square size: {SQUARE_SIZE} mm")
+    print("=" * 60)
 
-    args = parser.parse_args()
-
-    global CAMERA_INDEX
-    CAMERA_INDEX = args.camera
-
-    if args.calibrate_individual:
+    if MODE == "individual":
+        print("\nCalibrating individual cameras...")
         calibrate_individual_cameras()
-    elif args.calibrate_stereo:
+    elif MODE == "stereo":
+        print("\nCalibrating stereo pair...")
+        calibrate_stereo()
+    elif MODE == "both":
+        print("\nCalibrating individual cameras first...")
+        calibrate_individual_cameras()
+        print("\n\nNow calibrating stereo pair...")
         calibrate_stereo()
     else:
-        parser.print_help()
-        print("\n" + "=" * 60)
-        print("CALIBRATION WORKFLOW")
-        print("=" * 60)
-        print("\nStep 1: Calibrate individual cameras")
-        print(f"  python -m ball_detection.stereo_calibration --calibrate-individual")
-        print("\nStep 2: Calibrate stereo pair")
-        print(f"  python -m ball_detection.stereo_calibration --calibrate-stereo")
-        print("\nStep 3: Run 3D tracking")
-        print("  python -m ball_detection.stereo_tracker")
-        print("\n" + "=" * 60)
+        print(f"\nError: Invalid MODE '{MODE}'")
+        print("\nValid modes:")
+        print("  'individual' - Calibrate both cameras separately")
+        print("  'stereo' - Calibrate stereo pair (requires individual calibrations)")
+        print("  'both' - Do both steps sequentially")
+        print("\nEdit MODE setting at the top of this file.")
+        return
+
+    print("\n" + "=" * 60)
+    print("CALIBRATION WORKFLOW COMPLETE")
+    print("=" * 60)
+    print("\nNext step: Run 3D tracking")
+    print("  python -m ball_detection.stereo_tracker")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

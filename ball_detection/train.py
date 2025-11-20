@@ -2,11 +2,9 @@
 Training Script for Ball Detection CNN
 
 Trains the lightweight CNN for sub-pixel ball center detection.
-Includes validation, checkpointing, and tensorboard logging.
+Edit settings below and run: python ball_detection/train.py
 """
 
-import argparse
-import os
 import time
 from pathlib import Path
 import json
@@ -14,10 +12,28 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from model import BallDetectorCNN
 from dataset import create_dataloaders
+
+# ============================================================
+# SETTINGS - Edit these
+# ============================================================
+DATA_DIR = "./ball_detection/data/final"
+OUTPUT_DIR = "./ball_detection/models"
+EPOCHS = 100
+BATCH_SIZE = 512
+IMAGE_SIZE = 64
+CROP_SIZE = 128
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 1e-5
+TRAIN_SPLIT = 0.8
+NUM_WORKERS = 0  # Windows compatibility
+COORD_WEIGHT = 1.0
+CONF_WEIGHT = 0.1
+SAVE_INTERVAL = 10
+# ============================================================
 
 
 class DetectionLoss(nn.Module):
@@ -80,7 +96,7 @@ def calculate_pixel_error(pred, target, image_size=64):
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
-    """Train for one epoch."""
+    """Train for one epoch with AMP bf16."""
     model.train()
 
     total_loss = 0
@@ -88,33 +104,41 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     total_conf_loss = 0
     total_pixel_error = 0
     num_batches = len(dataloader)
+    use_amp = device.type == 'cuda'
 
-    for batch_idx, (images, targets) in enumerate(dataloader):
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch} Training')
+    for images, targets in pbar:
         images = images.to(device)
         targets = targets.to(device)
 
-        # Forward pass
-        outputs = model(images)
-        loss, coord_loss, conf_loss = criterion(outputs, targets)
+        # Forward pass with AMP bf16 (only on CUDA)
+        if use_amp:
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+                outputs = model(images)
+        else:
+            outputs = model(images)
 
-        # Backward pass
+        # Loss computation (BCE is unsafe in autocast, compute in fp32)
+        loss, coord_loss, conf_loss = criterion(outputs.float(), targets)
+
+        # Backward pass (no GradScaler needed for bf16)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Metrics
-        pixel_error = calculate_pixel_error(outputs, targets)
+        # Metrics (compute in fp32)
+        pixel_error = calculate_pixel_error(outputs.float(), targets)
 
         total_loss += loss.item()
         total_coord_loss += coord_loss.item()
         total_conf_loss += conf_loss.item()
         total_pixel_error += pixel_error
 
-        # Print progress
-        if (batch_idx + 1) % 10 == 0:
-            print(f"  Batch [{batch_idx+1}/{num_batches}] "
-                  f"Loss: {loss.item():.4f}, "
-                  f"Pixel Error: {pixel_error:.3f}px")
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'px_err': f'{pixel_error:.3f}'
+        })
 
     avg_loss = total_loss / num_batches
     avg_coord_loss = total_coord_loss / num_batches
@@ -135,11 +159,11 @@ def validate(model, dataloader, criterion, device):
     num_batches = len(dataloader)
 
     with torch.no_grad():
-        for images, targets in dataloader:
+        for images, targets in tqdm(dataloader, desc='Validation'):
             images = images.to(device)
             targets = targets.to(device)
 
-            # Forward pass
+            # Forward pass (no autocast needed for validation, keep in fp32)
             outputs = model(images)
             loss, coord_loss, conf_loss = criterion(outputs, targets)
 
@@ -159,32 +183,61 @@ def validate(model, dataloader, criterion, device):
     return avg_loss, avg_coord_loss, avg_conf_loss, avg_pixel_error
 
 
-def main(args):
+def main():
     """Main training loop."""
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+
+    print("=" * 60)
+    print("BALL DETECTION CNN TRAINING")
+    print("=" * 60)
+    print(f"Data: {DATA_DIR}")
+    print(f"Output: {OUTPUT_DIR}")
+    print(f"Device: {device}")
+
+    # Print GPU info if available
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"PyTorch Version: {torch.__version__}")
+        print(f"AMP bf16: Enabled")
+    else:
+        print("AMP: Disabled (CPU mode)")
+
+    print(f"Epochs: {EPOCHS}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
+    print(f"Crop size: {CROP_SIZE}x{CROP_SIZE}")
+    print("=" * 60)
+    print()
 
     # Create output directory
-    output_dir = Path(args.output_dir)
+    output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup tensorboard
-    writer = SummaryWriter(output_dir / 'runs')
-
     # Save training config
-    config = vars(args)
+    config = {
+        'data_dir': DATA_DIR,
+        'epochs': EPOCHS,
+        'batch_size': BATCH_SIZE,
+        'image_size': IMAGE_SIZE,
+        'crop_size': CROP_SIZE,
+        'learning_rate': LEARNING_RATE,
+        'weight_decay': WEIGHT_DECAY,
+        'train_split': TRAIN_SPLIT,
+    }
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
     # Create dataloaders
-    print(f"\nLoading data from: {args.data_dir}")
+    print(f"Loading data from: {DATA_DIR}")
     train_loader, val_loader = create_dataloaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
-        train_split=args.train_split,
-        num_workers=args.num_workers
+        data_dir=DATA_DIR,
+        batch_size=BATCH_SIZE,
+        image_size=IMAGE_SIZE,
+        crop_size=CROP_SIZE,
+        train_split=TRAIN_SPLIT,
+        num_workers=NUM_WORKERS
     )
 
     # Create model
@@ -193,26 +246,28 @@ def main(args):
     model = model.to(device)
     param_count = model.count_parameters()
     print(f"Model parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
+    print()
 
     # Loss and optimizer
-    criterion = DetectionLoss(coord_weight=args.coord_weight, conf_weight=args.conf_weight)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    criterion = DetectionLoss(coord_weight=COORD_WEIGHT, conf_weight=CONF_WEIGHT)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        optimizer, mode='min', factor=0.5, patience=5
     )
 
     # Training loop
-    print(f"\nStarting training for {args.epochs} epochs...")
+    print(f"Starting training for {EPOCHS} epochs...")
+    print("=" * 60)
+    print()
     best_val_loss = float('inf')
     best_pixel_error = float('inf')
 
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
+    training_history = []
 
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        print("-" * 60)
+    for epoch in range(1, EPOCHS + 1):
+        epoch_start = time.time()
 
         # Train
         train_loss, train_coord, train_conf, train_pixel_err = train_epoch(
@@ -228,23 +283,27 @@ def main(args):
         scheduler.step(val_loss)
 
         epoch_time = time.time() - epoch_start
+        current_lr = optimizer.param_groups[0]['lr']
 
         # Print summary
-        print(f"\nEpoch {epoch} Summary:")
-        print(f"  Train Loss: {train_loss:.4f} (coord: {train_coord:.4f}, conf: {train_conf:.4f})")
-        print(f"  Train Pixel Error: {train_pixel_err:.3f}px")
-        print(f"  Val Loss: {val_loss:.4f} (coord: {val_coord:.4f}, conf: {val_conf:.4f})")
-        print(f"  Val Pixel Error: {val_pixel_err:.3f}px")
-        print(f"  Time: {epoch_time:.1f}s")
+        print(f"\nEpoch {epoch}/{EPOCHS} Summary:")
+        print(f"  Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px")
+        print(f"  Val Loss: {val_loss:.4f} | Pixel Error: {val_pixel_err:.3f}px")
+        print(f"  LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
 
-        # Tensorboard logging
-        writer.add_scalars('Loss/total', {'train': train_loss, 'val': val_loss}, epoch)
-        writer.add_scalars('Loss/coord', {'train': train_coord, 'val': val_coord}, epoch)
-        writer.add_scalars('Metric/pixel_error', {'train': train_pixel_err, 'val': val_pixel_err}, epoch)
-        writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        # Save history
+        training_history.append({
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'train_pixel_error': train_pixel_err,
+            'val_loss': val_loss,
+            'val_pixel_error': val_pixel_err,
+            'learning_rate': current_lr,
+            'time': epoch_time
+        })
 
         # Save checkpoint
-        if (epoch % args.save_interval == 0) or (epoch == args.epochs):
+        if (epoch % SAVE_INTERVAL == 0) or (epoch == EPOCHS):
             checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pth'
             torch.save({
                 'epoch': epoch,
@@ -254,66 +313,35 @@ def main(args):
                 'val_loss': val_loss,
                 'pixel_error': val_pixel_err,
             }, checkpoint_path)
-            print(f"  Saved checkpoint: {checkpoint_path}")
+            print(f"  Checkpoint saved: {checkpoint_path}")
 
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = output_dir / 'best_model.pth'
             torch.save(model.state_dict(), best_path)
-            print(f"  New best validation loss! Saved to: {best_path}")
+            print(f"  ★ New best validation loss! Saved to: {best_path}")
 
         if val_pixel_err < best_pixel_error:
             best_pixel_error = val_pixel_err
             best_pixel_path = output_dir / 'best_pixel_error.pth'
             torch.save(model.state_dict(), best_pixel_path)
-            print(f"  New best pixel error! Saved to: {best_pixel_path}")
+            print(f"  ★ New best pixel error! Saved to: {best_pixel_path}")
+
+    # Save training history
+    with open(output_dir / 'training_history.json', 'w') as f:
+        json.dump(training_history, f, indent=2)
 
     # Training complete
-    writer.close()
     print("\n" + "=" * 60)
-    print("Training complete!")
+    print("TRAINING COMPLETE!")
+    print("=" * 60)
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Best pixel error: {best_pixel_error:.3f}px")
     print(f"Models saved to: {output_dir}")
+    print(f"History saved to: {output_dir}/training_history.json")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train Ball Detection CNN')
-
-    # Data
-    parser.add_argument('--data-dir', type=str, required=True,
-                        help='Directory containing training data')
-    parser.add_argument('--output-dir', type=str, default='./ball_detection/models',
-                        help='Output directory for models and logs')
-
-    # Training
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-5,
-                        help='Weight decay')
-    parser.add_argument('--train-split', type=float, default=0.8,
-                        help='Fraction of data for training')
-
-    # Model
-    parser.add_argument('--image-size', type=int, default=64,
-                        help='Input image size')
-    parser.add_argument('--coord-weight', type=float, default=1.0,
-                        help='Weight for coordinate loss')
-    parser.add_argument('--conf-weight', type=float, default=0.1,
-                        help='Weight for confidence loss')
-
-    # System
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of data loading workers')
-    parser.add_argument('--save-interval', type=int, default=10,
-                        help='Save checkpoint every N epochs')
-
-    args = parser.parse_args()
-
-    main(args)
+    main()

@@ -225,8 +225,17 @@ class BallLabelingTool:
 
         if self.current_label:
             if self.current_label.get('valid', True):
-                cv2.putText(info_bg, f"Label: ({self.current_label['x']}, {self.current_label['y']})",
-                            (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                label_text = f"Label: ({self.current_label['x']:.1f}, {self.current_label['y']:.1f})"
+                cv2.putText(info_bg, label_text, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                # Show confidence if available (auto-labeled)
+                if 'confidence' in self.current_label:
+                    conf = self.current_label['confidence']
+                    auto = self.current_label.get('auto_labeled', False)
+                    if auto:
+                        color = (0, 255, 255) if conf > 0.7 else (0, 165, 255)
+                        cv2.putText(info_bg, f"AUTO (conf: {conf:.2f})",
+                                   (500, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
             else:
                 cv2.putText(info_bg, "Label: NO BALL VISIBLE",
                             (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 1)

@@ -62,6 +62,9 @@ def record_video(camera_id=0, output_path=None, duration=None, fps=60):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, fps)
 
+    # Reduce buffering to minimize latency and tearing
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     # Verify settings
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -118,7 +121,11 @@ def record_video(camera_id=0, output_path=None, duration=None, fps=60):
 
     try:
         while True:
-            ret, frame = cap.read()
+            # Grab multiple times to flush buffer (reduces old frames in buffer)
+            for _ in range(2):
+                cap.grab()
+            ret, frame = cap.retrieve()
+
             if not ret:
                 print(f"\nWarning: Failed to capture frame {frame_count}")
                 dropped_frames += 1
