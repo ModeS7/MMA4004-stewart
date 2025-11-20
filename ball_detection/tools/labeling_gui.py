@@ -73,6 +73,7 @@ class BallLabelingTool:
         print(f"Output directory: {self.output_dir}")
         print(f"\nControls:")
         print("  Click: Label ball center")
+        print("  x: Mark 'no ball visible' for current camera")
         print("  TAB: Switch between left/right camera")
         print("  n: Next frame pair")
         print("  p: Previous frame pair")
@@ -223,8 +224,12 @@ class BallLabelingTool:
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         if self.current_label:
-            cv2.putText(info_bg, f"Label: ({self.current_label['x']}, {self.current_label['y']})",
-                        (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            if self.current_label.get('valid', True):
+                cv2.putText(info_bg, f"Label: ({self.current_label['x']}, {self.current_label['y']})",
+                            (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            else:
+                cv2.putText(info_bg, "Label: NO BALL VISIBLE",
+                            (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 1)
 
         display = np.vstack([img, info_bg])
 
@@ -252,7 +257,7 @@ class BallLabelingTool:
             img[:h, :w] = mask_rgb
 
         # Draw current label
-        if self.current_label is not None:
+        if self.current_label is not None and self.current_label.get('valid', True):
             cx = self.current_label['x']
             cy = self.current_label['y']
             cv2.circle(img, (cx, cy), 5, (0, 255, 0), -1)
@@ -261,14 +266,25 @@ class BallLabelingTool:
             # Draw crosshair
             cv2.line(img, (cx-10, cy), (cx+10, cy), (0, 255, 0), 1)
             cv2.line(img, (cx, cy-10), (cx, cy+10), (0, 255, 0), 1)
+        elif self.current_label is not None and not self.current_label.get('valid', True):
+            # Draw "NO BALL" indicator
+            h, w = img.shape[:2]
+            cv2.putText(img, "NO BALL", (w//2 - 80, h//2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
 
         # Draw saved label if different from current
         if img_name in self.labels and self.labels[img_name] != self.current_label:
             saved_label = self.labels[img_name]
-            sx = saved_label['x']
-            sy = saved_label['y']
-            cv2.circle(img, (sx, sy), 5, (255, 0, 0), -1)
-            cv2.circle(img, (sx, sy), self.crop_size//2, (255, 0, 0), 1)
+            if saved_label.get('valid', True):
+                sx = saved_label['x']
+                sy = saved_label['y']
+                cv2.circle(img, (sx, sy), 5, (255, 0, 0), -1)
+                cv2.circle(img, (sx, sy), self.crop_size//2, (255, 0, 0), 1)
+            else:
+                # Draw saved "NO BALL" in different color
+                h, w = img.shape[:2]
+                cv2.putText(img, "NO BALL (saved)", (w//2 - 150, h//2 + 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
 
     def _save_labels(self):
         """Save labels to JSON file."""
@@ -347,6 +363,11 @@ class BallLabelingTool:
                     self.labels[img_name] = self.current_label.copy()
                     print(f"Saved label for {img_name}")
                     self._save_labels()
+
+            elif key == ord('x'):
+                # Mark as "no ball visible"
+                self.current_label = {'x': -1, 'y': -1, 'valid': False}
+                print(f"Marked ({self.current_camera}): NO BALL VISIBLE")
 
             elif key == ord('d'):
                 # Delete label
