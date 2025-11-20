@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Comprehensive Model Benchmark Script
+CPU-Only Model Benchmark: FP32 vs Static INT8
 
-Tests multiple CNN architectures for ball detection with different:
-- Input sizes (32, 64, 96, 128, 160, 224)
-- Quantization formats (FP32, FP16, INT8, INT4)
-- Backends (DirectML GPU vs CPU)
+Tests multiple CNN architectures for ball detection comparing:
+- FP32 (baseline)
+- INT8 (static quantization with calibration)
 
-All operations are in-memory, no files created.
+Features:
+- Multiple models: BallDetectorCNN, MobileNetV3, MNASNet, SqueezeNet
+- Input sizes: 32, 64, 96, 128, 160, 224
+- Static INT8 quantization (weights + activations)
+- CPU-only with true INT8 compute kernels
+
+All operations are in-memory, no files created (temp files cleaned up).
 """
 
 import torch
@@ -148,81 +153,125 @@ def export_to_onnx_bytes(model, input_size=64):
     return buffer.read()
 
 
-def quantize_onnx_model(onnx_bytes, quant_format='int8'):
+class CalibrationDataReader:
     """
-    Quantize ONNX model in-memory.
+    Calibration data reader for static INT8 quantization.
+    Generates random calibration samples to compute activation ranges.
+    """
+    def __init__(self, input_size, num_samples=100):
+        self.input_size = input_size
+        self.num_samples = num_samples
+        self.data = self._generate_calibration_data()
+        self.current_index = 0
+
+    def _generate_calibration_data(self):
+        """Generate random calibration images."""
+        np.random.seed(42)  # Reproducible
+        data = []
+        for _ in range(self.num_samples):
+            # Random images in [0, 1] range
+            img = np.random.rand(1, 3, self.input_size, self.input_size).astype(np.float32)
+            data.append({'input': img})
+        return data
+
+    def get_next(self):
+        """Get next calibration sample."""
+        if self.current_index >= len(self.data):
+            return None
+        sample = self.data[self.current_index]
+        self.current_index += 1
+        return sample
+
+    def rewind(self):
+        """Reset to beginning."""
+        self.current_index = 0
+
+
+def quantize_onnx_model_static(onnx_bytes, input_size, num_calibration_samples=100):
+    """
+    Static INT8 quantization with calibration data.
+    Quantizes both weights AND activations for true INT8 compute.
 
     Args:
         onnx_bytes: ONNX model as bytes
-        quant_format: 'int8' or 'int4'
+        input_size: Input image size for calibration data
+        num_calibration_samples: Number of samples for calibration
 
     Returns:
         bytes: Quantized ONNX model, or None if quantization failed
     """
+    import tempfile
+    import os
+    import logging
+
+    # Suppress ONNX quantization warnings
+    logging.getLogger('root').setLevel(logging.ERROR)
+
     try:
-        # Load model from bytes
-        model = onnx.load(io.BytesIO(onnx_bytes))
+        # Create calibration data reader
+        calibration_reader = CalibrationDataReader(input_size, num_calibration_samples)
 
-        # Create temporary in-memory representation
-        input_buffer = io.BytesIO(onnx_bytes)
-        output_buffer = io.BytesIO()
+        # Create temp files
+        with tempfile.NamedTemporaryFile(suffix='.onnx', delete=False) as temp_in:
+            temp_in.write(onnx_bytes)
+            temp_in_path = temp_in.name
 
-        if quant_format == 'int8':
-            # Dynamic quantization (no calibration data needed)
-            from onnxruntime.quantization import quantize_dynamic, QuantType
+        with tempfile.NamedTemporaryFile(suffix='.onnx', delete=False) as temp_out:
+            temp_out_path = temp_out.name
 
-            # Save to temp buffer
-            temp_in = io.BytesIO(onnx_bytes)
-            temp_out = io.BytesIO()
+        try:
+            # Static quantization (weights + activations)
+            quantize_static(
+                model_input=temp_in_path,
+                model_output=temp_out_path,
+                calibration_data_reader=calibration_reader,
+                quant_format=QuantType.QUInt8,
+                per_channel=False,
+                reduce_range=False,
+                activation_type=QuantType.QUInt8,
+                weight_type=QuantType.QUInt8,
+                op_types_to_quantize=['Conv', 'MatMul', 'Gemm'],
+            )
 
-            # ONNX quantization requires file paths, so we'll skip for in-memory
-            # Instead, return original model (quantization skipped)
-            return None  # Indicate quantization not supported in-memory
+            # Read quantized model
+            with open(temp_out_path, 'rb') as f:
+                quantized_bytes = f.read()
 
-        elif quant_format == 'int4':
-            # INT4 quantization (experimental, may not be supported)
-            return None
+            return quantized_bytes
+
+        finally:
+            # Cleanup temp files
+            try:
+                os.unlink(temp_in_path)
+                os.unlink(temp_out_path)
+            except:
+                pass
 
     except Exception as e:
-        print(f"    Warning: {quant_format.upper()} quantization failed: {e}")
+        print(f"      Quantization error: {e}")
         return None
 
-    return None
 
-
-def create_inference_session(onnx_bytes, use_gpu=True, use_fp16=False):
+def create_inference_session(onnx_bytes):
     """
-    Create ONNX Runtime session from bytes.
+    Create ONNX Runtime CPU session from bytes.
 
     Args:
         onnx_bytes: ONNX model as bytes
-        use_gpu: Use DirectML provider
-        use_fp16: Enable FP16 mode (if supported)
 
     Returns:
         ort.InferenceSession or None
     """
     try:
-        # Setup providers
-        if use_gpu:
-            providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
-        else:
-            providers = ['CPUExecutionProvider']
-
         # Session options
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # Enable FP16 if requested (DirectML may support it)
-        if use_fp16 and use_gpu:
-            # Note: FP16 support depends on hardware
-            pass  # DirectML handles this automatically if supported
-
-        # Create session from bytes
+        # Create CPU-only session
         session = ort.InferenceSession(
             onnx_bytes,
             sess_options=sess_options,
-            providers=providers
+            providers=['CPUExecutionProvider']
         )
 
         return session
@@ -308,7 +357,7 @@ def run_comprehensive_benchmark():
     }
 
     input_sizes = [32, 64, 96, 128, 160, 224]
-    quantizations = ['fp32', 'fp16']  # INT8/INT4 require file-based quantization
+    quantizations = ['fp32', 'int8']
     num_iterations = 100
 
     print(f"Configuration:")
@@ -316,9 +365,9 @@ def run_comprehensive_benchmark():
     print(f"  Input sizes: {input_sizes}")
     print(f"  Quantizations: {quantizations}")
     print(f"  Iterations: {num_iterations}")
-    print(f"  Backends: GPU (DirectML) + CPU")
+    print(f"  Backend: CPU only")
     print()
-    print("Note: INT8/INT4 quantization requires file I/O (skipped for in-memory test)")
+    print("Note: INT8 uses static quantization (weights + activations, true INT8 compute)")
     print()
 
     # Results storage
@@ -353,52 +402,42 @@ def run_comprehensive_benchmark():
 
                 # Test each quantization
                 for quant in quantizations:
-                    # Create sessions
-                    if quant == 'fp32':
-                        session_gpu = create_inference_session(onnx_bytes, use_gpu=True, use_fp16=False)
-                        session_cpu = create_inference_session(onnx_bytes, use_gpu=False, use_fp16=False)
-                    elif quant == 'fp16':
-                        session_gpu = create_inference_session(onnx_bytes, use_gpu=True, use_fp16=True)
-                        session_cpu = None  # FP16 typically GPU-only
+                    # Prepare model bytes based on quantization
+                    model_bytes = onnx_bytes
+
+                    if quant == 'int8':
+                        # Apply static quantization
+                        print(f"    {quant.upper()}...", end=' ', flush=True)
+                        print("quantizing...", end=' ', flush=True)
+                        quantized_bytes = quantize_onnx_model_static(onnx_bytes, input_size)
+                        if quantized_bytes is None:
+                            print("FAILED")
+                            continue
+                        model_bytes = quantized_bytes
                     else:
-                        continue  # Skip INT8/INT4 for now
+                        print(f"    {quant.upper()}...", end=' ', flush=True)
 
-                    # Benchmark GPU
-                    print(f"    {quant.upper()} GPU...", end=' ', flush=True)
-                    stats_gpu = benchmark_model(session_gpu, input_size, num_iterations)
+                    # Create CPU session
+                    session = create_inference_session(model_bytes)
+                    if not session:
+                        print("Session creation FAILED")
+                        continue
 
-                    if stats_gpu:
-                        print(f"{stats_gpu['mean']:.2f}ms ({stats_gpu['fps']:.1f} FPS)")
+                    # Benchmark
+                    stats = benchmark_model(session, input_size, num_iterations)
+
+                    if stats:
+                        print(f"{stats['mean']:.2f}ms ({stats['fps']:.1f} FPS)")
 
                         results.append({
                             'model': model_name,
                             'params': params,
                             'input_size': input_size,
                             'quant': quant,
-                            'backend': 'GPU',
-                            **stats_gpu
+                            **stats
                         })
                     else:
                         print("FAILED")
-
-                    # Benchmark CPU (FP32 only)
-                    if quant == 'fp32' and session_cpu:
-                        print(f"    {quant.upper()} CPU...", end=' ', flush=True)
-                        stats_cpu = benchmark_model(session_cpu, input_size, num_iterations)
-
-                        if stats_cpu:
-                            print(f"{stats_cpu['mean']:.2f}ms ({stats_cpu['fps']:.1f} FPS)")
-
-                            results.append({
-                                'model': model_name,
-                                'params': params,
-                                'input_size': input_size,
-                                'quant': quant,
-                                'backend': 'CPU',
-                                **stats_cpu
-                            })
-                        else:
-                            print("FAILED")
 
             print()
 
@@ -422,14 +461,14 @@ def run_comprehensive_benchmark():
     results_sorted = sorted(results, key=lambda x: x['mean'])
 
     # Print table header
-    header = f"{'Model':<20} {'Size':>5} {'Quant':>6} {'Backend':>7} {'Params':>8} {'Mean':>8} {'Min':>8} {'P95':>8} {'FPS':>8}"
+    header = f"{'Model':<20} {'Size':>5} {'Quant':>6} {'Params':>8} {'Mean':>8} {'Min':>8} {'P95':>8} {'FPS':>8}"
     print(header)
     print("-" * len(header))
 
     # Print results
     for r in results_sorted:
         params_k = r['params'] / 1000
-        print(f"{r['model']:<20} {r['input_size']:>5} {r['quant']:>6} {r['backend']:>7} "
+        print(f"{r['model']:<20} {r['input_size']:>5} {r['quant']:>6} "
               f"{params_k:>7.0f}K {r['mean']:>7.2f}ms {r['min']:>7.2f}ms "
               f"{r['p95']:>7.2f}ms {r['fps']:>7.1f}")
 
@@ -439,18 +478,18 @@ def run_comprehensive_benchmark():
     print("TOP PERFORMERS:")
     print()
 
-    # Best GPU FP32
-    gpu_fp32 = [r for r in results_sorted if r['backend'] == 'GPU' and r['quant'] == 'fp32']
-    if gpu_fp32:
-        best = gpu_fp32[0]
-        print(f"  Fastest GPU FP32: {best['model']} @ {best['input_size']}x{best['input_size']}")
+    # Best FP32
+    fp32_results = [r for r in results_sorted if r['quant'] == 'fp32']
+    if fp32_results:
+        best = fp32_results[0]
+        print(f"  Fastest FP32: {best['model']} @ {best['input_size']}x{best['input_size']}")
         print(f"    {best['mean']:.2f}ms ({best['fps']:.1f} FPS) | {best['params']/1000:.0f}K params")
 
-    # Best GPU FP16
-    gpu_fp16 = [r for r in results_sorted if r['backend'] == 'GPU' and r['quant'] == 'fp16']
-    if gpu_fp16:
-        best = gpu_fp16[0]
-        print(f"  Fastest GPU FP16: {best['model']} @ {best['input_size']}x{best['input_size']}")
+    # Best INT8
+    int8_results = [r for r in results_sorted if r['quant'] == 'int8']
+    if int8_results:
+        best = int8_results[0]
+        print(f"  Fastest INT8: {best['model']} @ {best['input_size']}x{best['input_size']}")
         print(f"    {best['mean']:.2f}ms ({best['fps']:.1f} FPS) | {best['params']/1000:.0f}K params")
 
     # Best efficiency (FPS / param count)
@@ -469,40 +508,51 @@ def run_comprehensive_benchmark():
 
     # Analysis
     print()
-    print("ANALYSIS:")
+    print("INT8 QUANTIZATION SPEEDUP ANALYSIS:")
+    print()
 
-    # GPU speedup
-    fp32_gpu = [r for r in results if r['backend'] == 'GPU' and r['quant'] == 'fp32']
-    fp32_cpu = [r for r in results if r['backend'] == 'CPU' and r['quant'] == 'fp32']
+    # Calculate INT8 speedup for all models
+    fp32_results = [r for r in results if r['quant'] == 'fp32']
+    int8_results = [r for r in results if r['quant'] == 'int8']
 
-    if fp32_gpu and fp32_cpu:
-        avg_gpu = np.mean([r['mean'] for r in fp32_gpu])
-        avg_cpu = np.mean([r['mean'] for r in fp32_cpu])
-        speedup = avg_cpu / avg_gpu
-        print(f"  Average GPU speedup: {speedup:.1f}x")
-
-    # FP16 speedup
-    if gpu_fp16 and gpu_fp32:
-        # Match same model/size
-        for fp32_result in gpu_fp32:
-            fp16_match = next((r for r in gpu_fp16
+    if fp32_results and int8_results:
+        speedups = []
+        for fp32_result in fp32_results:
+            int8_match = next((r for r in int8_results
                               if r['model'] == fp32_result['model']
                               and r['input_size'] == fp32_result['input_size']), None)
-            if fp16_match:
-                speedup = fp32_result['mean'] / fp16_match['mean']
-                print(f"  FP16 speedup for {fp32_result['model']} @ {fp32_result['input_size']}: {speedup:.2f}x")
-                break
+            if int8_match:
+                speedup = fp32_result['mean'] / int8_match['mean']
+                speedups.append({
+                    'model': fp32_result['model'],
+                    'input_size': fp32_result['input_size'],
+                    'fp32_time': fp32_result['mean'],
+                    'int8_time': int8_match['mean'],
+                    'speedup': speedup
+                })
 
-    # Recommended for 60 FPS (< 16.67ms)
-    fast_enough = [r for r in results_sorted if r['mean'] < 16.67 and r['backend'] == 'GPU']
-    print(f"\n  Models fast enough for 60 FPS: {len(fast_enough)}/{len([r for r in results if r['backend'] == 'GPU'])}")
+        if speedups:
+            # Show top 5 speedups
+            speedups_sorted = sorted(speedups, key=lambda x: x['speedup'], reverse=True)
+            print("  Top 5 INT8 speedups:")
+            for s in speedups_sorted[:5]:
+                print(f"    {s['model']:<20} @ {s['input_size']:>3}x{s['input_size']:<3} "
+                      f"FP32: {s['fp32_time']:>6.2f}ms -> INT8: {s['int8_time']:>6.2f}ms "
+                      f"({s['speedup']:>4.2f}x)")
 
-    if fast_enough:
-        print("    Recommended:")
-        for r in fast_enough[:3]:
-            print(f"      - {r['model']} @ {r['input_size']}x{r['input_size']} "
-                  f"({r['quant']}) → {r['mean']:.2f}ms")
+            # Average speedup
+            avg_speedup = np.mean([s['speedup'] for s in speedups])
+            print()
+            print(f"  Average INT8 speedup: {avg_speedup:.2f}x")
 
+            # Best and worst
+            best_speedup = speedups_sorted[0]
+            worst_speedup = speedups_sorted[-1]
+            print(f"  Best: {best_speedup['speedup']:.2f}x ({best_speedup['model']} @ {best_speedup['input_size']})")
+            print(f"  Worst: {worst_speedup['speedup']:.2f}x ({worst_speedup['model']} @ {worst_speedup['input_size']})")
+
+    print()
+    print("=" * 80)
     print()
 
 
