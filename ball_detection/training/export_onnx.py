@@ -11,7 +11,7 @@ import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
-from model import BallDetectorCNN, BallDetectorMobileNetV3
+from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3
 
 
 def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet=True, opset_version=14):

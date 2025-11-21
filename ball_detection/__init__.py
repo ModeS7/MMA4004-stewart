@@ -1,14 +1,22 @@
 """
-Ball Detection Module for Stewart Platform Ball Tracking
+Ball Detection System
 
-High-speed ball detection using hybrid ROI extraction + CNN refinement.
-Two-stage pipeline: HSV color filtering -> MobileNetV3 CNN on 128x128 crop.
+High-level API for ball center detection using CNN + stereo triangulation.
+
+Main Components:
+- core: Detection pipeline (detector, roi_extractor, onnx_inference, model, dataset)
+- training: Training infrastructure (train, export_onnx)
+- apps: End-user applications (stereo_tracker, test_video)
+- calibration: Camera calibration tools
+- tuning: Interactive parameter tuning
+- utils: Shared utilities (camera initialization, config)
+- tools: Data collection and analysis
+- integration: System integration (camera_controller for Stewart platform)
 """
 
-__version__ = "1.0.0"
+# Main API exports for backward compatibility
+from .core.detector import BallDetector
 
-# Lazy imports to avoid loading onnxruntime until needed
-# Import detector directly when needed:
-#   from ball_detection.detector import BallDetector
+__version__ = "1.0.0"
 
 __all__ = ['BallDetector']

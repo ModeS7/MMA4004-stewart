@@ -31,7 +31,7 @@ warnings.filterwarnings('ignore')
 
 # Add parent directory to path to import model
 sys.path.insert(0, str(Path(__file__).parent))
-from model import BallDetectorCNN
+from ball_detection.core.model import BallDetectorCNN
 
 
 # ============================================================================

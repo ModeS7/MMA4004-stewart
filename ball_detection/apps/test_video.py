@@ -19,7 +19,7 @@ from pathlib import Path
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 
-from ball_detection.detector import BallDetector
+from ball_detection.core.detector import BallDetector
 
 
 def process_frame(detector, frame, crop_size, confidence_threshold):

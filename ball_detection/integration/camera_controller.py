@@ -80,7 +80,7 @@ class ZEDCameraController:
         """
         try:
             # Import ball detector here to avoid loading onnxruntime until needed
-            from ball_detection.detector import BallDetector
+            from ball_detection.core.detector import BallDetector
 
             # Open camera with DirectShow backend (better for Windows USB cameras)
             # Use DSHOW to avoid frame buffering issues

@@ -15,8 +15,8 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-from model import BallDetectorCNN, BallDetectorMobileNetV3, create_model
-from dataset import create_dataloaders
+from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, create_model
+from ..core.dataset import create_dataloaders
 
 # ============================================================
 # SETTINGS - Edit these

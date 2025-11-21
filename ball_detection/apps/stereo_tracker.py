@@ -20,7 +20,8 @@ from typing import Optional, Tuple
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-from .detector import BallDetector
+from ..core.detector import BallDetector
+from ..utils.camera import create_camera_capture
 
 # ============================================================
 # SETTINGS - Edit these
@@ -30,30 +31,13 @@ CAMERA_INDEX = 0
 
 # Stereo calibration paths (try local first, then fallback)
 CALIBRATION_DIRS = [
-    Path(__file__).parent / "calibrations",  # ball_detection/calibrations
+    Path(__file__).parent.parent / "calibrations",  # ball_detection/calibrations
     Path(r"W:\NTNU\Stereo_cam_test\calibrations")  # Fallback to old location
 ]
 
 # 3D plotting configuration
 MAX_POINTS = 100  # Maximum number of 3D points to keep in history
 # ============================================================
-
-
-def create_camera_capture(camera_index):
-    """Create VideoCapture object with Windows backends."""
-    backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW]
-
-    for backend in backends:
-        try:
-            cap = cv2.VideoCapture(camera_index, backend)
-            if cap.isOpened():
-                return cap
-            cap.release()
-        except Exception:
-            continue
-
-    cap = cv2.VideoCapture(camera_index)
-    return cap if cap.isOpened() else None
 
 
 def load_stereo_calibration():
