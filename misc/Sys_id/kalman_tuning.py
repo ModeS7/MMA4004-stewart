@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Tuple, List, Dict
 from core.control_core import KalmanFilter
-from core.utils import BallPhysicsConfig
+from core.utils import BallPhysicsConfig, CAMERA_TYPE
 
 
 def load_data(csv_file: str) -> pd.DataFrame:
@@ -102,7 +102,8 @@ def replay_kalman(df: pd.DataFrame, R_scale: float, Q_scale: float) -> Tuple[np.
         process_noise_scale=Q_scale,
         measurement_noise_scale=R_scale,
         ball_physics_params=ball_params,
-        dt=avg_dt
+        dt=avg_dt,
+        camera_type=CAMERA_TYPE
     )
 
     # Arrays to store results

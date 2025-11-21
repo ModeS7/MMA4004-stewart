@@ -303,7 +303,8 @@ class KalmanFilter:
                  measurement_noise_scale: float = 1.0,
                  ball_physics_params: Optional[dict] = None,
                  dt: float = 0.01,
-                 include_damping: bool = True) -> None:
+                 include_damping: bool = True,
+                 camera_type: str = 'PIXY2') -> None:
         """
         Args:
             process_noise_scale: Scaling factor for process noise Q (tunable)
@@ -311,7 +312,9 @@ class KalmanFilter:
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
             dt: Time step for prediction (control loop period)
             include_damping: If True, include velocity-dependent damping (rolling friction)
+            camera_type: Camera type ('PIXY2' or 'ZED') for noise characteristics
         """
+        self.camera_type = camera_type
         # Default ball physics parameters
         if ball_physics_params is None:
             ball_physics_params = {
@@ -393,20 +396,30 @@ class KalmanFilter:
 
         # Measurement noise covariance R
         # Based on camera characteristics (platform-specific):
-        # - Pixel quantization: uniform distribution over pixel size
-        # - Sub-pixel noise: Gaussian noise from camera
-        pixel_size = Pixy2CameraConfig.PIXEL_SIZE_MM / 1000.0  # Convert mm to meters
-        subpixel_noise = Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM / 1000.0  # Convert mm to meters
+        if self.camera_type == 'ZED':
+            # ZED camera: Use conservative operational noise estimates
+            # Note: Static measured noise (0.0309mm X, 0.0016mm Y) is too low for Kalman filter
+            # During operation, noise includes ball motion blur, lighting, vibration, CNN uncertainty
+            # Use values that give stable filtering similar to well-tuned Pixy2 performance
+            noise_std_x = 1.5 / 1000.0  # 1.5mm operational noise in X (m)
+            noise_std_y = 1.5 / 1000.0  # 1.5mm operational noise in Y (m)
 
-        # Quantization noise variance (uniform distribution)
-        quantization_var = (pixel_size ** 2) / 12
-        # Sub-pixel noise variance (Gaussian)
-        subpixel_var = subpixel_noise ** 2
+            # Conservative operational noise (better than Pixy2 but accounts for real conditions)
+            self.R_base = np.diag([noise_std_x ** 2, noise_std_y ** 2])
+        else:  # PIXY2
+            # Pixy2 camera: Pixel quantization + sub-pixel noise
+            from core.utils import Pixy2CameraConfig
+            pixel_size = Pixy2CameraConfig.PIXEL_SIZE_MM / 1000.0  # Convert mm to meters
+            subpixel_noise = Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM / 1000.0  # Convert mm to meters
 
-        # Total measurement noise
-        measurement_std = np.sqrt(quantization_var + subpixel_var)
+            # Quantization noise variance (uniform distribution)
+            quantization_var = (pixel_size ** 2) / 12
+            # Sub-pixel noise variance (Gaussian)
+            subpixel_var = subpixel_noise ** 2
 
-        self.R_base = np.eye(2) * (measurement_std ** 2)
+            # Total measurement noise (same for X and Y)
+            measurement_std = np.sqrt(quantization_var + subpixel_var)
+            self.R_base = np.eye(2) * (measurement_std ** 2)
 
         # Apply scaling factors
         self._update_noise_matrices()

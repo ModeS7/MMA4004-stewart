@@ -21,6 +21,11 @@ import numpy as np
 PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger platform)
 
 # ============================================================================
+# CAMERA TYPE SELECTION
+# ============================================================================
+CAMERA_TYPE = 'ZED'  # Options: 'PIXY2' or 'ZED'
+
+# ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS
 # ============================================================================
 
@@ -358,8 +363,13 @@ class KalmanFilterConfig:
     DEFAULT_PROCESS_NOISE = 1.0
 
     # Measurement noise (R matrix scaling)
-    MEASUREMENT_NOISE_RANGE = (0.01, 10.0)
+    MEASUREMENT_NOISE_RANGE = (0.01, 200.0)
     DEFAULT_MEASUREMENT_NOISE = 1.0
+
+    # Camera-specific defaults for measurement noise scaling
+    # ZED uses conservative operational noise model (1.5mm) similar to Pixy2
+    DEFAULT_MEASUREMENT_NOISE_PIXY2 = 1.0
+    DEFAULT_MEASUREMENT_NOISE_ZED = 1.0  # Same scale since operational noise is comparable
 
 class BallControlConfig:
     """Ball control parameters (reset, push, etc.)."""
@@ -428,6 +438,62 @@ class Pixy2CameraConfig:
     NOISE_RANGE = (0.0, 4.0)  # mm (extended range for measured noise)
     DETECTION_RATE_RANGE = (0.90, 1.0)  # probability
     SAMPLE_RATE_RANGE = (0.0, 60.0)  # Hz (0 = every frame)
+
+# ============================================================================
+# ZED CAMERA CONFIGURATION
+# ============================================================================
+
+class ZEDCameraConfig:
+    """ZED stereo camera parameters for ball detection using CNN."""
+
+    # Camera hardware
+    CAMERA_ID = 1  # OpenCV camera device ID
+    STEREO_CAMERA = 'LEFT'  # Which camera to use: 'LEFT' or 'RIGHT'
+
+    # Resolution and frame rate
+    # Camera opens at 2560x720 @ 60fps (stereo mode with MJPEG codec)
+    # Single camera after split: 1280x720
+    RESOLUTION_WIDTH_PX = 1280  # Single camera width (2560/2)
+    RESOLUTION_HEIGHT_PX = 720  # Camera height
+    TARGET_FPS = 60  # Target frame rate (Hz)
+
+    # Camera center point in pixels (default geometric center)
+    CENTER_X_PX = RESOLUTION_WIDTH_PX / 2.0  # 640 pixels
+    CENTER_Y_PX = RESOLUTION_HEIGHT_PX / 2.0  # 360 pixels
+
+    # Field of view (calibrated using 300mm platform diameter = 332 pixels)
+    # Conversion: 300mm / 332px = 0.9036 mm/px
+    FOV_WIDTH_MM = 1156.6  # Physical width of camera view (mm) - Calibrated
+    FOV_HEIGHT_MM = 650.6  # Physical height of camera view (mm) - Calibrated
+
+    # Platform center offset (calibrated using capture_calibration.py)
+    # Measured platform center at pixel (702, 228)
+    CENTER_X = 702  # X offset (pixels) - Calibrated
+    CENTER_Y = 228  # Y offset (pixels) - Calibrated
+
+    # Computed pixel-to-mm conversion factors
+    PIXELS_TO_MM_X = FOV_WIDTH_MM / RESOLUTION_WIDTH_PX
+    PIXELS_TO_MM_Y = FOV_HEIGHT_MM / RESOLUTION_HEIGHT_PX
+
+    # Ball detection parameters
+    CROP_SIZE = 128  # CNN input size (must match trained model)
+    CONFIDENCE_THRESHOLD = 0.5  # Detection confidence threshold
+    MODEL_PATH = 'ball_detection/models/best_pixel_error.onnx'  # Path to trained model
+    USE_GPU = False  # Use GPU acceleration (DirectML)
+
+    # Camera noise characteristics (measured from hardware)
+    NOISE_STD_X_MM = 0.0309  # X-axis measurement noise std dev (mm)
+    NOISE_STD_Y_MM = 0.0016  # Y-axis measurement noise std dev (mm)
+    DETECTION_RATE = 1.0  # Ball detection probability (100%)
+
+    # Camera update rate (measured from hardware)
+    DEFAULT_SAMPLE_RATE_HZ = 48.6  # Actual camera sample rate (Hz)
+
+    # GUI slider ranges (for simulation camera model)
+    NOISE_X_RANGE = (0.0, 0.5)  # mm (very low noise, measured X-axis)
+    NOISE_Y_RANGE = (0.0, 0.1)  # mm (extremely low Y noise, measured Y-axis)
+    DETECTION_RATE_RANGE = (0.95, 1.0)  # probability (very reliable detection)
+    SAMPLE_RATE_RANGE = (0.0, 100.0)  # Hz (higher fps than Pixy2)
 
 # ============================================================================
 # BALL PHYSICS CONFIGURATION

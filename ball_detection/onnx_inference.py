@@ -20,7 +20,7 @@ class ONNXBallDetector:
     Provides high-speed inference (~3-5ms on AMD Vega 8) with sub-pixel accuracy.
     """
 
-    def __init__(self, model_path, use_gpu=True, image_size=64):
+    def __init__(self, model_path, use_gpu=True, image_size=128):
         """
         Initialize ONNX detector.
 
@@ -128,8 +128,16 @@ class ONNXBallDetector:
         self.inference_count += 1
         self.total_inference_time += inference_time
 
-        # Parse output
-        x_norm, y_norm, confidence = outputs[0][0]
+        # Parse output (handle both 2-output and 3-output models)
+        output_data = outputs[0][0]
+
+        if len(output_data) == 2:
+            # Model outputs only (x, y)
+            x_norm, y_norm = output_data
+            confidence = 1.0  # No confidence score
+        else:
+            # Model outputs (x, y, confidence)
+            x_norm, y_norm, confidence = output_data
 
         return float(x_norm), float(y_norm), float(confidence)
 
@@ -160,7 +168,16 @@ class ONNXBallDetector:
         self.inference_count += len(images_rgb)
         self.total_inference_time += inference_time
 
-        return outputs[0]
+        # Handle both 2-output and 3-output models
+        raw_outputs = outputs[0]
+
+        if raw_outputs.shape[1] == 2:
+            # Model outputs only (x, y), add confidence column
+            confidence_col = np.ones((raw_outputs.shape[0], 1), dtype=raw_outputs.dtype)
+            return np.concatenate([raw_outputs, confidence_col], axis=1)
+        else:
+            # Model outputs (x, y, confidence)
+            return raw_outputs
 
     def get_statistics(self):
         """Get inference statistics."""
@@ -279,10 +296,24 @@ if __name__ == "__main__":
         print("Press 'q' to quit\n")
 
         detector = ONNXBallDetector(args.model, use_gpu=not args.no_gpu)
-        roi_extractor = RedBallROIExtractor(crop_size=64)
-        cap = cv2.VideoCapture(args.camera)
+        roi_extractor = RedBallROIExtractor(crop_size=128)
+
+        # Open camera with DirectShow backend (Windows, reduces tearing)
+        cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(args.camera)
+
+        # Reduce buffer size and set resolution
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
         while True:
+            # Flush old buffered frames
+            cap.grab()
+
             ret, frame = cap.read()
             if not ret:
                 break

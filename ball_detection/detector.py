@@ -24,7 +24,7 @@ class BallDetector:
     Total: ~5-6ms per image on Ryzen 7 5700U
     """
 
-    def __init__(self, onnx_model_path, use_gpu=True, crop_size=64, confidence_threshold=0.5):
+    def __init__(self, onnx_model_path, use_gpu=True, crop_size=128, confidence_threshold=0.5):
         """
         Initialize detector.
 
@@ -161,11 +161,6 @@ class BallDetector:
             cv2.line(vis, (int(x) - 20, int(y)), (int(x) + 20, int(y)), (0, 255, 0), 1)
             cv2.line(vis, (int(x), int(y) - 20), (int(x), int(y) + 20), (0, 255, 0), 1)
 
-            # Add confidence text
-            cv2.putText(vis, f"Conf: {conf:.3f}",
-                        (int(x) + 15, int(y) - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
         return vis
 
     def get_statistics(self):
@@ -199,15 +194,24 @@ def test_detector_webcam(model_path, camera_id=0, use_gpu=True):
     detector = BallDetector(
         onnx_model_path=model_path,
         use_gpu=use_gpu,
-        crop_size=64,
+        crop_size=128,
         confidence_threshold=0.5
     )
 
-    # Open camera
-    cap = cv2.VideoCapture(camera_id)
+    # Open camera with DirectShow backend (Windows, reduces tearing)
+    cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        print(f"Error: Could not open camera {camera_id}")
-        return
+        cap = cv2.VideoCapture(camera_id)
+        if not cap.isOpened():
+            print(f"Error: Could not open camera {camera_id}")
+            return
+
+    # Reduce buffer size and set resolution
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
     # FPS calculation
     import time
@@ -215,6 +219,9 @@ def test_detector_webcam(model_path, camera_id=0, use_gpu=True):
     frame_count = 0
 
     while True:
+        # Flush old buffered frames
+        cap.grab()
+
         ret, frame = cap.read()
         if not ret:
             break

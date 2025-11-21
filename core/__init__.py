@@ -17,7 +17,8 @@ from .core import (
     FirstOrderServo,
     SimpleBallPhysics2D,
     PatternFactory,
-    Pixy2Camera
+    CameraModel,
+    Pixy2Camera  # Backward compatibility alias
 )
 
 # Control algorithms
@@ -73,7 +74,8 @@ __all__ = [
     'FirstOrderServo',
     'SimpleBallPhysics2D',
     'PatternFactory',
-    'Pixy2Camera',
+    'CameraModel',
+    'Pixy2Camera',  # Backward compatibility
 
     # Control
     'PIDController',

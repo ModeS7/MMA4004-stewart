@@ -997,43 +997,64 @@ class PatternFactory:
         return ['static', 'circle', 'figure8', 'star']
 
 
-class Pixy2Camera:
+class CameraModel:
     """
-    Realistic Pixy2 camera model with quantization and measurement noise.
+    Camera sensor model with realistic measurement noise characteristics.
 
-    Models actual camera behavior:
-    - Pixel grid discretization (1.4mm resolution)
-    - Sub-pixel noise causes jumping between adjacent pixels
-    - When ball aligns with pixel: stable reading
-    - When ball between pixels: oscillates between them
-    - Realistic sample rate (19.3 Hz measured)
+    Models camera behavior based on configured camera type (CAMERA_TYPE):
+    - Pixy2: Pixel grid quantization + sub-pixel noise
+    - ZED: Sub-pixel CNN detection with measured noise characteristics
 
-    Physics:
-    - Ball on pixel center → stable measurements (low variance)
-    - Ball between pixels → jumps between adjacent pixels (high variance)
+    Features:
+    - Configurable noise model (quantization and/or Gaussian noise)
+    - Detection dropout modeling
+    - Realistic sample rate limiting
     """
 
     def __init__(self,
-                 pixel_size_mm=1.4,
-                 subpixel_noise_std=0.4,
-                 detection_rate=0.999,
-                 sample_rate_hz=19.3):
+                 pixel_size_mm=None,
+                 noise_std_x_mm=None,
+                 noise_std_y_mm=None,
+                 detection_rate=None,
+                 sample_rate_hz=None,
+                 camera_type=None):
         """
         Args:
-            pixel_size_mm: Physical size of one pixel (1.4mm for Pixy2)
-            subpixel_noise_std: Gaussian noise std before quantization (mm)
-                               Controls pixel jumping behavior
-            detection_rate: Probability of detecting ball (0.999 = 99.9%)
+            pixel_size_mm: Physical size of one pixel for quantization (None = no quantization)
+            noise_std_x_mm: Gaussian noise std dev in X-axis (mm)
+            noise_std_y_mm: Gaussian noise std dev in Y-axis (mm)
+            detection_rate: Probability of detecting ball (0.0 to 1.0)
             sample_rate_hz: Camera update rate in Hz (0 = sample every call)
+            camera_type: Camera type ('PIXY2' or 'ZED'), uses CAMERA_TYPE from config if None
         """
-        self.pixel_size = pixel_size_mm
-        self.subpixel_noise_std = subpixel_noise_std
-        self.detection_rate = detection_rate
+        # Import here to avoid circular import
+        from core.utils import CAMERA_TYPE, Pixy2CameraConfig, ZEDCameraConfig
 
-        if sample_rate_hz > 0:
-            self.sample_period = 1.0 / sample_rate_hz
+        # Use configured camera type if not specified
+        if camera_type is None:
+            camera_type = CAMERA_TYPE
+
+        # Load defaults based on camera type
+        if camera_type == 'ZED':
+            self.pixel_size = pixel_size_mm if pixel_size_mm is not None else 0.0  # No quantization
+            self.noise_std_x = noise_std_x_mm if noise_std_x_mm is not None else ZEDCameraConfig.NOISE_STD_X_MM
+            self.noise_std_y = noise_std_y_mm if noise_std_y_mm is not None else ZEDCameraConfig.NOISE_STD_Y_MM
+            self.detection_rate = detection_rate if detection_rate is not None else ZEDCameraConfig.DETECTION_RATE
+            sample_rate_default = ZEDCameraConfig.DEFAULT_SAMPLE_RATE_HZ
+        else:  # PIXY2
+            self.pixel_size = pixel_size_mm if pixel_size_mm is not None else Pixy2CameraConfig.PIXEL_SIZE_MM
+            self.noise_std_x = noise_std_x_mm if noise_std_x_mm is not None else Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM
+            self.noise_std_y = noise_std_y_mm if noise_std_y_mm is not None else Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM
+            self.detection_rate = detection_rate if detection_rate is not None else Pixy2CameraConfig.DEFAULT_DETECTION_RATE
+            sample_rate_default = Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ
+
+        self.camera_type = camera_type
+
+        # Setup sample rate
+        if sample_rate_hz is not None:
+            self.sample_period = 1.0 / sample_rate_hz if sample_rate_hz > 0 else 0.0
         else:
-            self.sample_period = 0.0  # Always sample
+            self.sample_period = 1.0 / sample_rate_default if sample_rate_default > 0 else 0.0
 
         # Timing state for sample rate
         self.last_sample_time = -float('inf')  # Force first sample
@@ -1075,14 +1096,19 @@ class Pixy2Camera:
             self.cached_detected = False
             return None, None, False, True
 
-        # Add sub-pixel noise (causes jumping between pixels)
+        # Add measurement noise (sub-pixel for Pixy2, CNN detection noise for ZED)
         x_true, y_true = true_position_mm
-        x_noisy = x_true + np.random.normal(0, self.subpixel_noise_std)
-        y_noisy = y_true + np.random.normal(0, self.subpixel_noise_std)
+        x_noisy = x_true + np.random.normal(0, self.noise_std_x)
+        y_noisy = y_true + np.random.normal(0, self.noise_std_y)
 
-        # Quantize to pixel grid
-        x_measured = np.round(x_noisy / self.pixel_size) * self.pixel_size
-        y_measured = np.round(y_noisy / self.pixel_size) * self.pixel_size
+        # Quantize to pixel grid (only if pixel size > 0, i.e., Pixy2)
+        if self.pixel_size > 0:
+            x_measured = np.round(x_noisy / self.pixel_size) * self.pixel_size
+            y_measured = np.round(y_noisy / self.pixel_size) * self.pixel_size
+        else:
+            # No quantization (ZED camera has sub-pixel accuracy)
+            x_measured = x_noisy
+            y_measured = y_noisy
 
         self.cached_measurement = (x_measured, y_measured)
         self.cached_detected = True
@@ -1110,12 +1136,18 @@ class Pixy2Camera:
         detection_probs = np.random.rand(batch_size)
         detected = detection_probs < self.detection_rate
 
-        # Sub-pixel noise
-        noise = np.random.randn(*true_positions_mm.shape) * self.subpixel_noise_std
+        # Measurement noise (different for X and Y axes)
+        noise_x = np.random.randn(batch_size) * self.noise_std_x
+        noise_y = np.random.randn(batch_size) * self.noise_std_y
+        noise = np.stack([noise_x, noise_y], axis=1)
         noisy_positions = true_positions_mm + noise
 
-        # Quantize to pixel grid
-        measured = np.round(noisy_positions / self.pixel_size) * self.pixel_size
+        # Quantize to pixel grid (only if pixel size > 0)
+        if self.pixel_size > 0:
+            measured = np.round(noisy_positions / self.pixel_size) * self.pixel_size
+        else:
+            # No quantization (ZED camera has sub-pixel accuracy)
+            measured = noisy_positions
 
         # Set undetected measurements to zero
         measured[~detected] = 0.0
@@ -1141,10 +1173,15 @@ class Pixy2Camera:
             return 1.0 / self.sample_period
         return float('inf')
 
-    def set_noise_level(self, subpixel_noise_std: float) -> None:
-        """Update noise level on the fly."""
-        self.subpixel_noise_std = subpixel_noise_std
+    def set_noise_level(self, noise_std: float) -> None:
+        """Update noise level on the fly (sets both X and Y to same value)."""
+        self.noise_std_x = noise_std
+        self.noise_std_y = noise_std
 
-    def get_noise_level(self) -> float:
-        """Get current noise standard deviation."""
-        return self.subpixel_noise_std
+    def get_noise_level(self) -> tuple:
+        """Get current noise standard deviations (X, Y)."""
+        return (self.noise_std_x, self.noise_std_y)
+
+
+# Backward compatibility alias
+Pixy2Camera = CameraModel

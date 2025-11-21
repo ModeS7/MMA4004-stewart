@@ -22,7 +22,7 @@ class RedBallROIExtractor:
     Speed: ~1-2ms per frame on modern CPU
     """
 
-    def __init__(self, crop_size=64, min_area=50):
+    def __init__(self, crop_size=128, min_area=50):
         """
         Initialize ROI extractor.
 
@@ -34,11 +34,11 @@ class RedBallROIExtractor:
         self.min_area = min_area
 
         # HSV color ranges for red ball
-        # Red wraps around in HSV (0-10 and 160-180)
-        self.lower_red1 = np.array([0, 100, 100])
+        # Red wraps around in HSV (0-10 and 160-179)
+        self.lower_red1 = np.array([0, 230, 100])
         self.upper_red1 = np.array([10, 255, 255])
         self.lower_red2 = np.array([160, 100, 100])
-        self.upper_red2 = np.array([180, 255, 255])
+        self.upper_red2 = np.array([179, 255, 255])
 
         # Morphological kernel for noise removal
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -201,14 +201,27 @@ def test_roi_extractor(camera_id=0):
     print("Testing ROI Extractor with webcam")
     print("Press 'q' to quit")
 
-    extractor = RedBallROIExtractor(crop_size=64)
-    cap = cv2.VideoCapture(camera_id)
+    extractor = RedBallROIExtractor(crop_size=128)
 
+    # Open camera with DirectShow backend (Windows, reduces tearing)
+    cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        print(f"Error: Could not open camera {camera_id}")
-        return
+        cap = cv2.VideoCapture(camera_id)
+        if not cap.isOpened():
+            print(f"Error: Could not open camera {camera_id}")
+            return
+
+    # Reduce buffer size and set resolution
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
     while True:
+        # Flush old buffered frames
+        cap.grab()
+
         ret, frame = cap.read()
         if not ret:
             break

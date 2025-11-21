@@ -25,9 +25,9 @@ from PyQt6.QtWidgets import QWidget, QApplication
 
 from setup.base_simulator import BaseStewartSimulator, ControllerConfig
 from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
-from core.utils import (ControlLoopConfig, Pixy2CameraConfig, BallPhysicsConfig,
-                         VisualizationConfig, HardwareConnectionConfig, PIDConfig,
-                         PerformanceConfig, get_controller_defaults, SerialConfig)
+from core.utils import (ControlLoopConfig, Pixy2CameraConfig, ZEDCameraConfig, BallPhysicsConfig,
+                         VisualizationConfig, HardwareConnectionConfig, PIDConfig, KalmanFilterConfig,
+                         PerformanceConfig, get_controller_defaults, SerialConfig, CAMERA_TYPE)
 
 # Thread priority constants
 THREAD_PRIORITY_IDLE = -15
@@ -635,6 +635,7 @@ class HardwareControllerBase(BaseStewartSimulator):
         """
         # Hardware components
         self.serial_controller: Optional[SerialController] = None
+        self.camera_controller: Optional[Any] = None  # ZEDCameraController when using ZED
         self.connected: bool = False
         self.port_var: str = ''
         self.ik_cache: Optional[IKCache] = None
@@ -644,11 +645,19 @@ class HardwareControllerBase(BaseStewartSimulator):
         self.control_interval: float = 1.0 / ControlLoopConfig.DEFAULT_FREQUENCY_HZ
         self.use_kalman_derivative: bool = False
 
-        # Camera calibration parameters (pixels to mm conversion)
-        self.pixy_width_mm: float = Pixy2CameraConfig.FOV_WIDTH_MM
-        self.pixy_height_mm: float = Pixy2CameraConfig.FOV_HEIGHT_MM
-        self.pixels_to_mm_x: float = Pixy2CameraConfig.PIXELS_TO_MM_X
-        self.pixels_to_mm_y: float = Pixy2CameraConfig.PIXELS_TO_MM_Y
+        # Camera type and calibration parameters (pixels to mm conversion)
+        self.camera_type: str = CAMERA_TYPE
+        if CAMERA_TYPE == 'ZED':
+            self.camera_width_mm: float = ZEDCameraConfig.FOV_WIDTH_MM
+            self.camera_height_mm: float = ZEDCameraConfig.FOV_HEIGHT_MM
+            self.pixels_to_mm_x: float = ZEDCameraConfig.PIXELS_TO_MM_X
+            self.pixels_to_mm_y: float = ZEDCameraConfig.PIXELS_TO_MM_Y
+        else:  # PIXY2
+            self.camera_width_mm: float = Pixy2CameraConfig.FOV_WIDTH_MM
+            self.camera_height_mm: float = Pixy2CameraConfig.FOV_HEIGHT_MM
+            self.pixels_to_mm_x: float = Pixy2CameraConfig.PIXELS_TO_MM_X
+            self.pixels_to_mm_y: float = Pixy2CameraConfig.PIXELS_TO_MM_Y
+
         self.last_ball_update: float = 0.0
         self.ball_pos_mm: np.ndarray = np.array([0.0, 0.0])
         self.ball_detected: bool = False
@@ -661,11 +670,18 @@ class HardwareControllerBase(BaseStewartSimulator):
         }
 
         # Initialize Kalman filter (required before super().__init__)
+        # Use camera-specific measurement noise defaults
+        if self.camera_type == 'ZED':
+            measurement_noise_scale = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_ZED
+        else:
+            measurement_noise_scale = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_PIXY2
+
         self.kalman_filter: KalmanFilter = KalmanFilter(
             process_noise_scale=1.0,
-            measurement_noise_scale=1.0,
+            measurement_noise_scale=measurement_noise_scale,
             ball_physics_params=BallPhysicsConfig.as_dict(),
-            dt=self.control_interval
+            dt=self.control_interval,
+            camera_type=self.camera_type
         )
         self.kalman_enabled: bool = True
 
@@ -676,6 +692,21 @@ class HardwareControllerBase(BaseStewartSimulator):
 
         # Call parent constructor
         super().__init__(app, controller_config)
+
+    def get_ball_data(self) -> Optional[Dict[str, Any]]:
+        """
+        Get latest ball detection data from active camera.
+
+        Returns:
+            Dictionary with ball data, or None if no data available.
+            Format: {'x': float (mm), 'y': float (mm), 'detected': bool, ...}
+        """
+        if self.camera_type == 'ZED' and self.camera_controller is not None:
+            return self.camera_controller.get_latest_ball_data()
+        elif self.camera_type == 'PIXY2' and self.serial_controller is not None:
+            return self.serial_controller.get_latest_ball_data()
+        else:
+            return None
 
     def _get_controller_type(self) -> str:
         """Override to return selected controller type."""
@@ -922,18 +953,25 @@ class HardwareControllerBase(BaseStewartSimulator):
         while self.simulation_running:
             loop_start = time.perf_counter()
 
-            # Get ball data from Pixy2 camera via serial
-            ball_data = self.serial_controller.get_latest_ball_data()
+            # Get ball data from active camera (Pixy2 or ZED)
+            ball_data = self.get_ball_data()
 
             if ball_data is not None:
                 self.last_ball_update = self.simulation_time
 
-                pixy_x = ball_data['x']
-                pixy_y = ball_data['y']
+                # Handle coordinate conversion based on camera type
+                if self.camera_type == 'PIXY2':
+                    # Pixy2 returns pixel coordinates, convert to mm
+                    pixy_x = ball_data['x']
+                    pixy_y = ball_data['y']
 
-                # Camera coordinate conversion (origin at top-left, convert to center-origin)
-                ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
-                ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
+                    # Camera coordinate conversion (origin at top-left, convert to center-origin)
+                    ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
+                    ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
+                else:  # ZED camera
+                    # ZED returns coordinates already in mm (from platform center)
+                    ball_x_mm = ball_data['x']
+                    ball_y_mm = ball_data['y']
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)

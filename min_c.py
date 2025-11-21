@@ -363,18 +363,25 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
             # Update IMU orientation (from mixin)
             self._update_imu_orientation()
 
-            # Get ball data from Pixy2 camera via serial
-            ball_data = self.serial_controller.get_latest_ball_data()
+            # Get ball data from camera (Pixy2 via serial, or ZED direct)
+            ball_data = self.get_ball_data()
 
             if ball_data is not None:
                 self.last_ball_update = self.simulation_time
 
-                pixy_x = ball_data['x']
-                pixy_y = ball_data['y']
+                # Handle coordinate conversion based on camera type
+                if self.camera_type == 'PIXY2':
+                    # Pixy2 returns pixel coordinates, convert to mm
+                    pixy_x = ball_data['x']
+                    pixy_y = ball_data['y']
 
-                # Camera dimensions: 316×208 pixels, origin at top-left
-                ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
-                ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
+                    # Camera dimensions: 316×208 pixels, origin at top-left
+                    ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
+                    ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
+                else:  # ZED camera
+                    # ZED returns coordinates already in mm (from platform center)
+                    ball_x_mm = ball_data['x']
+                    ball_y_mm = ball_data['y']
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
@@ -570,8 +577,8 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
         self.ball_trail = plot_item.plot([], [], pen=pg.mkPen(color='#ff8888', width=2, style=Qt.PenStyle.DashLine))
 
     def connect_serial(self) -> None:
-        """Establish serial connection to hardware."""
-        if self.connected and self.serial_controller is not None:
+        """Establish connection to hardware (serial for servos/Pixy2, or ZED camera)."""
+        if self.connected:
             self.log("Connection already established")
             return
 
@@ -584,42 +591,61 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
             QMessageBox.critical(self, "Error", "No port selected")
             return
 
+        # Connect to servo controller via serial
         self.serial_controller = SerialController(port)
         success, message = self.serial_controller.connect()
 
-        if success:
-            self.connected = True
-            self.log(f"Connected to {port}")
-
-            time.sleep(HardwareConnectionConfig.POST_CONNECTION_DELAY_S)
-            self.serial_controller.set_servo_speed(0)
-            time.sleep(HardwareConnectionConfig.POST_SERVO_SPEED_DELAY_S)
-            self.serial_controller.set_servo_acceleration(0)
-            time.sleep(HardwareConnectionConfig.POST_SERVO_ACCEL_DELAY_S)
-            self.log("Servo parameters configured: Speed=0, Acceleration=0")
-
-            success_timer, msg_timer = self.timer_manager.set_high_resolution()
-            self.log(msg_timer)
-
-            self.initialize_ik_cache()
-            self.start_imu_initialization()
-
-            if 'simulation_control' in self.gui_modules:
-                self.gui_modules['simulation_control'].start_btn.setEnabled(True)
-
-            if 'serial_connection' in self.gui_modules:
-                self.gui_modules['serial_connection'].update({'connected': True})
-        else:
+        if not success:
             QMessageBox.critical(self, "Error", message)
             self.log(f"Error: {message}")
+            return
+
+        self.connected = True
+        self.log(f"Connected to {port}")
+
+        time.sleep(HardwareConnectionConfig.POST_CONNECTION_DELAY_S)
+        self.serial_controller.set_servo_speed(0)
+        time.sleep(HardwareConnectionConfig.POST_SERVO_SPEED_DELAY_S)
+        self.serial_controller.set_servo_acceleration(0)
+        time.sleep(HardwareConnectionConfig.POST_SERVO_ACCEL_DELAY_S)
+        self.log("Servo parameters configured: Speed=0, Acceleration=0")
+
+        # Connect camera based on type
+        if self.camera_type == 'ZED':
+            from ball_detection.camera_controller import ZEDCameraController
+            self.camera_controller = ZEDCameraController()
+            cam_success, cam_message = self.camera_controller.connect()
+
+            if cam_success:
+                self.log(f"Camera: {cam_message}")
+            else:
+                QMessageBox.critical(self, "Camera Error", cam_message)
+                self.log(f"Camera Error: {cam_message}")
+                self.disconnect_serial()
+                return
+
+        success_timer, msg_timer = self.timer_manager.set_high_resolution()
+        self.log(msg_timer)
+
+        self.initialize_ik_cache()
+        self.start_imu_initialization()
+
+        if 'simulation_control' in self.gui_modules:
+            self.gui_modules['simulation_control'].start_btn.setEnabled(True)
+
+        if 'serial_connection' in self.gui_modules:
+            self.gui_modules['serial_connection'].update({'connected': True})
 
     def disconnect_serial(self) -> None:
-        """Disconnect from serial hardware."""
+        """Disconnect from hardware."""
         if self.simulation_running:
             self.stop_simulation()
 
         if self.serial_controller:
             self.serial_controller.disconnect()
+
+        if self.camera_controller:
+            self.camera_controller.disconnect()
 
         self.connected = False
 

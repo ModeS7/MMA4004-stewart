@@ -19,7 +19,7 @@ from PyQt6.QtGui import QFont
 from core.utils import (
     format_time, format_vector_2d, MAX_TILT_ANGLE_DEG,
     IMUKalmanConfig, TrajectoryPatternConfig,
-    KalmanFilterConfig, Pixy2CameraConfig, GUIConfig,
+    KalmanFilterConfig, Pixy2CameraConfig, ZEDCameraConfig, CAMERA_TYPE, GUIConfig,
     # GUI constants
     GUI_FONT_MONOSPACE, GUI_FONT_SANS,
     GUI_FONT_SIZE_TINY, GUI_FONT_SIZE_SMALL, GUI_FONT_SIZE_NORMAL, GUI_FONT_SIZE_LARGE,
@@ -988,19 +988,19 @@ class PerformanceStatsModule(GUIModule):
             self.timeout_label.setText(f"IK Timeouts: {state['ik_timeouts']}")
 
 
-class Pixy2CameraModule(GUIModule):
-    """Pixy2 camera noise model configuration and control."""
+class CameraModelModule(GUIModule):
+    """Camera noise model configuration and control."""
 
     def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
                  camera: Optional[Any] = None) -> None:
         """
-        Initialize Pixy2 camera module.
+        Initialize camera model module.
 
         Args:
             parent: Parent QWidget
             colors: Color scheme dict
             callbacks: Callback functions dict
-            camera: Optional Pixy2Camera instance to control
+            camera: Optional CameraModel instance to control
         """
         super().__init__(parent, colors, callbacks)
         self.camera = camera
@@ -1009,8 +1009,31 @@ class Pixy2CameraModule(GUIModule):
         self.camera_enabled = True
 
     def create(self) -> QWidget:
-        """Create Pixy2 camera configuration widget with noise parameters and statistics."""
-        group = QGroupBox("Pixy2 Camera Model")
+        """Create camera configuration widget with noise parameters and statistics."""
+        # Detect camera type and use appropriate config
+        camera_type = CAMERA_TYPE
+        if camera_type == 'ZED':
+            camera_name = "ZED Camera"
+            noise_x_range = ZEDCameraConfig.NOISE_X_RANGE
+            noise_y_range = ZEDCameraConfig.NOISE_Y_RANGE
+            noise_x_default = ZEDCameraConfig.NOISE_STD_X_MM
+            noise_y_default = ZEDCameraConfig.NOISE_STD_Y_MM
+            detection_range = ZEDCameraConfig.DETECTION_RATE_RANGE
+            detection_default = ZEDCameraConfig.DETECTION_RATE
+            sample_range = ZEDCameraConfig.SAMPLE_RATE_RANGE
+            sample_default = ZEDCameraConfig.DEFAULT_SAMPLE_RATE_HZ
+        else:  # PIXY2
+            camera_name = "Pixy2 Camera"
+            noise_x_range = Pixy2CameraConfig.NOISE_RANGE
+            noise_y_range = Pixy2CameraConfig.NOISE_RANGE
+            noise_x_default = Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM
+            noise_y_default = Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM
+            detection_range = Pixy2CameraConfig.DETECTION_RATE_RANGE
+            detection_default = Pixy2CameraConfig.DEFAULT_DETECTION_RATE
+            sample_range = Pixy2CameraConfig.SAMPLE_RATE_RANGE
+            sample_default = Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ
+
+        group = QGroupBox(f"{camera_name} Model")
         layout = QVBoxLayout()
 
         # Enable/Disable camera noise
@@ -1029,11 +1052,18 @@ class Pixy2CameraModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
-        # Parameters (defaults from Pixy2CameraConfig)
-        self._create_parameter_row(layout, "Pixel Size:", *Pixy2CameraConfig.PIXEL_SIZE_RANGE, Pixy2CameraConfig.PIXEL_SIZE_MM, 0.1, 'pixel_size', 'mm')
-        self._create_parameter_row(layout, "Sub-pixel Noise:", *Pixy2CameraConfig.NOISE_RANGE, Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM, 0.01, 'noise_std', 'mm')
-        self._create_parameter_row(layout, "Detection Rate:", *Pixy2CameraConfig.DETECTION_RATE_RANGE, Pixy2CameraConfig.DEFAULT_DETECTION_RATE, 0.001, 'detection_rate', '', "{:.3f}")
-        self._create_parameter_row(layout, "Sample Rate:", *Pixy2CameraConfig.SAMPLE_RATE_RANGE, Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ, 0.1, 'sample_rate', 'Hz', "{:.1f}")
+        # Parameters (camera-specific)
+        if camera_type == 'PIXY2':
+            # Pixy2 has pixel quantization
+            self._create_parameter_row(layout, "Pixel Size:", *Pixy2CameraConfig.PIXEL_SIZE_RANGE, Pixy2CameraConfig.PIXEL_SIZE_MM, 0.1, 'pixel_size', 'mm')
+            self._create_parameter_row(layout, "Sub-pixel Noise:", *noise_x_range, noise_x_default, 0.01, 'noise_std', 'mm')
+        else:
+            # ZED has different noise in X and Y (no pixel quantization)
+            self._create_parameter_row(layout, "Noise X-axis:", *noise_x_range, noise_x_default, 0.001, 'noise_x', 'mm', "{:.4f}")
+            self._create_parameter_row(layout, "Noise Y-axis:", *noise_y_range, noise_y_default, 0.0001, 'noise_y', 'mm', "{:.4f}")
+
+        self._create_parameter_row(layout, "Detection Rate:", *detection_range, detection_default, 0.001, 'detection_rate', '', "{:.3f}")
+        self._create_parameter_row(layout, "Sample Rate:", *sample_range, sample_default, 0.1, 'sample_rate', 'Hz', "{:.1f}")
 
         info_label = QLabel("(0 Hz = sample every frame)")
         font = QFont(GUI_FONT_SANS, GUI_FONT_SIZE_TINY)
@@ -1218,11 +1248,15 @@ class Pixy2CameraModule(GUIModule):
                 self.sample_status_label.setText(f"Last sample: {time_val:.3f}s")
 
 
+# Backward compatibility alias
+Pixy2CameraModule = CameraModelModule
+
+
 class KalmanFilterModule(GUIModule):
     """Kalman filter configuration and monitoring."""
 
     def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Dict[str, Any],
-                 kalman_filter: Optional[Any] = None, enabled: bool = False) -> None:
+                 kalman_filter: Optional[Any] = None, enabled: bool = False, camera_type: Optional[str] = None) -> None:
         """
         Initialize Kalman filter module.
 
@@ -1232,12 +1266,14 @@ class KalmanFilterModule(GUIModule):
             callbacks: Callback functions dict
             kalman_filter: Optional KalmanFilter instance to monitor
             enabled: Initial enabled state
+            camera_type: Camera type for selecting appropriate defaults ('PIXY2' or 'ZED')
         """
         super().__init__(parent, colors, callbacks)
         self.kalman_filter = kalman_filter
         self.sliders: Dict[str, QSlider] = {}
         self.value_labels: Dict[str, QLabel] = {}
         self.filter_enabled = enabled
+        self.camera_type = camera_type if camera_type is not None else CAMERA_TYPE
 
     def create(self) -> QWidget:
         """Create Kalman filter control panel with parameter sliders and state display."""
@@ -1262,9 +1298,15 @@ class KalmanFilterModule(GUIModule):
 
         layout.addLayout(enable_layout)
 
-        # Parameters (defaults from KalmanFilterConfig)
+        # Parameters (defaults from KalmanFilterConfig, camera-specific for measurement noise)
+        # Select measurement noise default based on camera type
+        if self.camera_type == 'ZED':
+            measurement_noise_default = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_ZED
+        else:
+            measurement_noise_default = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_PIXY2
+
         self._create_parameter_slider(layout, "Process Noise (Q):", *KalmanFilterConfig.PROCESS_NOISE_RANGE, KalmanFilterConfig.DEFAULT_PROCESS_NOISE, 'process_noise')
-        self._create_parameter_slider(layout, "Measurement Noise (R):", *KalmanFilterConfig.MEASUREMENT_NOISE_RANGE, KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE, 'measurement_noise')
+        self._create_parameter_slider(layout, "Measurement Noise (R):", *KalmanFilterConfig.MEASUREMENT_NOISE_RANGE, measurement_noise_default, 'measurement_noise')
 
         # Filter state display
         state_layout = QVBoxLayout()

@@ -16,7 +16,7 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, List
 
-from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, Pixy2Camera
+from core.core import FirstOrderServo, StewartPlatformIK, SimpleBallPhysics2D, PatternFactory, CameraModel
 from core.control_core import clip_tilt_vector
 from core.utils import (
     MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG, PLATFORM_RADIUS_MM, PLATFORM_HALF_SIZE_MM, PLATFORM_VERSION,
@@ -156,12 +156,8 @@ class BaseStewartSimulator(QMainWindow):
 
         self.ball_physics = SimpleBallPhysics2D(**BallPhysicsConfig.for_physics_sim())
 
-        self.pixy_camera = Pixy2Camera(
-            pixel_size_mm=Pixy2CameraConfig.PIXEL_SIZE_MM,
-            subpixel_noise_std=Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM,
-            detection_rate=Pixy2CameraConfig.DEFAULT_DETECTION_RATE,
-            sample_rate_hz=Pixy2CameraConfig.DEFAULT_SAMPLE_RATE_HZ
-        )
+        # Camera model automatically selects parameters based on CAMERA_TYPE
+        self.pixy_camera = CameraModel()
         self.camera_enabled = True
 
         self.controller = None

@@ -1,13 +1,14 @@
 """
-Ball Detection Module for Dual Camera 3D Tracking
+Ball Detection Module for Stewart Platform Ball Tracking
 
 High-speed ball detection using hybrid ROI extraction + CNN refinement.
-Optimized for AMD Ryzen 7 5700U with DirectML GPU acceleration.
+Two-stage pipeline: HSV color filtering -> MobileNetV3 CNN on 128x128 crop.
 """
 
 __version__ = "1.0.0"
 
-from .model import BallDetectorCNN
-from .detector import BallDetector
+# Lazy imports to avoid loading onnxruntime until needed
+# Import detector directly when needed:
+#   from ball_detection.detector import BallDetector
 
-__all__ = ['BallDetectorCNN', 'BallDetector']
+__all__ = ['BallDetector']
