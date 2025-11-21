@@ -5,3 +5,6 @@ pyqtgraph
 pandas
 scipy
 numba
+tqdm
+opencv-python
+matplotlib

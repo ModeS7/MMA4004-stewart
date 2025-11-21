@@ -10,6 +10,7 @@ Architecture optimized for:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 
 
 class ResidualBlock(nn.Module):
@@ -100,7 +101,7 @@ class BallDetectorCNN(nn.Module):
         # Regression head
         self.fc1 = nn.Linear(64, 32)
         self.dropout = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(32, 3)  # (x, y, confidence)
+        self.fc2 = nn.Linear(32, 2)  # (x, y) only
 
     def forward(self, x):
         """
@@ -110,10 +111,9 @@ class BallDetectorCNN(nn.Module):
             x: Input tensor of shape (batch, 3, 64, 64)
 
         Returns:
-            Output tensor of shape (batch, 3):
+            Output tensor of shape (batch, 2):
                 - [:, 0]: x_normalized ∈ [0, 1]
                 - [:, 1]: y_normalized ∈ [0, 1]
-                - [:, 2]: confidence ∈ [0, 1]
         """
         # Feature extraction
         x = self.conv1(x)
@@ -145,17 +145,86 @@ class BallDetectorCNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def create_model(pretrained_path=None):
+class BallDetectorMobileNetV3(nn.Module):
     """
-    Create BallDetectorCNN model.
+    Ball detector using MobileNetV3-Small backbone with pretrained weights.
+
+    Uses ImageNet pretrained MobileNetV3-Small as feature extractor,
+    with a custom regression head for ball center detection.
+
+    Total Parameters: ~1.5M (backbone) + ~10K (head)
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        # Load MobileNetV3-Small with pretrained weights
+        mobilenet = models.mobilenet_v3_small(pretrained=pretrained)
+
+        # Extract feature extractor (everything except classifier)
+        self.features = mobilenet.features
+        # MobileNetV3-Small outputs 576 channels after features
+
+        # Regression head
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(32, 2)  # (x, y) only
+        )
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, 3, 64, 64)
+
+        Returns:
+            Output tensor of shape (batch, 2):
+                - [:, 0]: x_normalized ∈ [0, 1]
+                - [:, 1]: y_normalized ∈ [0, 1]
+        """
+        # Feature extraction
+        x = self.features(x)
+
+        # Global pooling
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Regression head
+        x = self.head(x)
+
+        # Apply sigmoid to ensure outputs in [0, 1]
+        x = torch.sigmoid(x)
+
+        return x
+
+    def count_parameters(self):
+        """Count total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained=True):
+    """
+    Create ball detector model.
 
     Args:
         pretrained_path: Optional path to pretrained weights (.pth file)
+        use_mobilenet: If True, use MobileNetV3-Small backbone
+        mobilenet_pretrained: If True and use_mobilenet=True, load ImageNet pretrained weights
 
     Returns:
-        BallDetectorCNN model
+        BallDetectorCNN or BallDetectorMobileNetV3 model
     """
-    model = BallDetectorCNN()
+    if use_mobilenet:
+        model = BallDetectorMobileNetV3(pretrained=mobilenet_pretrained)
+    else:
+        model = BallDetectorCNN()
 
     if pretrained_path is not None:
         print(f"Loading pretrained weights from {pretrained_path}")

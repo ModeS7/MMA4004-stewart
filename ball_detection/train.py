@@ -8,13 +8,14 @@ Edit settings below and run: python ball_detection/train.py
 import time
 from pathlib import Path
 import json
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-from model import BallDetectorCNN
+from model import BallDetectorCNN, BallDetectorMobileNetV3, create_model
 from dataset import create_dataloaders
 
 # ============================================================
@@ -22,71 +23,60 @@ from dataset import create_dataloaders
 # ============================================================
 DATA_DIR = "./ball_detection/data/final"
 OUTPUT_DIR = "./ball_detection/models"
-EPOCHS = 100
-BATCH_SIZE = 512
-IMAGE_SIZE = 64
-CROP_SIZE = 128
-LEARNING_RATE = 0.001
+EPOCHS = 3200  # Overnight training
+BATCH_SIZE = 512  # Increased for faster training on RTX 3090
+CROP_SIZE = 128  # Crop size (scale variation handled by ShiftScaleRotate augmentation)
+LEARNING_RATE = 0.001  # Lower LR for long training
+WARMUP_EPOCHS = 10  # Linear warmup for stable start
 WEIGHT_DECAY = 1e-5
 TRAIN_SPLIT = 0.8
-NUM_WORKERS = 0  # Windows compatibility
-COORD_WEIGHT = 1.0
-CONF_WEIGHT = 0.1
-SAVE_INTERVAL = 10
+NUM_WORKERS = 24
+SAVE_INTERVAL = 100  # Save less frequently (every 100 epochs for 3000 epoch run)
+USE_MOBILENET = True  # Use MobileNetV3-Small with pretrained ImageNet weights
+MOBILENET_PRETRAINED = True  # Load ImageNet pretrained weights for MobileNetV3
+USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (simulate CV detection error)
+USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
 # ============================================================
 
 
 class DetectionLoss(nn.Module):
     """
-    Combined loss for ball detection.
-
-    Combines:
-    - MSE loss for (x, y) coordinates
-    - BCE loss for confidence (always 1.0 for valid detections)
+    MSE loss for (x, y) coordinate regression.
     """
-    def __init__(self, coord_weight=1.0, conf_weight=0.1):
+    def __init__(self):
         super().__init__()
-        self.coord_weight = coord_weight
-        self.conf_weight = conf_weight
         self.mse = nn.MSELoss()
-        self.bce = nn.BCELoss()
 
     def forward(self, pred, target):
         """
         Args:
-            pred: (batch, 3) - predicted (x, y, confidence)
-            target: (batch, 3) - ground truth (x, y, confidence)
+            pred: (batch, 2) - predicted (x, y)
+            target: (batch, 2) - ground truth (x, y)
 
         Returns:
-            total_loss, coord_loss, conf_loss
+            loss
         """
         # Coordinate loss (x, y)
-        coord_loss = self.mse(pred[:, :2], target[:, :2])
+        loss = self.mse(pred, target)
 
-        # Confidence loss
-        conf_loss = self.bce(pred[:, 2], target[:, 2])
-
-        # Total weighted loss
-        total_loss = self.coord_weight * coord_loss + self.conf_weight * conf_loss
-
-        return total_loss, coord_loss, conf_loss
+        return loss
 
 
-def calculate_pixel_error(pred, target, image_size=64):
+def calculate_pixel_error(pred, target, crop_size=128):
     """
     Calculate average pixel error.
 
     Args:
-        pred: (batch, 3) - predicted normalized coordinates
-        target: (batch, 3) - ground truth normalized coordinates
-        image_size: Image size in pixels
+        pred: (batch, 2) - predicted normalized coordinates
+        target: (batch, 2) - ground truth normalized coordinates
+        crop_size: Crop size in pixels
 
     Returns:
         Average pixel error
     """
     # Convert normalized coords to pixels
-    pred_pixels = pred[:, :2] * image_size
-    target_pixels = target[:, :2] * image_size
+    pred_pixels = pred * crop_size
+    target_pixels = target * crop_size
 
     # Calculate Euclidean distance
     diff = pred_pixels - target_pixels
@@ -100,8 +90,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     model.train()
 
     total_loss = 0
-    total_coord_loss = 0
-    total_conf_loss = 0
     total_pixel_error = 0
     num_batches = len(dataloader)
     use_amp = device.type == 'cuda'
@@ -118,8 +106,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         else:
             outputs = model(images)
 
-        # Loss computation (BCE is unsafe in autocast, compute in fp32)
-        loss, coord_loss, conf_loss = criterion(outputs.float(), targets)
+        # Loss computation in fp32
+        loss = criterion(outputs.float(), targets)
 
         # Backward pass (no GradScaler needed for bf16)
         optimizer.zero_grad()
@@ -130,8 +118,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         pixel_error = calculate_pixel_error(outputs.float(), targets)
 
         total_loss += loss.item()
-        total_coord_loss += coord_loss.item()
-        total_conf_loss += conf_loss.item()
         total_pixel_error += pixel_error
 
         # Update progress bar
@@ -141,11 +127,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         })
 
     avg_loss = total_loss / num_batches
-    avg_coord_loss = total_coord_loss / num_batches
-    avg_conf_loss = total_conf_loss / num_batches
     avg_pixel_error = total_pixel_error / num_batches
 
-    return avg_loss, avg_coord_loss, avg_conf_loss, avg_pixel_error
+    return avg_loss, avg_pixel_error
 
 
 def validate(model, dataloader, criterion, device):
@@ -153,8 +137,6 @@ def validate(model, dataloader, criterion, device):
     model.eval()
 
     total_loss = 0
-    total_coord_loss = 0
-    total_conf_loss = 0
     total_pixel_error = 0
     num_batches = len(dataloader)
 
@@ -165,28 +147,43 @@ def validate(model, dataloader, criterion, device):
 
             # Forward pass (no autocast needed for validation, keep in fp32)
             outputs = model(images)
-            loss, coord_loss, conf_loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets)
 
             # Metrics
             pixel_error = calculate_pixel_error(outputs, targets)
 
             total_loss += loss.item()
-            total_coord_loss += coord_loss.item()
-            total_conf_loss += conf_loss.item()
             total_pixel_error += pixel_error
 
     avg_loss = total_loss / num_batches
-    avg_coord_loss = total_coord_loss / num_batches
-    avg_conf_loss = total_conf_loss / num_batches
     avg_pixel_error = total_pixel_error / num_batches
 
-    return avg_loss, avg_coord_loss, avg_conf_loss, avg_pixel_error
+    return avg_loss, avg_pixel_error
 
 
 def main():
     """Main training loop."""
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # CUDA optimizations for maximum performance
+    if device.type == 'cuda':
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.enabled = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+        # Scaled Dot Product Attention optimizations (PyTorch 2.0+)
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+        except AttributeError:
+            pass  # Older PyTorch versions don't have these
+
+        # Dynamo cache size for torch.compile
+        torch._dynamo.config.cache_size_limit = 32
 
     print("=" * 60)
     print("BALL DETECTION CNN TRAINING")
@@ -201,12 +198,13 @@ def main():
         print(f"CUDA Version: {torch.version.cuda}")
         print(f"PyTorch Version: {torch.__version__}")
         print(f"AMP bf16: Enabled")
+        print(f"TF32: Enabled (cuDNN & matmul)")
+        print(f"cuDNN benchmark: Enabled")
     else:
         print("AMP: Disabled (CPU mode)")
 
     print(f"Epochs: {EPOCHS}")
     print(f"Batch size: {BATCH_SIZE}")
-    print(f"Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
     print(f"Crop size: {CROP_SIZE}x{CROP_SIZE}")
     print("=" * 60)
     print()
@@ -220,42 +218,87 @@ def main():
         'data_dir': DATA_DIR,
         'epochs': EPOCHS,
         'batch_size': BATCH_SIZE,
-        'image_size': IMAGE_SIZE,
         'crop_size': CROP_SIZE,
         'learning_rate': LEARNING_RATE,
         'weight_decay': WEIGHT_DECAY,
         'train_split': TRAIN_SPLIT,
+        'use_mobilenet': USE_MOBILENET,
+        'mobilenet_pretrained': MOBILENET_PRETRAINED,
+        'use_spatial_augmentation': USE_SPATIAL_AUGMENTATION,
+        'use_appearance_augmentation': USE_APPEARANCE_AUGMENTATION,
     }
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
     # Create dataloaders
     print(f"Loading data from: {DATA_DIR}")
+    print(f"Spatial augmentation: {'Enabled' if USE_SPATIAL_AUGMENTATION else 'Disabled'}")
+    print(f"Appearance augmentation: {'Enabled' if USE_APPEARANCE_AUGMENTATION else 'Disabled'}")
     train_loader, val_loader = create_dataloaders(
         data_dir=DATA_DIR,
         batch_size=BATCH_SIZE,
-        image_size=IMAGE_SIZE,
         crop_size=CROP_SIZE,
         train_split=TRAIN_SPLIT,
-        num_workers=NUM_WORKERS
+        num_workers=NUM_WORKERS,
+        use_spatial_augmentation=USE_SPATIAL_AUGMENTATION,
+        use_appearance_augmentation=USE_APPEARANCE_AUGMENTATION
     )
 
     # Create model
     print("\nCreating model...")
-    model = BallDetectorCNN()
+    if USE_MOBILENET:
+        print(f"Using MobileNetV3-Small (pretrained: {MOBILENET_PRETRAINED})")
+        model = BallDetectorMobileNetV3(pretrained=MOBILENET_PRETRAINED)
+    else:
+        print("Using custom BallDetectorCNN")
+        model = BallDetectorCNN()
+
     model = model.to(device)
+
+    # Compile model for faster training (PyTorch 2.0+)
+    model = torch.compile(model)
+
     param_count = model.count_parameters()
     print(f"Model parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
+    print(f"torch.compile: Enabled")
     print()
 
     # Loss and optimizer
-    criterion = DetectionLoss(coord_weight=COORD_WEIGHT, conf_weight=CONF_WEIGHT)
+    criterion = DetectionLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+    # Learning rate scheduler: Warmup + Cosine Annealing with Warm Restarts
+    # This periodically resets LR to help escape local minima during long training
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=WARMUP_EPOCHS
     )
+
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=50,        # First restart after 50 epochs
+        T_mult=2,      # Double the cycle length after each restart (50, 100, 200, ...)
+        eta_min=1e-6   # Minimum LR
+    )
+
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[WARMUP_EPOCHS]
+    )
+
+    # Calculate restart epochs for checkpointing
+    restart_epochs = [WARMUP_EPOCHS]  # After warmup
+    cycle_length = 50
+    next_restart = WARMUP_EPOCHS + cycle_length
+    while next_restart <= EPOCHS:
+        restart_epochs.append(next_restart)
+        cycle_length *= 2  # T_mult = 2
+        next_restart += cycle_length
+
+    print(f"LR restart epochs: {restart_epochs[:10]}...")  # Show first 10
 
     # Training loop
     print(f"Starting training for {EPOCHS} epochs...")
@@ -270,17 +313,17 @@ def main():
         epoch_start = time.time()
 
         # Train
-        train_loss, train_coord, train_conf, train_pixel_err = train_epoch(
+        train_loss, train_pixel_err = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch
         )
 
         # Validate
-        val_loss, val_coord, val_conf, val_pixel_err = validate(
+        val_loss, val_pixel_err = validate(
             model, val_loader, criterion, device
         )
 
-        # Scheduler step
-        scheduler.step(val_loss)
+        # Scheduler step (CosineAnnealingLR steps every epoch)
+        scheduler.step()
 
         epoch_time = time.time() - epoch_start
         current_lr = optimizer.param_groups[0]['lr']
@@ -302,18 +345,23 @@ def main():
             'time': epoch_time
         })
 
-        # Save checkpoint
-        if (epoch % SAVE_INTERVAL == 0) or (epoch == EPOCHS):
+        # Save checkpoint at regular intervals OR before LR restarts
+        is_restart_epoch = epoch in restart_epochs
+        if (epoch % SAVE_INTERVAL == 0) or (epoch == EPOCHS) or is_restart_epoch:
             checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pth'
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'pixel_error': val_pixel_err,
             }, checkpoint_path)
-            print(f"  Checkpoint saved: {checkpoint_path}")
+            if is_restart_epoch:
+                print(f"  🔄 Checkpoint saved before LR restart: {checkpoint_path}")
+            else:
+                print(f"  Checkpoint saved: {checkpoint_path}")
 
         # Save best model
         if val_loss < best_val_loss:
