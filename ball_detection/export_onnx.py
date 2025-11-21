@@ -1,7 +1,7 @@
 """
 Export Trained PyTorch Model to ONNX Format
 
-Converts the trained BallDetectorCNN to ONNX for deployment with ONNX Runtime + DirectML.
+Converts the trained BallDetectorCNN or MobileNetV3 to ONNX for deployment with ONNX Runtime + DirectML.
 """
 
 import argparse
@@ -11,39 +11,59 @@ import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
-from model import BallDetectorCNN
+from model import BallDetectorCNN, BallDetectorMobileNetV3
 
 
-def export_to_onnx(pytorch_model_path, output_path, image_size=64, opset_version=14):
+def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet=True, opset_version=14):
     """
     Export PyTorch model to ONNX format.
 
     Args:
         pytorch_model_path: Path to trained PyTorch model (.pth)
         output_path: Output path for ONNX model (.onnx)
-        image_size: Input image size
+        crop_size: Input crop size (128x128)
+        use_mobilenet: Whether to use MobileNetV3 architecture
         opset_version: ONNX opset version (14 recommended for DirectML)
     """
     device = torch.device('cpu')  # Export on CPU for compatibility
 
     # Load PyTorch model
+    print("=" * 60)
+    print("PYTORCH TO ONNX EXPORT")
+    print("=" * 60)
     print(f"Loading PyTorch model from: {pytorch_model_path}")
-    model = BallDetectorCNN()
+
+    if use_mobilenet:
+        print("Architecture: MobileNetV3-Small")
+        model = BallDetectorMobileNetV3(pretrained=False)
+    else:
+        print("Architecture: BallDetectorCNN")
+        model = BallDetectorCNN()
+
     state_dict = torch.load(pytorch_model_path, map_location=device)
 
     # Handle checkpoint vs direct state_dict
     if 'model_state_dict' in state_dict:
-        model.load_state_dict(state_dict['model_state_dict'])
+        state_dict = state_dict['model_state_dict']
         print(f"  Loaded from checkpoint (epoch {state_dict.get('epoch', 'unknown')})")
-    else:
-        model.load_state_dict(state_dict)
-        print("  Loaded model state dict")
+
+    # Remove _orig_mod. prefix from torch.compile
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  Removing torch.compile wrapper (_orig_mod. prefix)...")
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
+    print("  ✓ Model weights loaded successfully")
 
     model.eval()
     model.to(device)
 
-    # Create dummy input
-    dummy_input = torch.randn(1, 3, image_size, image_size, device=device)
+    param_count = model.count_parameters()
+    print(f"  Parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
+    print()
+
+    # Create dummy input (128x128 RGB crop)
+    dummy_input = torch.randn(1, 3, crop_size, crop_size, device=device)
 
     # Export to ONNX
     print(f"\nExporting to ONNX (opset {opset_version})...")
@@ -112,7 +132,7 @@ def test_onnx_inference(onnx_path, use_directml=True):
 
     # Test inference
     print(f"\nRunning test inference...")
-    dummy_input = np.random.randn(1, 3, 64, 64).astype(np.float32)
+    dummy_input = np.random.randn(1, 3, 128, 128).astype(np.float32)
 
     import time
     start = time.time()
@@ -123,11 +143,10 @@ def test_onnx_inference(onnx_path, use_directml=True):
     print(f"Output shape: {outputs[0].shape}")
     print(f"Output values: {outputs[0]}")
 
-    x, y, conf = outputs[0][0]
+    x, y = outputs[0][0]
     print(f"\nParsed output:")
     print(f"  x (normalized): {x:.4f}")
     print(f"  y (normalized): {y:.4f}")
-    print(f"  confidence: {conf:.4f}")
 
     # Benchmark with multiple runs
     print(f"\nBenchmarking (100 runs)...")
@@ -153,12 +172,15 @@ def test_onnx_inference(onnx_path, use_directml=True):
 def main():
     parser = argparse.ArgumentParser(description='Export PyTorch model to ONNX')
 
-    parser.add_argument('--model', type=str, required=True,
+    parser.add_argument('--model', type=str,
+                        default='./ball_detection/models/best_pixel_error.pth',
                         help='Path to PyTorch model (.pth)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output path for ONNX model (.onnx)')
-    parser.add_argument('--image-size', type=int, default=64,
-                        help='Input image size')
+    parser.add_argument('--crop-size', type=int, default=128,
+                        help='Input crop size (default: 128)')
+    parser.add_argument('--use-custom-cnn', action='store_true',
+                        help='Use custom BallDetectorCNN instead of MobileNetV3')
     parser.add_argument('--opset', type=int, default=14,
                         help='ONNX opset version')
     parser.add_argument('--test', action='store_true',
@@ -177,7 +199,8 @@ def main():
     onnx_path = export_to_onnx(
         pytorch_model_path=args.model,
         output_path=args.output,
-        image_size=args.image_size,
+        crop_size=args.crop_size,
+        use_mobilenet=not args.use_custom_cnn,
         opset_version=args.opset
     )
 
