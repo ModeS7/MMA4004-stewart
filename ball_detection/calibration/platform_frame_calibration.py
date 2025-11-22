@@ -41,8 +41,8 @@ from ball_detection.utils.coordinate_transform import (
 # IMPORTANT: Use INNER CORNERS, not number of squares!
 # If you have 8 rows × 11 columns of SQUARES:
 #   Inner corners = (11-1, 8-1) = (10, 7) in format (columns, rows)
-CHESSBOARD_SIZE = (10, 7)  # Inner corners (columns, rows) - 8x11 squares
-SQUARE_SIZE_MM = 50.0  # Size of each square in mm
+CHESSBOARD_SIZE = (8, 6)  # Inner corners (columns, rows) - 8x11 squares
+SQUARE_SIZE_MM = 24.88888889  # Size of each square in mm
 
 # Camera configuration
 CAMERA_INDEX = 0  # ZED stereo camera
@@ -212,12 +212,17 @@ def calibrate_platform_frame():
     # Instructions
     print("[3/4] Instructions:")
     print("  1. Place physical checkerboard flat on Stewart platform")
-    print("  2. Align corner (0,0) with desired origin point")
+    print("  2. The ORIGIN corner will be marked with:")
+    print("     - Large RED circle")
+    print("     - Label 'ORIGIN (0,0,0)'")
+    print("     - BLUE arrow showing +X axis direction")
+    print("     - GREEN arrow showing +Y axis direction")
+    print("  3. Align the ORIGIN corner with your desired platform origin:")
     print("     - Platform center, OR")
     print("     - Platform center at home height")
-    print("  3. Ensure checkerboard is perfectly flat (defines XY plane)")
-    print("  4. Press SPACE when ready to capture")
-    print("  5. Press 'q' to quit")
+    print("  4. Ensure checkerboard is perfectly flat (defines XY plane)")
+    print("  5. Press SPACE when ready to capture")
+    print("  6. Press 'q' to quit")
     print()
 
     # Generate known platform points
@@ -270,9 +275,42 @@ def calibrate_platform_frame():
                 corners_left = cv2.cornerSubPix(gray_left, corners_left, (11, 11), (-1, -1), criteria)
                 corners_right = cv2.cornerSubPix(gray_right, corners_right, (11, 11), (-1, -1), criteria)
 
-                # Draw
+                # Draw checkerboard pattern
                 cv2.drawChessboardCorners(display_left, CHESSBOARD_SIZE, corners_left, ret_left)
                 cv2.drawChessboardCorners(display_right, CHESSBOARD_SIZE, corners_right, ret_right)
+
+                # Highlight ORIGIN corner (0,0) - first detected corner
+                origin_left = tuple(corners_left[0].ravel().astype(int))
+                origin_right = tuple(corners_right[0].ravel().astype(int))
+
+                # Draw large red circle at origin
+                cv2.circle(display_left, origin_left, 15, (0, 0, 255), 3)
+                cv2.circle(display_right, origin_right, 15, (0, 0, 255), 3)
+
+                # Label origin
+                cv2.putText(display_left, "ORIGIN (0,0,0)", (origin_left[0] + 20, origin_left[1]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(display_right, "ORIGIN (0,0,0)", (origin_right[0] + 20, origin_right[1]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # Draw X-axis direction (to next corner in first row)
+                if len(corners_left) > 1:
+                    x_axis_pt_left = tuple(corners_left[1].ravel().astype(int))
+                    x_axis_pt_right = tuple(corners_right[1].ravel().astype(int))
+                    cv2.arrowedLine(display_left, origin_left, x_axis_pt_left, (255, 0, 0), 2, tipLength=0.3)
+                    cv2.arrowedLine(display_right, origin_right, x_axis_pt_right, (255, 0, 0), 2, tipLength=0.3)
+                    cv2.putText(display_left, "+X", x_axis_pt_left, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    cv2.putText(display_right, "+X", x_axis_pt_right, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+                # Draw Y-axis direction (to next corner in first column)
+                cols, rows = CHESSBOARD_SIZE
+                if len(corners_left) > cols:
+                    y_axis_pt_left = tuple(corners_left[cols].ravel().astype(int))
+                    y_axis_pt_right = tuple(corners_right[cols].ravel().astype(int))
+                    cv2.arrowedLine(display_left, origin_left, y_axis_pt_left, (0, 255, 0), 2, tipLength=0.3)
+                    cv2.arrowedLine(display_right, origin_right, y_axis_pt_right, (0, 255, 0), 2, tipLength=0.3)
+                    cv2.putText(display_left, "+Y", y_axis_pt_left, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(display_right, "+Y", y_axis_pt_right, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 cv2.putText(display_left, "CHECKERBOARD DETECTED - Press SPACE to calibrate",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)

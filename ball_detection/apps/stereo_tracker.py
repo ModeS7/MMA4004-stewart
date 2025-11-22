@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import os
 import glob
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 import matplotlib.pyplot as plt
@@ -22,6 +23,10 @@ from mpl_toolkits.mplot3d import Axes3D
 
 from ..core.detector import BallDetector
 from ..utils.camera import create_camera_capture
+from ..utils.coordinate_transform import (
+    load_platform_transform,
+    apply_platform_transform
+)
 
 # ============================================================
 # SETTINGS - Edit these
@@ -29,11 +34,8 @@ from ..utils.camera import create_camera_capture
 # Camera configuration
 CAMERA_INDEX = 0  # ZED stereo camera
 
-# Stereo calibration paths (try local first, then fallback)
-CALIBRATION_DIRS = [
-    Path(__file__).parent.parent / "calibrations",  # ball_detection/calibrations
-    Path(r"W:\NTNU\Stereo_cam_test\calibrations")  # Fallback to old location
-]
+# Stereo calibration path
+CALIBRATION_DIR = Path(__file__).parent.parent / "calibration" / "calibrations"
 
 # 3D plotting configuration
 MAX_POINTS = 100  # Maximum number of 3D points to keep in history
@@ -41,62 +43,58 @@ MAX_POINTS = 100  # Maximum number of 3D points to keep in history
 
 
 def load_stereo_calibration():
-    """
-    Load latest stereo calibration data.
+    """Load latest stereo calibration data."""
+    calib_dir = CALIBRATION_DIR
 
-    Tries multiple directories:
-    1. Local calibrations directory (from stereo_calibration.py)
-    2. Stereo_cam_test directory (legacy)
-    """
-    for calib_dir in CALIBRATION_DIRS:
-        if not calib_dir.exists():
-            continue
+    if not calib_dir.exists():
+        print("\nError: No stereo calibration found!")
+        print("\nYou need to run stereo calibration first:")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
+        return None
 
-        # Find latest stereo calibration files
-        p1_files = sorted(calib_dir.glob('stereo_P1_*.csv'), reverse=True)
-        p2_files = sorted(calib_dir.glob('stereo_P2_*.csv'), reverse=True)
-        map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
+    # Find latest stereo calibration files
+    p1_files = sorted(calib_dir.glob('stereo_P1_*.csv'), reverse=True)
+    p2_files = sorted(calib_dir.glob('stereo_P2_*.csv'), reverse=True)
+    map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
 
-        if not p1_files or not p2_files or not map_files:
-            continue
+    if not p1_files or not p2_files or not map_files:
+        print("\nError: No stereo calibration files found!")
+        print("\nYou need to run stereo calibration first:")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
+        return None
 
-        # Extract timestamp from filename
-        timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
+    # Extract timestamp from filename
+    timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
 
-        try:
-            # Load projection matrices
-            P1 = np.loadtxt(calib_dir / f'stereo_P1_{timestamp}.csv', delimiter=',')
-            P2 = np.loadtxt(calib_dir / f'stereo_P2_{timestamp}.csv', delimiter=',')
+    try:
+        # Load projection matrices
+        P1 = np.loadtxt(calib_dir / f'stereo_P1_{timestamp}.csv', delimiter=',')
+        P2 = np.loadtxt(calib_dir / f'stereo_P2_{timestamp}.csv', delimiter=',')
 
-            # Load rectification maps
-            left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
-            left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
-            right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
-            right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
+        # Load rectification maps
+        left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
+        left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
+        right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
+        right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
 
-            print(f"✓ Loaded stereo calibration: {timestamp}")
-            print(f"  Source: {calib_dir}")
+        print(f"✓ Loaded stereo calibration: {timestamp}")
+        print(f"  Source: {calib_dir}")
 
-            return {
-                'P1': P1,
-                'P2': P2,
-                'left_map1': left_map1,
-                'left_map2': left_map2,
-                'right_map1': right_map1,
-                'right_map2': right_map2,
-                'timestamp': timestamp
-            }
+        return {
+            'P1': P1,
+            'P2': P2,
+            'left_map1': left_map1,
+            'left_map2': left_map2,
+            'right_map1': right_map1,
+            'right_map2': right_map2,
+            'timestamp': timestamp
+        }
 
-        except Exception as e:
-            print(f"  Error loading from {calib_dir}: {e}")
-            continue
-
-    # No calibration found
-    print("\nError: No stereo calibration found!")
-    print("\nYou need to run stereo calibration first:")
-    print("  python -m ball_detection.stereo_calibration --calibrate-individual")
-    print("  python -m ball_detection.stereo_calibration --calibrate-stereo")
-    return None
+    except Exception as e:
+        print(f"\nError loading calibration from {calib_dir}: {e}")
+        return None
 
 
 def triangulate_3d_point(left_point, right_point, P1, P2):
@@ -186,13 +184,28 @@ def main():
     print("=" * 60)
 
     # Load stereo calibration
-    print("\n[1/3] Loading stereo calibration...")
+    print("\n[1/4] Loading stereo calibration...")
     stereo_calib = load_stereo_calibration()
     if not stereo_calib:
         return
 
+    # Load platform transformation (optional)
+    print("\n[2/4] Loading platform transformation...")
+    platform_transform = None
+    try:
+        platform_calib = load_platform_transform(CALIBRATION_DIR)
+        R = platform_calib['R']
+        T = platform_calib['T']
+        platform_transform = (R, T)
+        print(f"✓ Platform transformation loaded: {platform_calib['timestamp']}")
+        print(f"  Coordinates will be in platform frame")
+    except FileNotFoundError:
+        print("  No platform transformation found - using camera coordinates")
+        print("  Run platform calibration to get platform coordinates:")
+        print("    python -m ball_detection.calibration.platform_frame_calibration")
+
     # Initialize CNN detector
-    print("\n[2/3] Initializing CNN ball detector...")
+    print("\n[3/4] Initializing CNN ball detector...")
     # Try relative path (when run from ball_detection dir) and parent path
     model_paths = [
         Path(__file__).parent.parent / "models" / "best_pixel_error.onnx",  # ball_detection/models
@@ -222,7 +235,7 @@ def main():
     )
 
     # Open camera
-    print("\n[3/3] Opening camera...")
+    print("\n[4/4] Opening camera...")
     cap = create_camera_capture(CAMERA_INDEX)
     if cap is None:
         print(f"Failed to open camera {CAMERA_INDEX}")
@@ -327,6 +340,11 @@ def main():
                 triangulation_times.append(triangulation_time)
 
                 if point_3d is not None:
+                    # Transform to platform coordinates if available
+                    if platform_transform is not None:
+                        R, T = platform_transform
+                        point_3d = apply_platform_transform(point_3d, R, T)
+
                     # Add to history
                     points_history.append(point_3d.copy())
 
@@ -340,7 +358,8 @@ def main():
 
             # Add 3D coordinates on left view
             if point_3d is not None:
-                coord_text = f"3D: ({point_3d[0]:.1f}, {point_3d[1]:.1f}, {point_3d[2]:.1f}) mm"
+                frame_type = "Platform" if platform_transform else "Camera"
+                coord_text = f"3D ({frame_type}): ({point_3d[0]:.1f}, {point_3d[1]:.1f}, {point_3d[2]:.1f}) mm"
                 cv2.putText(vis_left, coord_text, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:

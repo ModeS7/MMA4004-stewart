@@ -1,0 +1,12 @@
+Camera Calibration Summary
+Timestamp: 20251122_025232
+Number of images: 20
+RMS reprojection error: 0.0525 pixels
+
+Camera Matrix:
+[[530.87249295   0.         632.45039393]
+ [  0.         531.06443717 361.35894499]
+ [  0.           0.           1.        ]]
+
+Distortion Coefficients:
+[[-0.06401606  0.04003212  0.0004999  -0.00034946 -0.01583295]]

@@ -22,50 +22,48 @@ CAMERA_INDEX = 0  # ZED stereo camera
 
 def load_stereo_calibration():
     """Load latest stereo calibration data."""
-    CALIBRATION_DIRS = [
-        Path(__file__).parent.parent / "calibrations",
-        Path(r"W:\NTNU\Stereo_cam_test\calibrations")
-    ]
+    calib_dir = Path(__file__).parent.parent / "calibration" / "calibrations"
 
-    for calib_dir in CALIBRATION_DIRS:
-        if not calib_dir.exists():
-            continue
+    if not calib_dir.exists():
+        print("Error: No stereo calibration found!")
+        print("\nRun stereo calibration first:")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
+        return None
 
-        # Find latest stereo calibration files
-        p1_files = sorted(calib_dir.glob('stereo_P1_*.csv'), reverse=True)
-        map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
+    # Find latest stereo calibration files
+    map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
 
-        if not p1_files or not map_files:
-            continue
+    if not map_files:
+        print("Error: No stereo calibration files found!")
+        print("\nRun stereo calibration first:")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
+        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
+        return None
 
-        timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
+    timestamp = map_files[0].name.replace('stereo_left_map1_', '').replace('.npy', '')
 
-        try:
-            # Load rectification maps
-            left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
-            left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
-            right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
-            right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
+    try:
+        # Load rectification maps
+        left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
+        left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
+        right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
+        right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
 
-            print(f"Loaded stereo calibration: {timestamp}")
-            print(f"Source: {calib_dir}\n")
+        print(f"Loaded stereo calibration: {timestamp}")
+        print(f"Source: {calib_dir}\n")
 
-            return {
-                'left_map1': left_map1,
-                'left_map2': left_map2,
-                'right_map1': right_map1,
-                'right_map2': right_map2,
-                'timestamp': timestamp
-            }
+        return {
+            'left_map1': left_map1,
+            'left_map2': left_map2,
+            'right_map1': right_map1,
+            'right_map2': right_map2,
+            'timestamp': timestamp
+        }
 
-        except Exception as e:
-            print(f"Error loading from {calib_dir}: {e}")
-            continue
-
-    print("Error: No stereo calibration found!")
-    print("\nRun stereo calibration first:")
-    print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
-    return None
+    except Exception as e:
+        print(f"Error loading calibration from {calib_dir}: {e}")
+        return None
 
 
 def main():
