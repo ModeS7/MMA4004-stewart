@@ -90,25 +90,59 @@ def benchmark_onnx_model(model_path, input_size=128, num_iterations=100, stereo_
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
+
+    # Default: test both CustomCNN and MobileNetV3Lite
+    models_dir = Path(__file__).parent.parent / "models"
 
     if len(sys.argv) > 1:
-        model_path = sys.argv[1]
+        # User provided model path(s)
+        model_paths = sys.argv[1:]
     else:
-        model_path = "../models/best_pixel_error.onnx"
+        # Default: test both models
+        model_paths = [
+            str(models_dir / "CustomCNN.onnx"),
+            str(models_dir / "mobileLiteV3.onnx")
+        ]
+        # Filter out models that don't exist
+        model_paths = [p for p in model_paths if Path(p).exists()]
 
-    # Benchmark single frame
-    print("=" * 60)
-    print("SINGLE FRAME (mono camera)")
-    print("=" * 60)
-    benchmark_onnx_model(model_path, input_size=128, num_iterations=1000, stereo_mode=False)
+        if not model_paths:
+            print("ERROR: No default models found in ball_detection/models/")
+            print("Expected: CustomCNN.onnx, mobileLiteV3.onnx")
+            sys.exit(1)
 
-    # Benchmark stereo (2 sequential inferences)
-    print("=" * 60)
-    print("STEREO (ZED camera - left + right frames)")
-    print("=" * 60)
-    benchmark_onnx_model(model_path, input_size=128, num_iterations=1000, stereo_mode=True)
+    print("=" * 80)
+    print("ONNX MODEL BENCHMARK")
+    print("=" * 80)
+    print(f"Testing {len(model_paths)} model(s)")
+    print("=" * 80)
+    print()
 
-    print("=" * 60)
+    # Benchmark each model
+    for model_path in model_paths:
+        model_name = Path(model_path).stem
+
+        print("=" * 80)
+        print(f"MODEL: {model_name}")
+        print("=" * 80)
+
+        # Benchmark single frame
+        print()
+        print("-" * 60)
+        print("SINGLE FRAME (mono camera)")
+        print("-" * 60)
+        benchmark_onnx_model(model_path, input_size=128, num_iterations=1000, stereo_mode=False)
+
+        # Benchmark stereo (2 sequential inferences)
+        print("-" * 60)
+        print("STEREO (ZED camera - left + right frames)")
+        print("-" * 60)
+        benchmark_onnx_model(model_path, input_size=128, num_iterations=1000, stereo_mode=True)
+        print()
+
+    print("=" * 80)
     print("RECOMMENDATION:")
     print("For ZED stereo: Use GPU if per-frame time < 10ms")
     print("Allows CPU to handle triangulation/control while GPU infers")
+    print("=" * 80)
