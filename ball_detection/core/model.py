@@ -71,12 +71,11 @@ class BallDetectorCNN(nn.Module):
         Regression Head:
         - Global Average Pooling: 8x8x64 → 64
         - FC1: 64 → 32
-        - FC2: 32 → 3 (x, y, confidence)
+        - FC2: 32 → 2 (x, y)
 
         Output:
         - x_norm ∈ [0, 1]: Normalized X coordinate in crop
         - y_norm ∈ [0, 1]: Normalized Y coordinate in crop
-        - confidence ∈ [0, 1]: Detection confidence
 
     Total Parameters: ~98K
     """
@@ -257,7 +256,7 @@ if __name__ == "__main__":
     print(f"Output shape: {output.shape}")
     print(f"\nExample outputs:")
     for i in range(batch_size):
-        x, y, conf = output[i].numpy()
-        print(f"  Sample {i+1}: x={x:.4f}, y={y:.4f}, confidence={conf:.4f}")
+        x, y = output[i].numpy()
+        print(f"  Sample {i+1}: x={x:.4f}, y={y:.4f}")
 
     print("\nModel test successful!")
