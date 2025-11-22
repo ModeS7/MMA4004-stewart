@@ -185,7 +185,8 @@ class ONNXBallDetector:
             return {
                 'count': 0,
                 'avg_time_ms': 0.0,
-                'fps': 0.0
+                'fps': 0.0,
+                'using_gpu': self.use_gpu
             }
 
         avg_time = self.total_inference_time / self.inference_count

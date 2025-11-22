@@ -27,7 +27,7 @@ from ..utils.camera import create_camera_capture
 # SETTINGS - Edit these
 # ============================================================
 # Camera configuration
-CAMERA_INDEX = 0
+CAMERA_INDEX = 0  # ZED stereo camera
 
 # Stereo calibration paths (try local first, then fallback)
 CALIBRATION_DIRS = [
@@ -195,8 +195,8 @@ def main():
     print("\n[2/3] Initializing CNN ball detector...")
     # Try relative path (when run from ball_detection dir) and parent path
     model_paths = [
-        Path(__file__).parent / "models" / "ball_detector.onnx",  # Same directory
-        Path("ball_detection/models/ball_detector.onnx")  # From root
+        Path(__file__).parent.parent / "models" / "best_pixel_error.onnx",  # ball_detection/models
+        Path("ball_detection/models/best_pixel_error.onnx")  # From root
     ]
 
     model_path = None
@@ -216,8 +216,8 @@ def main():
 
     detector = BallDetector(
         onnx_model_path=str(model_path),
-        use_gpu=True,
-        crop_size=64,
+        use_gpu=False,  # CPU - better performance than DirectML for this model
+        crop_size=128,  # Match training crop size
         confidence_threshold=0.5
     )
 
@@ -232,6 +232,18 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+    # Apply camera settings (same as tune_hsv for consistent detection)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+    cap.set(cv2.CAP_PROP_BRIGHTNESS, 5)
+    cap.set(cv2.CAP_PROP_CONTRAST, 2)
+    cap.set(cv2.CAP_PROP_SATURATION, 4)
+    cap.set(cv2.CAP_PROP_GAIN, 2)
+    cap.set(cv2.CAP_PROP_SHARPNESS, 0)
+    cap.set(cv2.CAP_PROP_GAMMA, 102)
 
     print("\n" + "=" * 60)
     print("System ready!")
@@ -281,9 +293,10 @@ def main():
             right_rectified = cv2.remap(right_frame, stereo_calib['right_map1'],
                                         stereo_calib['right_map2'], cv2.INTER_LINEAR)
 
-            # Detect ball in both cameras (batched for speed!)
+            # Detect ball in both cameras (separate inferences, no batching)
             det_start = time.time()
-            result_left, result_right = detector.detect_dual_camera(left_rectified, right_rectified)
+            result_left = detector.detect(left_rectified)
+            result_right = detector.detect(right_rectified)
             detection_time = (time.time() - det_start) * 1000  # ms
             detection_times.append(detection_time)
 

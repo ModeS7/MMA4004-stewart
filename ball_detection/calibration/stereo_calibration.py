@@ -23,9 +23,11 @@ from datetime import datetime
 # Calibration mode: "individual", "stereo", or "both"
 MODE = "both"  # "individual" = calibrate cameras separately, "stereo" = calibrate stereo pair, "both" = do both
 
-# Chessboard configuration
-CHESSBOARD_SIZE = (9, 6)  # Inner corners (columns, rows)
-SQUARE_SIZE = 25.0  # mm (adjust to your chessboard)
+# Chessboard configuration (INNER CORNERS, not squares!)
+# If you have 8 rows × 11 columns of SQUARES:
+#   Inner corners = (11-1, 8-1) = (10, 7) in format (columns, rows)
+CHESSBOARD_SIZE = (10, 7)  # Inner corners (columns, rows) - 8x11 squares
+SQUARE_SIZE = 50.0  # mm - size of each checkerboard square
 
 # Camera configuration
 CAMERA_INDEX = 0
@@ -54,26 +56,34 @@ def create_camera_capture(camera_index):
     return cap if cap.isOpened() else None
 
 
-def collect_calibration_images(camera_id, num_images=20, is_stereo=False):
+def collect_calibration_images(camera_id, num_images=20, is_stereo=False, camera_side='left'):
     """
     Collect calibration images by showing chessboard to camera.
 
     Args:
         camera_id: Camera device index
         num_images: Number of images to collect
-        is_stereo: If True, expects dual camera (2560x720)
+        is_stereo: If True, expects dual camera (2560x720) and splits frame
+        camera_side: 'left' or 'right' - which camera to calibrate (for individual calibration)
 
     Returns:
         List of images with detected chessboard corners
     """
     print(f"\n{'='*60}")
     print(f"Collecting {num_images} calibration images")
+    if not is_stereo:
+        print(f"Camera: {camera_side.upper()}")
     print(f"{'='*60}")
     print("\nInstructions:")
     print("  1. Hold chessboard in front of camera")
-    print("  2. Move it to different positions and angles")
-    print("  3. Press SPACE when chessboard is detected to capture")
-    print("  4. Press 'q' to quit early")
+    if not is_stereo:
+        print(f"  2. Show checkerboard to {camera_side.upper()} camera ONLY")
+        print("  3. Move it to different positions and angles")
+    else:
+        print("  2. Show checkerboard to BOTH cameras simultaneously")
+        print("  3. Move it to different positions and angles")
+    print("  4. Press SPACE when chessboard is detected to capture")
+    print("  5. Press 'q' to quit early")
     print(f"\nTarget: {num_images} images\n")
 
     cap = create_camera_capture(camera_id)
@@ -81,13 +91,9 @@ def collect_calibration_images(camera_id, num_images=20, is_stereo=False):
         print(f"Failed to open camera {camera_id}")
         return None
 
-    # Configure camera
-    if is_stereo:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    else:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Always configure for stereo (ZED camera outputs 2560x720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     collected_images = []
@@ -100,15 +106,31 @@ def collect_calibration_images(camera_id, num_images=20, is_stereo=False):
 
     try:
         while collected_count < num_images:
-            ret, frame = cap.read()
+            ret, full_frame = cap.read()
             if not ret:
                 print("Failed to capture frame")
                 break
 
-            display_frame = frame.copy()
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Split stereo frame
+            left_frame = full_frame[:, 0:1280].copy()
+            right_frame = full_frame[:, 1280:2560].copy()
 
-            # Find chessboard corners
+            # For individual calibration, only analyze the selected camera
+            if not is_stereo:
+                if camera_side.lower() == 'left':
+                    active_frame = left_frame
+                    inactive_frame = right_frame
+                else:  # right
+                    active_frame = right_frame
+                    inactive_frame = left_frame
+            else:
+                # For stereo calibration, use full frame
+                active_frame = full_frame
+
+            display_active = active_frame.copy()
+            gray = cv2.cvtColor(active_frame, cv2.COLOR_BGR2GRAY)
+
+            # Find chessboard corners in ACTIVE camera only
             ret_corners, corners = cv2.findChessboardCorners(
                 gray, CHESSBOARD_SIZE,
                 cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
@@ -120,20 +142,38 @@ def collect_calibration_images(camera_id, num_images=20, is_stereo=False):
                 criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
                 corners_refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
 
-                cv2.drawChessboardCorners(display_frame, CHESSBOARD_SIZE, corners_refined, ret_corners)
+                cv2.drawChessboardCorners(display_active, CHESSBOARD_SIZE, corners_refined, ret_corners)
 
                 # Add status
-                cv2.putText(display_frame, "CHESSBOARD DETECTED - Press SPACE to capture",
+                cv2.putText(display_active, "CHESSBOARD DETECTED - Press SPACE to capture",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
-                cv2.putText(display_frame, "Searching for chessboard...",
+                cv2.putText(display_active, "Searching for chessboard...",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # Show progress
-            cv2.putText(display_frame, f"Collected: {collected_count}/{num_images}",
+            cv2.putText(display_active, f"Collected: {collected_count}/{num_images}",
                         (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            cv2.imshow('Calibration Image Collection', display_frame)
+            # Display based on mode
+            if not is_stereo:
+                # Individual calibration: show both cameras side-by-side
+                # Mark which one is being calibrated
+                display_inactive = inactive_frame.copy()
+                cv2.putText(display_inactive, "INACTIVE - Not being calibrated",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+
+                if camera_side.lower() == 'left':
+                    combined_display = np.hstack([display_active, display_inactive])
+                    window_title = 'LEFT Camera Calibration (Left=Active, Right=Inactive)'
+                else:
+                    combined_display = np.hstack([display_inactive, display_active])
+                    window_title = 'RIGHT Camera Calibration (Left=Inactive, Right=Active)'
+
+                cv2.imshow(window_title, combined_display)
+            else:
+                # Stereo calibration: show full frame
+                cv2.imshow('Stereo Calibration Image Collection', display_active)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -380,13 +420,9 @@ def calibrate_individual_cameras():
 
     # Left camera
     print("\n[1/2] LEFT CAMERA")
-    left_images = collect_calibration_images(CAMERA_INDEX, num_images=20, is_stereo=True)
+    left_images = collect_calibration_images(CAMERA_INDEX, num_images=20, is_stereo=False, camera_side='left')
     if not left_images:
         return None
-
-    # Split left half (for stereo camera)
-    for img_data in left_images:
-        img_data['image'] = img_data['image'][:, 0:1280]
 
     image_size = (1280, 720)
     left_calib = calibrate_camera(left_images, image_size)
@@ -399,13 +435,9 @@ def calibrate_individual_cameras():
 
     # Right camera
     print("\n[2/2] RIGHT CAMERA")
-    right_images = collect_calibration_images(CAMERA_INDEX, num_images=20, is_stereo=True)
+    right_images = collect_calibration_images(CAMERA_INDEX, num_images=20, is_stereo=False, camera_side='right')
     if not right_images:
         return None
-
-    # Split right half (for stereo camera)
-    for img_data in right_images:
-        img_data['image'] = img_data['image'][:, 1280:2560]
 
     right_calib = calibrate_camera(right_images, image_size)
     if not right_calib:

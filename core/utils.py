@@ -447,7 +447,7 @@ class ZEDCameraConfig:
     """ZED stereo camera parameters for ball detection using CNN."""
 
     # Camera hardware
-    CAMERA_ID = 1  # OpenCV camera device ID
+    CAMERA_ID = 0  # OpenCV camera device ID (ZED stereo camera)
     STEREO_CAMERA = 'LEFT'  # Which camera to use: 'LEFT' or 'RIGHT'
 
     # Resolution and frame rate
