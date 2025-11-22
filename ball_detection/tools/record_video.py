@@ -16,23 +16,12 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import time
+import sys
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-def create_camera_capture(camera_index):
-    """Create VideoCapture object with Windows backends."""
-    backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW]
-
-    for backend in backends:
-        try:
-            cap = cv2.VideoCapture(camera_index, backend)
-            if cap.isOpened():
-                return cap
-            cap.release()
-        except Exception:
-            continue
-
-    cap = cv2.VideoCapture(camera_index)
-    return cap if cap.isOpened() else None
+from ball_detection.utils.camera import create_camera_capture
 
 
 def record_video(camera_id=0, output_path=None, duration=None, fps=60):

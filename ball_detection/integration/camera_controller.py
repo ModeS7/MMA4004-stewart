@@ -19,6 +19,7 @@ parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 
 from core.utils import ZEDCameraConfig
+from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
 
 
 class ZEDCameraController:
@@ -82,15 +83,10 @@ class ZEDCameraController:
             # Import ball detector here to avoid loading onnxruntime until needed
             from ball_detection.core.detector import BallDetector
 
-            # Open camera with DirectShow backend (better for Windows USB cameras)
-            # Use DSHOW to avoid frame buffering issues
-            self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_DSHOW)
-
-            if not self.cap.isOpened():
-                # Fallback to default backend
-                self.cap = cv2.VideoCapture(self.camera_id)
-                if not self.cap.isOpened():
-                    return False, f"Could not open camera {self.camera_id}"
+            # Open camera
+            self.cap = create_camera_capture(self.camera_id)
+            if self.cap is None:
+                return False, f"Could not open camera {self.camera_id}"
 
             # Reduce buffer size to minimize frame tearing and latency
             # Smaller buffer = fresher frames, less tearing
@@ -166,49 +162,8 @@ class ZEDCameraController:
 
     def _apply_camera_settings(self) -> None:
         """Apply camera settings from config file or defaults."""
-        import json
-
-        config_file = Path(__file__).parent / "camera_config.json"
-
-        # Default settings optimized for ball detection
-        default_settings = {
-            'AUTO_EXPOSURE': 0.25,   # Disable auto-exposure (0.25 = manual mode for some cameras)
-            'EXPOSURE': -6,          # Manual exposure value (adjust based on lighting)
-            'AUTO_WB': 1,            # Enable auto white balance
-            'BRIGHTNESS': 5,
-            'CONTRAST': 2,
-            'SATURATION': 4,
-            'GAIN': 2,
-            'SHARPNESS': 0,
-            'GAMMA': 102
-        }
-
-        try:
-            if config_file.exists():
-                # Load settings from file
-                with open(config_file, 'r') as f:
-                    config = json.load(f)
-
-                print("Applying saved camera settings:")
-                settings = config.get('settings', {})
-            else:
-                # Use default settings
-                print("Applying default camera settings:")
-                settings = default_settings
-
-            # Apply settings to camera
-            for name, value in settings.items():
-                prop_id = getattr(cv2, f'CAP_PROP_{name}', None)
-                if prop_id is not None:
-                    self.cap.set(prop_id, value)
-                    if 'AUTO' in name:
-                        print(f"  {name} = {'OFF' if value < 0.5 else 'ON'}")
-                    else:
-                        print(f"  {name} = {value:.1f}")
-
-        except Exception as e:
-            print(f"Warning: Could not apply camera settings: {e}")
-            print("Camera will use default automatic settings")
+        camera_config = load_camera_config()
+        apply_camera_settings(self.cap, camera_config)
 
     def disconnect(self) -> None:
         """Disconnect from camera and stop detection thread."""

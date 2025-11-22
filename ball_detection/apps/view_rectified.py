@@ -14,56 +14,21 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from ball_detection.utils.camera import create_camera_capture
+from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
+from ball_detection.utils.calibration import load_rectification_maps_only
 
 # Camera configuration
 CAMERA_INDEX = 0  # ZED stereo camera
+CALIBRATION_DIR = Path(__file__).parent.parent / "calibration" / "calibrations"
 
 
-def load_stereo_calibration():
-    """Load latest stereo calibration data."""
-    calib_dir = Path(__file__).parent.parent / "calibration" / "calibrations"
-
-    if not calib_dir.exists():
-        print("Error: No stereo calibration found!")
-        print("\nRun stereo calibration first:")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
-        return None
-
-    # Find latest stereo calibration files
-    map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
-
-    if not map_files:
-        print("Error: No stereo calibration files found!")
-        print("\nRun stereo calibration first:")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
-        return None
-
-    timestamp = map_files[0].name.replace('stereo_left_map1_', '').replace('.npy', '')
-
-    try:
-        # Load rectification maps
-        left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
-        left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
-        right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
-        right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
-
-        print(f"Loaded stereo calibration: {timestamp}")
-        print(f"Source: {calib_dir}\n")
-
-        return {
-            'left_map1': left_map1,
-            'left_map2': left_map2,
-            'right_map1': right_map1,
-            'right_map2': right_map2,
-            'timestamp': timestamp
-        }
-
-    except Exception as e:
-        print(f"Error loading calibration from {calib_dir}: {e}")
-        return None
+def load_stereo_maps():
+    """Load stereo rectification maps using utility function."""
+    maps = load_rectification_maps_only(CALIBRATION_DIR)
+    if maps:
+        print(f"Loaded stereo calibration: {maps['timestamp']}")
+        print(f"Source: {CALIBRATION_DIR}\n")
+    return maps
 
 
 def main():
@@ -85,21 +50,15 @@ def main():
         return
 
     # Configure camera for stereo
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize latency
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-    # Apply camera settings (same as tune_hsv)
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
-    cap.set(cv2.CAP_PROP_BRIGHTNESS, 5)
-    cap.set(cv2.CAP_PROP_CONTRAST, 2)
-    cap.set(cv2.CAP_PROP_SATURATION, 4)
-    cap.set(cv2.CAP_PROP_GAIN, 2)
-    cap.set(cv2.CAP_PROP_SHARPNESS, 0)
-    cap.set(cv2.CAP_PROP_GAMMA, 102)
+    # Load and apply camera settings from config
+    camera_config = load_camera_config()
+    apply_camera_settings(cap, camera_config)
 
     print("\n" + "=" * 70)
     print("Controls:")

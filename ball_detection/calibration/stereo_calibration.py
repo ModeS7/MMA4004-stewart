@@ -14,8 +14,14 @@ Usage:
 import cv2
 import numpy as np
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
+
+# Add parent directory for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
 
 # ============================================================
 # SETTINGS - Edit these
@@ -37,23 +43,6 @@ CALIBRATION_DIR = Path(__file__).parent / "calibrations"
 # ============================================================
 
 CALIBRATION_DIR.mkdir(exist_ok=True)
-
-
-def create_camera_capture(camera_index):
-    """Create VideoCapture object with Windows backends."""
-    backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW]
-
-    for backend in backends:
-        try:
-            cap = cv2.VideoCapture(camera_index, backend)
-            if cap.isOpened():
-                return cap
-            cap.release()
-        except Exception:
-            continue
-
-    cap = cv2.VideoCapture(camera_index)
-    return cap if cap.isOpened() else None
 
 
 def collect_calibration_images(camera_id, num_images=20, is_stereo=False, camera_side='left'):

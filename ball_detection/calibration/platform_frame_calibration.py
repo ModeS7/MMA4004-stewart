@@ -29,6 +29,8 @@ import sys
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
+from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
+from ball_detection.utils.calibration import load_stereo_calibration
 from ball_detection.utils.coordinate_transform import (
     compute_transformation_from_points,
     save_platform_transform
@@ -53,70 +55,6 @@ CALIBRATION_DIR = Path(__file__).parent / "calibrations"
 # Z-offset (optional): Set to platform home height if origin should be (0, 0, home_height)
 Z_OFFSET_MM = 0.0  # Change to home_height if needed (e.g., 50.0 for 50mm)
 # ============================================================
-
-
-def create_camera_capture(camera_index):
-    """Create VideoCapture object with Windows backends."""
-    backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW]
-
-    for backend in backends:
-        try:
-            cap = cv2.VideoCapture(camera_index, backend)
-            if cap.isOpened():
-                return cap
-            cap.release()
-        except Exception:
-            continue
-
-    cap = cv2.VideoCapture(camera_index)
-    return cap if cap.isOpened() else None
-
-
-def load_stereo_calibration(calib_dir):
-    """Load latest stereo calibration data."""
-    import glob
-
-    # Find latest stereo calibration files
-    p1_files = sorted(calib_dir.glob('stereo_P1_*.csv'), reverse=True)
-    p2_files = sorted(calib_dir.glob('stereo_P2_*.csv'), reverse=True)
-    map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
-
-    if not p1_files or not p2_files or not map_files:
-        print("\nError: No stereo calibration found!")
-        print("You need to run stereo calibration first:")
-        print("  python -m ball_detection.calibration.stereo_calibration")
-        return None
-
-    # Extract timestamp from filename
-    timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
-
-    try:
-        # Load projection matrices
-        P1 = np.loadtxt(calib_dir / f'stereo_P1_{timestamp}.csv', delimiter=',')
-        P2 = np.loadtxt(calib_dir / f'stereo_P2_{timestamp}.csv', delimiter=',')
-
-        # Load rectification maps
-        left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
-        left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
-        right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
-        right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
-
-        print(f"Loaded stereo calibration: {timestamp}")
-        print(f"  Source: {calib_dir}")
-
-        return {
-            'P1': P1,
-            'P2': P2,
-            'left_map1': left_map1,
-            'left_map2': left_map2,
-            'right_map1': right_map1,
-            'right_map2': right_map2,
-            'timestamp': timestamp
-        }
-
-    except Exception as e:
-        print(f"Error loading stereo calibration: {e}")
-        return None
 
 
 def triangulate_3d_point(left_point, right_point, P1, P2):
@@ -206,6 +144,11 @@ def calibrate_platform_frame():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
+
+    # Load and apply camera settings
+    camera_config = load_camera_config()
+    apply_camera_settings(cap, camera_config)
+
     print(f"Camera opened: 2560x720 @ 30fps")
     print()
 

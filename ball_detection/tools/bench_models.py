@@ -556,27 +556,186 @@ def run_comprehensive_benchmark():
     print()
 
 
+def benchmark_onnx_file(model_path, input_size=128, num_iterations=100, stereo_mode=False):
+    """
+    Quick benchmark for existing ONNX model file.
+    Tests both CPU and GPU (DirectML) inference.
+
+    Args:
+        model_path: Path to ONNX model file
+        input_size: Input image size (default: 128)
+        num_iterations: Number of iterations (default: 100)
+        stereo_mode: If True, run 2 sequential inferences (left + right)
+    """
+    print(f"Benchmarking: {model_path}")
+    print(f"Input size: {input_size}x{input_size}")
+    print(f"Mode: {'Stereo (2 frames)' if stereo_mode else 'Single frame'}")
+    print(f"Iterations: {num_iterations}")
+    print()
+
+    # Test data
+    dummy_input1 = np.random.rand(1, 3, input_size, input_size).astype(np.float32)
+    dummy_input2 = np.random.rand(1, 3, input_size, input_size).astype(np.float32)
+
+    # CPU session
+    print("CPU Inference:")
+    sess_cpu = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+    input_name = sess_cpu.get_inputs()[0].name
+
+    # Warmup
+    for _ in range(10):
+        sess_cpu.run(None, {input_name: dummy_input1})
+        if stereo_mode:
+            sess_cpu.run(None, {input_name: dummy_input2})
+
+    # Benchmark
+    times = []
+    for _ in range(num_iterations):
+        start = time.perf_counter()
+        sess_cpu.run(None, {input_name: dummy_input1})
+        if stereo_mode:
+            sess_cpu.run(None, {input_name: dummy_input2})
+        times.append((time.perf_counter() - start) * 1000)
+
+    mean_time = np.mean(times)
+    min_time = np.min(times)
+    fps = 1000 / mean_time
+    per_frame = mean_time / (2 if stereo_mode else 1)
+    print(f"  Mean: {mean_time:.2f}ms ({fps:.1f} FPS)")
+    if stereo_mode:
+        print(f"  Per frame: {per_frame:.2f}ms")
+    print(f"  Min:  {min_time:.2f}ms ({1000/min_time:.1f} FPS)")
+    print()
+
+    # GPU session (DirectML)
+    print("GPU Inference (DirectML):")
+    try:
+        sess_gpu = ort.InferenceSession(
+            model_path,
+            providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+        )
+
+        # Warmup
+        for _ in range(10):
+            sess_gpu.run(None, {input_name: dummy_input1})
+            if stereo_mode:
+                sess_gpu.run(None, {input_name: dummy_input2})
+
+        # Benchmark
+        times = []
+        for _ in range(num_iterations):
+            start = time.perf_counter()
+            sess_gpu.run(None, {input_name: dummy_input1})
+            if stereo_mode:
+                sess_gpu.run(None, {input_name: dummy_input2})
+            times.append((time.perf_counter() - start) * 1000)
+
+        mean_time = np.mean(times)
+        min_time = np.min(times)
+        fps = 1000 / mean_time
+        per_frame = mean_time / (2 if stereo_mode else 1)
+        print(f"  Mean: {mean_time:.2f}ms ({fps:.1f} FPS)")
+        if stereo_mode:
+            print(f"  Per frame: {per_frame:.2f}ms")
+        print(f"  Min:  {min_time:.2f}ms ({1000/min_time:.1f} FPS)")
+
+    except Exception as e:
+        print(f"  GPU not available: {e}")
+
+    print()
+
+
+def run_onnx_benchmark(model_paths=None):
+    """Run quick ONNX model benchmark (from quick_bench.py functionality)."""
+
+    if model_paths is None:
+        # Default: test models in ball_detection/models/
+        models_dir = Path(__file__).parent.parent / "models"
+        model_paths = [
+            str(models_dir / "CustomCNN.onnx"),
+            str(models_dir / "mobileLiteV3.onnx"),
+            str(models_dir / "best_pixel_error.onnx")
+        ]
+        # Filter out models that don't exist
+        model_paths = [p for p in model_paths if Path(p).exists()]
+
+        if not model_paths:
+            print("ERROR: No ONNX models found in ball_detection/models/")
+            print("Expected: CustomCNN.onnx, mobileLiteV3.onnx, or best_pixel_error.onnx")
+            return
+
+    print("=" * 80)
+    print("ONNX MODEL BENCHMARK")
+    print("=" * 80)
+    print(f"Testing {len(model_paths)} model(s)")
+    print("=" * 80)
+    print()
+
+    # Benchmark each model
+    for model_path in model_paths:
+        model_name = Path(model_path).stem
+
+        print("=" * 80)
+        print(f"MODEL: {model_name}")
+        print("=" * 80)
+
+        # Benchmark single frame
+        print()
+        print("-" * 60)
+        print("SINGLE FRAME (mono camera)")
+        print("-" * 60)
+        benchmark_onnx_file(model_path, input_size=128, num_iterations=1000, stereo_mode=False)
+
+        # Benchmark stereo (2 sequential inferences)
+        print("-" * 60)
+        print("STEREO (ZED camera - left + right frames)")
+        print("-" * 60)
+        benchmark_onnx_file(model_path, input_size=128, num_iterations=1000, stereo_mode=True)
+        print()
+
+    print("=" * 80)
+    print("RECOMMENDATION:")
+    print("For ZED stereo: Use GPU if per-frame time < 10ms")
+    print("Allows CPU to handle triangulation/control while GPU infers")
+    print("=" * 80)
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description='Benchmark CNN models for ball detection')
     parser.add_argument('--quick', action='store_true',
-                       help='Quick test (fewer iterations and sizes)')
+                       help='Quick comprehensive test (fewer iterations and sizes)')
+    parser.add_argument('--onnx', nargs='*', metavar='PATH',
+                       help='Quick ONNX benchmark mode: test existing ONNX models (provide paths or use defaults)')
 
     args = parser.parse_args()
 
-    if args.quick:
-        print("Quick mode: Testing only 64x64 and 128x128 with 50 iterations")
-        # Modify globals (hacky but works for demo)
-        import __main__
-        __main__.input_sizes = [64, 128]
-        __main__.num_iterations = 50
+    if args.onnx is not None:
+        # ONNX benchmark mode (replaces quick_bench.py functionality)
+        model_paths = args.onnx if args.onnx else None
+        try:
+            run_onnx_benchmark(model_paths)
+        except KeyboardInterrupt:
+            print("\n\nBenchmark interrupted by user")
+        except Exception as e:
+            print(f"\n\nFatal error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        # Comprehensive benchmark mode (default)
+        if args.quick:
+            print("Quick mode: Testing only 64x64 and 128x128 with 50 iterations")
+            # Modify globals (hacky but works for demo)
+            import __main__
+            __main__.input_sizes = [64, 128]
+            __main__.num_iterations = 50
 
-    try:
-        run_comprehensive_benchmark()
-    except KeyboardInterrupt:
-        print("\n\nBenchmark interrupted by user")
-    except Exception as e:
-        print(f"\n\nFatal error: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            run_comprehensive_benchmark()
+        except KeyboardInterrupt:
+            print("\n\nBenchmark interrupted by user")
+        except Exception as e:
+            print(f"\n\nFatal error: {e}")
+            import traceback
+            traceback.print_exc()

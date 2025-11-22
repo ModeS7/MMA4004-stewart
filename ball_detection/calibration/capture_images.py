@@ -10,27 +10,12 @@ import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+import sys
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-def apply_default_camera_settings(cap):
-    """Apply default camera settings optimized for ball detection."""
-    settings = {
-        'AUTO_EXPOSURE': 0.25,
-        'EXPOSURE': -6,
-        'AUTO_WB': 1,
-        'BRIGHTNESS': 5,
-        'CONTRAST': 2,
-        'SATURATION': 4,
-        'GAIN': 2,
-        'SHARPNESS': 0,
-        'GAMMA': 102
-    }
-
-    print("Applying camera settings:")
-    for name, value in settings.items():
-        prop_id = getattr(cv2, f'CAP_PROP_{name}', None)
-        if prop_id is not None:
-            cap.set(prop_id, value)
+from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
 
 
 def capture_calibration_images(camera_id=1, output_dir="ball_detection/calibration"):
@@ -56,20 +41,22 @@ def capture_calibration_images(camera_id=1, output_dir="ball_detection/calibrati
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Open camera with DirectShow backend
-    cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(camera_id)
-        if not cap.isOpened():
-            print(f"Error: Could not open camera {camera_id}")
-            return
+    # Open camera
+    cap = create_camera_capture(camera_id)
+    if cap is None:
+        print(f"Error: Could not open camera {camera_id}")
+        return
 
-    # Configure camera
+    # Configure camera for stereo
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+    # Load and apply camera settings
+    camera_config = load_camera_config()
+    apply_camera_settings(cap, camera_config)
 
     # Get actual resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -77,9 +64,6 @@ def capture_calibration_images(camera_id=1, output_dir="ball_detection/calibrati
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
     print(f"Camera opened: {width}x{height} @ {fps}fps")
-
-    # Apply camera settings
-    apply_default_camera_settings(cap)
 
     # Detect stereo camera
     is_stereo = (width > height * 1.5)

@@ -16,13 +16,13 @@ import numpy as np
 import os
 import glob
 import time
+import argparse
 from pathlib import Path
 from typing import Optional, Tuple
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 from ..core.detector import BallDetector
-from ..utils.camera import create_camera_capture
+from ..utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
+from ..utils.calibration import load_stereo_calibration
 from ..utils.coordinate_transform import (
     load_platform_transform,
     apply_platform_transform
@@ -40,61 +40,6 @@ CALIBRATION_DIR = Path(__file__).parent.parent / "calibration" / "calibrations"
 # 3D plotting configuration
 MAX_POINTS = 100  # Maximum number of 3D points to keep in history
 # ============================================================
-
-
-def load_stereo_calibration():
-    """Load latest stereo calibration data."""
-    calib_dir = CALIBRATION_DIR
-
-    if not calib_dir.exists():
-        print("\nError: No stereo calibration found!")
-        print("\nYou need to run stereo calibration first:")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
-        return None
-
-    # Find latest stereo calibration files
-    p1_files = sorted(calib_dir.glob('stereo_P1_*.csv'), reverse=True)
-    p2_files = sorted(calib_dir.glob('stereo_P2_*.csv'), reverse=True)
-    map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
-
-    if not p1_files or not p2_files or not map_files:
-        print("\nError: No stereo calibration files found!")
-        print("\nYou need to run stereo calibration first:")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
-        print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
-        return None
-
-    # Extract timestamp from filename
-    timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
-
-    try:
-        # Load projection matrices
-        P1 = np.loadtxt(calib_dir / f'stereo_P1_{timestamp}.csv', delimiter=',')
-        P2 = np.loadtxt(calib_dir / f'stereo_P2_{timestamp}.csv', delimiter=',')
-
-        # Load rectification maps
-        left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
-        left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
-        right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
-        right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
-
-        print(f"✓ Loaded stereo calibration: {timestamp}")
-        print(f"  Source: {calib_dir}")
-
-        return {
-            'P1': P1,
-            'P2': P2,
-            'left_map1': left_map1,
-            'left_map2': left_map2,
-            'right_map1': right_map1,
-            'right_map2': right_map2,
-            'timestamp': timestamp
-        }
-
-    except Exception as e:
-        print(f"\nError loading calibration from {calib_dir}: {e}")
-        return None
 
 
 def triangulate_3d_point(left_point, right_point, P1, P2):
@@ -177,17 +122,27 @@ def update_3d_plot(ax, points_history):
         ax.set_zlim([min(z_coords) - margin, max(z_coords) + margin])
 
 
-def main():
-    """Main function for CNN-based 3D ball tracking."""
+def main(enable_plot=True):
+    """
+    Main function for CNN-based 3D ball tracking.
+
+    Args:
+        enable_plot: Enable 3D matplotlib visualization (default: True)
+    """
     print("=" * 60)
     print("3D Ball Tracking: CNN Detection + Stereo Triangulation")
+    if not enable_plot:
+        print("(Simple mode - 3D plotting disabled)")
     print("=" * 60)
 
     # Load stereo calibration
     print("\n[1/4] Loading stereo calibration...")
-    stereo_calib = load_stereo_calibration()
+    stereo_calib = load_stereo_calibration(CALIBRATION_DIR)
     if not stereo_calib:
         return
+
+    print(f"✓ Loaded stereo calibration: {stereo_calib['timestamp']}")
+    print(f"  Source: {CALIBRATION_DIR}")
 
     # Load platform transformation (optional)
     print("\n[2/4] Loading platform transformation...")
@@ -241,22 +196,16 @@ def main():
         print(f"Failed to open camera {CAMERA_INDEX}")
         return
 
-    # Configure camera
+    # Configure camera for stereo
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize latency
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-    # Apply camera settings (same as tune_hsv for consistent detection)
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-    cap.set(cv2.CAP_PROP_AUTO_WB, 1)
-    cap.set(cv2.CAP_PROP_BRIGHTNESS, 5)
-    cap.set(cv2.CAP_PROP_CONTRAST, 2)
-    cap.set(cv2.CAP_PROP_SATURATION, 4)
-    cap.set(cv2.CAP_PROP_GAIN, 2)
-    cap.set(cv2.CAP_PROP_SHARPNESS, 0)
-    cap.set(cv2.CAP_PROP_GAMMA, 102)
+    # Load and apply camera settings from config
+    camera_config = load_camera_config()
+    apply_camera_settings(cap, camera_config)
 
     print("\n" + "=" * 60)
     print("System ready!")
@@ -265,12 +214,22 @@ def main():
     print("  'q' - Quit")
     print("  'c' - Clear 3D trajectory")
     print("  's' - Print statistics")
-    print("  'p' - Toggle 3D plot")
+    if enable_plot:
+        print("  'p' - Toggle 3D plot")
     print("\nStarting tracking...\n")
 
     # Setup matplotlib (optional)
     show_3d_plot = False
     fig, ax = None, None
+
+    # Import matplotlib only if plotting is enabled
+    if enable_plot:
+        try:
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D
+        except ImportError:
+            print("Warning: matplotlib not available, 3D plotting disabled")
+            enable_plot = False
 
     # Initialize points history
     points_history = []
@@ -385,7 +344,7 @@ def main():
             cv2.imshow('CNN Stereo Ball Tracking', combined)
 
             # Update 3D plot if enabled
-            if show_3d_plot and frame_count % 3 == 0:  # Update every 3 frames
+            if enable_plot and show_3d_plot and frame_count % 3 == 0:  # Update every 3 frames
                 if fig is None:
                     plt.ion()
                     fig = plt.figure(figsize=(10, 8))
@@ -407,7 +366,7 @@ def main():
             elif key == ord('c'):
                 points_history.clear()
                 print("✓ Cleared 3D trajectory")
-            elif key == ord('p'):
+            elif key == ord('p') and enable_plot:
                 show_3d_plot = not show_3d_plot
                 if not show_3d_plot and fig:
                     plt.close(fig)
@@ -448,7 +407,7 @@ def main():
         # Cleanup
         cap.release()
         cv2.destroyAllWindows()
-        if fig:
+        if enable_plot and fig:
             plt.close('all')
 
         # Final statistics
@@ -480,4 +439,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description='3D Ball Tracking with CNN Detection + Stereo Triangulation'
+    )
+    parser.add_argument('--simple', '--no-plot', action='store_true',
+                       help='Disable 3D visualization (faster, lower resource usage)')
+    args = parser.parse_args()
+
+    # Run with plotting enabled unless --simple flag is set
+    main(enable_plot=not args.simple)

@@ -6,21 +6,101 @@ Extracted to reduce code duplication across 8+ files.
 """
 
 import cv2
+import json
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 
 # Default camera settings for consistent capture
 # These settings disable auto-exposure and auto white balance for stable tracking
+# Used as fallback if camera_config.json is not found
 DEFAULT_CAMERA_SETTINGS = {
     'AUTO_EXPOSURE': 0.25,  # 0.25 = manual mode, 0.75 = auto mode
     'EXPOSURE': -6,          # Manual exposure value (log scale, -13 to -1)
-    'AUTO_WB': 0,            # Disable auto white balance
-    'WB_TEMPERATURE': 4600,  # Manual white balance (Kelvin)
-    'BRIGHTNESS': 128,       # Brightness (0-255)
-    'CONTRAST': 128,         # Contrast (0-255)
-    'SATURATION': 128,       # Saturation (0-255)
-    'GAIN': 0,               # Gain/ISO (0-100)
+    'AUTO_WB': 1,            # Enable auto white balance
+    'BRIGHTNESS': 5,         # Brightness
+    'CONTRAST': 2,           # Contrast
+    'SATURATION': 4,         # Saturation
+    'GAIN': 2,               # Gain/ISO
+    'SHARPNESS': 0,          # Sharpness
+    'GAMMA': 102,            # Gamma
 }
+
+
+def load_camera_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Load camera configuration from JSON file.
+
+    Args:
+        config_path: Path to camera_config.json file.
+                     If None, searches in common locations:
+                     1. ./camera_config.json
+                     2. ./ball_detection/camera_config.json
+                     3. Falls back to DEFAULT_CAMERA_SETTINGS
+
+    Returns:
+        Dictionary of camera settings
+
+    Example:
+        >>> config = load_camera_config()
+        >>> cap = create_camera_capture(0)
+        >>> apply_camera_settings(cap, config)
+    """
+    if config_path is None:
+        # Search common locations
+        search_paths = [
+            Path("camera_config.json"),
+            Path("ball_detection/camera_config.json"),
+            Path(__file__).parent.parent / "camera_config.json"
+        ]
+
+        for path in search_paths:
+            if path.exists():
+                config_path = path
+                break
+
+    if config_path is None or not config_path.exists():
+        print(f"Camera config not found, using defaults")
+        return DEFAULT_CAMERA_SETTINGS.copy()
+
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        print(f"Loaded camera config from: {config_path}")
+        return config
+    except Exception as e:
+        print(f"Error loading camera config from {config_path}: {e}")
+        print("Using default settings")
+        return DEFAULT_CAMERA_SETTINGS.copy()
+
+
+def save_camera_config(settings: Dict[str, Any], config_path: Optional[Path] = None) -> bool:
+    """
+    Save camera configuration to JSON file.
+
+    Args:
+        settings: Dictionary of camera settings
+        config_path: Path to save camera_config.json
+                     If None, saves to ./camera_config.json
+
+    Returns:
+        True if saved successfully, False otherwise
+
+    Example:
+        >>> settings = {'AUTO_EXPOSURE': 0.25, 'EXPOSURE': -6, ...}
+        >>> save_camera_config(settings)
+    """
+    if config_path is None:
+        config_path = Path("camera_config.json")
+
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(settings, f, indent=2)
+        print(f"Camera config saved to: {config_path}")
+        return True
+    except Exception as e:
+        print(f"Error saving camera config to {config_path}: {e}")
+        return False
 
 
 def create_camera_capture(camera_id: int = 0, backend_priority: list = None) -> Optional[cv2.VideoCapture]:
