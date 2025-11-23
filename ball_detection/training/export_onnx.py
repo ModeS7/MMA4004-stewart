@@ -52,6 +52,40 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet
         print("  Removing torch.compile wrapper (_orig_mod. prefix)...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
+    # Handle pruned models (weight_orig + weight_mask → weight)
+    if any(k.endswith('_orig') for k in state_dict.keys()):
+        print("  Detected pruned model - making pruning permanent...")
+        new_state_dict = {}
+
+        # Find all pruned parameters
+        pruned_params = set()
+        for key in state_dict.keys():
+            if key.endswith('_orig'):
+                param_name = key[:-5]  # Remove '_orig'
+                pruned_params.add(param_name)
+
+        # Convert pruned parameters
+        for param_name in pruned_params:
+            orig_key = f"{param_name}_orig"
+            mask_key = f"{param_name}_mask"
+
+            if mask_key in state_dict:
+                # Apply mask: weight = weight_orig * mask
+                weight = state_dict[orig_key] * state_dict[mask_key]
+                new_state_dict[param_name] = weight
+                print(f"    {param_name}: {(state_dict[mask_key] == 0).sum().item()} / {state_dict[mask_key].numel()} weights pruned")
+            else:
+                # No mask, just copy original
+                new_state_dict[param_name] = state_dict[orig_key]
+
+        # Copy non-pruned parameters
+        for key, value in state_dict.items():
+            if not (key.endswith('_orig') or key.endswith('_mask')):
+                new_state_dict[key] = value
+
+        state_dict = new_state_dict
+        print("  ✓ Pruning made permanent")
+
     model.load_state_dict(state_dict)
     print("  ✓ Model weights loaded successfully")
 
