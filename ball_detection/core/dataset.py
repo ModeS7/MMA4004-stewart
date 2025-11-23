@@ -47,7 +47,7 @@ class BallDetectionDataset(Dataset):
     """
 
     def __init__(self, data_dir, labels_file='labels.json',
-                 crop_size=128, use_spatial_aug=True, use_appearance_aug=True, split='train'):
+                 crop_size=128, use_spatial_aug=True, use_appearance_aug=True, split='train', disable_normalize=False):
         """
         Initialize dataset.
 
@@ -58,11 +58,13 @@ class BallDetectionDataset(Dataset):
             use_spatial_aug: Enable spatial augmentations (offset, rotate, scale, shift)
             use_appearance_aug: Enable appearance augmentations (brightness, hue, blur, noise)
             split: 'train' or 'val' (affects augmentation)
+            disable_normalize: If True, skip normalization (for GPU augmentations)
         """
         self.data_dir = Path(data_dir)
         self.crop_size = crop_size
         self.use_spatial_aug = use_spatial_aug and (split == 'train')
         self.use_appearance_aug = use_appearance_aug and (split == 'train')
+        self.disable_normalize = disable_normalize
 
         # Check for images in subdirectory or root
         if (self.data_dir / 'images').exists():
@@ -191,11 +193,16 @@ class BallDetectionDataset(Dataset):
                 A.ImageCompression(quality_lower=70, quality_upper=100, p=0.2),
             ])
 
-        # Always normalize and convert to tensor
-        transforms_list.extend([
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ToTensorV2(),
-        ])
+        # Normalize and convert to tensor (skip normalize if using GPU augmentations)
+        if self.disable_normalize:
+            # When using GPU augmentations, ensure conversion to float [0, 1]
+            # Add a dummy normalize that just converts to float without changing values
+            transforms_list.append(A.ToFloat(max_value=255.0))
+        else:
+            # Standard ImageNet normalization
+            transforms_list.append(A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+
+        transforms_list.append(ToTensorV2())
 
         return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
 
@@ -293,7 +300,7 @@ class BallDetectionDataset(Dataset):
 
 
 def create_dataloaders(data_dir, batch_size=32, crop_size=128,
-                       train_split=0.8, num_workers=4, use_spatial_augmentation=True, use_appearance_augmentation=True):
+                       train_split=0.8, num_workers=4, use_spatial_augmentation=True, use_appearance_augmentation=True, disable_normalize=False):
     """
     Create train and validation dataloaders.
 
@@ -305,6 +312,7 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         num_workers: Number of workers for data loading
         use_spatial_augmentation: Enable spatial augmentations (offset, rotate, scale, shift)
         use_appearance_augmentation: Enable appearance augmentations (brightness, hue, blur, noise)
+        disable_normalize: If True, skip normalization (for GPU augmentations)
 
     Returns:
         train_loader, val_loader
@@ -315,7 +323,8 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         crop_size=crop_size,
         use_spatial_aug=False,  # We'll split first
         use_appearance_aug=False,
-        split='train'
+        split='train',
+        disable_normalize=disable_normalize
     )
 
     # Split into train/val
@@ -332,7 +341,8 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         crop_size=crop_size,
         use_spatial_aug=use_spatial_augmentation,
         use_appearance_aug=use_appearance_augmentation,
-        split='train'
+        split='train',
+        disable_normalize=disable_normalize
     )
     train_dataset.samples = [full_dataset.samples[i] for i in train_indices]
 
@@ -341,7 +351,8 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         crop_size=crop_size,
         use_spatial_aug=False,
         use_appearance_aug=False,
-        split='val'
+        split='val',
+        disable_normalize=disable_normalize
     )
     val_dataset.samples = [full_dataset.samples[i] for i in val_indices]
 
@@ -355,7 +366,7 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=8 if num_workers > 0 else None,  # Increased prefetch for better GPU utilization
         drop_last=True,  # Avoid small last batch for consistent performance
         multiprocessing_context='fork' if num_workers > 0 else None  # Faster on Linux
     )
@@ -364,12 +375,12 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=num_workers // 2 if num_workers > 0 else 0,  # Fewer workers for validation
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=True if num_workers > 1 else False,
+        prefetch_factor=4 if num_workers > 1 else None,
         drop_last=False,  # Keep all validation samples
-        multiprocessing_context='fork' if num_workers > 0 else None  # Faster on Linux
+        multiprocessing_context='fork' if num_workers > 1 else None  # Faster on Linux
     )
 
     return train_loader, val_loader

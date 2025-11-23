@@ -9,33 +9,76 @@ import time
 from pathlib import Path
 import json
 import numpy as np
+from collections import deque
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.utils.prune as prune
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+import torchvision.utils as vutils
 
 from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, create_model
 from ..core.dataset import create_dataloaders
+from ..core.gpu_augmentations import GPUAugmentationsWithTargets
+from ..core.cached_dataset import CachedAugmentationDataset
 
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
 DATA_DIR = "./ball_detection/data/final"
 OUTPUT_DIR = "./ball_detection/models"
-EPOCHS = 3200  # Overnight training
-BATCH_SIZE = 512  # Increased for faster training on RTX 3090
+EPOCHS = 7000  # Overnight training
+BATCH_SIZE = 128 # Large batch for RTX 3090 (24GB VRAM) - max GPU utilization
 CROP_SIZE = 128  # Crop size (scale variation handled by ShiftScaleRotate augmentation)
-LEARNING_RATE = 0.001  # Lower LR for long training
+LEARNING_RATE = 0.0003  # Lower LR for fine-tuning pretrained MobileNetV3
 WARMUP_EPOCHS = 10  # Linear warmup for stable start
-WEIGHT_DECAY = 1e-5
+WEIGHT_DECAY = 1e-4  # Slightly higher weight decay for regularization
 TRAIN_SPLIT = 0.8
-NUM_WORKERS = 24
+NUM_WORKERS = 8  # Reduced workers for smaller batch size
 SAVE_INTERVAL = 100  # Save less frequently (every 100 epochs for 3000 epoch run)
-USE_MOBILENET = False  # Use MobileNetV3-Small with pretrained ImageNet weights
+VALIDATION_INTERVAL = 2  # Validate every N epochs (reduce sync overhead)
+USE_MOBILENET = True  # Use MobileNetV3-Small with pretrained ImageNet weights
 MOBILENET_PRETRAINED = True  # Load ImageNet pretrained weights for MobileNetV3
 USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (simulate CV detection error)
 USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
+
+# ============================================================
+# GPU AUGMENTATION SETTINGS (Kornia - Much faster than CPU!)
+# ============================================================
+USE_GPU_AUGMENTATIONS = False   # Use Kornia GPU augmentations instead of Albumentations
+# When enabled, CPU augmentations (Albumentations) are disabled for max speed
+
+# ============================================================
+# CACHED AUGMENTATION SETTINGS (For Maximum GPU Utilization)
+# ============================================================
+USE_CACHED_AUGMENTATIONS = True  # Use pre-augmented cache in RAM
+CACHE_SIZE_MULTIPLIER = 3        # Cache size = dataset_size × multiplier (3x = ~21K images)
+CACHE_MAX_REUSE_COUNT = 3        # Replace cached items after N uses
+CACHE_ENABLE_REFRESH = True      # Background thread continuously refreshes cache
+# Memory usage: ~1.3GB for 7K images × 3 multiplier
+# Expected GPU utilization: <20% → 60-80%
+
+# ============================================================
+# PRUNING SETTINGS
+# ============================================================
+ENABLE_PRUNING = True
+PRUNING_START_EPOCH = 150           # Start after initial convergence
+PRUNING_CHECK_INTERVAL = 10         # Check every 10 epochs if ready to prune
+INITIAL_TARGET_SPARSITY = 0.90      # 90% sparsity (~150K params)
+SPARSITY_INCREMENT = 0.02           # After 90%, prune 2% more each time
+PRUNE_AMOUNT_PER_STEP = 0.05        # Remove 20% of remaining params each step
+VALIDATION_PIXEL_THRESHOLD = 1.0    # Max acceptable pixel error
+PRUNING_PATIENCE = 10               # Must have px_error < 1.0 for 10 epochs
+
+# ============================================================
+# TENSORBOARD SETTINGS
+# ============================================================
+ENABLE_TENSORBOARD = True
+TENSORBOARD_LOG_INTERVAL = 1        # Log scalars every N epochs
+TENSORBOARD_IMAGE_INTERVAL = 50     # Log prediction images every N epochs
+TENSORBOARD_HISTOGRAM_INTERVAL = 100 # Log weights/gradients every N epochs
 # ============================================================
 
 
@@ -85,9 +128,11 @@ def calculate_pixel_error(pred, target, crop_size=128):
     return distances.mean().item()
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gpu_aug=None):
     """Train for one epoch with AMP bf16."""
     model.train()
+    if gpu_aug is not None:
+        gpu_aug.train()
 
     total_loss = 0
     total_pixel_error = 0
@@ -96,8 +141,12 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} Training')
     for images, targets in pbar:
-        images = images.to(device)
-        targets = targets.to(device)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        # Apply GPU augmentations (if enabled)
+        if gpu_aug is not None:
+            images, targets = gpu_aug(images, targets)
 
         # Forward pass with AMP bf16 (only on CUDA)
         if use_amp:
@@ -114,19 +163,20 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         loss.backward()
         optimizer.step()
 
-        # Metrics (compute in fp32)
+        # Metrics (compute in fp32) - accumulate tensors to reduce sync
         pixel_error = calculate_pixel_error(outputs.float(), targets)
 
-        total_loss += loss.item()
+        total_loss += loss.detach()
         total_pixel_error += pixel_error
 
-        # Update progress bar
+        # Update progress bar (sync every batch for display)
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
             'px_err': f'{pixel_error:.3f}'
         })
 
-    avg_loss = total_loss / num_batches
+    # Synchronize only at epoch end
+    avg_loss = (total_loss / num_batches).item()
     avg_pixel_error = total_pixel_error / num_batches
 
     return avg_loss, avg_pixel_error
@@ -142,8 +192,8 @@ def validate(model, dataloader, criterion, device):
 
     with torch.no_grad():
         for images, targets in tqdm(dataloader, desc='Validation'):
-            images = images.to(device)
-            targets = targets.to(device)
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
             # Forward pass (no autocast needed for validation, keep in fp32)
             outputs = model(images)
@@ -159,6 +209,114 @@ def validate(model, dataloader, criterion, device):
     avg_pixel_error = total_pixel_error / num_batches
 
     return avg_loss, avg_pixel_error
+
+
+def apply_structured_pruning(model, amount):
+    """
+    Apply structured pruning to convolutional layers.
+    Prunes filters based on L1 norm (importance criterion).
+
+    CRITICAL: Also resets BatchNorm statistics to prevent feature collapse.
+    """
+    parameters_to_prune = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            parameters_to_prune.append((module, 'weight'))
+
+    # Apply L1 unstructured pruning
+    for module, param_name in parameters_to_prune:
+        prune.l1_unstructured(module, name=param_name, amount=amount)
+
+    # CRITICAL: Reset BatchNorm statistics after pruning
+    # Pruning changes activation distributions, making old running mean/var invalid
+    # Without this, model outputs collapse to corners during validation
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            module.reset_running_stats()
+
+    return model
+
+
+def get_model_sparsity(model):
+    """Calculate percentage of zero weights in pruned model."""
+    total_params = 0
+    zero_params = 0
+
+    for module in model.modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            if hasattr(module, 'weight_mask'):
+                mask = module.weight_mask
+                total_params += mask.numel()
+                zero_params += (mask == 0).sum().item()
+            else:
+                total_params += module.weight.numel()
+
+    sparsity = (zero_params / total_params * 100) if total_params > 0 else 0.0
+    return sparsity
+
+
+def count_model_parameters(model, only_nonzero=False):
+    """Count total or non-zero parameters."""
+    total = 0
+    for module in model.modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            if only_nonzero and hasattr(module, 'weight_mask'):
+                total += (module.weight_mask != 0).sum().item()
+            else:
+                total += module.weight.numel()
+    return total
+
+
+def check_pruning_readiness(pixel_error_history, threshold=1.0):
+    """Check if all values in deque are below threshold."""
+    if len(pixel_error_history) < pixel_error_history.maxlen:
+        return False
+    return all(err < threshold for err in pixel_error_history)
+
+
+def visualize_predictions(images, targets, preds, crop_size):
+    """
+    Create visualization grid with GT (green) and predictions (red).
+
+    Args:
+        images: (B, 3, H, W) tensor (ImageNet normalized)
+        targets: (B, 2) normalized coordinates
+        preds: (B, 2) normalized coordinates
+        crop_size: Image size for denormalization
+
+    Returns:
+        (3, H, W*B) tensor grid
+    """
+    import cv2
+
+    # ImageNet normalization stats
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    vis_images = []
+    for i in range(len(images)):
+        # Denormalize from ImageNet stats
+        img = images[i].cpu()
+        img = img * std + mean  # Denormalize to [0, 1]
+        img = torch.clamp(img, 0, 1)  # Clamp to valid range
+
+        img = img.numpy().transpose(1, 2, 0)  # CHW -> HWC
+        img = (img * 255).astype(np.uint8).copy()
+
+        # Convert normalized coords to pixels
+        gt_x, gt_y = int(targets[i, 0] * crop_size), int(targets[i, 1] * crop_size)
+        pred_x, pred_y = int(preds[i, 0] * crop_size), int(preds[i, 1] * crop_size)
+
+        # Draw circles
+        cv2.circle(img, (gt_x, gt_y), 3, (0, 255, 0), -1)  # Green = GT
+        cv2.circle(img, (pred_x, pred_y), 3, (255, 0, 0), -1)  # Red = Pred
+
+        # Draw line between them
+        cv2.line(img, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
+
+        vis_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+
+    return vutils.make_grid(vis_images, nrow=4, padding=2)
 
 
 def main():
@@ -209,12 +367,29 @@ def main():
     print("=" * 60)
     print()
 
-    # Create output directory
-    output_dir = Path(OUTPUT_DIR)
+    # Create output directory and run name
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"run_{timestamp}"
+    if USE_MOBILENET:
+        run_name += "_mobilenetv3"
+    else:
+        run_name += "_customcnn"
+    if ENABLE_PRUNING:
+        run_name += "_pruning"
+
+    # Each run gets its own directory under models/
+    output_dir = Path(OUTPUT_DIR) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nRun Name: {run_name}")
+    print(f"Output Directory: {output_dir}")
+    print()
 
     # Save training config
     config = {
+        'run_name': run_name,
+        'timestamp': timestamp,
         'data_dir': DATA_DIR,
         'epochs': EPOCHS,
         'batch_size': BATCH_SIZE,
@@ -226,23 +401,127 @@ def main():
         'mobilenet_pretrained': MOBILENET_PRETRAINED,
         'use_spatial_augmentation': USE_SPATIAL_AUGMENTATION,
         'use_appearance_augmentation': USE_APPEARANCE_AUGMENTATION,
+        'enable_pruning': ENABLE_PRUNING,
+        'enable_tensorboard': ENABLE_TENSORBOARD,
     }
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
+    # Initialize TensorBoard - centralized in models/tensorboard_logs/
+    if ENABLE_TENSORBOARD:
+        tensorboard_base = Path(OUTPUT_DIR) / 'tensorboard_logs'
+        tensorboard_dir = tensorboard_base / run_name
+        writer = SummaryWriter(log_dir=tensorboard_dir)
+        print(f"TensorBoard:")
+        print(f"  Logs: {tensorboard_dir}")
+        print(f"  Command: tensorboard --logdir={tensorboard_base}")
+        print()
+    else:
+        writer = None
+
     # Create dataloaders
     print(f"Loading data from: {DATA_DIR}")
-    print(f"Spatial augmentation: {'Enabled' if USE_SPATIAL_AUGMENTATION else 'Disabled'}")
-    print(f"Appearance augmentation: {'Enabled' if USE_APPEARANCE_AUGMENTATION else 'Disabled'}")
-    train_loader, val_loader = create_dataloaders(
-        data_dir=DATA_DIR,
-        batch_size=BATCH_SIZE,
-        crop_size=CROP_SIZE,
-        train_split=TRAIN_SPLIT,
-        num_workers=NUM_WORKERS,
-        use_spatial_augmentation=USE_SPATIAL_AUGMENTATION,
-        use_appearance_augmentation=USE_APPEARANCE_AUGMENTATION
-    )
+
+    # Disable CPU augmentations if using GPU augmentations or cached augmentations
+    cpu_spatial_aug = USE_SPATIAL_AUGMENTATION and not USE_GPU_AUGMENTATIONS and not USE_CACHED_AUGMENTATIONS
+    cpu_appearance_aug = USE_APPEARANCE_AUGMENTATION and not USE_GPU_AUGMENTATIONS and not USE_CACHED_AUGMENTATIONS
+
+    if USE_CACHED_AUGMENTATIONS:
+        print(f"Cached augmentations: Enabled")
+        print(f"  Cache multiplier: {CACHE_SIZE_MULTIPLIER}x")
+        print(f"  Max reuse: {CACHE_MAX_REUSE_COUNT}")
+        print(f"  Background refresh: {'Enabled' if CACHE_ENABLE_REFRESH else 'Disabled'}")
+        print()
+
+        # Load labels and filter valid samples first
+        labels_path = Path(DATA_DIR) / 'labels.json'
+        with open(labels_path, 'r') as f:
+            all_labels = json.load(f)
+
+        # Filter valid samples (skip invalid ones)
+        valid_samples = []
+        for img_name, label in all_labels.items():
+            if label.get('valid', True):
+                valid_samples.append((img_name, label))
+
+        # Calculate split indices based on valid samples
+        dataset_size = len(valid_samples)
+        train_size = int(TRAIN_SPLIT * dataset_size)
+        train_indices = list(range(train_size))
+        val_indices = list(range(train_size, dataset_size))
+
+        # Create cached datasets
+        train_dataset = CachedAugmentationDataset(
+            data_dir=DATA_DIR,
+            crop_size=CROP_SIZE,
+            cache_multiplier=CACHE_SIZE_MULTIPLIER,
+            max_reuse_count=CACHE_MAX_REUSE_COUNT,
+            use_spatial_aug=USE_SPATIAL_AUGMENTATION,
+            use_appearance_aug=USE_APPEARANCE_AUGMENTATION,
+            enable_refresh=CACHE_ENABLE_REFRESH,
+            indices=train_indices
+        )
+
+        val_dataset = CachedAugmentationDataset(
+            data_dir=DATA_DIR,
+            crop_size=CROP_SIZE,
+            cache_multiplier=1,  # No multiplier for validation
+            max_reuse_count=999999,  # Never refresh validation
+            use_spatial_aug=False,
+            use_appearance_aug=False,
+            enable_refresh=False,
+            indices=val_indices
+        )
+
+        # Create dataloaders with minimal prefetching to save RAM
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=2,  # Fewer workers = less memory overhead
+            pin_memory=True,  # Pin memory for faster GPU transfer
+            prefetch_factor=2,  # Reduced prefetch to save RAM
+            persistent_workers=True,  # Keep workers alive between epochs
+            drop_last=True
+        )
+
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+            drop_last=False
+        )
+
+    elif USE_GPU_AUGMENTATIONS:
+        print(f"GPU augmentations (Kornia): Enabled")
+        print(f"  CPU augmentations: Disabled (for max speed)")
+        train_loader, val_loader = create_dataloaders(
+            data_dir=DATA_DIR,
+            batch_size=BATCH_SIZE,
+            crop_size=CROP_SIZE,
+            train_split=TRAIN_SPLIT,
+            num_workers=NUM_WORKERS,
+            use_spatial_augmentation=cpu_spatial_aug,
+            use_appearance_augmentation=cpu_appearance_aug,
+            disable_normalize=USE_GPU_AUGMENTATIONS
+        )
+    else:
+        print(f"CPU Spatial augmentation: {'Enabled' if cpu_spatial_aug else 'Disabled'}")
+        print(f"CPU Appearance augmentation: {'Enabled' if cpu_appearance_aug else 'Disabled'}")
+        train_loader, val_loader = create_dataloaders(
+            data_dir=DATA_DIR,
+            batch_size=BATCH_SIZE,
+            crop_size=CROP_SIZE,
+            train_split=TRAIN_SPLIT,
+            num_workers=NUM_WORKERS,
+            use_spatial_augmentation=cpu_spatial_aug,
+            use_appearance_augmentation=cpu_appearance_aug,
+            disable_normalize=False
+        )
 
     # Create model
     print("\nCreating model...")
@@ -255,20 +534,32 @@ def main():
 
     model = model.to(device)
 
-    # Compile model for faster training (PyTorch 2.0+)
-    model = torch.compile(model)
+    # Create GPU augmentation module
+    if USE_GPU_AUGMENTATIONS:
+        gpu_aug = GPUAugmentationsWithTargets(crop_size=CROP_SIZE).to(device)
+        print(f"GPU augmentations: Initialized on {device}")
+    else:
+        gpu_aug = None
+
+    # Disable torch.compile for small models/datasets (overhead > benefit)
+    # model = torch.compile(model)
 
     param_count = model.count_parameters()
     print(f"Model parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
-    print(f"torch.compile: Enabled")
+    print(f"torch.compile: Disabled (small model/dataset)")
     print()
 
     # Loss and optimizer
     criterion = DetectionLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Learning rate scheduler: Warmup + Cosine Annealing with Warm Restarts
-    # This periodically resets LR to help escape local minima during long training
+    # Learning rate scheduler:
+    # Phase 1: Warmup (0-10)
+    # Phase 2: Cosine annealing until pruning starts (10-150)
+    # Phase 3: Small constant LR during pruning (150+)
+
+    PRUNING_LR = 1e-5  # Small LR for stable pruning fine-tuning
+
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.1,
@@ -276,29 +567,47 @@ def main():
         total_iters=WARMUP_EPOCHS
     )
 
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    # Cosine decay from LEARNING_RATE to PRUNING_LR until pruning starts
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_0=50,        # First restart after 50 epochs
-        T_mult=2,      # Double the cycle length after each restart (50, 100, 200, ...)
-        eta_min=1e-6   # Minimum LR
+        T_max=PRUNING_START_EPOCH - WARMUP_EPOCHS,
+        eta_min=PRUNING_LR
+    )
+
+    # Constant small LR during pruning for stability
+    constant_scheduler = optim.lr_scheduler.ConstantLR(
+        optimizer,
+        factor=PRUNING_LR / LEARNING_RATE,  # Scale to get PRUNING_LR
+        total_iters=EPOCHS - PRUNING_START_EPOCH
     )
 
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[WARMUP_EPOCHS]
+        schedulers=[warmup_scheduler, cosine_scheduler, constant_scheduler],
+        milestones=[WARMUP_EPOCHS, PRUNING_START_EPOCH]
     )
 
-    # Calculate restart epochs for checkpointing
-    restart_epochs = [WARMUP_EPOCHS]  # After warmup
-    cycle_length = 50
-    next_restart = WARMUP_EPOCHS + cycle_length
-    while next_restart <= EPOCHS:
-        restart_epochs.append(next_restart)
-        cycle_length *= 2  # T_mult = 2
-        next_restart += cycle_length
+    # No restart epochs with this scheduler
+    restart_epochs = []
 
-    print(f"LR restart epochs: {restart_epochs[:10]}...")  # Show first 10
+    print(f"LR schedule:")
+    print(f"  Warmup: epochs 1-{WARMUP_EPOCHS} (3e-5 → 3e-4)")
+    print(f"  Cosine: epochs {WARMUP_EPOCHS+1}-{PRUNING_START_EPOCH} (3e-4 → {PRUNING_LR})")
+    print(f"  Pruning: epochs {PRUNING_START_EPOCH+1}-{EPOCHS} (constant {PRUNING_LR})")
+
+    # Initialize pruning state
+    if ENABLE_PRUNING:
+        pixel_error_history = deque(maxlen=PRUNING_PATIENCE)
+        current_sparsity_target = INITIAL_TARGET_SPARSITY
+        pruning_active = True
+        print(f"\nPruning Configuration:")
+        print(f"  Enabled: True")
+        print(f"  Start epoch: {PRUNING_START_EPOCH}")
+        print(f"  Initial target: {INITIAL_TARGET_SPARSITY*100:.0f}% sparsity")
+        print(f"  Check interval: every {PRUNING_CHECK_INTERVAL} epochs")
+        print(f"  Patience: {PRUNING_PATIENCE} epochs < {VALIDATION_PIXEL_THRESHOLD}px")
+        print(f"  Prune amount per step: {PRUNE_AMOUNT_PER_STEP*100:.0f}%")
+        print()
 
     # Training loop
     print(f"Starting training for {EPOCHS} epochs...")
@@ -314,13 +623,18 @@ def main():
 
         # Train
         train_loss, train_pixel_err = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch
+            model, train_loader, criterion, optimizer, device, epoch, gpu_aug
         )
 
-        # Validate
-        val_loss, val_pixel_err = validate(
-            model, val_loader, criterion, device
-        )
+        # Validate only every N epochs (reduce sync overhead)
+        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+            val_loss, val_pixel_err = validate(
+                model, val_loader, criterion, device
+            )
+        else:
+            # Skip validation, reuse previous values
+            val_loss = val_loss if epoch > 1 else 0.0
+            val_pixel_err = val_pixel_err if epoch > 1 else 0.0
 
         # Scheduler step (CosineAnnealingLR steps every epoch)
         scheduler.step()
@@ -329,65 +643,175 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
 
         # Print summary
-        print(f"\nEpoch {epoch}/{EPOCHS} Summary:")
-        print(f"  Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px")
-        print(f"  Val Loss: {val_loss:.4f} | Pixel Error: {val_pixel_err:.3f}px")
-        print(f"  LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
+        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+            print(f"\nEpoch {epoch}/{EPOCHS} Summary:")
+            print(f"  Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px")
+            print(f"  Val Loss: {val_loss:.4f} | Pixel Error: {val_pixel_err:.3f}px")
+            print(f"  LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
+        else:
+            print(f"\nEpoch {epoch}/{EPOCHS}: Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px | LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
+
+        # TensorBoard logging
+        if writer is not None:
+            # Scalars (every epoch)
+            if epoch % TENSORBOARD_LOG_INTERVAL == 0:
+                writer.add_scalar('Loss/train', train_loss, epoch)
+                writer.add_scalar('PixelError/train', train_pixel_err, epoch)
+                writer.add_scalar('LearningRate/lr', current_lr, epoch)
+                writer.add_scalar('Performance/epoch_time', epoch_time, epoch)
+
+                # Only log validation metrics when we actually validated
+                if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+                    writer.add_scalar('Loss/val', val_loss, epoch)
+                    writer.add_scalar('PixelError/val', val_pixel_err, epoch)
+
+                if ENABLE_PRUNING:
+                    sparsity = get_model_sparsity(model)
+                    writer.add_scalar('Sparsity/global', sparsity, epoch)
+
+            # Images (every N epochs)
+            if epoch % TENSORBOARD_IMAGE_INTERVAL == 0:
+                sample_images, sample_targets = next(iter(val_loader))
+                sample_images = sample_images[:8].to(device, non_blocking=True)
+                sample_targets = sample_targets[:8].to(device, non_blocking=True)
+
+                with torch.no_grad():
+                    sample_preds = model(sample_images)
+
+                vis_grid = visualize_predictions(
+                    sample_images, sample_targets, sample_preds, CROP_SIZE
+                )
+                writer.add_image('Predictions/validation', vis_grid, epoch)
+
+            # Histograms (every N epochs)
+            if epoch % TENSORBOARD_HISTOGRAM_INTERVAL == 0:
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        writer.add_histogram(f'Weights/{name}', param, epoch)
+                        if param.grad is not None:
+                            writer.add_histogram(f'Gradients/{name}', param.grad, epoch)
+
+        # Pruning logic
+        if ENABLE_PRUNING and pruning_active:
+            # Track validation pixel error (only on validation epochs)
+            if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+                pixel_error_history.append(val_pixel_err)
+
+            # Check if ready to prune (only on validation epochs)
+            if (epoch >= PRUNING_START_EPOCH and
+                epoch % PRUNING_CHECK_INTERVAL == 0 and
+                (epoch % VALIDATION_INTERVAL == 0 or epoch == 1)):
+
+                if check_pruning_readiness(pixel_error_history, VALIDATION_PIXEL_THRESHOLD):
+                    current_sparsity = get_model_sparsity(model)
+
+                    # Check if we need more pruning
+                    if current_sparsity < current_sparsity_target * 100:
+                        print(f"\n{'='*60}")
+                        print(f"APPLYING PRUNING at Epoch {epoch}")
+                        print(f"  Current sparsity: {current_sparsity:.1f}%")
+                        print(f"  Target sparsity: {current_sparsity_target*100:.0f}%")
+
+                        # Apply pruning
+                        model = apply_structured_pruning(model, PRUNE_AMOUNT_PER_STEP)
+
+                        new_sparsity = get_model_sparsity(model)
+                        remaining_params = count_model_parameters(model, only_nonzero=True)
+
+                        print(f"  New sparsity: {new_sparsity:.1f}%")
+                        print(f"  Remaining params: {remaining_params:,}")
+                        print(f"{'='*60}\n")
+
+                        # Reset history after pruning to allow recovery
+                        pixel_error_history.clear()
+
+                    # If reached target and still capable, increase target
+                    elif current_sparsity >= current_sparsity_target * 100:
+                        print(f"\n  ✓ Reached {current_sparsity_target*100:.0f}% sparsity target!")
+                        print(f"  Validation px_error has been < {VALIDATION_PIXEL_THRESHOLD} for {PRUNING_PATIENCE} epochs")
+                        print(f"  Increasing target by {SPARSITY_INCREMENT*100:.0f}%")
+                        current_sparsity_target += SPARSITY_INCREMENT
+                        print(f"  New target: {current_sparsity_target*100:.0f}% sparsity\n")
 
         # Save history
-        training_history.append({
+        history_entry = {
             'epoch': epoch,
             'train_loss': train_loss,
             'train_pixel_error': train_pixel_err,
-            'val_loss': val_loss,
-            'val_pixel_error': val_pixel_err,
             'learning_rate': current_lr,
-            'time': epoch_time
-        })
+            'time': epoch_time,
+            'sparsity': get_model_sparsity(model) if ENABLE_PRUNING else 0.0
+        }
+
+        # Only include validation metrics when we actually validated
+        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+            history_entry['val_loss'] = val_loss
+            history_entry['val_pixel_error'] = val_pixel_err
+
+        training_history.append(history_entry)
 
         # Save checkpoint at regular intervals OR before LR restarts
         is_restart_epoch = epoch in restart_epochs
         if (epoch % SAVE_INTERVAL == 0) or (epoch == EPOCHS) or is_restart_epoch:
             checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pth'
-            torch.save({
+            checkpoint_data = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss,
-                'val_loss': val_loss,
-                'pixel_error': val_pixel_err,
-            }, checkpoint_path)
+                'train_pixel_error': train_pixel_err,
+            }
+            # Only include validation metrics if we actually validated this epoch
+            if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+                checkpoint_data['val_loss'] = val_loss
+                checkpoint_data['val_pixel_error'] = val_pixel_err
+            torch.save(checkpoint_data, checkpoint_path)
             if is_restart_epoch:
                 print(f"  🔄 Checkpoint saved before LR restart: {checkpoint_path}")
             else:
                 print(f"  Checkpoint saved: {checkpoint_path}")
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_path = output_dir / 'best_model.pth'
-            torch.save(model.state_dict(), best_path)
-            print(f"  ★ New best validation loss! Saved to: {best_path}")
+        # Save best model (only on validation epochs)
+        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_path = output_dir / 'best_model.pth'
+                torch.save(model.state_dict(), best_path)
+                print(f"  ★ New best validation loss! Saved to: {best_path}")
 
-        if val_pixel_err < best_pixel_error:
-            best_pixel_error = val_pixel_err
-            best_pixel_path = output_dir / 'best_pixel_error.pth'
-            torch.save(model.state_dict(), best_pixel_path)
-            print(f"  ★ New best pixel error! Saved to: {best_pixel_path}")
+            if val_pixel_err < best_pixel_error:
+                best_pixel_error = val_pixel_err
+                best_pixel_path = output_dir / 'best_pixel_error.pth'
+                torch.save(model.state_dict(), best_pixel_path)
+                print(f"  ★ New best pixel error! Saved to: {best_pixel_path}")
 
     # Save training history
     with open(output_dir / 'training_history.json', 'w') as f:
         json.dump(training_history, f, indent=2)
 
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.close()
+        print(f"\nTensorBoard logs saved to: {tensorboard_dir}")
+
     # Training complete
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE!")
     print("=" * 60)
+    print(f"Run: {run_name}")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Best pixel error: {best_pixel_error:.3f}px")
-    print(f"Models saved to: {output_dir}")
-    print(f"History saved to: {output_dir}/training_history.json")
+    print()
+    print(f"Run directory: {output_dir}")
+    print(f"  ├── best_model.pth")
+    print(f"  ├── best_pixel_error.pth")
+    print(f"  ├── checkpoint_epoch_*.pth")
+    print(f"  ├── config.json")
+    print(f"  └── training_history.json")
+    print()
+    print(f"TensorBoard logs: {tensorboard_dir}")
+    print(f"TensorBoard: tensorboard --logdir={Path(OUTPUT_DIR) / 'tensorboard_logs'}")
     print("=" * 60)
 
 
