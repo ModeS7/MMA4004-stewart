@@ -4,7 +4,11 @@ View Augmentation Examples
 Loads random images from the dataset and shows how augmentations affect them.
 Useful for debugging and tuning augmentation parameters.
 
-Usage: python ball_detection/view_a.py
+Usage:
+    python ball_detection/tools/view_a.py
+
+To view validation examples:
+    Set MODE = "val" in the settings below
 """
 
 import cv2
@@ -20,10 +24,11 @@ from ball_detection.core.dataset import BallDetectionDataset
 # ============================================================
 DATA_DIR = "./ball_detection/data/final"
 CROP_SIZE = 128
-USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift
+MODE = "train"  # "train" or "val" - choose which dataset to visualize
+USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (train only)
 USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
 NUM_SAMPLES = 5  # Number of different images to show
-NUM_AUGMENTATIONS = 4  # Number of augmented versions per image
+NUM_AUGMENTATIONS = 7  # Number of augmented versions per image
 FIGSIZE = (16, 10)  # Figure size for display
 SAVE_OUTPUT = True  # Save visualization to file
 OUTPUT_PATH = "./ball_detection/augmentation_examples.png"
@@ -60,9 +65,21 @@ def main():
     print("AUGMENTATION VISUALIZATION")
     print("=" * 60)
     print(f"Data: {DATA_DIR}")
+    print(f"Mode: {MODE.upper()}")
     print(f"Crop size: {CROP_SIZE}x{CROP_SIZE}")
-    print(f"Spatial augmentation: {'Enabled' if USE_SPATIAL_AUGMENTATION else 'Disabled'}")
-    print(f"Appearance augmentation: {'Enabled' if USE_APPEARANCE_AUGMENTATION else 'Disabled'}")
+
+    # Validation mode: force no spatial augmentation
+    if MODE == "val":
+        spatial_aug = False
+        appearance_aug = USE_APPEARANCE_AUGMENTATION
+        print(f"Spatial augmentation: Disabled (validation mode)")
+        print(f"Appearance augmentation: {'Enabled' if appearance_aug else 'Disabled'}")
+    else:
+        spatial_aug = USE_SPATIAL_AUGMENTATION
+        appearance_aug = USE_APPEARANCE_AUGMENTATION
+        print(f"Spatial augmentation: {'Enabled' if spatial_aug else 'Disabled'}")
+        print(f"Appearance augmentation: {'Enabled' if appearance_aug else 'Disabled'}")
+
     print(f"Samples: {NUM_SAMPLES}")
     print(f"Augmentations per sample: {NUM_AUGMENTATIONS}")
     print("=" * 60)
@@ -74,15 +91,15 @@ def main():
         crop_size=CROP_SIZE,
         use_spatial_aug=False,
         use_appearance_aug=False,
-        split='train'
+        split=MODE
     )
 
     dataset_with_aug = BallDetectionDataset(
         data_dir=DATA_DIR,
         crop_size=CROP_SIZE,
-        use_spatial_aug=USE_SPATIAL_AUGMENTATION,
-        use_appearance_aug=USE_APPEARANCE_AUGMENTATION,
-        split='train'
+        use_spatial_aug=spatial_aug,
+        use_appearance_aug=appearance_aug,
+        split=MODE
     )
 
     print(f"Dataset loaded: {len(dataset_no_aug)} samples")
@@ -94,7 +111,8 @@ def main():
 
     # Create figure
     fig, axes = plt.subplots(NUM_SAMPLES, NUM_AUGMENTATIONS + 1, figsize=FIGSIZE)
-    fig.suptitle('Augmentation Examples (Green crosshair = ball center)', fontsize=14, y=0.995)
+    title = f'{MODE.upper()} Augmentation Examples (Green crosshair = ball center)'
+    fig.suptitle(title, fontsize=14, y=0.995)
 
     for row, idx in enumerate(sample_indices):
         # Get original (no augmentation)

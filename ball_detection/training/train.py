@@ -29,10 +29,10 @@ from ..core.cached_dataset import CachedAugmentationDataset
 # ============================================================
 DATA_DIR = "./ball_detection/data/final"
 OUTPUT_DIR = "./ball_detection/models"
-EPOCHS = 7000  # Overnight training
+EPOCHS = 4000  # Overnight training
 BATCH_SIZE = 128 # Large batch for RTX 3090 (24GB VRAM) - max GPU utilization
 CROP_SIZE = 128  # Crop size (scale variation handled by ShiftScaleRotate augmentation)
-LEARNING_RATE = 0.0003  # Lower LR for fine-tuning pretrained MobileNetV3
+LEARNING_RATE = 0.001  # Max LR for warmup and cosine decay (should be > PRUNING_LR)
 WARMUP_EPOCHS = 10  # Linear warmup for stable start
 WEIGHT_DECAY = 1e-4  # Slightly higher weight decay for regularization
 TRAIN_SPLIT = 0.8
@@ -45,7 +45,7 @@ USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (simulate CV det
 USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
 
 # ============================================================
-# GPU AUGMENTATION SETTINGS (Kornia - Much faster than CPU!)
+# GPU AUGMENTATION SETTINGS (Kornia - Much faster than CPU)
 # ============================================================
 USE_GPU_AUGMENTATIONS = False   # Use Kornia GPU augmentations instead of Albumentations
 # When enabled, CPU augmentations (Albumentations) are disabled for max speed
@@ -54,11 +54,11 @@ USE_GPU_AUGMENTATIONS = False   # Use Kornia GPU augmentations instead of Albume
 # CACHED AUGMENTATION SETTINGS (For Maximum GPU Utilization)
 # ============================================================
 USE_CACHED_AUGMENTATIONS = True  # Use pre-augmented cache in RAM
-CACHE_SIZE_MULTIPLIER = 3        # Cache size = dataset_size × multiplier (3x = ~21K images)
-CACHE_MAX_REUSE_COUNT = 3        # Replace cached items after N uses
+CACHE_SIZE_MULTIPLIER = 3        # Cache size = dataset_size x multiplier (3x = ~21K images)
+CACHE_MAX_REUSE_COUNT = 2        # Replace cached items after N uses
 CACHE_ENABLE_REFRESH = True      # Background thread continuously refreshes cache
-# Memory usage: ~1.3GB for 7K images × 3 multiplier
-# Expected GPU utilization: <20% → 60-80%
+# Memory usage: ~1.3GB for 7K images x 3 multiplier
+# Expected GPU utilization: <20% -> 60-80%
 
 # ============================================================
 # PRUNING SETTINGS
@@ -67,8 +67,8 @@ ENABLE_PRUNING = True
 PRUNING_START_EPOCH = 150           # Start after initial convergence
 PRUNING_CHECK_INTERVAL = 10         # Check every 10 epochs if ready to prune
 INITIAL_TARGET_SPARSITY = 0.90      # 90% sparsity (~150K params)
-SPARSITY_INCREMENT = 0.02           # After 90%, prune 2% more each time
-PRUNE_AMOUNT_PER_STEP = 0.05        # Remove 20% of remaining params each step
+SPARSITY_INCREMENT = 0.05           # After 90%, prune 2% more each time
+PRUNE_AMOUNT_PER_STEP = 0.1        # Remove 20% of remaining params each step
 VALIDATION_PIXEL_THRESHOLD = 1.0    # Max acceptable pixel error
 PRUNING_PATIENCE = 10               # Must have px_error < 1.0 for 10 epochs
 
@@ -213,23 +213,45 @@ def validate(model, dataloader, criterion, device):
 
 def apply_structured_pruning(model, amount):
     """
-    Apply structured pruning to convolutional layers.
-    Prunes filters based on L1 norm (importance criterion).
+    Apply STRUCTURED pruning to convolutional layers - actually removes filters.
+
+    This creates a permanently smaller model (not just zeroed weights):
+    - Ranks filters by L1 norm (importance)
+    - Removes least important filters
+    - Reduces model dimensions (faster inference!)
 
     CRITICAL: Also resets BatchNorm statistics to prevent feature collapse.
     """
-    parameters_to_prune = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d):
-            parameters_to_prune.append((module, 'weight'))
+    import torch_pruning as tp
 
-    # Apply L1 unstructured pruning
-    for module, param_name in parameters_to_prune:
-        prune.l1_unstructured(module, name=param_name, amount=amount)
+    # Use torch-pruning library for true structured pruning
+    # This actually removes channels/filters, making the model smaller and faster
+
+    # Define importance criterion (L1 norm of filters)
+    imp = tp.importance.MagnitudeImportance(p=1)
+
+    # Identify layers that can be pruned
+    ignored_layers = []
+    for name, module in model.named_modules():
+        # Don't prune the final output layer
+        if isinstance(module, nn.Linear) and module.out_features == 2:
+            ignored_layers.append(module)
+
+    # Create pruner
+    pruner = tp.pruner.MagnitudePruner(
+        model,
+        example_inputs=torch.randn(1, 3, 128, 128).to(next(model.parameters()).device),
+        importance=imp,
+        iterative_steps=1,
+        pruning_ratio=amount,
+        ignored_layers=ignored_layers,
+    )
+
+    # Apply pruning (actually removes filters)
+    pruner.step()
 
     # CRITICAL: Reset BatchNorm statistics after pruning
     # Pruning changes activation distributions, making old running mean/var invalid
-    # Without this, model outputs collapse to corners during validation
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
             module.reset_running_stats()
@@ -237,33 +259,43 @@ def apply_structured_pruning(model, amount):
     return model
 
 
-def get_model_sparsity(model):
-    """Calculate percentage of zero weights in pruned model."""
-    total_params = 0
-    zero_params = 0
+def get_model_sparsity(model, original_params=None):
+    """
+    Calculate percentage parameter reduction from structured pruning.
 
-    for module in model.modules():
-        if isinstance(module, (nn.Conv2d, nn.Linear)):
-            if hasattr(module, 'weight_mask'):
-                mask = module.weight_mask
-                total_params += mask.numel()
-                zero_params += (mask == 0).sum().item()
-            else:
-                total_params += module.weight.numel()
+    For structured pruning: compares current param count to original.
+    For unstructured pruning: counts zero weights.
+    """
+    current_params = count_model_parameters(model)
 
-    sparsity = (zero_params / total_params * 100) if total_params > 0 else 0.0
-    return sparsity
+    if original_params is not None:
+        # Structured pruning: measure actual parameter reduction
+        reduction_ratio = 1.0 - (current_params / original_params)
+        return reduction_ratio * 100
+    else:
+        # Unstructured pruning: count zero weights
+        total_params = 0
+        zero_params = 0
+        for module in model.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                if hasattr(module, 'weight_mask'):
+                    mask = module.weight_mask
+                    total_params += mask.numel()
+                    zero_params += (mask == 0).sum().item()
+                else:
+                    total_params += module.weight.numel()
+
+        return (zero_params / total_params * 100) if total_params > 0 else 0.0
 
 
 def count_model_parameters(model, only_nonzero=False):
-    """Count total or non-zero parameters."""
+    """Count total parameters in the model."""
     total = 0
     for module in model.modules():
         if isinstance(module, (nn.Conv2d, nn.Linear)):
-            if only_nonzero and hasattr(module, 'weight_mask'):
-                total += (module.weight_mask != 0).sum().item()
-            else:
-                total += module.weight.numel()
+            total += module.weight.numel()
+            if module.bias is not None:
+                total += module.bias.numel()
     return total
 
 
@@ -545,6 +577,7 @@ def main():
     # model = torch.compile(model)
 
     param_count = model.count_parameters()
+    original_param_count = param_count  # Store for structured pruning tracking
     print(f"Model parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
     print(f"torch.compile: Disabled (small model/dataset)")
     print()
@@ -558,7 +591,7 @@ def main():
     # Phase 2: Cosine annealing until pruning starts (10-150)
     # Phase 3: Small constant LR during pruning (150+)
 
-    PRUNING_LR = 1e-5  # Small LR for stable pruning fine-tuning
+    PRUNING_LR = 2e-4  # Higher LR for structured pruning recovery (was 1e-5, then 1e-4)
 
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer,
@@ -575,9 +608,10 @@ def main():
     )
 
     # Constant small LR during pruning for stability
+    # Cosine scheduler already brings LR down to PRUNING_LR, so just keep it constant
     constant_scheduler = optim.lr_scheduler.ConstantLR(
         optimizer,
-        factor=PRUNING_LR / LEARNING_RATE,  # Scale to get PRUNING_LR
+        factor=1.0,  # Keep LR constant at current value (PRUNING_LR from cosine)
         total_iters=EPOCHS - PRUNING_START_EPOCH
     )
 
@@ -591,15 +625,26 @@ def main():
     restart_epochs = []
 
     print(f"LR schedule:")
-    print(f"  Warmup: epochs 1-{WARMUP_EPOCHS} (3e-5 → 3e-4)")
-    print(f"  Cosine: epochs {WARMUP_EPOCHS+1}-{PRUNING_START_EPOCH} (3e-4 → {PRUNING_LR})")
-    print(f"  Pruning: epochs {PRUNING_START_EPOCH+1}-{EPOCHS} (constant {PRUNING_LR})")
+    print(f"  Warmup: epochs 1-{WARMUP_EPOCHS} ({LEARNING_RATE*0.1:.6f} -> {LEARNING_RATE:.6f})")
+    print(f"  Cosine: epochs {WARMUP_EPOCHS+1}-{PRUNING_START_EPOCH} ({LEARNING_RATE:.6f} -> {PRUNING_LR:.6f})")
+    print(f"  Pruning: epochs {PRUNING_START_EPOCH+1}-{EPOCHS} (constant {PRUNING_LR:.6f}, then {PRUNING_LR*0.5:.6f} after each prune)")
 
     # Initialize pruning state
     if ENABLE_PRUNING:
         pixel_error_history = deque(maxlen=PRUNING_PATIENCE)
         current_sparsity_target = INITIAL_TARGET_SPARSITY
         pruning_active = True
+        last_pruning_epoch = 0  # Track when we last pruned for LR decay
+        last_successful_prune_epoch = 0  # Track when pruning actually happened (not just LR boost)
+        lr_recovery_epochs = 50  # Decay boosted LR back over 50 epochs
+        stall_reset_interval = 50  # Reset LR if stuck for this many epochs
+
+        # Auto-finish when pruning hits limit
+        pruning_limit_reached = False
+        final_training_epochs_remaining = 200  # Train 200 more epochs after limit
+        final_training_best_val_error = float('inf')
+        final_training_best_model = None
+
         print(f"\nPruning Configuration:")
         print(f"  Enabled: True")
         print(f"  Start epoch: {PRUNING_START_EPOCH}")
@@ -607,6 +652,9 @@ def main():
         print(f"  Check interval: every {PRUNING_CHECK_INTERVAL} epochs")
         print(f"  Patience: {PRUNING_PATIENCE} epochs < {VALIDATION_PIXEL_THRESHOLD}px")
         print(f"  Prune amount per step: {PRUNE_AMOUNT_PER_STEP*100:.0f}%")
+        print(f"  LR after pruning: {PRUNING_LR * 0.5:.6f} (constant, no decay)")
+        print(f"  Stall recovery: Reset to {PRUNING_LR:.6f} if no pruning for {stall_reset_interval} epochs")
+        print(f"  Auto-finish: Train {final_training_epochs_remaining} epochs after pruning limit reached")
         print()
 
     # Training loop
@@ -615,6 +663,12 @@ def main():
     print()
     best_val_loss = float('inf')
     best_pixel_error = float('inf')
+
+    # Track best model in each 100-epoch interval
+    interval_best_error = float('inf')
+    interval_best_model_state = None
+    interval_best_epoch = 0
+    current_interval_start = 1
 
     training_history = []
 
@@ -639,17 +693,29 @@ def main():
         # Scheduler step (CosineAnnealingLR steps every epoch)
         scheduler.step()
 
+        # No LR decay after pruning - keep it constant at 1e-4
+        # (Following structured pruning papers: stable low LR prevents overshoot)
+
         epoch_time = time.time() - epoch_start
         current_lr = optimizer.param_groups[0]['lr']
 
         # Print summary
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
-            print(f"\nEpoch {epoch}/{EPOCHS} Summary:")
+            # Add final training countdown to summary
+            epoch_str = f"Epoch {epoch}/{EPOCHS}"
+            if ENABLE_PRUNING and pruning_limit_reached:
+                epoch_str += f" [Final Training: {final_training_epochs_remaining} epochs remaining]"
+
+            print(f"\n{epoch_str} Summary:")
             print(f"  Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px")
             print(f"  Val Loss: {val_loss:.4f} | Pixel Error: {val_pixel_err:.3f}px")
             print(f"  LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
         else:
-            print(f"\nEpoch {epoch}/{EPOCHS}: Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px | LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
+            epoch_str = f"Epoch {epoch}/{EPOCHS}"
+            if ENABLE_PRUNING and pruning_limit_reached:
+                epoch_str += f" [Final: {final_training_epochs_remaining} left]"
+
+            print(f"\n{epoch_str}: Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px | LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
 
         # TensorBoard logging
         if writer is not None:
@@ -666,7 +732,7 @@ def main():
                     writer.add_scalar('PixelError/val', val_pixel_err, epoch)
 
                 if ENABLE_PRUNING:
-                    sparsity = get_model_sparsity(model)
+                    sparsity = get_model_sparsity(model, original_param_count)
                     writer.add_scalar('Sparsity/global', sparsity, epoch)
 
             # Images (every N epochs)
@@ -697,41 +763,150 @@ def main():
             if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
                 pixel_error_history.append(val_pixel_err)
 
+            # Stall detection: Boost LR if pruning hasn't happened for too long
+            if epoch >= PRUNING_START_EPOCH and last_successful_prune_epoch > 0:
+                epochs_since_last_prune = epoch - last_successful_prune_epoch
+
+                if epochs_since_last_prune >= stall_reset_interval and epochs_since_last_prune % stall_reset_interval == 0:
+                    # Model is stuck - try modest LR increase to help escape
+                    # Not too high (avoids overshoot), just enough to explore
+                    boost_lr = PRUNING_LR  # Reset to 2e-4 (from 1e-4)
+                    current_lr = optimizer.param_groups[0]['lr']
+
+                    if abs(current_lr - boost_lr) > 1e-7:  # Only if different
+                        print(f"\n{'~'*60}")
+                        print(f"PRUNING STALLED - LR RESET")
+                        print(f"{'~'*60}")
+                        print(f"  No pruning for {epochs_since_last_prune} epochs")
+                        print(f"  Last prune: epoch {last_successful_prune_epoch}")
+                        print(f"  Current LR: {current_lr:.6f}")
+                        print(f"  Resetting LR to: {boost_lr:.6f}")
+                        print(f"  (Modest increase to help escape, but not overshoot)")
+                        print(f"{'~'*60}\n")
+
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = boost_lr
+
+                        # Track so we don't reset again immediately
+                        last_pruning_epoch = epoch
+
             # Check if ready to prune (only on validation epochs)
             if (epoch >= PRUNING_START_EPOCH and
                 epoch % PRUNING_CHECK_INTERVAL == 0 and
                 (epoch % VALIDATION_INTERVAL == 0 or epoch == 1)):
 
                 if check_pruning_readiness(pixel_error_history, VALIDATION_PIXEL_THRESHOLD):
-                    current_sparsity = get_model_sparsity(model)
+                    current_sparsity = get_model_sparsity(model, original_param_count)
 
                     # Check if we need more pruning
                     if current_sparsity < current_sparsity_target * 100:
                         print(f"\n{'='*60}")
-                        print(f"APPLYING PRUNING at Epoch {epoch}")
-                        print(f"  Current sparsity: {current_sparsity:.1f}%")
-                        print(f"  Target sparsity: {current_sparsity_target*100:.0f}%")
+                        print(f"APPLYING STRUCTURED PRUNING at Epoch {epoch}")
+                        print(f"  Current param reduction: {current_sparsity:.1f}%")
+                        print(f"  Target reduction: {current_sparsity_target*100:.0f}%")
 
-                        # Apply pruning
+                        # Apply structured pruning (actually removes filters)
+                        params_before_pruning = count_model_parameters(model)
                         model = apply_structured_pruning(model, PRUNE_AMOUNT_PER_STEP)
 
-                        new_sparsity = get_model_sparsity(model)
-                        remaining_params = count_model_parameters(model, only_nonzero=True)
+                        new_sparsity = get_model_sparsity(model, original_param_count)
+                        remaining_params = count_model_parameters(model)
+                        params_removed = params_before_pruning - remaining_params
 
-                        print(f"  New sparsity: {new_sparsity:.1f}%")
-                        print(f"  Remaining params: {remaining_params:,}")
-                        print(f"{'='*60}\n")
+                        print(f"  New param reduction: {new_sparsity:.1f}%")
+                        print(f"  Remaining params: {remaining_params:,} (was {original_param_count:,})")
+                        print(f"  Params removed this step: {params_removed:,}")
+                        print(f"  Model is now {(1 - new_sparsity/100):.1%} of original size")
 
-                        # Reset history after pruning to allow recovery
-                        pixel_error_history.clear()
+                        # Check if pruning actually removed parameters
+                        # If no params removed, pruning can't go further (no more channels to remove)
+                        if params_removed < 10:  # Essentially no change (< 10 params)
+                            print(f"\n{'!'*60}")
+                            print(f"PRUNING LIMIT REACHED!")
+                            print(f"{'!'*60}")
+                            print(f"  Cannot prune further (no more channels can be removed)")
+                            print(f"  Current params: {remaining_params:,}")
+                            print(f"  Param reduction: {new_sparsity:.2f}%")
+                            print(f"\n  Switching to final training phase:")
+                            print(f"  - Training for {final_training_epochs_remaining} more epochs")
+                            print(f"  - Will save best model from this phase")
+                            print(f"  - Then export ONNX and complete")
+                            print(f"{'!'*60}\n")
+
+                            pruning_limit_reached = True
+                            pruning_active = False  # Disable further pruning attempts
+
+                        else:
+                            # CRITICAL: LOWER LR after pruning (following structured pruning papers)
+                            # Papers (ThiNet, Network Slimming): Use low stable LR for fine-tuning
+                            # This prevents overshoot: model briefly hits 0.5px, then overshoots to 1.5px
+                            # Low LR = slower recovery but locks in the good solution
+                            recovery_lr = PRUNING_LR * 0.5  # 1e-4 (half of 2e-4 min)
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = recovery_lr
+                            print(f"  LR lowered to {recovery_lr:.6f} for stable fine-tuning")
+                            print(f"  (Prevents overshoot: keeps model at optimal 0.5-1.0px instead of settling at 1.5px)")
+                            print(f"{'='*60}\n")
+
+                            # Track pruning epoch (no decay needed with constant low LR)
+                            last_pruning_epoch = epoch
+                            last_successful_prune_epoch = epoch  # Track actual pruning (not just LR boost)
+
+                            # Reset history after pruning to allow recovery
+                            pixel_error_history.clear()
 
                     # If reached target and still capable, increase target
                     elif current_sparsity >= current_sparsity_target * 100:
-                        print(f"\n  ✓ Reached {current_sparsity_target*100:.0f}% sparsity target!")
+                        print(f"\n  [OK] Reached {current_sparsity_target*100:.0f}% sparsity target!")
                         print(f"  Validation px_error has been < {VALIDATION_PIXEL_THRESHOLD} for {PRUNING_PATIENCE} epochs")
                         print(f"  Increasing target by {SPARSITY_INCREMENT*100:.0f}%")
                         current_sparsity_target += SPARSITY_INCREMENT
                         print(f"  New target: {current_sparsity_target*100:.0f}% sparsity\n")
+
+                        # This is progress, update tracking
+                        last_successful_prune_epoch = epoch
+
+        # Final training phase tracking (after pruning limit reached)
+        if ENABLE_PRUNING and pruning_limit_reached:
+            # Track best model during final training
+            if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+                if val_pixel_err < final_training_best_val_error:
+                    final_training_best_val_error = val_pixel_err
+                    final_training_best_model = {
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'train_loss': train_loss,
+                        'train_pixel_error': train_pixel_err,
+                        'val_loss': val_loss,
+                        'val_pixel_error': val_pixel_err,
+                    }
+                    print(f"  [OK] New best final model: {val_pixel_err:.4f}px (epoch {epoch})")
+
+            # Countdown
+            final_training_epochs_remaining -= 1
+
+            if final_training_epochs_remaining <= 0:
+                print(f"\n{'='*60}")
+                print(f"FINAL TRAINING COMPLETE!")
+                print(f"{'='*60}")
+                print(f"  Best final model: epoch {final_training_best_model['epoch']}")
+                print(f"  Validation error: {final_training_best_val_error:.4f}px")
+                print(f"  Saving best final model and exporting ONNX...")
+
+                # Save best final model
+                final_model_path = output_dir / 'final_pruned_model.pth'
+                torch.save(final_training_best_model, final_model_path)
+                print(f"  Saved to: {final_model_path}")
+
+                # Load best model for ONNX export
+                model.load_state_dict(final_training_best_model['model_state_dict'])
+                print(f"  Loaded best model for export")
+                print(f"{'='*60}\n")
+
+                # Break out of training loop to export ONNX
+                break
 
         # Save history
         history_entry = {
@@ -740,7 +915,7 @@ def main():
             'train_pixel_error': train_pixel_err,
             'learning_rate': current_lr,
             'time': epoch_time,
-            'sparsity': get_model_sparsity(model) if ENABLE_PRUNING else 0.0
+            'sparsity': get_model_sparsity(model, original_param_count) if ENABLE_PRUNING else 0.0
         }
 
         # Only include validation metrics when we actually validated
@@ -750,26 +925,49 @@ def main():
 
         training_history.append(history_entry)
 
-        # Save checkpoint at regular intervals OR before LR restarts
+        # Track best model within current 100-epoch interval
+        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+            if val_pixel_err < interval_best_error:
+                interval_best_error = val_pixel_err
+                interval_best_model_state = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'train_loss': train_loss,
+                    'train_pixel_error': train_pixel_err,
+                    'val_loss': val_loss,
+                    'val_pixel_error': val_pixel_err,
+                }
+                interval_best_epoch = epoch
+
+        # Save best model from interval at interval boundaries
         is_restart_epoch = epoch in restart_epochs
         if (epoch % SAVE_INTERVAL == 0) or (epoch == EPOCHS) or is_restart_epoch:
-            checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pth'
-            checkpoint_data = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': train_loss,
-                'train_pixel_error': train_pixel_err,
-            }
-            # Only include validation metrics if we actually validated this epoch
-            if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
-                checkpoint_data['val_loss'] = val_loss
-                checkpoint_data['val_pixel_error'] = val_pixel_err
-            torch.save(checkpoint_data, checkpoint_path)
-            if is_restart_epoch:
-                print(f"  🔄 Checkpoint saved before LR restart: {checkpoint_path}")
+            if interval_best_model_state is not None:
+                # Save best from this interval
+                checkpoint_path = output_dir / f'checkpoint_epoch_{interval_best_epoch}.pth'
+                torch.save(interval_best_model_state, checkpoint_path)
+                print(f"  Checkpoint saved: {checkpoint_path}")
+                print(f"    Epoch {interval_best_epoch} with {interval_best_error:.3f}px")
+
+                # Reset interval tracking for next 100 epochs
+                current_interval_start = epoch + 1
+                interval_best_error = float('inf')
+                interval_best_model_state = None
+                interval_best_epoch = 0
             else:
+                # Fallback: save current if no validation happened yet
+                checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pth'
+                checkpoint_data = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'train_loss': train_loss,
+                    'train_pixel_error': train_pixel_err,
+                }
+                torch.save(checkpoint_data, checkpoint_path)
                 print(f"  Checkpoint saved: {checkpoint_path}")
 
         # Save best model (only on validation epochs)
@@ -778,13 +976,13 @@ def main():
                 best_val_loss = val_loss
                 best_path = output_dir / 'best_model.pth'
                 torch.save(model.state_dict(), best_path)
-                print(f"  ★ New best validation loss! Saved to: {best_path}")
+                print(f"  * New best validation loss! Saved to: {best_path}")
 
             if val_pixel_err < best_pixel_error:
                 best_pixel_error = val_pixel_err
                 best_pixel_path = output_dir / 'best_pixel_error.pth'
                 torch.save(model.state_dict(), best_pixel_path)
-                print(f"  ★ New best pixel error! Saved to: {best_pixel_path}")
+                print(f"  * New best pixel error! Saved to: {best_pixel_path}")
 
     # Save training history
     with open(output_dir / 'training_history.json', 'w') as f:
@@ -795,18 +993,72 @@ def main():
         writer.close()
         print(f"\nTensorBoard logs saved to: {tensorboard_dir}")
 
+    # Export to ONNX (for pruned models, export while model is in memory)
+    print("\n" + "=" * 60)
+    print("EXPORTING TO ONNX")
+    print("=" * 60)
+    try:
+        onnx_path = output_dir / f"{run_name}.onnx"
+        dummy_input = torch.randn(1, 3, CROP_SIZE, CROP_SIZE).to(device)
+
+        print(f"Exporting model to: {onnx_path}")
+        print(f"  Input shape: (1, 3, {CROP_SIZE}, {CROP_SIZE})")
+        print(f"  Output shape: (1, 2)")
+
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            export_params=True,
+            opset_version=14,  # DirectML compatible
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+        )
+
+        # Verify ONNX model
+        import onnx
+        onnx_model = onnx.load(str(onnx_path))
+        onnx.checker.check_model(onnx_model)
+
+        model_size_mb = onnx_path.stat().st_size / (1024 * 1024)
+        print(f"  ONNX model exported successfully!")
+        print(f"  Model size: {model_size_mb:.2f} MB")
+
+    except Exception as e:
+        print(f"  [ERROR] ONNX export failed: {e}")
+        print(f"  (This is OK - you can export manually later)")
+
     # Training complete
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE!")
     print("=" * 60)
     print(f"Run: {run_name}")
-    print(f"Best validation loss: {best_val_loss:.4f}")
-    print(f"Best pixel error: {best_pixel_error:.3f}px")
+
+    # Show final pruned model info if applicable
+    if ENABLE_PRUNING and pruning_limit_reached and final_training_best_model is not None:
+        print(f"\nFinal Pruned Model (auto-finished after pruning limit):")
+        print(f"  Epoch: {final_training_best_model['epoch']}")
+        print(f"  Validation error: {final_training_best_val_error:.4f}px")
+        print(f"  Parameters: {count_model_parameters(model):,}")
+        print(f"  Reduction: {get_model_sparsity(model, original_param_count):.2f}%")
+        print(f"  Saved as: final_pruned_model.pth")
+    else:
+        print(f"Best validation loss: {best_val_loss:.4f}")
+        print(f"Best pixel error: {best_pixel_error:.3f}px")
+
     print()
     print(f"Run directory: {output_dir}")
     print(f"  ├── best_model.pth")
     print(f"  ├── best_pixel_error.pth")
+    if ENABLE_PRUNING and pruning_limit_reached:
+        print(f"  ├── final_pruned_model.pth  ← Best from final training")
     print(f"  ├── checkpoint_epoch_*.pth")
+    print(f"  ├── {run_name}.onnx  ← ONNX export")
     print(f"  ├── config.json")
     print(f"  └── training_history.json")
     print()

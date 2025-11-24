@@ -2,16 +2,169 @@
 Export Trained PyTorch Model to ONNX Format
 
 Converts the trained BallDetectorCNN or MobileNetV3 to ONNX for deployment with ONNX Runtime + DirectML.
+
+For STRUCTURED PRUNED models (torch_pruning), this script dynamically reconstructs
+the pruned architecture from the checkpoint's layer shapes.
 """
 
 import argparse
 import torch
+import torch.nn as nn
 import onnx
 import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
 from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3
+
+
+def is_structurally_pruned(state_dict, use_mobilenet=True):
+    """Check if model has been structurally pruned by comparing first layer shape."""
+    if use_mobilenet:
+        expected_shape = (16, 3, 3, 3)  # MobileNetV3 first conv
+        actual_shape = state_dict['features.0.0.weight'].shape
+    else:
+        expected_shape = (16, 3, 3, 3)  # Custom CNN first conv
+        actual_shape = state_dict['conv1.weight'].shape
+
+    return tuple(actual_shape) != expected_shape
+
+
+def build_pruned_mobilenetv3_from_state_dict(state_dict):
+    """
+    Reconstruct a pruned MobileNetV3 model by using torch_pruning to re-prune.
+
+    Since we can't infer the exact architecture, we'll:
+    1. Load an unpruned model
+    2. Progressively prune it until parameter count matches
+    3. Load the state dict
+    """
+    print("  Reconstructing pruned model using iterative pruning...")
+
+    # Count parameters in the pruned state dict (exclude buffers like running_mean/running_var)
+    target_params = sum(v.numel() for k, v in state_dict.items()
+                       if not any(x in k for x in ['running_mean', 'running_var', 'num_batches_tracked']))
+
+    print(f"    Target parameters: {target_params:,}")
+
+    # Load unpruned model
+    from ..core.model import BallDetectorMobileNetV3
+    model = BallDetectorMobileNetV3(pretrained=False)
+
+    original_params = sum(p.numel() for p in model.parameters())
+    print(f"    Original parameters: {original_params:,}")
+
+    # Apply iterative pruning until we match target
+    import torch_pruning as tp
+
+    prune_ratio_needed = 1.0 - (target_params / original_params)
+    print(f"    Need to prune: {prune_ratio_needed*100:.1f}%")
+
+    # Prune in steps
+    current_params = original_params
+    step = 0
+
+    while current_params > target_params * 1.01:  # Allow 1% tolerance
+        step += 1
+
+        # Calculate prune amount for this step
+        remaining_to_prune = current_params - target_params
+        prune_this_step = min(0.1, remaining_to_prune / current_params)  # Max 10% per step
+
+        if prune_this_step < 0.01:  # Less than 1%, do final prune
+            prune_this_step = remaining_to_prune / current_params
+
+        print(f"    Step {step}: Pruning {prune_this_step*100:.1f}%...")
+
+        # Apply pruning
+        imp = tp.importance.MagnitudeImportance(p=1)
+        ignored_layers = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and module.out_features == 2:
+                ignored_layers.append(module)
+
+        try:
+            pruner = tp.pruner.MagnitudePruner(
+                model,
+                example_inputs=torch.randn(1, 3, 128, 128),
+                importance=imp,
+                iterative_steps=1,
+                pruning_ratio=prune_this_step,
+                ignored_layers=ignored_layers,
+            )
+            pruner.step()
+        except Exception as e:
+            print(f"    [WARNING] Pruning failed: {e}")
+            print(f"    Achieved {current_params:,} params (target: {target_params:,})")
+            break
+
+        # Reset BatchNorm stats
+        for module in model.modules():
+            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                module.reset_running_stats()
+
+        current_params = sum(p.numel() for p in model.parameters())
+        print(f"      -> {current_params:,} params")
+
+        if step > 50:  # Safety limit
+            print(f"    [WARNING] Reached step limit")
+            break
+
+    print(f"    [OK] Pruned to {current_params:,} params (target: {target_params:,})")
+
+    # Now load the state dict
+    try:
+        model.load_state_dict(state_dict, strict=False)
+        print(f"    [OK] State dict loaded")
+        return model
+    except Exception as e:
+        print(f"    [ERROR] Failed to load state dict: {e}")
+        return None
+
+
+def export_pruned_model_via_scripting(state_dict, output_path, crop_size, device):
+    """
+    Export a structurally pruned model by reconstructing from state dict.
+    """
+    print("\n" + "!" * 60)
+    print("STRUCTURED PRUNING DETECTED")
+    print("!" * 60)
+    print("\nReconstructing pruned model architecture from state dict...")
+
+    # Build a model that matches the pruned architecture
+    model = build_pruned_mobilenetv3_from_state_dict(state_dict)
+
+    if model is None:
+        print("\n[WARNING] Automatic reconstruction not yet implemented.")
+        print("The model architecture is too complex to infer from state dict alone.")
+        print()
+        print("SOLUTION: Check if ONNX was already exported during training.")
+        print("The train.py script automatically exports ONNX at the end (line 1073).")
+        print()
+        print("If training completed, check the model directory for .onnx file.")
+        print("If not exported, the training may have been interrupted.")
+        print()
+        raise RuntimeError("Cannot export structurally pruned models from checkpoint alone")
+
+    # Load the state dict
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    model.to(device)
+
+    print(f"  [OK] Pruned model reconstructed ({model.count_parameters():,} parameters)")
+
+    # Export to ONNX
+    dummy_input = torch.randn(1, 3, crop_size, crop_size, device=device)
+    torch.onnx.export(
+        model, dummy_input, output_path,
+        opset_version=14,
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+    )
+
+    print(f"  [OK] ONNX exported to: {output_path}")
+    return output_path
 
 
 def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet=True, opset_version=14):
@@ -40,21 +193,34 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet
         print("Architecture: BallDetectorCNN")
         model = BallDetectorCNN()
 
-    state_dict = torch.load(pytorch_model_path, map_location=device)
+    checkpoint = torch.load(pytorch_model_path, map_location=device)
 
     # Handle checkpoint vs direct state_dict
-    if 'model_state_dict' in state_dict:
-        state_dict = state_dict['model_state_dict']
-        print(f"  Loaded from checkpoint (epoch {state_dict.get('epoch', 'unknown')})")
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+        epoch = checkpoint.get('epoch', 'unknown')
+        val_error = checkpoint.get('val_pixel_error', 'unknown')
+        print(f"  Loaded checkpoint from epoch {epoch}")
+        print(f"  Validation error: {val_error}")
+    else:
+        state_dict = checkpoint
+        epoch = 'unknown'
+        val_error = 'unknown'
+
+    # Check for STRUCTURED pruning (torch_pruning) - layer dimensions changed
+    if is_structurally_pruned(state_dict, use_mobilenet):
+        onnx_path = export_pruned_model_via_scripting(state_dict, output_path, crop_size, device)
+        return onnx_path  # Return the exported path
 
     # Remove _orig_mod. prefix from torch.compile
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         print("  Removing torch.compile wrapper (_orig_mod. prefix)...")
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-    # Handle pruned models (weight_orig + weight_mask → weight)
+    # Handle UNSTRUCTURED pruned models (weight_orig + weight_mask → weight)
+    # This is old-style pruning that doesn't change architecture
     if any(k.endswith('_orig') for k in state_dict.keys()):
-        print("  Detected pruned model - making pruning permanent...")
+        print("  Detected unstructured pruned model - making pruning permanent...")
         new_state_dict = {}
 
         # Find all pruned parameters
@@ -84,10 +250,10 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet
                 new_state_dict[key] = value
 
         state_dict = new_state_dict
-        print("  ✓ Pruning made permanent")
+        print("  [OK] Unstructured pruning made permanent")
 
     model.load_state_dict(state_dict)
-    print("  ✓ Model weights loaded successfully")
+    print("  [OK] Model weights loaded successfully")
 
     model.eval()
     model.to(device)

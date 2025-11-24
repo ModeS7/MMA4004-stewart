@@ -98,25 +98,32 @@ class BallDetectionDataset(Dataset):
 
         print(f"Loaded {len(self.samples)} samples from {data_dir}")
 
-        # Setup augmentation pipeline
-        self.transform = self._get_transforms()
+        # Setup augmentation pipelines (separate for spatial and appearance)
+        self.spatial_transform = self._get_spatial_transforms()
+        self.appearance_transform = self._get_appearance_transforms()
 
-    def _get_transforms(self):
-        """Create augmentation pipeline with two-tier control."""
+    def _get_spatial_transforms(self):
+        """Create spatial augmentation pipeline (applied to FULL image before cropping).
+
+        For validation: Will use seeded randomness (deterministic per sample)
+        For training: Uses normal randomness (different every epoch)
+        """
+        # Spatial augmentations: shift, scale, rotate
+        # Applied to full image, then we crop centered on augmented ball position
+        # Using BORDER_CONSTANT (black padding) is acceptable
+        return A.Compose([
+            A.ShiftScaleRotate(
+                shift_limit=0.1,  # ±10% = ~±64px on 640px image
+                scale_limit=0.1,     # ±10% scale
+                rotate_limit=180,    # Full 360° rotation (±180 covers all angles)
+                p=1.0,
+                border_mode=cv2.BORDER_CONSTANT  # Black padding (default)
+            ),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def _get_appearance_transforms(self):
+        """Create appearance augmentation pipeline (applied to crop after spatial aug)."""
         transforms_list = []
-
-        # Spatial augmentations (offset, rotate, scale, shift)
-        if self.use_spatial_aug:
-            transforms_list.extend([
-                A.Rotate(limit=15, p=0.5, border_mode=cv2.BORDER_CONSTANT),
-                A.ShiftScaleRotate(
-                    shift_limit=0.0625,
-                    scale_limit=0.1,
-                    rotate_limit=0,
-                    p=0.5,
-                    border_mode=cv2.BORDER_CONSTANT
-                ),
-            ])
 
         # Appearance augmentations (brightness, hue, blur, noise)
         if self.use_appearance_aug:
@@ -175,9 +182,11 @@ class BallDetectionDataset(Dataset):
                         p=1.0
                     ),
                     A.Downscale(
-                        scale_min=0.75,
-                        scale_max=0.95,
-                        interpolation=cv2.INTER_LINEAR,
+                        scale_range=(0.75, 0.95),
+                        interpolation_pair={
+                            'downscale': cv2.INTER_LINEAR,
+                            'upscale': cv2.INTER_LINEAR
+                        },
                         p=1.0
                     ),
                 ], p=0.4),  # 40% chance of ONE heavy augmentation
@@ -188,9 +197,9 @@ class BallDetectionDataset(Dataset):
                     A.MedianBlur(blur_limit=3, p=1.0),
                 ], p=0.3),
                 # Mild noise (always available)
-                A.GaussNoise(var_limit=(10.0, 20.0), p=0.3),
+                A.GaussNoise(std_range=(10.0/255, 20.0/255), p=0.3),
                 # Mild quality degradation
-                A.ImageCompression(quality_lower=70, quality_upper=100, p=0.2),
+                A.ImageCompression(quality_range=(70, 100), p=0.2),
             ])
 
         # Normalize and convert to tensor (skip normalize if using GPU augmentations)
@@ -204,94 +213,144 @@ class BallDetectionDataset(Dataset):
 
         transforms_list.append(ToTensorV2())
 
-        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+        # No keypoints needed for appearance transforms (ball position already set)
+        return A.Compose(transforms_list)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         """
-        Get training sample.
+        Get training sample with NEW two-stage augmentation pipeline:
+        1. Apply spatial augmentations to FULL image (shift/scale/rotate)
+        2. Crop centered on augmented ball position (no padding)
+        3. Apply appearance augmentations to crop
 
         Returns:
             image: Tensor of shape (3, H, W)
-            target: Tensor of shape (3,) containing (x_norm, y_norm, confidence=1.0)
+            target: Tensor of shape (2,) containing (x_norm, y_norm)
         """
         img_path, label = self.samples[idx]
 
-        # Load image with optimized flags for WSL2
+        # Load image
         image = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Failed to load image: {img_path}")
-
-        # Use faster color conversion
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         height, width = image.shape[:2]
 
-        # Get ball center coordinates (extract once)
+        # Original ball coordinates
         ball_x = label['x']
         ball_y = label['y']
 
-        # Add random offset during training for robustness (simulates CV detection error)
-        if self.use_spatial_aug:
-            max_offset = int(self.crop_size * 0.2)
-            offset_x = np.random.randint(-max_offset, max_offset + 1)
-            offset_y = np.random.randint(-max_offset, max_offset + 1)
+        # STAGE 1: Apply spatial augmentations to FULL image
+        # For validation: seed randomness for deterministic augmentation
+        # For training: use natural randomness (different every epoch)
+        if not self.use_spatial_aug:
+            # Validation: seed based on sample index for deterministic augmentation
+            seed_val = int(idx)  # Convert to Python int (idx might be numpy int64)
+            np.random.seed(seed_val)
+            # Also seed albumentations random state
+            import random
+            random.seed(seed_val)
+
+        spatial_transformed = self.spatial_transform(image=image, keypoints=[(ball_x, ball_y)])
+
+        # Reset random state for training (validation seed is only for this sample)
+        if not self.use_spatial_aug:
+            np.random.seed(None)
+            import random
+            random.seed(None)
+        augmented_image = spatial_transformed['image']
+        aug_height, aug_width = augmented_image.shape[:2]
+
+        # Get augmented ball coordinates
+        if len(spatial_transformed['keypoints']) > 0:
+            aug_ball_x, aug_ball_y = spatial_transformed['keypoints'][0]
         else:
-            offset_x = 0
-            offset_y = 0
+            # Keypoint went out of bounds - fall back to image center
+            aug_ball_x, aug_ball_y = aug_width / 2, aug_height / 2
 
-        # Calculate crop bounds (centered on ball + offset)
-        crop_center_x = int(ball_x + offset_x)
-        crop_center_y = int(ball_y + offset_y)
-
+        # STAGE 2: Crop with random offset from augmented ball position
+        # Add random offset to create ball position variation in the crop
         half_crop = self.crop_size // 2
-        x1 = crop_center_x - half_crop
-        y1 = crop_center_y - half_crop
+
+        # Both training and validation use random offset for ball position variation
+        max_offset = int(self.crop_size * 0.2)  # ±20% = ±25.6 pixels
+
+        if not self.use_spatial_aug:
+            # Validation: use seeded randomness (deterministic)
+            np.random.seed(int(idx) + 1000)  # Different seed than spatial aug
+
+        offset_x = np.random.randint(-max_offset, max_offset + 1)
+        offset_y = np.random.randint(-max_offset, max_offset + 1)
+
+        if not self.use_spatial_aug:
+            # Reset seed
+            np.random.seed(None)
+
+        x1 = int(aug_ball_x) - half_crop + offset_x
+        y1 = int(aug_ball_y) - half_crop + offset_y
         x2 = x1 + self.crop_size
         y2 = y1 + self.crop_size
 
-        # Handle boundary conditions with padding
-        pad_left = max(0, -x1)
-        pad_top = max(0, -y1)
-        pad_right = max(0, x2 - width)
-        pad_bottom = max(0, y2 - height)
+        # Calculate ball position relative to crop (before any clamping)
+        ball_x_in_crop = aug_ball_x - x1
+        ball_y_in_crop = aug_ball_y - y1
 
-        # Adjust crop bounds to valid image region
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(width, x2)
-        y2 = min(height, y2)
+        # Extract crop, handling out-of-bounds cases
+        # Calculate what part of the desired crop is within the image
+        crop_in_img_y1 = max(0, y1)
+        crop_in_img_x1 = max(0, x1)
+        crop_in_img_y2 = min(aug_height, y2)
+        crop_in_img_x2 = min(aug_width, x2)
 
-        # Extract crop
-        crop = image[y1:y2, x1:x2]
-
-        # Apply padding if needed
-        if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
-            crop = cv2.copyMakeBorder(
-                crop,
-                pad_top, pad_bottom, pad_left, pad_right,
-                cv2.BORDER_REFLECT_101
-            )
-
-        # Calculate ball position relative to crop
-        ball_x_in_crop = ball_x - (crop_center_x - half_crop)
-        ball_y_in_crop = ball_y - (crop_center_y - half_crop)
-
-        # Apply transforms (augmentations only, NO resize)
-        transformed = self.transform(image=crop, keypoints=[(ball_x_in_crop, ball_y_in_crop)])
-        image_tensor = transformed['image']
-
-        # Get transformed keypoint (stays in crop_size coordinates)
-        if len(transformed['keypoints']) > 0:
-            x_transformed, y_transformed = transformed['keypoints'][0]
+        # Handle case where crop is completely outside the image
+        if crop_in_img_y2 <= crop_in_img_y1 or crop_in_img_x2 <= crop_in_img_x1:
+            # Entire crop is outside image - create black crop
+            crop = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
         else:
-            # Keypoint went out of bounds after augmentation
-            x_transformed, y_transformed = self.crop_size / 2, self.crop_size / 2
+            # Extract the visible part
+            crop = augmented_image[crop_in_img_y1:crop_in_img_y2, crop_in_img_x1:crop_in_img_x2]
+
+            # Calculate padding needed
+            pad_top = max(0, -y1)
+            pad_bottom = max(0, y2 - aug_height)
+            pad_left = max(0, -x1)
+            pad_right = max(0, x2 - aug_width)
+
+            # Apply padding
+            if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+                crop = cv2.copyMakeBorder(
+                    crop, pad_top, pad_bottom, pad_left, pad_right,
+                    cv2.BORDER_CONSTANT, value=0  # Black padding
+                )
+
+        # Final safety check - ensure exactly crop_size
+        assert crop.shape[0] == self.crop_size and crop.shape[1] == self.crop_size, \
+            f"Crop size error: got {crop.shape}, expected ({self.crop_size}, {self.crop_size}). " \
+            f"y1={y1}, y2={y2}, x1={x1}, x2={x2}, aug_size=({aug_height}, {aug_width})"
+
+        # STAGE 3: Apply appearance augmentations to crop
+        # For validation: seed for deterministic augmentation
+        if not self.use_spatial_aug:
+            seed_val = int(idx) + 2000  # Different seed than spatial/crop
+            np.random.seed(seed_val)
+            import random
+            random.seed(seed_val)
+
+        appearance_transformed = self.appearance_transform(image=crop)
+        image_tensor = appearance_transformed['image']
+
+        # Reset seed
+        if not self.use_spatial_aug:
+            np.random.seed(None)
+            import random
+            random.seed(None)
 
         # Normalize coordinates to [0, 1] relative to crop_size
-        x_norm = np.clip(x_transformed / self.crop_size, 0.0, 1.0)
-        y_norm = np.clip(y_transformed / self.crop_size, 0.0, 1.0)
+        x_norm = np.clip(ball_x_in_crop / self.crop_size, 0.0, 1.0)
+        y_norm = np.clip(ball_y_in_crop / self.crop_size, 0.0, 1.0)
 
         # Create target tensor: (x_norm, y_norm)
         target = torch.tensor([x_norm, y_norm], dtype=torch.float32)
