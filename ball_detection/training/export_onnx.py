@@ -15,14 +15,17 @@ import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
-from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3
+from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2
 
 
-def is_structurally_pruned(state_dict, use_mobilenet=True):
+def is_structurally_pruned(state_dict, model_type='mobilenet'):
     """Check if model has been structurally pruned by comparing first layer shape."""
-    if use_mobilenet:
+    if model_type == 'mobilenet':
         expected_shape = (16, 3, 3, 3)  # MobileNetV3 first conv
         actual_shape = state_dict['features.0.0.weight'].shape
+    elif model_type == 'shufflenet':
+        expected_shape = (24, 3, 3, 3)  # ShuffleNetV2 x0.5 first conv
+        actual_shape = state_dict['conv1.0.weight'].shape
     else:
         expected_shape = (16, 3, 3, 3)  # Custom CNN first conv
         actual_shape = state_dict['conv1.weight'].shape
@@ -167,7 +170,7 @@ def export_pruned_model_via_scripting(state_dict, output_path, crop_size, device
     return output_path
 
 
-def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet=True, opset_version=14):
+def export_to_onnx(pytorch_model_path, output_path, crop_size=128, model_type='mobilenet', opset_version=14):
     """
     Export PyTorch model to ONNX format.
 
@@ -175,7 +178,7 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet
         pytorch_model_path: Path to trained PyTorch model (.pth)
         output_path: Output path for ONNX model (.onnx)
         crop_size: Input crop size (128x128)
-        use_mobilenet: Whether to use MobileNetV3 architecture
+        model_type: Model architecture ('mobilenet', 'shufflenet', or 'custom')
         opset_version: ONNX opset version (14 recommended for DirectML)
     """
     device = torch.device('cpu')  # Export on CPU for compatibility
@@ -186,7 +189,10 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet
     print("=" * 60)
     print(f"Loading PyTorch model from: {pytorch_model_path}")
 
-    if use_mobilenet:
+    if model_type == 'shufflenet':
+        print("Architecture: ShuffleNetV2 x0.5")
+        model = BallDetectorShuffleNetV2(pretrained=False)
+    elif model_type == 'mobilenet':
         print("Architecture: MobileNetV3-Small")
         model = BallDetectorMobileNetV3(pretrained=False)
     else:
@@ -208,7 +214,7 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, use_mobilenet
         val_error = 'unknown'
 
     # Check for STRUCTURED pruning (torch_pruning) - layer dimensions changed
-    if is_structurally_pruned(state_dict, use_mobilenet):
+    if is_structurally_pruned(state_dict, model_type):
         onnx_path = export_pruned_model_via_scripting(state_dict, output_path, crop_size, device)
         return onnx_path  # Return the exported path
 
@@ -379,8 +385,9 @@ def main():
                         help='Output path for ONNX model (.onnx)')
     parser.add_argument('--crop-size', type=int, default=128,
                         help='Input crop size (default: 128)')
-    parser.add_argument('--use-custom-cnn', action='store_true',
-                        help='Use custom BallDetectorCNN instead of MobileNetV3')
+    parser.add_argument('--model-type', type=str, default='mobilenet',
+                        choices=['mobilenet', 'shufflenet', 'custom'],
+                        help='Model architecture (default: mobilenet)')
     parser.add_argument('--opset', type=int, default=14,
                         help='ONNX opset version')
     parser.add_argument('--test', action='store_true',
@@ -400,7 +407,7 @@ def main():
         pytorch_model_path=args.model,
         output_path=args.output,
         crop_size=args.crop_size,
-        use_mobilenet=not args.use_custom_cnn,
+        model_type=args.model_type,
         opset_version=args.opset
     )
 

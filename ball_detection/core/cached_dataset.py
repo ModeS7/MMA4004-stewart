@@ -93,12 +93,12 @@ class CachedAugmentationDataset(Dataset):
         # Load all raw images into RAM
         print(f"  Loading images into RAM...")
         self.raw_images = self._load_all_images()
-        print(f"  ✓ All images loaded ({len(self.raw_images)} images)")
+        print(f"  [OK] All images loaded ({len(self.raw_images)} images)")
 
         # Build initial cache
         print(f"  Building augmentation cache...")
         self.cache = self._build_initial_cache()
-        print(f"  ✓ Cache built ({len(self.cache)} items)")
+        print(f"  [OK] Cache built ({len(self.cache)} items)")
 
         # Calculate memory usage
         if self.cache:
@@ -111,7 +111,7 @@ class CachedAugmentationDataset(Dataset):
         self.stop_refresh = threading.Event()
         if enable_refresh:
             self._start_refresh_thread()
-            print(f"  ✓ Background refresh enabled")
+            print(f"  [OK] Background refresh enabled")
 
         print()
 
@@ -144,15 +144,22 @@ class CachedAugmentationDataset(Dataset):
                     A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), angle_range=(0, 1), num_flare_circles_range=(3, 6), src_radius=100, p=1.0),
                     A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
                     A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.2), p=1.0),
-                    A.Downscale(scale_min=0.75, scale_max=0.95, interpolation=cv2.INTER_LINEAR, p=1.0),
+                    A.Downscale(
+                        scale_range=(0.75, 0.95),
+                        interpolation_pair={
+                            'downscale': cv2.INTER_LINEAR,
+                            'upscale': cv2.INTER_LINEAR
+                        },
+                        p=1.0
+                    ),
                 ], p=0.4),
                 A.OneOf([
                     A.GaussianBlur(blur_limit=(3, 5), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                     A.MedianBlur(blur_limit=3, p=1.0),
                 ], p=0.3),
-                A.GaussNoise(var_limit=(10.0, 20.0), p=0.3),
-                A.ImageCompression(quality_lower=70, quality_upper=100, p=0.2),
+                A.GaussNoise(std_range=(10.0/255, 20.0/255), p=0.3),
+                A.ImageCompression(quality_range=(70, 100), p=0.2),
             ])
 
         # Normalize and convert to tensor
@@ -173,46 +180,27 @@ class CachedAugmentationDataset(Dataset):
                 raise ValueError(f"Failed to load image: {img_path}")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            # Pre-crop image (same logic as regular dataset)
+            # Pre-crop image (centered on ball, no padding)
             ball_x, ball_y = label['x'], label['y']
+            width, height = image.shape[1], image.shape[0]
 
-            # Calculate crop bounds (centered on ball)
-            crop_center_x = int(ball_x)
-            crop_center_y = int(ball_y)
-
+            # Center crop on ball, ensuring it fits within image bounds (no padding)
             half_crop = self.crop_size // 2
-            x1 = crop_center_x - half_crop
-            y1 = crop_center_y - half_crop
+            x1 = max(0, min(int(ball_x) - half_crop, width - self.crop_size))
+            y1 = max(0, min(int(ball_y) - half_crop, height - self.crop_size))
             x2 = x1 + self.crop_size
             y2 = y1 + self.crop_size
 
-            # Handle boundary conditions with padding
-            width, height = image.shape[1], image.shape[0]
-            pad_left = max(0, -x1)
-            pad_top = max(0, -y1)
-            pad_right = max(0, x2 - width)
-            pad_bottom = max(0, y2 - height)
-
-            # Adjust crop bounds to valid image region
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(width, x2)
-            y2 = min(height, y2)
-
-            # Extract crop
+            # Extract crop (no clamping - ranges calculated to fit)
             crop = image[y1:y2, x1:x2]
 
-            # Apply padding if needed
-            if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
-                crop = cv2.copyMakeBorder(
-                    crop,
-                    pad_top, pad_bottom, pad_left, pad_right,
-                    cv2.BORDER_REFLECT_101
-                )
+            # Sanity check
+            assert crop.shape[0] == self.crop_size and crop.shape[1] == self.crop_size, \
+                f"Crop size mismatch: got {crop.shape}, expected ({self.crop_size}, {self.crop_size})"
 
             # Calculate ball position relative to crop (normalized)
-            ball_x_in_crop = ball_x - (crop_center_x - half_crop)
-            ball_y_in_crop = ball_y - (crop_center_y - half_crop)
+            ball_x_in_crop = ball_x - x1
+            ball_y_in_crop = ball_y - y1
             target = np.array([ball_x_in_crop / self.crop_size, ball_y_in_crop / self.crop_size], dtype=np.float32)
 
             raw_images.append({

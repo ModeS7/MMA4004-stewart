@@ -141,7 +141,7 @@ def main(enable_plot=True):
     if not stereo_calib:
         return
 
-    print(f"✓ Loaded stereo calibration: {stereo_calib['timestamp']}")
+    print(f"[OK] Loaded stereo calibration: {stereo_calib['timestamp']}")
     print(f"  Source: {CALIBRATION_DIR}")
 
     # Load platform transformation (optional)
@@ -152,7 +152,7 @@ def main(enable_plot=True):
         R = platform_calib['R']
         T = platform_calib['T']
         platform_transform = (R, T)
-        print(f"✓ Platform transformation loaded: {platform_calib['timestamp']}")
+        print(f"[OK] Platform transformation loaded: {platform_calib['timestamp']}")
         print(f"  Coordinates will be in platform frame")
     except FileNotFoundError:
         print("  No platform transformation found - using camera coordinates")
@@ -365,13 +365,13 @@ def main(enable_plot=True):
                 break
             elif key == ord('c'):
                 points_history.clear()
-                print("✓ Cleared 3D trajectory")
+                print("[OK] Cleared 3D trajectory")
             elif key == ord('p') and enable_plot:
                 show_3d_plot = not show_3d_plot
                 if not show_3d_plot and fig:
                     plt.close(fig)
                     fig, ax = None, None
-                print(f"✓ 3D plot {'enabled' if show_3d_plot else 'disabled'}")
+                print(f"[OK] 3D plot {'enabled' if show_3d_plot else 'disabled'}")
             elif key == ord('s'):
                 # Print statistics
                 print("\n" + "=" * 60)

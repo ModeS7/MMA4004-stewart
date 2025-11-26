@@ -173,7 +173,7 @@ def collect_calibration_images(camera_id, num_images=20, is_stereo=False, camera
                     'objpoints': objp.copy()
                 })
                 collected_count += 1
-                print(f"✓ Captured image {collected_count}/{num_images}")
+                print(f"[OK] Captured image {collected_count}/{num_images}")
 
             elif key == ord('q'):
                 if collected_count >= 10:
@@ -232,7 +232,7 @@ def calibrate_camera(images_data, image_size):
 
     mean_error = total_error / len(objpoints)
 
-    print(f"✓ Calibration successful!")
+    print(f"[OK] Calibration successful!")
     print(f"  RMS reprojection error: {mean_error:.4f} pixels")
 
     return {
@@ -282,7 +282,7 @@ def save_calibration(calib_data, prefix, timestamp=None):
         f.write(f"Camera Matrix:\n{calib_data['camera_matrix']}\n\n")
         f.write(f"Distortion Coefficients:\n{calib_data['dist_coeffs']}\n")
 
-    print(f"\n✓ Saved calibration to: {CALIBRATION_DIR}/{prefix}_*_{timestamp}.*")
+    print(f"\n[OK] Saved calibration to: {CALIBRATION_DIR}/{prefix}_*_{timestamp}.*")
 
 
 def calibrate_stereo_pair(left_images, right_images, image_size,
@@ -323,7 +323,7 @@ def calibrate_stereo_pair(left_images, right_images, image_size,
         print("Stereo calibration failed!")
         return None
 
-    print(f"✓ Stereo calibration successful! RMS error: {ret:.4f}")
+    print(f"[OK] Stereo calibration successful! RMS error: {ret:.4f}")
 
     # Stereo rectification
     R1, R2, P1, P2, Q, roi_left, roi_right = cv2.stereoRectify(
@@ -340,7 +340,7 @@ def calibrate_stereo_pair(left_images, right_images, image_size,
         K2, D2, R2, P2, image_size, cv2.CV_32FC1
     )
 
-    print("✓ Stereo rectification computed")
+    print("[OK] Stereo rectification computed")
 
     return {
         'K1': K1, 'D1': D1,
@@ -394,7 +394,7 @@ def save_stereo_calibration(stereo_calib, timestamp=None):
         f.write(f"Projection Matrix P1:\n{stereo_calib['P1']}\n\n")
         f.write(f"Projection Matrix P2:\n{stereo_calib['P2']}\n")
 
-    print(f"\n✓ Saved stereo calibration to: {CALIBRATION_DIR}/stereo_*_{timestamp}.*")
+    print(f"\n[OK] Saved stereo calibration to: {CALIBRATION_DIR}/stereo_*_{timestamp}.*")
     print(f"  Baseline: {baseline:.2f} mm")
     print(f"  RMS error: {stereo_calib['rms_error']:.4f}")
 
@@ -435,7 +435,7 @@ def calibrate_individual_cameras():
     save_calibration(right_calib, "right_camera", timestamp)
 
     print("\n" + "=" * 60)
-    print("✓ Individual camera calibration complete!")
+    print("[OK] Individual camera calibration complete!")
     print("=" * 60)
     print(f"\nNext step: Run stereo calibration")
     print(f"  python -m ball_detection.stereo_calibration --calibrate-stereo")
@@ -473,8 +473,8 @@ def calibrate_stereo():
         'dist_coeffs': np.loadtxt(CALIBRATION_DIR / f"right_camera_distortion_{right_timestamp}.csv", delimiter=',')
     }
 
-    print(f"\n✓ Loaded left camera calibration: {left_timestamp}")
-    print(f"✓ Loaded right camera calibration: {right_timestamp}")
+    print(f"\n[OK] Loaded left camera calibration: {left_timestamp}")
+    print(f"[OK] Loaded right camera calibration: {right_timestamp}")
 
     # Collect stereo image pairs
     print("\n\nCollecting stereo image pairs...")
@@ -514,7 +514,7 @@ def calibrate_stereo():
                 'objpoints': img_data['objpoints']
             })
 
-    print(f"\n✓ Found {len(left_images)} valid stereo pairs")
+    print(f"\n[OK] Found {len(left_images)} valid stereo pairs")
 
     if len(left_images) < 10:
         print("Error: Need at least 10 valid stereo pairs")
@@ -532,7 +532,7 @@ def calibrate_stereo():
     save_stereo_calibration(stereo_calib, timestamp)
 
     print("\n" + "=" * 60)
-    print("✓ Stereo calibration complete!")
+    print("[OK] Stereo calibration complete!")
     print("=" * 60)
     print(f"\nYou can now use the stereo tracker:")
     print(f"  python -m ball_detection.stereo_tracker")
