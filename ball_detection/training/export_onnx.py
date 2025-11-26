@@ -15,12 +15,6 @@ import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
-try:
-    import onnxoptimizer
-    HAS_ONNXOPTIMIZER = True
-except ImportError:
-    HAS_ONNXOPTIMIZER = False
-
 from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2
 
 
@@ -41,10 +35,10 @@ def count_onnx_params(model_path):
 
 def optimize_onnx_graph(model_path, output_path=None):
     """
-    Optimize ONNX graph by removing empty/identity ops and fusing layers.
+    Optimize ONNX graph using ONNX Runtime's built-in optimizer.
 
-    This fixes the issue where pruned models keep all original nodes
-    even though channels/filters have been removed.
+    Removes identity ops, fuses layers, and eliminates dead code.
+    Uses ONNX Runtime (already installed) instead of onnxoptimizer.
 
     Args:
         model_path: Path to input ONNX model
@@ -53,37 +47,39 @@ def optimize_onnx_graph(model_path, output_path=None):
     Returns:
         Path to optimized model
     """
-    if not HAS_ONNXOPTIMIZER:
-        print("  [WARNING] onnxoptimizer not installed. Run: pip install onnxoptimizer")
-        return model_path
+    import tempfile
+    import shutil
 
     if output_path is None:
         output_path = model_path
 
     print(f"  Optimizing ONNX graph...")
-    model = onnx.load(model_path)
-    original_nodes = len(model.graph.node)
+    original_nodes = count_onnx_nodes(model_path)
 
-    # Optimization passes to clean up pruned models
-    passes = [
-        'eliminate_identity',
-        'eliminate_nop_transpose',
-        'eliminate_nop_pad',
-        'eliminate_unused_initializer',
-        'eliminate_deadend',
-        'fuse_consecutive_transposes',
-        'fuse_bn_into_conv',
-        'fuse_add_bias_into_conv',
-    ]
+    # Use ONNX Runtime session with optimization to create optimized model
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.optimized_model_filepath = str(output_path) + ".tmp"
 
     try:
-        optimized = onnxoptimizer.optimize(model, passes)
-        onnx.save(optimized, output_path)
-        new_nodes = len(optimized.graph.node)
-        print(f"  Nodes: {original_nodes} -> {new_nodes} ({original_nodes - new_nodes} removed)")
+        # Create session which triggers optimization and saves to file
+        _ = ort.InferenceSession(str(model_path), sess_options, providers=['CPUExecutionProvider'])
+
+        # Move optimized model to output path
+        if Path(sess_options.optimized_model_filepath).exists():
+            shutil.move(sess_options.optimized_model_filepath, output_path)
+            new_nodes = count_onnx_nodes(output_path)
+            print(f"  Nodes: {original_nodes} -> {new_nodes} ({original_nodes - new_nodes} removed)")
+        else:
+            print(f"  [WARNING] Optimized model not created")
+
         return output_path
     except Exception as e:
         print(f"  [WARNING] Optimization failed: {e}")
+        # Clean up temp file if exists
+        tmp_path = Path(str(output_path) + ".tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
         return model_path
 
 
@@ -477,7 +473,7 @@ def main():
 
     parser.add_argument('--model', type=str,
                         default='./ball_detection/models/best_pixel_error.pth',
-                        help='Path to PyTorch model (.pth)')
+                        help='Path to PyTorch model (.pth) or existing ONNX model (.onnx)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output path for ONNX model (.onnx)')
     parser.add_argument('--crop-size', type=int, default=128,
@@ -498,19 +494,36 @@ def main():
 
     args = parser.parse_args()
 
-    # Set default output path
-    if args.output is None:
-        model_path = Path(args.model)
-        args.output = model_path.parent / f"{model_path.stem}.onnx"
+    model_path = Path(args.model)
 
-    # Export to ONNX
-    onnx_path = export_to_onnx(
-        pytorch_model_path=args.model,
-        output_path=args.output,
-        crop_size=args.crop_size,
-        model_type=args.model_type,
-        opset_version=args.opset
-    )
+    # Check if input is already ONNX (optimize/quantize only)
+    if model_path.suffix.lower() == '.onnx':
+        print("=" * 60)
+        print("ONNX MODEL PROCESSING")
+        print("=" * 60)
+        print(f"Input: {model_path}")
+        print(f"Nodes: {count_onnx_nodes(str(model_path))}")
+        print(f"Params: {count_onnx_params(str(model_path)):,}")
+
+        onnx_path = model_path
+        if args.output:
+            # Copy to output path first
+            import shutil
+            shutil.copy(model_path, args.output)
+            onnx_path = Path(args.output)
+    else:
+        # Set default output path for PyTorch export
+        if args.output is None:
+            args.output = model_path.parent / f"{model_path.stem}.onnx"
+
+        # Export to ONNX
+        onnx_path = export_to_onnx(
+            pytorch_model_path=args.model,
+            output_path=args.output,
+            crop_size=args.crop_size,
+            model_type=args.model_type,
+            opset_version=args.opset
+        )
 
     # Optimize graph (remove empty ops from pruned models)
     if not args.no_optimize:

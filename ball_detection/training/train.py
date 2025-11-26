@@ -1084,7 +1084,6 @@ def main():
                 print(f"  Nodes: {nodes_before} -> {nodes_after}")
             except Exception as opt_e:
                 print(f"  [WARNING] ONNX optimization failed: {opt_e}")
-                print(f"  (Install onnxoptimizer: pip install onnxoptimizer)")
 
     except Exception as e:
         print(f"  [ERROR] ONNX export failed: {e}")
