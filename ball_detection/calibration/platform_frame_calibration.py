@@ -44,16 +44,22 @@ from ball_detection.utils.coordinate_transform import (
 # If you have 8 rows × 11 columns of SQUARES:
 #   Inner corners = (11-1, 8-1) = (10, 7) in format (columns, rows)
 CHESSBOARD_SIZE = (8, 6)  # Inner corners (columns, rows) - 8x11 squares
-SQUARE_SIZE_MM = 24.88888889  # Size of each square in mm
+SQUARE_SIZE_MM = 27.42857  # Size of each square in mm
 
 # Camera configuration
-CAMERA_INDEX = 0  # ZED stereo camera
+CAMERA_INDEX = 1  # ZED stereo camera
 
 # Calibration directory
 CALIBRATION_DIR = Path(__file__).parent / "calibrations"
 
 # Z-offset (optional): Set to platform home height if origin should be (0, 0, home_height)
-Z_OFFSET_MM = 0.0  # Change to home_height if needed (e.g., 50.0 for 50mm)
+Z_OFFSET_MM = 227.12  # Change to home_height if needed (e.g., 50.0 for 50mm)
+
+# Axis direction configuration: 1 = normal, -1 = inverted
+# Use these to align camera coordinates with your platform base frame
+AXIS_DIRECTION_X = 1   # Set to -1 to invert X-axis
+AXIS_DIRECTION_Y = -1   # Set to -1 to invert Y-axis
+AXIS_DIRECTION_Z = 1   # Set to -1 to invert Z-axis
 # ============================================================
 
 
@@ -85,19 +91,22 @@ def triangulate_3d_point(left_point, right_point, P1, P2):
     return points_3d.flatten()
 
 
-def generate_platform_points(chessboard_size, square_size):
+def generate_platform_points(chessboard_size, square_size, axis_dir_x=1, axis_dir_y=1, axis_dir_z=1):
     """
     Generate known 3D positions of checkerboard corners in platform frame.
 
     Platform coordinate system:
         - Origin at corner (0, 0)
-        - X-axis along first row
-        - Y-axis along first column
-        - Z = 0 (flat on platform)
+        - X-axis along first row (direction controlled by axis_dir_x)
+        - Y-axis along first column (direction controlled by axis_dir_y)
+        - Z = 0 (flat on platform, direction controlled by axis_dir_z)
 
     Args:
         chessboard_size: (columns, rows) of inner corners
         square_size: Size of each square in mm
+        axis_dir_x: X-axis direction multiplier (1 or -1)
+        axis_dir_y: Y-axis direction multiplier (1 or -1)
+        axis_dir_z: Z-axis direction multiplier (1 or -1)
 
     Returns:
         Nx3 array of corner positions in platform frame
@@ -107,8 +116,8 @@ def generate_platform_points(chessboard_size, square_size):
 
     for row in range(rows):
         for col in range(cols):
-            x = col * square_size
-            y = row * square_size
+            x = col * square_size * axis_dir_x
+            y = row * square_size * axis_dir_y
             z = 0.0  # Checkerboard is flat on platform
             points.append([x, y, z])
 
@@ -123,6 +132,7 @@ def calibrate_platform_frame():
     print(f"Checkerboard: {CHESSBOARD_SIZE[0]}x{CHESSBOARD_SIZE[1]} inner corners")
     print(f"Square size: {SQUARE_SIZE_MM} mm")
     print(f"Z offset: {Z_OFFSET_MM} mm")
+    print(f"Axis directions: X={AXIS_DIRECTION_X:+d}, Y={AXIS_DIRECTION_Y:+d}, Z={AXIS_DIRECTION_Z:+d}")
     print("=" * 60)
     print()
 
@@ -164,17 +174,35 @@ def calibrate_platform_frame():
     print("     - Platform center, OR")
     print("     - Platform center at home height")
     print("  4. Ensure checkerboard is perfectly flat (defines XY plane)")
-    print("  5. Press SPACE when ready to capture")
-    print("  6. Press 'q' to quit")
+    print()
+    print("  CONTROLS:")
+    print("     'x' - Toggle X axis direction")
+    print("     'y' - Toggle Y axis direction")
+    print("     'z' - Toggle Z axis direction")
+    print("     SPACE - Capture and calibrate")
+    print("     'q' - Quit")
     print()
 
-    # Generate known platform points
-    platform_points = generate_platform_points(CHESSBOARD_SIZE, SQUARE_SIZE_MM)
+    # Interactive axis direction settings
+    axis_dir_x = AXIS_DIRECTION_X
+    axis_dir_y = AXIS_DIRECTION_Y
+    axis_dir_z = AXIS_DIRECTION_Z
 
-    # Apply Z offset if specified
-    if Z_OFFSET_MM != 0:
-        platform_points[:, 2] += Z_OFFSET_MM
-        print(f"Applied Z offset: {Z_OFFSET_MM} mm")
+    def regenerate_platform_points():
+        """Regenerate platform points with current axis directions."""
+        points = generate_platform_points(
+            CHESSBOARD_SIZE, SQUARE_SIZE_MM,
+            axis_dir_x=axis_dir_x,
+            axis_dir_y=axis_dir_y,
+            axis_dir_z=axis_dir_z
+        )
+        # Apply Z offset if specified (respecting Z direction)
+        if Z_OFFSET_MM != 0:
+            points[:, 2] += Z_OFFSET_MM * axis_dir_z
+        return points
+
+    platform_points = regenerate_platform_points()
+    print(f"Initial axis directions: X={axis_dir_x:+d}, Y={axis_dir_y:+d}, Z={axis_dir_z:+d}")
 
     calibrated = False
 
@@ -265,11 +293,30 @@ def calibrate_platform_frame():
                 cv2.putText(display_right, "Searching for checkerboard...",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # Display axis directions on screen
+            axis_text = f"Axis: X={axis_dir_x:+d} Y={axis_dir_y:+d} Z={axis_dir_z:+d} | Press x/y/z to toggle"
+            cv2.putText(display_left, axis_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            cv2.putText(display_right, axis_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
             # Display side-by-side
             combined = np.hstack([display_left, display_right])
             cv2.imshow('Platform Frame Calibration', combined)
 
             key = cv2.waitKey(1) & 0xFF
+
+            # Toggle axis directions
+            if key == ord('x'):
+                axis_dir_x *= -1
+                platform_points = regenerate_platform_points()
+                print(f"Toggled X axis: X={axis_dir_x:+d}, Y={axis_dir_y:+d}, Z={axis_dir_z:+d}")
+            elif key == ord('y'):
+                axis_dir_y *= -1
+                platform_points = regenerate_platform_points()
+                print(f"Toggled Y axis: X={axis_dir_x:+d}, Y={axis_dir_y:+d}, Z={axis_dir_z:+d}")
+            elif key == ord('z'):
+                axis_dir_z *= -1
+                platform_points = regenerate_platform_points()
+                print(f"Toggled Z axis: X={axis_dir_x:+d}, Y={axis_dir_y:+d}, Z={axis_dir_z:+d}")
 
             if key == ord(' ') and ret_left and ret_right:
                 print("[4/4] Computing platform transformation...")

@@ -19,7 +19,7 @@ from PyQt6.QtGui import QFont
 from core.utils import (
     format_time, format_vector_2d, MAX_TILT_ANGLE_DEG,
     IMUKalmanConfig, TrajectoryPatternConfig,
-    KalmanFilterConfig, Pixy2CameraConfig, ZEDCameraConfig, CAMERA_TYPE, GUIConfig,
+    KalmanFilterConfig, Pixy2CameraConfig, StereoCameraConfig, CAMERA_TYPE, GUIConfig,
     # GUI constants
     GUI_FONT_MONOSPACE, GUI_FONT_SANS,
     GUI_FONT_SIZE_TINY, GUI_FONT_SIZE_SMALL, GUI_FONT_SIZE_NORMAL, GUI_FONT_SIZE_LARGE,
@@ -1012,16 +1012,16 @@ class CameraModelModule(GUIModule):
         """Create camera configuration widget with noise parameters and statistics."""
         # Detect camera type and use appropriate config
         camera_type = CAMERA_TYPE
-        if camera_type == 'ZED':
-            camera_name = "ZED Camera"
-            noise_x_range = ZEDCameraConfig.NOISE_X_RANGE
-            noise_y_range = ZEDCameraConfig.NOISE_Y_RANGE
-            noise_x_default = ZEDCameraConfig.NOISE_STD_X_MM
-            noise_y_default = ZEDCameraConfig.NOISE_STD_Y_MM
-            detection_range = ZEDCameraConfig.DETECTION_RATE_RANGE
-            detection_default = ZEDCameraConfig.DETECTION_RATE
-            sample_range = ZEDCameraConfig.SAMPLE_RATE_RANGE
-            sample_default = ZEDCameraConfig.DEFAULT_SAMPLE_RATE_HZ
+        if camera_type == 'STEREO':
+            camera_name = "Stereo Camera"
+            noise_x_range = StereoCameraConfig.NOISE_XY_RANGE
+            noise_y_range = StereoCameraConfig.NOISE_XY_RANGE
+            noise_x_default = StereoCameraConfig.NOISE_STD_XY_MM
+            noise_y_default = StereoCameraConfig.NOISE_STD_XY_MM
+            detection_range = StereoCameraConfig.DETECTION_RATE_RANGE
+            detection_default = StereoCameraConfig.DETECTION_RATE
+            sample_range = StereoCameraConfig.SAMPLE_RATE_RANGE
+            sample_default = StereoCameraConfig.DEFAULT_SAMPLE_RATE_HZ
         else:  # PIXY2
             camera_name = "Pixy2 Camera"
             noise_x_range = Pixy2CameraConfig.NOISE_RANGE
@@ -1058,7 +1058,7 @@ class CameraModelModule(GUIModule):
             self._create_parameter_row(layout, "Pixel Size:", *Pixy2CameraConfig.PIXEL_SIZE_RANGE, Pixy2CameraConfig.PIXEL_SIZE_MM, 0.1, 'pixel_size', 'mm')
             self._create_parameter_row(layout, "Sub-pixel Noise:", *noise_x_range, noise_x_default, 0.01, 'noise_std', 'mm')
         else:
-            # ZED has different noise in X and Y (no pixel quantization)
+            # Stereo uses triangulation - noise is similar in X and Y
             self._create_parameter_row(layout, "Noise X-axis:", *noise_x_range, noise_x_default, 0.001, 'noise_x', 'mm', "{:.4f}")
             self._create_parameter_row(layout, "Noise Y-axis:", *noise_y_range, noise_y_default, 0.0001, 'noise_y', 'mm', "{:.4f}")
 
@@ -1266,7 +1266,7 @@ class KalmanFilterModule(GUIModule):
             callbacks: Callback functions dict
             kalman_filter: Optional KalmanFilter instance to monitor
             enabled: Initial enabled state
-            camera_type: Camera type for selecting appropriate defaults ('PIXY2' or 'ZED')
+            camera_type: Camera type for selecting appropriate defaults ('PIXY2' or 'STEREO')
         """
         super().__init__(parent, colors, callbacks)
         self.kalman_filter = kalman_filter
@@ -1300,8 +1300,8 @@ class KalmanFilterModule(GUIModule):
 
         # Parameters (defaults from KalmanFilterConfig, camera-specific for measurement noise)
         # Select measurement noise default based on camera type
-        if self.camera_type == 'ZED':
-            measurement_noise_default = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_ZED
+        if self.camera_type == 'STEREO':
+            measurement_noise_default = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_STEREO
         else:
             measurement_noise_default = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_PIXY2
 

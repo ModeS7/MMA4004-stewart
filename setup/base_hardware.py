@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import QWidget, QApplication
 
 from setup.base_simulator import BaseStewartSimulator, ControllerConfig
 from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
-from core.utils import (ControlLoopConfig, Pixy2CameraConfig, ZEDCameraConfig, BallPhysicsConfig,
+from core.utils import (ControlLoopConfig, Pixy2CameraConfig, StereoCameraConfig, BallPhysicsConfig,
                          VisualizationConfig, HardwareConnectionConfig, PIDConfig, KalmanFilterConfig,
                          PerformanceConfig, get_controller_defaults, SerialConfig, CAMERA_TYPE)
 
@@ -635,7 +635,7 @@ class HardwareControllerBase(BaseStewartSimulator):
         """
         # Hardware components
         self.serial_controller: Optional[SerialController] = None
-        self.camera_controller: Optional[Any] = None  # ZEDCameraController when using ZED
+        self.camera_controller: Optional[Any] = None  # StereoCameraController when using STEREO
         self.connected: bool = False
         self.port_var: str = ''
         self.ik_cache: Optional[IKCache] = None
@@ -647,11 +647,13 @@ class HardwareControllerBase(BaseStewartSimulator):
 
         # Camera type and calibration parameters (pixels to mm conversion)
         self.camera_type: str = CAMERA_TYPE
-        if CAMERA_TYPE == 'ZED':
-            self.camera_width_mm: float = ZEDCameraConfig.FOV_WIDTH_MM
-            self.camera_height_mm: float = ZEDCameraConfig.FOV_HEIGHT_MM
-            self.pixels_to_mm_x: float = ZEDCameraConfig.PIXELS_TO_MM_X
-            self.pixels_to_mm_y: float = ZEDCameraConfig.PIXELS_TO_MM_Y
+        if CAMERA_TYPE == 'STEREO':
+            # Stereo uses triangulation - no pixel-to-mm conversion needed
+            # These are kept for compatibility but not used
+            self.camera_width_mm: float = StereoCameraConfig.SINGLE_CAMERA_WIDTH
+            self.camera_height_mm: float = StereoCameraConfig.SINGLE_CAMERA_HEIGHT
+            self.pixels_to_mm_x: float = 1.0
+            self.pixels_to_mm_y: float = 1.0
         else:  # PIXY2
             self.camera_width_mm: float = Pixy2CameraConfig.FOV_WIDTH_MM
             self.camera_height_mm: float = Pixy2CameraConfig.FOV_HEIGHT_MM
@@ -671,8 +673,8 @@ class HardwareControllerBase(BaseStewartSimulator):
 
         # Initialize Kalman filter (required before super().__init__)
         # Use camera-specific measurement noise defaults
-        if self.camera_type == 'ZED':
-            measurement_noise_scale = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_ZED
+        if self.camera_type == 'STEREO':
+            measurement_noise_scale = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_STEREO
         else:
             measurement_noise_scale = KalmanFilterConfig.DEFAULT_MEASUREMENT_NOISE_PIXY2
 
@@ -701,7 +703,7 @@ class HardwareControllerBase(BaseStewartSimulator):
             Dictionary with ball data, or None if no data available.
             Format: {'x': float (mm), 'y': float (mm), 'detected': bool, ...}
         """
-        if self.camera_type == 'ZED' and self.camera_controller is not None:
+        if self.camera_type == 'STEREO' and self.camera_controller is not None:
             return self.camera_controller.get_latest_ball_data()
         elif self.camera_type == 'PIXY2' and self.serial_controller is not None:
             return self.serial_controller.get_latest_ball_data()
@@ -953,7 +955,7 @@ class HardwareControllerBase(BaseStewartSimulator):
         while self.simulation_running:
             loop_start = time.perf_counter()
 
-            # Get ball data from active camera (Pixy2 or ZED)
+            # Get ball data from active camera (Pixy2 or STEREO)
             ball_data = self.get_ball_data()
 
             if ball_data is not None:
@@ -968,8 +970,8 @@ class HardwareControllerBase(BaseStewartSimulator):
                     # Camera coordinate conversion (origin at top-left, convert to center-origin)
                     ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
                     ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
-                else:  # ZED camera
-                    # ZED returns coordinates already in mm (from platform center)
+                else:  # STEREO camera
+                    # Stereo returns 3D coordinates in platform frame (mm)
                     ball_x_mm = ball_data['x']
                     ball_y_mm = ball_data['y']
 

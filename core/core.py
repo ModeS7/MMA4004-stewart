@@ -1025,22 +1025,22 @@ class CameraModel:
             noise_std_y_mm: Gaussian noise std dev in Y-axis (mm)
             detection_rate: Probability of detecting ball (0.0 to 1.0)
             sample_rate_hz: Camera update rate in Hz (0 = sample every call)
-            camera_type: Camera type ('PIXY2' or 'ZED'), uses CAMERA_TYPE from config if None
+            camera_type: Camera type ('PIXY2' or 'STEREO'), uses CAMERA_TYPE from config if None
         """
         # Import here to avoid circular import
-        from core.utils import CAMERA_TYPE, Pixy2CameraConfig, ZEDCameraConfig
+        from core.utils import CAMERA_TYPE, Pixy2CameraConfig, StereoCameraConfig
 
         # Use configured camera type if not specified
         if camera_type is None:
             camera_type = CAMERA_TYPE
 
         # Load defaults based on camera type
-        if camera_type == 'ZED':
+        if camera_type == 'STEREO':
             self.pixel_size = pixel_size_mm if pixel_size_mm is not None else 0.0  # No quantization
-            self.noise_std_x = noise_std_x_mm if noise_std_x_mm is not None else ZEDCameraConfig.NOISE_STD_X_MM
-            self.noise_std_y = noise_std_y_mm if noise_std_y_mm is not None else ZEDCameraConfig.NOISE_STD_Y_MM
-            self.detection_rate = detection_rate if detection_rate is not None else ZEDCameraConfig.DETECTION_RATE
-            sample_rate_default = ZEDCameraConfig.DEFAULT_SAMPLE_RATE_HZ
+            self.noise_std_x = noise_std_x_mm if noise_std_x_mm is not None else StereoCameraConfig.NOISE_STD_XY_MM
+            self.noise_std_y = noise_std_y_mm if noise_std_y_mm is not None else StereoCameraConfig.NOISE_STD_XY_MM
+            self.detection_rate = detection_rate if detection_rate is not None else StereoCameraConfig.DETECTION_RATE
+            sample_rate_default = StereoCameraConfig.DEFAULT_SAMPLE_RATE_HZ
         else:  # PIXY2
             self.pixel_size = pixel_size_mm if pixel_size_mm is not None else Pixy2CameraConfig.PIXEL_SIZE_MM
             self.noise_std_x = noise_std_x_mm if noise_std_x_mm is not None else Pixy2CameraConfig.SUBPIXEL_NOISE_STD_MM

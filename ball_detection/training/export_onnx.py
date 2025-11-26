@@ -15,7 +15,104 @@ import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
+try:
+    import onnxoptimizer
+    HAS_ONNXOPTIMIZER = True
+except ImportError:
+    HAS_ONNXOPTIMIZER = False
+
 from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2
+
+
+def count_onnx_nodes(model_path):
+    """Count number of nodes in ONNX model."""
+    model = onnx.load(model_path)
+    return len(model.graph.node)
+
+
+def count_onnx_params(model_path):
+    """Count total parameters in ONNX model."""
+    model = onnx.load(model_path)
+    total = 0
+    for init in model.graph.initializer:
+        total += np.prod(init.dims) if init.dims else 1
+    return total
+
+
+def optimize_onnx_graph(model_path, output_path=None):
+    """
+    Optimize ONNX graph by removing empty/identity ops and fusing layers.
+
+    This fixes the issue where pruned models keep all original nodes
+    even though channels/filters have been removed.
+
+    Args:
+        model_path: Path to input ONNX model
+        output_path: Path to save optimized model (defaults to overwriting input)
+
+    Returns:
+        Path to optimized model
+    """
+    if not HAS_ONNXOPTIMIZER:
+        print("  [WARNING] onnxoptimizer not installed. Run: pip install onnxoptimizer")
+        return model_path
+
+    if output_path is None:
+        output_path = model_path
+
+    print(f"  Optimizing ONNX graph...")
+    model = onnx.load(model_path)
+    original_nodes = len(model.graph.node)
+
+    # Optimization passes to clean up pruned models
+    passes = [
+        'eliminate_identity',
+        'eliminate_nop_transpose',
+        'eliminate_nop_pad',
+        'eliminate_unused_initializer',
+        'eliminate_deadend',
+        'fuse_consecutive_transposes',
+        'fuse_bn_into_conv',
+        'fuse_add_bias_into_conv',
+    ]
+
+    try:
+        optimized = onnxoptimizer.optimize(model, passes)
+        onnx.save(optimized, output_path)
+        new_nodes = len(optimized.graph.node)
+        print(f"  Nodes: {original_nodes} -> {new_nodes} ({original_nodes - new_nodes} removed)")
+        return output_path
+    except Exception as e:
+        print(f"  [WARNING] Optimization failed: {e}")
+        return model_path
+
+
+def quantize_to_int8(model_path, output_path=None):
+    """
+    Apply dynamic INT8 quantization for faster CPU inference.
+
+    Args:
+        model_path: Path to input ONNX model (FP32)
+        output_path: Path to save INT8 model (defaults to model_int8.onnx)
+
+    Returns:
+        Path to quantized model
+    """
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+
+    if output_path is None:
+        output_path = str(model_path).replace('.onnx', '_int8.onnx')
+
+    print(f"  Applying INT8 quantization...")
+    quantize_dynamic(
+        model_input=str(model_path),
+        model_output=str(output_path),
+        weight_type=QuantType.QInt8,
+        optimize_model=True
+    )
+
+    print(f"  INT8 model saved: {output_path}")
+    return output_path
 
 
 def is_structurally_pruned(state_dict, model_type='mobilenet'):
@@ -394,6 +491,10 @@ def main():
                         help='Test ONNX inference after export')
     parser.add_argument('--no-directml', action='store_true',
                         help='Disable DirectML for testing (CPU only)')
+    parser.add_argument('--no-optimize', action='store_true',
+                        help='Skip ONNX graph optimization')
+    parser.add_argument('--quantize', type=str, choices=['int8'], default=None,
+                        help='Quantization type (int8 for CPU inference)')
 
     args = parser.parse_args()
 
@@ -410,6 +511,23 @@ def main():
         model_type=args.model_type,
         opset_version=args.opset
     )
+
+    # Optimize graph (remove empty ops from pruned models)
+    if not args.no_optimize:
+        print("\n" + "=" * 60)
+        print("ONNX GRAPH OPTIMIZATION")
+        print("=" * 60)
+        optimize_onnx_graph(onnx_path)
+
+    # Quantize to INT8
+    if args.quantize == 'int8':
+        print("\n" + "=" * 60)
+        print("INT8 QUANTIZATION")
+        print("=" * 60)
+        int8_path = quantize_to_int8(onnx_path)
+        print(f"\nGenerated files:")
+        print(f"  FP32: {onnx_path}")
+        print(f"  INT8: {int8_path}")
 
     # Test if requested
     if args.test:

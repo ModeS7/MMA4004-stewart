@@ -32,7 +32,7 @@ from ..utils.coordinate_transform import (
 # SETTINGS - Edit these
 # ============================================================
 # Camera configuration
-CAMERA_INDEX = 0  # ZED stereo camera
+CAMERA_INDEX = 1  # ZED stereo camera
 
 # Stereo calibration path
 CALIBRATION_DIR = Path(__file__).parent.parent / "calibration" / "calibrations"
@@ -141,7 +141,7 @@ def main(enable_plot=True):
     if not stereo_calib:
         return
 
-    print(f"[OK] Loaded stereo calibration: {stereo_calib['timestamp']}")
+    print(f"✓ Loaded stereo calibration: {stereo_calib['timestamp']}")
     print(f"  Source: {CALIBRATION_DIR}")
 
     # Load platform transformation (optional)
@@ -152,7 +152,7 @@ def main(enable_plot=True):
         R = platform_calib['R']
         T = platform_calib['T']
         platform_transform = (R, T)
-        print(f"[OK] Platform transformation loaded: {platform_calib['timestamp']}")
+        print(f"✓ Platform transformation loaded: {platform_calib['timestamp']}")
         print(f"  Coordinates will be in platform frame")
     except FileNotFoundError:
         print("  No platform transformation found - using camera coordinates")
@@ -315,10 +315,10 @@ def main(enable_plot=True):
             vis_left = detector.visualize(left_rectified, result_left)
             vis_right = detector.visualize(right_rectified, result_right)
 
-            # Add 3D coordinates on left view
+            # Add 3D coordinates on left view with X, Y, Z labels
             if point_3d is not None:
                 frame_type = "Platform" if platform_transform else "Camera"
-                coord_text = f"3D ({frame_type}): ({point_3d[0]:.1f}, {point_3d[1]:.1f}, {point_3d[2]:.1f}) mm"
+                coord_text = f"3D ({frame_type}): X={point_3d[0]:.1f}  Y={point_3d[1]:.1f}  Z={point_3d[2]:.1f} mm"
                 cv2.putText(vis_left, coord_text, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
@@ -365,13 +365,13 @@ def main(enable_plot=True):
                 break
             elif key == ord('c'):
                 points_history.clear()
-                print("[OK] Cleared 3D trajectory")
+                print("✓ Cleared 3D trajectory")
             elif key == ord('p') and enable_plot:
                 show_3d_plot = not show_3d_plot
                 if not show_3d_plot and fig:
                     plt.close(fig)
                     fig, ax = None, None
-                print(f"[OK] 3D plot {'enabled' if show_3d_plot else 'disabled'}")
+                print(f"✓ 3D plot {'enabled' if show_3d_plot else 'disabled'}")
             elif key == ord('s'):
                 # Print statistics
                 print("\n" + "=" * 60)

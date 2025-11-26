@@ -23,7 +23,7 @@ PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger plat
 # ============================================================================
 # CAMERA TYPE SELECTION
 # ============================================================================
-CAMERA_TYPE = 'ZED'  # Options: 'PIXY2' or 'ZED'
+CAMERA_TYPE = 'STEREO'  # Options: 'PIXY2' or 'STEREO'
 
 # ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS
@@ -367,9 +367,8 @@ class KalmanFilterConfig:
     DEFAULT_MEASUREMENT_NOISE = 1.0
 
     # Camera-specific defaults for measurement noise scaling
-    # ZED uses conservative operational noise model (1.5mm) similar to Pixy2
     DEFAULT_MEASUREMENT_NOISE_PIXY2 = 1.0
-    DEFAULT_MEASUREMENT_NOISE_ZED = 1.0  # Same scale since operational noise is comparable
+    DEFAULT_MEASUREMENT_NOISE_STEREO = 1.0  # Stereo triangulation noise
 
 class BallControlConfig:
     """Ball control parameters (reset, push, etc.)."""
@@ -494,6 +493,45 @@ class ZEDCameraConfig:
     NOISE_Y_RANGE = (0.0, 0.1)  # mm (extremely low Y noise, measured Y-axis)
     DETECTION_RATE_RANGE = (0.95, 1.0)  # probability (very reliable detection)
     SAMPLE_RATE_RANGE = (0.0, 100.0)  # Hz (higher fps than Pixy2)
+
+# ============================================================================
+# STEREO CAMERA CONFIGURATION
+# ============================================================================
+
+class StereoCameraConfig:
+    """Stereo camera configuration for 3D ball tracking via triangulation."""
+
+    # Camera hardware
+    CAMERA_ID = 1  # OpenCV camera device ID
+
+    # Resolution (stereo: 2560x720, single: 1280x720)
+    STEREO_FRAME_WIDTH = 2560
+    STEREO_FRAME_HEIGHT = 720
+    SINGLE_CAMERA_WIDTH = 1280
+    SINGLE_CAMERA_HEIGHT = 720
+    TARGET_FPS = 60
+
+    # Calibration directory
+    CALIBRATION_DIR = 'ball_detection/calibration/calibrations'
+
+    # Ball detection parameters
+    CROP_SIZE = 128  # CNN input size (must match trained model)
+    CONFIDENCE_THRESHOLD = 0.5  # Detection confidence threshold
+    MODEL_PATH = 'ball_detection/models/mobileLiteV3/mobileLiteV3.onnx'  # Path to trained model
+    USE_GPU = True  # Use GPU acceleration (DirectML)
+
+    # Stereo triangulation noise characteristics
+    NOISE_STD_XY_MM = 1.0   # X/Y measurement noise (mm) - operational estimate
+    NOISE_STD_Z_MM = 2.0    # Z measurement noise (mm) - less accurate due to triangulation
+    DETECTION_RATE = 0.95   # Detection probability (lower due to requiring both cameras)
+
+    # Camera update rate
+    DEFAULT_SAMPLE_RATE_HZ = 48.0  # Expected sample rate (Hz)
+
+    # GUI slider ranges (for simulation camera model)
+    NOISE_XY_RANGE = (0.0, 5.0)  # mm
+    DETECTION_RATE_RANGE = (0.80, 1.0)  # probability
+    SAMPLE_RATE_RANGE = (0.0, 100.0)  # Hz
 
 # ============================================================================
 # BALL PHYSICS CONFIGURATION

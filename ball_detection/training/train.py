@@ -1073,6 +1073,19 @@ def main():
         print(f"  ONNX model exported successfully!")
         print(f"  Model size: {model_size_mb:.2f} MB")
 
+        # Optimize ONNX graph when pruning is enabled (removes empty ops)
+        if enable_pruning:
+            try:
+                from .export_onnx import optimize_onnx_graph, count_onnx_nodes
+                print(f"\n  Optimizing pruned ONNX graph...")
+                nodes_before = count_onnx_nodes(str(onnx_path))
+                optimize_onnx_graph(str(onnx_path))
+                nodes_after = count_onnx_nodes(str(onnx_path))
+                print(f"  Nodes: {nodes_before} -> {nodes_after}")
+            except Exception as opt_e:
+                print(f"  [WARNING] ONNX optimization failed: {opt_e}")
+                print(f"  (Install onnxoptimizer: pip install onnxoptimizer)")
+
     except Exception as e:
         print(f"  [ERROR] ONNX export failed: {e}")
         print(f"  (This is OK - you can export manually later)")

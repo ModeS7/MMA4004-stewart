@@ -443,9 +443,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         self.log("Servo parameters configured: Speed=0, Acceleration=0")
 
         # Connect camera based on type
-        if self.camera_type == 'ZED':
-            from ball_detection.camera_controller import ZEDCameraController
-            self.camera_controller = ZEDCameraController()
+        if self.camera_type == 'STEREO':
+            from ball_detection.integration.stereo_controller import StereoCameraController
+            self.camera_controller = StereoCameraController()
             cam_success, cam_message = self.camera_controller.connect()
 
             if cam_success:
@@ -889,10 +889,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                     # Camera dimensions: 316×208 pixels, origin at top-left
                     ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
                     ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
-                else:  # ZED camera
-                    # ZED returns coordinates already in mm (from platform center)
+                else:  # STEREO camera
+                    # Stereo returns 3D coordinates in platform frame (mm)
+                    # X, Y used for control; Z logged only
                     ball_x_mm = ball_data['x']
                     ball_y_mm = ball_data['y']
+                    # Z available via ball_data.get('z', 0.0) for logging
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)

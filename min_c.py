@@ -611,9 +611,9 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
         self.log("Servo parameters configured: Speed=0, Acceleration=0")
 
         # Connect camera based on type
-        if self.camera_type == 'ZED':
-            from ball_detection.camera_controller import ZEDCameraController
-            self.camera_controller = ZEDCameraController()
+        if self.camera_type == 'STEREO':
+            from ball_detection.integration.stereo_controller import StereoCameraController
+            self.camera_controller = StereoCameraController()
             cam_success, cam_message = self.camera_controller.connect()
 
             if cam_success:

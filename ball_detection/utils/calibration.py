@@ -10,19 +10,23 @@ from pathlib import Path
 from typing import Dict, Optional
 
 
-def load_stereo_calibration(calib_dir: Path) -> Optional[Dict]:
+def load_stereo_calibration(calib_dir: Path, load_maps: bool = True) -> Optional[Dict]:
     """
     Load latest stereo calibration data.
 
     Args:
         calib_dir: Path to calibration directory
+        load_maps: Whether to load rectification maps (False for point-only rectification)
 
     Returns:
         Dictionary containing:
             - 'P1': 3x4 projection matrix for left camera
             - 'P2': 3x4 projection matrix for right camera
-            - 'left_map1', 'left_map2': Rectification maps for left camera
-            - 'right_map1', 'right_map2': Rectification maps for right camera
+            - 'K1', 'K2': Camera matrices
+            - 'D1', 'D2': Distortion coefficients
+            - 'R1', 'R2': Rectification rotation matrices
+            - 'left_map1', 'left_map2': Rectification maps for left camera (if load_maps=True)
+            - 'right_map1', 'right_map2': Rectification maps for right camera (if load_maps=True)
             - 'timestamp': Calibration timestamp string
         Returns None if calibration not found or error occurs
 
@@ -42,38 +46,62 @@ def load_stereo_calibration(calib_dir: Path) -> Optional[Dict]:
     # Find latest stereo calibration files
     p1_files = sorted(calib_dir.glob('stereo_P1_*.csv'), reverse=True)
     p2_files = sorted(calib_dir.glob('stereo_P2_*.csv'), reverse=True)
-    map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
+    r1_files = sorted(calib_dir.glob('stereo_R1_*.csv'), reverse=True)
 
-    if not p1_files or not p2_files or not map_files:
+    if not p1_files or not p2_files or not r1_files:
         print(f"\nError: No stereo calibration files found in: {calib_dir}")
         print("\nYou need to run stereo calibration first:")
         print("  python -m ball_detection.calibration.stereo_calibration --calibrate-individual")
         print("  python -m ball_detection.calibration.stereo_calibration --calibrate-stereo")
         return None
 
-    # Extract timestamp from filename
-    timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
+    # Extract timestamp from stereo calibration
+    stereo_timestamp = p1_files[0].name.replace('stereo_P1_', '').replace('.csv', '')
+
+    # Find individual camera calibration timestamp
+    k_files = sorted(calib_dir.glob('left_camera_camera_matrix_*.csv'), reverse=True)
+    if not k_files:
+        print(f"\nError: No individual camera calibration files found in: {calib_dir}")
+        return None
+    camera_timestamp = k_files[0].name.replace('left_camera_camera_matrix_', '').replace('.csv', '')
 
     try:
         # Load projection matrices
-        P1 = np.loadtxt(calib_dir / f'stereo_P1_{timestamp}.csv', delimiter=',')
-        P2 = np.loadtxt(calib_dir / f'stereo_P2_{timestamp}.csv', delimiter=',')
+        P1 = np.loadtxt(calib_dir / f'stereo_P1_{stereo_timestamp}.csv', delimiter=',')
+        P2 = np.loadtxt(calib_dir / f'stereo_P2_{stereo_timestamp}.csv', delimiter=',')
 
-        # Load rectification maps
-        left_map1 = np.load(calib_dir / f'stereo_left_map1_{timestamp}.npy')
-        left_map2 = np.load(calib_dir / f'stereo_left_map2_{timestamp}.npy')
-        right_map1 = np.load(calib_dir / f'stereo_right_map1_{timestamp}.npy')
-        right_map2 = np.load(calib_dir / f'stereo_right_map2_{timestamp}.npy')
+        # Load rectification rotation matrices
+        R1 = np.loadtxt(calib_dir / f'stereo_R1_{stereo_timestamp}.csv', delimiter=',')
+        R2 = np.loadtxt(calib_dir / f'stereo_R2_{stereo_timestamp}.csv', delimiter=',')
 
-        return {
+        # Load camera matrices and distortion coefficients
+        K1 = np.loadtxt(calib_dir / f'left_camera_camera_matrix_{camera_timestamp}.csv', delimiter=',')
+        K2 = np.loadtxt(calib_dir / f'right_camera_camera_matrix_{camera_timestamp}.csv', delimiter=',')
+        D1 = np.loadtxt(calib_dir / f'left_camera_distortion_{camera_timestamp}.csv', delimiter=',')
+        D2 = np.loadtxt(calib_dir / f'right_camera_distortion_{camera_timestamp}.csv', delimiter=',')
+
+        result = {
             'P1': P1,
             'P2': P2,
-            'left_map1': left_map1,
-            'left_map2': left_map2,
-            'right_map1': right_map1,
-            'right_map2': right_map2,
-            'timestamp': timestamp
+            'R1': R1,
+            'R2': R2,
+            'K1': K1,
+            'K2': K2,
+            'D1': D1,
+            'D2': D2,
+            'timestamp': stereo_timestamp
         }
+
+        # Optionally load rectification maps
+        if load_maps:
+            map_files = sorted(calib_dir.glob('stereo_left_map1_*.npy'), reverse=True)
+            if map_files:
+                result['left_map1'] = np.load(calib_dir / f'stereo_left_map1_{stereo_timestamp}.npy')
+                result['left_map2'] = np.load(calib_dir / f'stereo_left_map2_{stereo_timestamp}.npy')
+                result['right_map1'] = np.load(calib_dir / f'stereo_right_map1_{stereo_timestamp}.npy')
+                result['right_map2'] = np.load(calib_dir / f'stereo_right_map2_{stereo_timestamp}.npy')
+
+        return result
 
     except Exception as e:
         print(f"\nError loading calibration from {calib_dir}: {e}")

@@ -312,7 +312,7 @@ class KalmanFilter:
             ball_physics_params: Dict with 'radius', 'mass', 'gravity', 'mass_factor'
             dt: Time step for prediction (control loop period)
             include_damping: If True, include velocity-dependent damping (rolling friction)
-            camera_type: Camera type ('PIXY2' or 'ZED') for noise characteristics
+            camera_type: Camera type ('PIXY2' or 'STEREO') for noise characteristics
         """
         self.camera_type = camera_type
         # Default ball physics parameters
@@ -396,15 +396,14 @@ class KalmanFilter:
 
         # Measurement noise covariance R
         # Based on camera characteristics (platform-specific):
-        if self.camera_type == 'ZED':
-            # ZED camera: Use conservative operational noise estimates
-            # Note: Static measured noise (0.0309mm X, 0.0016mm Y) is too low for Kalman filter
-            # During operation, noise includes ball motion blur, lighting, vibration, CNN uncertainty
+        if self.camera_type == 'STEREO':
+            # Stereo camera: Use conservative operational noise estimates
+            # Stereo triangulation introduces noise from both cameras and depth estimation
             # Use values that give stable filtering similar to well-tuned Pixy2 performance
-            noise_std_x = 1.5 / 1000.0  # 1.5mm operational noise in X (m)
-            noise_std_y = 1.5 / 1000.0  # 1.5mm operational noise in Y (m)
+            noise_std_x = 1.0 / 1000.0  # 1.0mm operational noise in X (m)
+            noise_std_y = 1.0 / 1000.0  # 1.0mm operational noise in Y (m)
 
-            # Conservative operational noise (better than Pixy2 but accounts for real conditions)
+            # Conservative operational noise for stereo triangulation
             self.R_base = np.diag([noise_std_x ** 2, noise_std_y ** 2])
         else:  # PIXY2
             # Pixy2 camera: Pixel quantization + sub-pixel noise
