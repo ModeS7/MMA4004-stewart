@@ -2317,6 +2317,66 @@ class PerformanceDataCollectionModule(GUIModule):
             self.filename_label.setText("File: None")
 
 
+
+class VideoRecordModule(GUIModule):
+    """Video recording toggle for stereo camera."""
+
+    def __init__(self, parent=None, colors=None, callbacks=None):
+        super().__init__(parent, colors, callbacks)
+        self.is_recording = False
+
+    def create(self) -> QWidget:
+        """Create video recording toggle panel."""
+        group = QGroupBox("Video Recording")
+        layout = QVBoxLayout()
+
+        # Toggle button
+        self.record_btn = QPushButton("Start Video Recording")
+        self.record_btn.setCheckable(True)
+        self.record_btn.clicked.connect(self._on_toggle)
+        self.record_btn.setStyleSheet("""
+            QPushButton { padding: 8px; font-weight: bold; }
+            QPushButton:checked { background-color: #cc4444; color: white; }
+        """)
+        layout.addWidget(self.record_btn)
+
+        # Status label
+        self.status_label = QLabel("Status: Not recording")
+        self.status_label.setStyleSheet(f"color: {self.colors['fg']};")
+        layout.addWidget(self.status_label)
+
+        # Filename label
+        self.filename_label = QLabel("")
+        self.filename_label.setStyleSheet(f"color: {self.colors['fg']}; font-size: 10px;")
+        layout.addWidget(self.filename_label)
+
+        group.setLayout(layout)
+        self.widget = group
+        return group
+
+    def _on_toggle(self) -> None:
+        """Handle record button toggle."""
+        if self.record_btn.isChecked():
+            callback = self.callbacks.get('start_video_recording')
+            if callback:
+                filepath = callback()
+                self.is_recording = True
+                self.record_btn.setText("Stop Video Recording")
+                self.status_label.setText("Status: Recording...")
+                self.filename_label.setText(f"File: {filepath}")
+        else:
+            callback = self.callbacks.get('stop_video_recording')
+            if callback:
+                callback()
+            self.is_recording = False
+            self.record_btn.setText("Start Video Recording")
+            self.status_label.setText("Status: Stopped")
+
+    def update(self, state: dict) -> None:
+        """Update display from state."""
+        pass
+
+
 class Plot3DModule(GUIModule):
     """3D visualization of ball and platform using PyQtGraph OpenGL."""
 

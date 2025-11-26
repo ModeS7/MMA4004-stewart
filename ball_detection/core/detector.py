@@ -6,6 +6,7 @@ Combines fast ROI extraction with CNN refinement for high-speed, accurate ball d
 
 import cv2
 import numpy as np
+import time
 from typing import Optional, Tuple
 from pathlib import Path
 
@@ -82,6 +83,51 @@ class BallDetector:
         y_abs = y_offset + y_norm * self.crop_size
 
         return (x_abs, y_abs, confidence)
+
+    def detect_with_timing(self, frame) -> Tuple[Optional[Tuple[float, float, float]], dict]:
+        """
+        Detect ball with detailed timing breakdown.
+
+        Returns:
+            result: (x, y, confidence) or None
+            timing: dict with 'roi_ms', 'preprocess_ms', 'inference_ms', 'total_ms'
+        """
+        t_start = time.perf_counter()
+
+        # Stage 1: Fast ROI extraction
+        t0 = time.perf_counter()
+        crop, roi_center, crop_offset = self.roi_extractor.extract_roi(frame)
+        t_roi = time.perf_counter()
+
+        timing = {
+            'roi_ms': (t_roi - t0) * 1000,
+            'preprocess_ms': 0.0,
+            'inference_ms': 0.0,
+            'total_ms': 0.0
+        }
+
+        if crop is None:
+            timing['total_ms'] = (time.perf_counter() - t_start) * 1000
+            return None, timing
+
+        # Stage 2: CNN refinement with timing
+        (x_norm, y_norm, confidence), cnn_timing = self.cnn_detector.detect_with_timing(crop)
+        timing['preprocess_ms'] = cnn_timing['preprocess_ms']
+        timing['inference_ms'] = cnn_timing['inference_ms']
+
+        # Check confidence threshold
+        if confidence < self.confidence_threshold:
+            timing['total_ms'] = (time.perf_counter() - t_start) * 1000
+            return None, timing
+
+        # Convert normalized coordinates to original frame coordinates
+        x_offset, y_offset = crop_offset
+        x_abs = x_offset + x_norm * self.crop_size
+        y_abs = y_offset + y_norm * self.crop_size
+
+        timing['total_ms'] = (time.perf_counter() - t_start) * 1000
+
+        return (x_abs, y_abs, confidence), timing
 
     def detect_dual_camera(self, frame1, frame2) -> Tuple[Optional[Tuple], Optional[Tuple]]:
         """

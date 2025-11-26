@@ -141,6 +141,43 @@ class ONNXBallDetector:
 
         return float(x_norm), float(y_norm), float(confidence)
 
+    def detect_with_timing(self, image_rgb) -> Tuple[Tuple[float, float, float], dict]:
+        """
+        Detect ball center with detailed timing breakdown.
+
+        Returns:
+            result: (x_norm, y_norm, confidence)
+            timing: dict with 'preprocess_ms' and 'inference_ms'
+        """
+        # Preprocess with timing
+        t0 = time.perf_counter()
+        input_tensor = self.preprocess(image_rgb)
+        t1 = time.perf_counter()
+
+        # Inference with timing
+        outputs = self.session.run([self.output_name], {self.input_name: input_tensor})
+        t2 = time.perf_counter()
+
+        # Update statistics
+        inference_time = t2 - t1
+        self.inference_count += 1
+        self.total_inference_time += inference_time
+
+        # Parse output
+        output_data = outputs[0][0]
+        if len(output_data) == 2:
+            x_norm, y_norm = output_data
+            confidence = 1.0
+        else:
+            x_norm, y_norm, confidence = output_data
+
+        timing = {
+            'preprocess_ms': (t1 - t0) * 1000,
+            'inference_ms': (t2 - t1) * 1000
+        }
+
+        return (float(x_norm), float(y_norm), float(confidence)), timing
+
     def detect_batch(self, images_rgb) -> np.ndarray:
         """
         Detect ball centers in batch of images.

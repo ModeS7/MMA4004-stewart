@@ -82,6 +82,11 @@ class StereoCameraController:
         self.frame_count = 0
         self.detection_count = 0
         self.stereo_pair_count = 0
+
+        # Video recording
+        self.video_writer = None
+        self.recording = False
+        self.record_path = None
         self.triangulation_count = 0
         self.start_time = None
 
@@ -225,6 +230,10 @@ class StereoCameraController:
         """Disconnect from camera and stop detection thread."""
         self.running = False
 
+        # Stop recording if active
+        if self.recording:
+            self.stop_recording()
+
         if self.thread:
             self.thread.join(timeout=1.0)
 
@@ -235,6 +244,36 @@ class StereoCameraController:
             self.cap.release()
 
         print("Stereo camera disconnected")
+
+    def start_recording(self, output_path: str = None) -> str:
+        """Start recording video to file."""
+        if self.recording:
+            return self.record_path
+
+        if output_path is None:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"recording_{timestamp}.mp4"
+
+        self.record_path = output_path
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = 60.0
+        frame_size = (self.frame_width, self.frame_height)
+        self.video_writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
+        self.recording = True
+        print(f"Recording started: {output_path}")
+        return output_path
+
+    def stop_recording(self) -> None:
+        """Stop recording video."""
+        if not self.recording:
+            return
+
+        self.recording = False
+        if self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+        print(f"Recording stopped: {self.record_path}")
 
     def _triangulate_3d_point(self, left_point: tuple, right_point: tuple) -> Optional[np.ndarray]:
         """
@@ -308,6 +347,10 @@ class StereoCameraController:
                     self.frame_ready.set()
                     grab_count += 1
 
+                    # Write frame to video if recording
+                    if self.recording and self.video_writer:
+                        self.video_writer.write(frame)
+
                     # Calculate grabber FPS every 100 frames
                     if grab_count % 100 == 0:
                         elapsed = time.perf_counter() - grab_start
@@ -345,9 +388,9 @@ class StereoCameraController:
                 t_split = time.perf_counter()
 
                 # Run ball detection on raw (unrectified) frames
-                result_left = self.detector.detect(left_frame)
+                result_left, timing_left = self.detector.detect_with_timing(left_frame)
                 t_detect_left = time.perf_counter()
-                result_right = self.detector.detect(right_frame)
+                result_right, timing_right = self.detector.detect_with_timing(right_frame)
                 t_detect_right = time.perf_counter()
                 t_rectify = t_detect_right  # Default (no rectification if no detection)
 
@@ -416,6 +459,8 @@ class StereoCameraController:
                           f"get: {get_frame_ms:.1f} | split: {split_ms:.1f} | "
                           f"detect_L: {detect_l_ms:.1f} | detect_R: {detect_r_ms:.1f} | "
                           f"pt_rect: {rectify_ms:.1f} | rest: {rest_ms:.1f} | grabber: {self.grabber_fps:.1f}fps")
+                    print(f"  L: roi={timing_left['roi_ms']:.1f} prep={timing_left['preprocess_ms']:.1f} cnn={timing_left['inference_ms']:.1f} | "
+                          f"R: roi={timing_right['roi_ms']:.1f} prep={timing_right['preprocess_ms']:.1f} cnn={timing_right['inference_ms']:.1f}")
 
                 # Put in queue (non-blocking, drop oldest if full)
                 if self.ball_data_queue.full():

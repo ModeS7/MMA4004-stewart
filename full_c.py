@@ -351,6 +351,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             'imu_kalman_parameters': gm.IMUKalmanParametersModule,
             'ik_z_optimization': gm.IKZOptimizationModule,
             'performance_data': gm.PerformanceDataCollectionModule,
+            'video_record': gm.VideoRecordModule,
         }
 
         layout_config = self.get_layout_config()

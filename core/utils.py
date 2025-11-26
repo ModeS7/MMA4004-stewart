@@ -526,8 +526,8 @@ class StereoCameraConfig:
     #   2 = mobileLiteV3         (1M params, full MobileNetV3-Small)
     #   3 = CustomCNN            (custom architecture)
     #   4 = shufflenetV2         (ShuffleNetV2 x0.5)
-    MODEL_SELECT = 2  # <-- Change this to switch models
-    USE_INT8 = False  # <-- Set True to use INT8 quantized version
+    MODEL_SELECT = 1  # <-- Change this to switch models
+    USE_INT8 = True  # <-- Set True to use INT8 quantized version
 
     # Model paths (auto-selected based on MODEL_SELECT and USE_INT8)
     _MODEL_PATHS = {
@@ -539,7 +539,7 @@ class StereoCameraConfig:
     MODEL_PATH = _MODEL_PATHS[MODEL_SELECT] + ('_int8.onnx' if USE_INT8 else '.onnx')
     # =========================================================================
 
-    USE_GPU = True  # Use GPU acceleration (DirectML)
+    USE_GPU = False  # Use GPU acceleration (DirectML)
 
     # Stereo triangulation noise characteristics
     NOISE_STD_XY_MM = 1.0   # X/Y measurement noise (mm) - operational estimate

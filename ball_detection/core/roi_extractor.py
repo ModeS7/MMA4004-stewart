@@ -22,7 +22,7 @@ class RedBallROIExtractor:
     Speed: ~1-2ms per frame on modern CPU
     """
 
-    def __init__(self, crop_size=128, min_area=50):
+    def __init__(self, crop_size=128, min_area=50, downsample_factor=4):
         """
         Initialize ROI extractor.
 
@@ -32,6 +32,7 @@ class RedBallROIExtractor:
         """
         self.crop_size = crop_size
         self.min_area = min_area
+        self.downsample_factor = downsample_factor
 
         # HSV color ranges for red ball
         # Red wraps around in HSV (0-10 and 160-179)
@@ -41,7 +42,7 @@ class RedBallROIExtractor:
         self.upper_red2 = np.array([179, 255, 255])
 
         # Morphological kernel for noise removal
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     def set_hsv_ranges(self, lower1, upper1, lower2, upper2):
         """
@@ -73,17 +74,21 @@ class RedBallROIExtractor:
             center: (x, y) ball center in original frame coordinates, or None
             crop_offset: (x_offset, y_offset) top-left corner of crop in original frame, or None
         """
-        # Convert to HSV
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Downsample for fast ROI finding
+        scale = self.downsample_factor
+        h, w = frame.shape[:2]
+        small = cv2.resize(frame, (w // scale, h // scale), interpolation=cv2.INTER_NEAREST)
+
+        # Convert downsampled frame to HSV
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
 
         # Create mask for red color (two ranges)
         mask1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
         mask2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
         mask = cv2.bitwise_or(mask1, mask2)
 
-        # Morphological operations to remove noise
+        # Single morphological operation for speed
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
 
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -95,18 +100,20 @@ class RedBallROIExtractor:
         largest_contour = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest_contour)
 
-        if area < self.min_area:
+        # Adjust min_area for downsampled image
+        if area < self.min_area // (scale * scale):
             return None, None, None
 
-        # Calculate ball center using moments
+        # Calculate ball center in downsampled image
         M = cv2.moments(largest_contour)
         if M['m00'] == 0:
             return None, None, None
 
-        cx = int(M['m10'] / M['m00'])
-        cy = int(M['m01'] / M['m00'])
+        # Scale coordinates back to full resolution
+        cx = int(M['m10'] / M['m00']) * scale
+        cy = int(M['m01'] / M['m00']) * scale
 
-        # Extract crop centered on ball
+        # Extract crop from FULL resolution frame
         crop, crop_offset = self._extract_crop(frame, (cx, cy))
 
         if crop is None:
