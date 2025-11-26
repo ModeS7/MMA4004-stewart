@@ -103,8 +103,7 @@ def quantize_to_int8(model_path, output_path=None):
     quantize_dynamic(
         model_input=str(model_path),
         model_output=str(output_path),
-        weight_type=QuantType.QInt8,
-        optimize_model=True
+        weight_type=QuantType.QInt8
     )
 
     print(f"  INT8 model saved: {output_path}")
