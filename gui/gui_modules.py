@@ -1708,6 +1708,13 @@ class ControllerSelectionModule(GUIModule):
         self.lqr_btn.clicked.connect(lambda: self._on_controller_select('LQR'))
         btn_layout.addWidget(self.lqr_btn)
 
+        self.rl_btn = QPushButton("RL")
+        self.rl_btn.setCheckable(True)
+        self.rl_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
+        self.rl_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
+        self.rl_btn.clicked.connect(lambda: self._on_controller_select('RL'))
+        btn_layout.addWidget(self.rl_btn)
+
         self.manual_btn = QPushButton("Manual")
         self.manual_btn.setCheckable(True)
         self.manual_btn.setMinimumWidth(GUI_BUTTON_WIDTH_MEDIUM)
@@ -1724,6 +1731,8 @@ class ControllerSelectionModule(GUIModule):
             self.pid_btn.setChecked(True)
         elif self.current_controller == 'LQR':
             self.lqr_btn.setChecked(True)
+        elif self.current_controller == 'RL':
+            self.rl_btn.setChecked(True)
         else:
             self.manual_btn.setChecked(True)
 
@@ -1741,6 +1750,7 @@ class ControllerSelectionModule(GUIModule):
         # Update button states
         self.pid_btn.setChecked(controller == 'PID')
         self.lqr_btn.setChecked(controller == 'LQR')
+        self.rl_btn.setChecked(controller == 'RL')
         self.manual_btn.setChecked(controller == 'Manual')
 
         if self.callbacks.get('controller_type_change'):

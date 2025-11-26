@@ -605,6 +605,36 @@ class LQRControllerConfig(ControllerConfig):
         return self.scalar_values
 
 
+class RLControllerConfig(ControllerConfig):
+    """RL (Reinforcement Learning) controller configuration.
+
+    The RL controller has no tunable parameters - the policy is fixed after training.
+    """
+
+    def __init__(self, model_path: str = 'RL/checkpoints/sac_final.pt') -> None:
+        """Initialize RL controller configuration."""
+        self.model_path = model_path
+        self.scalar_values: List[float] = []  # No tunable params
+        self.controller_ref: Optional[Any] = None
+
+    def get_controller_name(self) -> str:
+        """Get controller name."""
+        return "RL"
+
+    def create_controller(self, **kwargs):
+        """Create RL controller instance."""
+        from core.control_core import RLController
+        return RLController(
+            model_path=kwargs.get('model_path', self.model_path),
+            output_limit=kwargs.get('output_limit', 15.0),
+            device='cpu'
+        )
+
+    def get_scalar_values(self) -> List[float]:
+        """Get list of scalar values (empty for RL)."""
+        return self.scalar_values
+
+
 # ============================================================================
 # HARDWARE CONTROLLER BASE CLASS
 # ============================================================================
@@ -723,6 +753,9 @@ class HardwareControllerBase(BaseStewartSimulator):
                 return LQRControllerConfig(mode='hardware')
             else:
                 return LQRControllerConfig(mode='simulation')
+        elif self.controller_type_selection == 'RL':
+            # RL controller has no tunable parameters
+            return RLControllerConfig()
         else:
             # Manual mode uses default configuration
             return HardwareControllerConfig()
@@ -773,6 +806,19 @@ class HardwareControllerBase(BaseStewartSimulator):
             except Exception as e:
                 self.log(f"LQR initialization failed: {str(e)}")
                 self.log("Adjust Q/R parameters and retry")
+                self.controller = None
+
+        elif self.controller_type_selection == 'RL':
+            try:
+                from core.control_core import RLController
+                self.controller = RLController(
+                    model_path='RL/checkpoints/sac_final.pt',
+                    output_limit=15.0,
+                    device='cpu'
+                )
+                self.log("RL controller initialized (SAC policy)")
+            except Exception as e:
+                self.log(f"RL initialization failed: {str(e)}")
                 self.controller = None
 
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):

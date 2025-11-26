@@ -129,6 +129,12 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
             rx, ry = self.controller.update(ball_pos_filtered, target_pos_mm, dt)
         elif "LQR" in controller_name:
             rx, ry = self.controller.update(ball_pos_filtered, ball_vel_filtered, target_pos_mm)
+        elif self.controller_type_selection == 'RL':
+            platform_tilt = (self.prev_effective_angles['rx'], self.prev_effective_angles['ry'])
+            rx, ry = self.controller.update(
+                ball_pos_filtered, ball_vel_filtered, target_pos_mm,
+                platform_tilt_deg=platform_tilt
+            )
         else:
             return None
 

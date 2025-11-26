@@ -5,6 +5,7 @@ Stewart Platform Control Core
 Controllers:
 - PIDController: PID control for ball balancing
 - LQRController: Linear Quadratic Regulator for optimal control
+- RLController: Reinforcement Learning (SAC) policy for ball balancing
 - KalmanFilter: Linear Kalman Filter for ball state estimation
 - OrientationKalmanFilter: EKF for IMU-based orientation estimation
 """
@@ -281,6 +282,146 @@ class LQRController:
     def get_gain_matrix(self):
         """Get current LQR gain matrix."""
         return self.K.copy() if self.K is not None else None
+
+
+class RLController:
+    """
+    Reinforcement Learning Controller using trained SAC policy.
+
+    Uses a neural network policy trained in simulation to control
+    platform tilt for ball balancing.
+    """
+
+    def __init__(self,
+                 model_path: str = "RL/checkpoints/sac_final.pt",
+                 output_limit: float = MAX_CONTROLLER_OUTPUT_DEG,
+                 device: str = "cpu") -> None:
+        """
+        Args:
+            model_path: Path to trained SAC model checkpoint
+            output_limit: Maximum tilt angle (degrees)
+            device: "cpu" or "cuda" for inference
+        """
+        import torch
+        import torch.nn as nn
+
+        self.output_limit = output_limit
+        self.device = torch.device(device)
+
+        # Normalization constants (must match training)
+        self.platform_radius_mm = 150.0
+        self.max_vel_mm_s = 500.0
+        self.max_tilt_deg = 10.0
+
+        # Build actor network (same architecture as training)
+        class Actor(nn.Module):
+            def __init__(self, state_dim=6, action_dim=2, hidden_dim=256):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(state_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU()
+                )
+                self.mean = nn.Linear(hidden_dim, action_dim)
+
+            def forward(self, state):
+                features = self.network(state)
+                return torch.tanh(self.mean(features))
+
+        self.actor = Actor().to(self.device)
+        self.actor.eval()
+
+        # Load trained weights
+        self._load_model(model_path)
+
+        # Track current platform tilt (updated externally or from last action)
+        self.current_rx = 0.0
+        self.current_ry = 0.0
+
+    def _load_model(self, model_path: str) -> None:
+        """Load trained actor weights."""
+        import torch
+
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
+            if 'actor' in checkpoint:
+                self.actor.load_state_dict(checkpoint['actor'], strict=False)
+            else:
+                self.actor.load_state_dict(checkpoint, strict=False)
+            print(f"[RLController] Loaded model from {model_path}")
+        except Exception as e:
+            print(f"[RLController] Warning: Could not load model: {e}")
+            print("[RLController] Using random initialization")
+
+    def update(self, ball_pos_mm: Tuple[float, float], ball_vel_mm_s: Tuple[float, float],
+               target_pos_mm: Tuple[float, float] = (0.0, 0.0),
+               platform_tilt_deg: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
+        """
+        Compute RL control output.
+
+        Args:
+            ball_pos_mm: (x, y) current position in mm
+            ball_vel_mm_s: (vx, vy) current velocity in mm/s
+            target_pos_mm: (x, y) target position in mm (used to compute error)
+            platform_tilt_deg: (rx, ry) current platform tilt in degrees (optional)
+
+        Returns:
+            (rx, ry): platform tilt angles in degrees
+        """
+        import torch
+
+        # Use provided platform tilt or tracked values
+        if platform_tilt_deg is not None:
+            rx_current, ry_current = platform_tilt_deg
+        else:
+            rx_current, ry_current = self.current_rx, self.current_ry
+
+        # Compute error relative to target
+        error_x = ball_pos_mm[0] - target_pos_mm[0]
+        error_y = ball_pos_mm[1] - target_pos_mm[1]
+
+        # Build normalized observation (must match training)
+        # [ball_x, ball_y, ball_vx, ball_vy, platform_rx, platform_ry]
+        obs = np.array([
+            error_x / self.platform_radius_mm,  # Normalized position
+            error_y / self.platform_radius_mm,
+            ball_vel_mm_s[0] / self.max_vel_mm_s,  # Normalized velocity
+            ball_vel_mm_s[1] / self.max_vel_mm_s,
+            rx_current / self.max_tilt_deg,  # Normalized tilt
+            ry_current / self.max_tilt_deg
+        ], dtype=np.float32)
+
+        # Clip to prevent extreme inputs
+        obs = np.clip(obs, -2.0, 2.0)
+
+        # Run inference
+        with torch.no_grad():
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            action = self.actor(obs_tensor).cpu().numpy()[0]
+
+        # Scale action from [-1, 1] to degrees
+        rx_target = action[0] * self.max_tilt_deg
+        ry_target = action[1] * self.max_tilt_deg
+
+        # Apply output limit
+        rx, ry, _ = clip_tilt_vector(rx_target, ry_target, self.output_limit)
+
+        # Track for next iteration
+        self.current_rx = rx
+        self.current_ry = ry
+
+        return rx, ry
+
+    def reset(self) -> None:
+        """Reset controller state."""
+        self.current_rx = 0.0
+        self.current_ry = 0.0
+
+    def set_platform_tilt(self, rx: float, ry: float) -> None:
+        """Update tracked platform tilt (call with IMU/FK feedback)."""
+        self.current_rx = rx
+        self.current_ry = ry
 
 
 class KalmanFilter:
