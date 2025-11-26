@@ -19,7 +19,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 
-from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, create_model
+from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2, create_model
 from ..core.dataset import create_dataloaders
 from ..core.gpu_augmentations import GPUAugmentationsWithTargets
 from ..core.cached_dataset import CachedAugmentationDataset
@@ -39,8 +39,9 @@ TRAIN_SPLIT = 0.8
 NUM_WORKERS = 8  # Reduced workers for smaller batch size
 SAVE_INTERVAL = 100  # Save less frequently (every 100 epochs for 3000 epoch run)
 VALIDATION_INTERVAL = 2  # Validate every N epochs (reduce sync overhead)
-USE_MOBILENET = True  # Use MobileNetV3-Small with pretrained ImageNet weights
-MOBILENET_PRETRAINED = True  # Load ImageNet pretrained weights for MobileNetV3
+USE_MOBILENET = False  # Use MobileNetV3-Small with pretrained ImageNet weights
+USE_SHUFFLENET = True  # Use ShuffleNetV2 x0.5 (faster than MobileNetV3, ~350K params)
+PRETRAINED_BACKBONE = True  # Load ImageNet pretrained weights for MobileNetV3/ShuffleNet
 USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (simulate CV detection error)
 USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
 
@@ -53,7 +54,7 @@ USE_GPU_AUGMENTATIONS = False   # Use Kornia GPU augmentations instead of Albume
 # ============================================================
 # CACHED AUGMENTATION SETTINGS (For Maximum GPU Utilization)
 # ============================================================
-USE_CACHED_AUGMENTATIONS = True  # Use pre-augmented cache in RAM
+USE_CACHED_AUGMENTATIONS = False  # Use pre-augmented cache in RAM
 CACHE_SIZE_MULTIPLIER = 3        # Cache size = dataset_size x multiplier (3x = ~21K images)
 CACHE_MAX_REUSE_COUNT = 2        # Replace cached items after N uses
 CACHE_ENABLE_REFRESH = True      # Background thread continuously refreshes cache
@@ -403,11 +404,13 @@ def main():
     from datetime import datetime
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_name = f"run_{timestamp}"
-    if USE_MOBILENET:
+    if USE_SHUFFLENET:
+        run_name += "_shufflenetv2"
+    elif USE_MOBILENET:
         run_name += "_mobilenetv3"
     else:
         run_name += "_customcnn"
-    if ENABLE_PRUNING:
+    if ENABLE_PRUNING and not USE_SHUFFLENET:  # Pruning not supported for ShuffleNet
         run_name += "_pruning"
 
     # Each run gets its own directory under models/
@@ -430,7 +433,8 @@ def main():
         'weight_decay': WEIGHT_DECAY,
         'train_split': TRAIN_SPLIT,
         'use_mobilenet': USE_MOBILENET,
-        'mobilenet_pretrained': MOBILENET_PRETRAINED,
+        'use_shufflenet': USE_SHUFFLENET,
+        'pretrained_backbone': PRETRAINED_BACKBONE,
         'use_spatial_augmentation': USE_SPATIAL_AUGMENTATION,
         'use_appearance_augmentation': USE_APPEARANCE_AUGMENTATION,
         'enable_pruning': ENABLE_PRUNING,
@@ -557,9 +561,12 @@ def main():
 
     # Create model
     print("\nCreating model...")
-    if USE_MOBILENET:
-        print(f"Using MobileNetV3-Small (pretrained: {MOBILENET_PRETRAINED})")
-        model = BallDetectorMobileNetV3(pretrained=MOBILENET_PRETRAINED)
+    if USE_SHUFFLENET:
+        print(f"Using ShuffleNetV2 x0.5 (pretrained: {PRETRAINED_BACKBONE})")
+        model = BallDetectorShuffleNetV2(pretrained=PRETRAINED_BACKBONE)
+    elif USE_MOBILENET:
+        print(f"Using MobileNetV3-Small (pretrained: {PRETRAINED_BACKBONE})")
+        model = BallDetectorMobileNetV3(pretrained=PRETRAINED_BACKBONE)
     else:
         print("Using custom BallDetectorCNN")
         model = BallDetectorCNN()
@@ -586,51 +593,88 @@ def main():
     criterion = DetectionLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Learning rate scheduler:
-    # Phase 1: Warmup (0-10)
-    # Phase 2: Cosine annealing until pruning starts (10-150)
-    # Phase 3: Small constant LR during pruning (150+)
+    # Determine if pruning will be enabled (ShuffleNet doesn't support it)
+    will_prune = ENABLE_PRUNING and not USE_SHUFFLENET
 
-    PRUNING_LR = 2e-4  # Higher LR for structured pruning recovery (was 1e-5, then 1e-4)
+    # Learning rate scheduler - different strategies for pruning vs non-pruning
+    PRUNING_LR = 2e-4  # Higher LR for structured pruning recovery
+    MIN_LR = 1e-6  # Minimum LR for warm restarts
 
-    warmup_scheduler = optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=WARMUP_EPOCHS
-    )
+    if will_prune:
+        # Pruning scheduler:
+        # Phase 1: Warmup (0-10)
+        # Phase 2: Cosine annealing until pruning starts (10-150)
+        # Phase 3: Small constant LR during pruning (150+)
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=WARMUP_EPOCHS
+        )
 
-    # Cosine decay from LEARNING_RATE to PRUNING_LR until pruning starts
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=PRUNING_START_EPOCH - WARMUP_EPOCHS,
-        eta_min=PRUNING_LR
-    )
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=PRUNING_START_EPOCH - WARMUP_EPOCHS,
+            eta_min=PRUNING_LR
+        )
 
-    # Constant small LR during pruning for stability
-    # Cosine scheduler already brings LR down to PRUNING_LR, so just keep it constant
-    constant_scheduler = optim.lr_scheduler.ConstantLR(
-        optimizer,
-        factor=1.0,  # Keep LR constant at current value (PRUNING_LR from cosine)
-        total_iters=EPOCHS - PRUNING_START_EPOCH
-    )
+        constant_scheduler = optim.lr_scheduler.ConstantLR(
+            optimizer,
+            factor=1.0,
+            total_iters=EPOCHS - PRUNING_START_EPOCH
+        )
 
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler, constant_scheduler],
-        milestones=[WARMUP_EPOCHS, PRUNING_START_EPOCH]
-    )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler, constant_scheduler],
+            milestones=[WARMUP_EPOCHS, PRUNING_START_EPOCH]
+        )
+        restart_epochs = []
 
-    # No restart epochs with this scheduler
-    restart_epochs = []
+        print(f"LR schedule (pruning mode):")
+        print(f"  Warmup: epochs 1-{WARMUP_EPOCHS} ({LEARNING_RATE*0.1:.6f} -> {LEARNING_RATE:.6f})")
+        print(f"  Cosine: epochs {WARMUP_EPOCHS+1}-{PRUNING_START_EPOCH} ({LEARNING_RATE:.6f} -> {PRUNING_LR:.6f})")
+        print(f"  Pruning: epochs {PRUNING_START_EPOCH+1}-{EPOCHS} (constant {PRUNING_LR:.6f})")
+    else:
+        # Non-pruning scheduler: Warmup + CosineAnnealingWarmRestarts
+        # T_0=400: cycle every 400 epochs
+        # T_mult=1: fixed cycle length (no doubling)
+        T_0 = 400
+        T_mult = 1
 
-    print(f"LR schedule:")
-    print(f"  Warmup: epochs 1-{WARMUP_EPOCHS} ({LEARNING_RATE*0.1:.6f} -> {LEARNING_RATE:.6f})")
-    print(f"  Cosine: epochs {WARMUP_EPOCHS+1}-{PRUNING_START_EPOCH} ({LEARNING_RATE:.6f} -> {PRUNING_LR:.6f})")
-    print(f"  Pruning: epochs {PRUNING_START_EPOCH+1}-{EPOCHS} (constant {PRUNING_LR:.6f}, then {PRUNING_LR*0.5:.6f} after each prune)")
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=WARMUP_EPOCHS
+        )
 
-    # Initialize pruning state
-    if ENABLE_PRUNING:
+        cosine_restarts_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=T_0,
+            T_mult=T_mult,
+            eta_min=MIN_LR
+        )
+
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_restarts_scheduler],
+            milestones=[WARMUP_EPOCHS]
+        )
+
+        # Calculate restart epochs for logging (after warmup)
+        restart_epochs = [WARMUP_EPOCHS + T_0 * i for i in range(1, (EPOCHS - WARMUP_EPOCHS) // T_0 + 1)]
+
+        print(f"LR schedule (warm restarts):")
+        print(f"  Warmup: epochs 1-{WARMUP_EPOCHS} ({LEARNING_RATE*0.1:.6f} -> {LEARNING_RATE:.6f})")
+        print(f"  CosineAnnealingWarmRestarts: T_0={T_0}, T_mult={T_mult}")
+        print(f"  LR range: {LEARNING_RATE:.6f} -> {MIN_LR:.6f}")
+        print(f"  Restart epochs: {restart_epochs}")
+
+    # Initialize pruning state (will_prune already accounts for ShuffleNet)
+    enable_pruning = will_prune
+
+    if enable_pruning:
         pixel_error_history = deque(maxlen=PRUNING_PATIENCE)
         current_sparsity_target = INITIAL_TARGET_SPARSITY
         pruning_active = True
@@ -703,7 +747,7 @@ def main():
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
             # Add final training countdown to summary
             epoch_str = f"Epoch {epoch}/{EPOCHS}"
-            if ENABLE_PRUNING and pruning_limit_reached:
+            if enable_pruning and pruning_limit_reached:
                 epoch_str += f" [Final Training: {final_training_epochs_remaining} epochs remaining]"
 
             print(f"\n{epoch_str} Summary:")
@@ -712,7 +756,7 @@ def main():
             print(f"  LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
         else:
             epoch_str = f"Epoch {epoch}/{EPOCHS}"
-            if ENABLE_PRUNING and pruning_limit_reached:
+            if enable_pruning and pruning_limit_reached:
                 epoch_str += f" [Final: {final_training_epochs_remaining} left]"
 
             print(f"\n{epoch_str}: Train Loss: {train_loss:.4f} | Pixel Error: {train_pixel_err:.3f}px | LR: {current_lr:.6f} | Time: {epoch_time:.1f}s")
@@ -731,7 +775,7 @@ def main():
                     writer.add_scalar('Loss/val', val_loss, epoch)
                     writer.add_scalar('PixelError/val', val_pixel_err, epoch)
 
-                if ENABLE_PRUNING:
+                if enable_pruning:
                     sparsity = get_model_sparsity(model, original_param_count)
                     writer.add_scalar('Sparsity/global', sparsity, epoch)
 
@@ -758,7 +802,7 @@ def main():
                             writer.add_histogram(f'Gradients/{name}', param.grad, epoch)
 
         # Pruning logic
-        if ENABLE_PRUNING and pruning_active:
+        if enable_pruning and pruning_active:
             # Track validation pixel error (only on validation epochs)
             if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
                 pixel_error_history.append(val_pixel_err)
@@ -867,7 +911,7 @@ def main():
                         last_successful_prune_epoch = epoch
 
         # Final training phase tracking (after pruning limit reached)
-        if ENABLE_PRUNING and pruning_limit_reached:
+        if enable_pruning and pruning_limit_reached:
             # Track best model during final training
             if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
                 if val_pixel_err < final_training_best_val_error:
@@ -915,7 +959,7 @@ def main():
             'train_pixel_error': train_pixel_err,
             'learning_rate': current_lr,
             'time': epoch_time,
-            'sparsity': get_model_sparsity(model, original_param_count) if ENABLE_PRUNING else 0.0
+            'sparsity': get_model_sparsity(model, original_param_count) if enable_pruning else 0.0
         }
 
         # Only include validation metrics when we actually validated
@@ -1040,7 +1084,7 @@ def main():
     print(f"Run: {run_name}")
 
     # Show final pruned model info if applicable
-    if ENABLE_PRUNING and pruning_limit_reached and final_training_best_model is not None:
+    if enable_pruning and pruning_limit_reached and final_training_best_model is not None:
         print(f"\nFinal Pruned Model (auto-finished after pruning limit):")
         print(f"  Epoch: {final_training_best_model['epoch']}")
         print(f"  Validation error: {final_training_best_val_error:.4f}px")
@@ -1055,7 +1099,7 @@ def main():
     print(f"Run directory: {output_dir}")
     print(f"  ├── best_model.pth")
     print(f"  ├── best_pixel_error.pth")
-    if ENABLE_PRUNING and pruning_limit_reached:
+    if enable_pruning and pruning_limit_reached:
         print(f"  ├── final_pruned_model.pth  ← Best from final training")
     print(f"  ├── checkpoint_epoch_*.pth")
     print(f"  ├── {run_name}.onnx  ← ONNX export")

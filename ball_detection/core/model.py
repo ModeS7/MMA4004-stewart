@@ -208,19 +208,104 @@ class BallDetectorMobileNetV3(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained=True):
+class BallDetectorShuffleNetV2(nn.Module):
+    """
+    Ball detector using ShuffleNetV2 x0.5 backbone with pretrained weights.
+
+    ShuffleNetV2 is optimized for speed with channel shuffle operations.
+    The x0.5 variant is the smallest, with only ~350K parameters.
+
+    Total Parameters: ~350K (backbone) + ~5K (head) = ~355K
+    Expected inference: ~0.3-0.5ms (faster than MobileNetV3)
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        # Load ShuffleNetV2 x0.5 with pretrained weights
+        if pretrained:
+            weights = models.ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+
+        shufflenet = models.shufflenet_v2_x0_5(weights=weights)
+
+        # Extract feature extractor (everything except fc)
+        # ShuffleNetV2 structure: conv1, maxpool, stage2, stage3, stage4, conv5
+        self.conv1 = shufflenet.conv1
+        self.maxpool = shufflenet.maxpool
+        self.stage2 = shufflenet.stage2
+        self.stage3 = shufflenet.stage3
+        self.stage4 = shufflenet.stage4
+        self.conv5 = shufflenet.conv5
+
+        # ShuffleNetV2 x0.5 outputs 1024 channels after conv5
+
+        # Regression head (gradual reduction like MobileNetV3)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(1024, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 2)  # (x, y) coordinates
+        )
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, 3, H, W)
+
+        Returns:
+            Output tensor of shape (batch, 2):
+                - [:, 0]: x_normalized in [0, 1]
+                - [:, 1]: y_normalized in [0, 1]
+        """
+        # Feature extraction
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.conv5(x)
+
+        # Global pooling
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Regression head
+        x = self.head(x)
+
+        # Apply sigmoid to ensure outputs in [0, 1]
+        x = torch.sigmoid(x)
+
+        return x
+
+    def count_parameters(self):
+        """Count total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained=True, use_shufflenet=False):
     """
     Create ball detector model.
 
     Args:
         pretrained_path: Optional path to pretrained weights (.pth file)
         use_mobilenet: If True, use MobileNetV3-Small backbone
-        mobilenet_pretrained: If True and use_mobilenet=True, load ImageNet pretrained weights
+        mobilenet_pretrained: If True and use_mobilenet/use_shufflenet=True, load ImageNet pretrained weights
+        use_shufflenet: If True, use ShuffleNetV2 x0.5 backbone (faster than MobileNetV3)
 
     Returns:
-        BallDetectorCNN or BallDetectorMobileNetV3 model
+        BallDetectorCNN, BallDetectorMobileNetV3, or BallDetectorShuffleNetV2 model
     """
-    if use_mobilenet:
+    if use_shufflenet:
+        model = BallDetectorShuffleNetV2(pretrained=mobilenet_pretrained)
+    elif use_mobilenet:
         model = BallDetectorMobileNetV3(pretrained=mobilenet_pretrained)
     else:
         model = BallDetectorCNN()
@@ -238,25 +323,32 @@ def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained
 
 
 if __name__ == "__main__":
-    # Test model creation and forward pass
-    print("Testing BallDetectorCNN...")
-
-    model = create_model()
-    model.eval()
-
-    # Create dummy input
+    # Test all model architectures
     batch_size = 2
-    dummy_input = torch.randn(batch_size, 3, 64, 64)
+    dummy_input = torch.randn(batch_size, 3, 128, 128)
 
-    # Forward pass
-    with torch.no_grad():
-        output = model(dummy_input)
+    models_to_test = [
+        ("BallDetectorCNN", BallDetectorCNN()),
+        ("BallDetectorMobileNetV3", BallDetectorMobileNetV3(pretrained=False)),
+        ("BallDetectorShuffleNetV2", BallDetectorShuffleNetV2(pretrained=False)),
+    ]
 
-    print(f"\nInput shape: {dummy_input.shape}")
-    print(f"Output shape: {output.shape}")
-    print(f"\nExample outputs:")
-    for i in range(batch_size):
-        x, y = output[i].numpy()
-        print(f"  Sample {i+1}: x={x:.4f}, y={y:.4f}")
+    for name, model in models_to_test:
+        print("=" * 60)
+        print(f"Testing {name}...")
+        print("=" * 60)
 
-    print("\nModel test successful!")
+        model.eval()
+        param_count = model.count_parameters()
+        print(f"Parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
+
+        # Forward pass
+        with torch.no_grad():
+            output = model(dummy_input)
+
+        print(f"Input shape: {dummy_input.shape}")
+        print(f"Output shape: {output.shape}")
+        print(f"Example output: x={output[0, 0]:.4f}, y={output[0, 1]:.4f}")
+        print()
+
+    print("All model tests successful!")
