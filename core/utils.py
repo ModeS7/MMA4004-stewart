@@ -26,6 +26,12 @@ PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger plat
 CAMERA_TYPE = 'STEREO'  # Options: 'PIXY2' or 'STEREO'
 
 # ============================================================================
+# DEBUG OPTIONS
+# ============================================================================
+DEBUG_DETECTION_TIMING = True   # Print detection timing breakdown (ROI, prep, CNN)
+DEBUG_TIMING_INTERVAL = 100     # Print timing every N frames
+
+# ============================================================================
 # PHYSICAL CONSTANTS AND LIMITS
 # ============================================================================
 
@@ -527,7 +533,7 @@ class StereoCameraConfig:
     #   3 = CustomCNN            (custom architecture)
     #   4 = shufflenetV2         (ShuffleNetV2 x0.5)
     MODEL_SELECT = 1  # <-- Change this to switch models
-    USE_INT8 = True  # <-- Set True to use INT8 quantized version
+    USE_INT8 = False  # <-- Set True to use INT8 quantized version
 
     # Model paths (auto-selected based on MODEL_SELECT and USE_INT8)
     _MODEL_PATHS = {
@@ -539,7 +545,7 @@ class StereoCameraConfig:
     MODEL_PATH = _MODEL_PATHS[MODEL_SELECT] + ('_int8.onnx' if USE_INT8 else '.onnx')
     # =========================================================================
 
-    USE_GPU = False  # Use GPU acceleration (DirectML)
+    USE_GPU = True  # Use GPU acceleration (DirectML)
 
     # Stereo triangulation noise characteristics
     NOISE_STD_XY_MM = 1.0   # X/Y measurement noise (mm) - operational estimate

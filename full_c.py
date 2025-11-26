@@ -196,6 +196,13 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             'stop_recording': self.stop_recording,
         })
 
+        # Add video recording callbacks (hardware only)
+        if self.operation_mode == 'real':
+            callbacks.update({
+                'start_video_recording': self.start_video_recording,
+                'stop_video_recording': self.stop_video_recording,
+            })
+
         # Add IMU callbacks (hardware only)
         if self.operation_mode == 'real':
             callbacks.update({
@@ -254,6 +261,10 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Performance data collection (both sim and hardware)
         left_modules.append({'type': 'performance_data',
                            'args': {'controller_type': self.controller_type_selection}})
+
+        # Hardware-only: Video recording
+        if self.operation_mode == 'real':
+            left_modules.append({'type': 'video_record'})
 
         # Simulation-only: Ball control
         if self.operation_mode == 'sim':
@@ -860,6 +871,22 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             self.recording_filename = None
         except Exception as e:
             self.log(f"ERROR: Failed to stop recording: {e}")
+
+    def start_video_recording(self) -> str:
+        """Start recording video from stereo camera."""
+        if not hasattr(self, 'camera_controller') or self.camera_controller is None:
+            self.log("ERROR: No camera connected")
+            return ""
+        filepath = self.camera_controller.start_recording()
+        self.log(f"Video recording started: {filepath}")
+        return filepath
+
+    def stop_video_recording(self) -> None:
+        """Stop recording video from stereo camera."""
+        if not hasattr(self, 'camera_controller') or self.camera_controller is None:
+            return
+        self.camera_controller.stop_recording()
+        self.log("Video recording stopped")
 
     def _control_thread_func(self) -> None:
         """Hardware control thread with IMU integration."""

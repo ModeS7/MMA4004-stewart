@@ -110,8 +110,8 @@ class RedBallROIExtractor:
             return None, None, None
 
         # Scale coordinates back to full resolution
-        cx = int(M['m10'] / M['m00']) * scale
-        cy = int(M['m01'] / M['m00']) * scale
+        cx = int((M['m10'] / M['m00']) * scale)
+        cy = int((M['m01'] / M['m00']) * scale)
 
         # Extract crop from FULL resolution frame
         crop, crop_offset = self._extract_crop(frame, (cx, cy))
