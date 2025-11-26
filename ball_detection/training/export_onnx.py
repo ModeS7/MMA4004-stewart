@@ -94,7 +94,10 @@ def optimize_onnx_graph(model_path, output_path=None, for_quantization=False):
 
 def quantize_to_int8(model_path, output_path=None):
     """
-    Apply dynamic INT8 quantization for faster CPU inference.
+    Apply INT8 quantization using QDQ format for better compatibility.
+
+    Uses static quantization with QDQ (QuantizeLinear/DequantizeLinear) format
+    instead of fused integer operators (ConvInteger) which have limited support.
 
     Args:
         model_path: Path to input ONNX model (FP32)
@@ -104,16 +107,45 @@ def quantize_to_int8(model_path, output_path=None):
         Path to quantized model
     """
     import onnx
-    from onnxruntime.quantization import quantize_dynamic, QuantType
+    import numpy as np
+    from onnxruntime.quantization import quantize_static, QuantType, QuantFormat, CalibrationDataReader
 
     if output_path is None:
         output_path = str(model_path).replace('.onnx', '_int8.onnx')
 
-    print(f"  Applying INT8 quantization...")
-    quantize_dynamic(
+    # Get input shape from model
+    model = onnx.load(str(model_path))
+    input_shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
+    if input_shape[0] == 0:  # Dynamic batch
+        input_shape[0] = 1
+
+    # Calibration data reader with random data (for weight quantization)
+    class DummyCalibrationReader(CalibrationDataReader):
+        def __init__(self, input_name, input_shape, num_samples=10):
+            self.input_name = input_name
+            self.input_shape = input_shape
+            self.num_samples = num_samples
+            self.current = 0
+
+        def get_next(self):
+            if self.current >= self.num_samples:
+                return None
+            self.current += 1
+            # Random calibration data (normalized like ImageNet)
+            data = np.random.randn(*self.input_shape).astype(np.float32)
+            return {self.input_name: data}
+
+    input_name = model.graph.input[0].name
+    calibration_reader = DummyCalibrationReader(input_name, input_shape)
+
+    print(f"  Applying INT8 quantization (QDQ format)...")
+    quantize_static(
         model_input=str(model_path),
         model_output=str(output_path),
+        calibration_data_reader=calibration_reader,
+        quant_format=QuantFormat.QDQ,  # Use QDQ format (universally supported)
         weight_type=QuantType.QInt8,
+        activation_type=QuantType.QUInt8,
         extra_options={'DefaultTensorType': onnx.TensorProto.FLOAT}
     )
 
@@ -125,12 +157,29 @@ def is_structurally_pruned(state_dict, model_type='mobilenet'):
     """Check if model has been structurally pruned by comparing first layer shape."""
     if model_type == 'mobilenet':
         expected_shape = (16, 3, 3, 3)  # MobileNetV3 first conv
-        actual_shape = state_dict['features.0.0.weight'].shape
+        # Try different key patterns (with/without 'model.' prefix, etc.)
+        possible_keys = [
+            'features.0.0.weight',
+            'model.features.0.0.weight',
+            'backbone.features.0.0.weight',
+        ]
+        actual_shape = None
+        for key in possible_keys:
+            if key in state_dict:
+                actual_shape = state_dict[key].shape
+                break
+        if actual_shape is None:
+            # Key not found - assume not pruned (standard model)
+            return False
     elif model_type == 'shufflenet':
         expected_shape = (24, 3, 3, 3)  # ShuffleNetV2 x0.5 first conv
+        if 'conv1.0.weight' not in state_dict:
+            return False
         actual_shape = state_dict['conv1.0.weight'].shape
     else:
         expected_shape = (16, 3, 3, 3)  # Custom CNN first conv
+        if 'conv1.weight' not in state_dict:
+            return False
         actual_shape = state_dict['conv1.weight'].shape
 
     return tuple(actual_shape) != expected_shape

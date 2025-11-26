@@ -21,7 +21,8 @@ from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
-                              QPushButton, QApplication, QWidget, QHBoxLayout, QCheckBox)
+                              QPushButton, QApplication, QWidget, QHBoxLayout, QCheckBox,
+                              QTabWidget, QGroupBox)
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import QTimer, Qt
 
@@ -902,6 +903,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 # Update ball_pos tensor for plotting (convert mm to m)
                 self.ball_pos[0, 0] = ball_x_mm / 1000.0
                 self.ball_pos[0, 1] = ball_y_mm / 1000.0
+                # Update Z from stereo camera if available
+                if 'z' in ball_data:
+                    self.ball_pos[0, 2] = ball_data['z'] / 1000.0
 
                 # Track ball history for trail (only in hardware mode, only if detected)
                 # In simulation mode, base_simulator.py handles trail updates
@@ -1169,13 +1173,18 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Update GUI modules
         self.update_gui_modules()
 
-        # Update plot
-        if self.plot_enabled:
-            self.update_plot()
+        # Update plot based on active tab
+        if self.plot_enabled and hasattr(self, 'plot_tab_widget'):
+            if self.plot_tab_widget.currentIndex() == 0:
+                # 2D View tab active
+                self.update_plot()
 
-            # Update ball trail from history
-            if hasattr(self, 'ball_trail') and self.ball_history_x and len(self.ball_history_x) > 1:
-                self.ball_trail.setData(self.ball_history_x, self.ball_history_y)
+                # Update ball trail from history
+                if hasattr(self, 'ball_trail') and self.ball_history_x and len(self.ball_history_x) > 1:
+                    self.ball_trail.setData(self.ball_history_x, self.ball_history_y)
+            else:
+                # 3D View tab active
+                self._update_3d_view()
 
         # Calculate plot update rate
         plot_interval_ms = int(1000 / self.plot_rate_hz) if self.plot_enabled else GUIConfig.PLOT_DISABLED_INTERVAL_MS
@@ -1183,14 +1192,105 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Schedule next update
         QTimer.singleShot(plot_interval_ms, self._gui_update_loop)
 
+    def _update_3d_view(self) -> None:
+        """Update 3D visualization with current ball and platform state."""
+        if not hasattr(self, 'plot_3d') or self.plot_3d is None:
+            return
+
+        # Get ball position (ball_pos stores [x, y, z] in meters)
+        # Z is updated by control thread from stereo camera or simulation physics
+        ball_x_mm = self.ball_pos[0, 0].item() * 1000
+        ball_y_mm = self.ball_pos[0, 1].item() * 1000
+        ball_z_mm = self.ball_pos[0, 2].item() * 1000
+
+        # Get platform pose from FK
+        platform_x, platform_y, platform_z = 0.0, 0.0, self.ik.home_height_top_surface
+        platform_rx, platform_ry = 0.0, 0.0
+        if hasattr(self, 'last_fk_translation') and self.last_fk_translation is not None:
+            platform_x = self.last_fk_translation[0]
+            platform_y = self.last_fk_translation[1]
+            platform_z = self.last_fk_translation[2]
+        if hasattr(self, 'last_fk_rotation') and self.last_fk_rotation is not None:
+            platform_rx = self.last_fk_rotation[0]
+            platform_ry = self.last_fk_rotation[1]
+        elif hasattr(self, 'dof_values'):
+            platform_rx = self.dof_values.get('rx', 0.0)
+            platform_ry = self.dof_values.get('ry', 0.0)
+
+        # Get current target position from trajectory pattern
+        target_x, target_y = 0.0, 0.0
+        if hasattr(self, 'current_pattern') and self.current_pattern is not None:
+            pattern_time = self.simulation_time - self.pattern_start_time
+            target_x, target_y = self.current_pattern.get_position(pattern_time)
+
+        # Get pattern type and parameters for visualization
+        pattern_type = getattr(self, 'pattern_type', 'static').capitalize()
+        pattern_params = {}
+        if hasattr(self, 'current_pattern'):
+            pattern = self.current_pattern
+            if hasattr(pattern, 'radius'):
+                pattern_params['radius'] = pattern.radius
+            if hasattr(pattern, 'width'):
+                pattern_params['width'] = pattern.width
+            if hasattr(pattern, 'height'):
+                pattern_params['height'] = pattern.height
+
+        # Update 3D module
+        state = {
+            'ball_x': ball_x_mm,
+            'ball_y': ball_y_mm,
+            'ball_z': ball_z_mm,
+            'platform_x': platform_x,
+            'platform_y': platform_y,
+            'platform_z': platform_z,
+            'platform_rx': platform_rx,
+            'platform_ry': platform_ry,
+            'target_x': target_x,
+            'target_y': target_y,
+            'pattern_type': pattern_type,
+            'pattern_params': pattern_params,
+        }
+        self.plot_3d.update(state)
+
     def _create_plot(self, parent: QWidget) -> None:
-        """Override to add ball trail plot item.
+        """Create plot panel with 2D/3D tab views.
 
         Args:
             parent: Parent widget to contain the plot.
         """
-        # Call parent to create standard plot
-        super()._create_plot(parent)
+        # Create tab widget
+        self.plot_tab_widget = QTabWidget()
+
+        # === 2D View Tab ===
+        plot_2d_container = QWidget()
+        plot_2d_layout = QVBoxLayout(plot_2d_container)
+        plot_2d_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create PyQtGraph 2D plot widget
+        pg.setConfigOptions(antialias=True)
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground(self.colors['widget_bg'])
+        self.plot_widget.setMinimumSize(600, 600)
+        plot_2d_layout.addWidget(self.plot_widget)
+
+        self.plot_tab_widget.addTab(plot_2d_container, "2D View")
+
+        # === 3D View Tab ===
+        platform_home_z = self.ik.home_height_top_surface
+        self.plot_3d = gm.Plot3DModule(
+            parent, self.colors, self._create_callbacks(),
+            platform_home_z=platform_home_z
+        )
+        plot_3d_widget = self.plot_3d.create()
+        if plot_3d_widget:
+            self.plot_tab_widget.addTab(plot_3d_widget, "3D View")
+
+        # Add tab widget to parent layout
+        if hasattr(parent, 'layout') and parent.layout() is not None:
+            parent.layout().addWidget(self.plot_tab_widget)
+
+        # Setup 2D plot (platform boundary, markers, etc.)
+        self.setup_plot()
 
         # Add ball trail plot item (dashed red line)
         plot_item = self.plot_widget.getPlotItem()

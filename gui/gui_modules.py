@@ -14,7 +14,15 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                               QLabel, QPushButton, QSlider, QCheckBox, QComboBox,
                               QGroupBox, QTextEdit, QMessageBox)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QMatrix4x4, QQuaternion, QVector3D
+import numpy as np
+
+try:
+    import pyqtgraph.opengl as gl
+    HAS_OPENGL = True
+except ImportError:
+    HAS_OPENGL = False
+    print("Warning: pyqtgraph.opengl not available. Install PyOpenGL for 3D visualization.")
 
 from core.utils import (
     format_time, format_vector_2d, MAX_TILT_ANGLE_DEG,
@@ -2307,3 +2315,505 @@ class PerformanceDataCollectionModule(GUIModule):
             self.stop_btn.setEnabled(False)
             self.stats_label.setText("Duration: 0.0s | Samples: 0 | Rate: 0.0 Hz")
             self.filename_label.setText("File: None")
+
+
+class Plot3DModule(GUIModule):
+    """3D visualization of ball and platform using PyQtGraph OpenGL."""
+
+    # Constants
+    BALL_RADIUS_MM = 20.0  # Ping pong ball radius
+    PLATFORM_DIAMETER_MM = 300.0  # Platform disc diameter
+    PLATFORM_THICKNESS_MM = 10.0  # Platform thickness
+    TRAIL_LENGTH = 50  # Number of trail points
+    TARGET_MARKER_RADIUS_MM = 5.0  # Target marker size
+    TRAJECTORY_LINE_WIDTH = 2.0  # Trajectory path line width
+
+    def __init__(self, parent: QWidget, colors: Dict[str, str],
+                 callbacks: Optional[Dict[str, Any]] = None,
+                 platform_home_z: float = 180.0) -> None:
+        """
+        Initialize 3D visualization module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            platform_home_z: Platform home height in mm
+        """
+        super().__init__(parent, colors, callbacks)
+        self.platform_home_z = platform_home_z
+        self.trail_positions: list = []
+        self.view: Optional[gl.GLViewWidget] = None
+        self.current_pattern_type: Optional[str] = None
+        self.current_pattern_params: Dict[str, float] = {}
+
+    def create(self) -> Optional[QWidget]:
+        """Create and return the 3D view widget."""
+        if not HAS_OPENGL:
+            # Return placeholder if OpenGL not available
+            placeholder = QLabel("3D View requires PyOpenGL.\nInstall with: pip install PyOpenGL")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.widget = placeholder
+            return self.widget
+
+        self.view = gl.GLViewWidget()
+        self.view.setBackgroundColor(self.colors.get('bg', '#1e1e1e'))
+
+        # Setup camera - elevated view looking down at platform
+        self.view.setCameraPosition(distance=600, elevation=45, azimuth=-135)
+        self.view.pan(0, 0, self.platform_home_z)  # Center view on platform height
+
+        # Add grid at Z=0
+        self._setup_grid()
+
+        # Add platform disc
+        self._setup_platform()
+
+        # Add ball sphere
+        self._setup_ball()
+
+        # Add trail scatter
+        self._setup_trail()
+
+        # Add trajectory path and target marker
+        self._setup_trajectory()
+        self._setup_target_marker()
+
+        # Add coordinate axes
+        self._setup_axes()
+
+        self.widget = self.view
+        return self.widget
+
+    def _setup_axes(self) -> None:
+        """Add X and Y coordinate axis arrows at edges with mm labels."""
+        edge_offset = -180.0  # Position at edge of grid (grid is 400x400, so ±200)
+        axis_length = 60.0  # Length of axis arrows in mm
+        arrow_head_size = 8.0  # Size of arrow head
+        z = self.platform_home_z + 2  # Slightly above platform
+
+        # X axis (red) at bottom edge, pointing in +X direction
+        x_start = edge_offset
+        x_axis_points = np.array([
+            [x_start, edge_offset, z],
+            [x_start + axis_length, edge_offset, z],
+        ])
+        x_arrow_head = np.array([
+            [x_start + axis_length, edge_offset, z],
+            [x_start + axis_length - arrow_head_size, edge_offset + arrow_head_size * 0.4, z],
+            [x_start + axis_length, edge_offset, z],
+            [x_start + axis_length - arrow_head_size, edge_offset - arrow_head_size * 0.4, z],
+        ])
+        self.x_axis = gl.GLLinePlotItem(
+            pos=x_axis_points,
+            color=(1.0, 0.3, 0.3, 1.0),  # Red
+            width=2.5,
+            antialias=True
+        )
+        self.x_arrow = gl.GLLinePlotItem(
+            pos=x_arrow_head,
+            color=(1.0, 0.3, 0.3, 1.0),  # Red
+            width=2.5,
+            antialias=True
+        )
+        self.view.addItem(self.x_axis)
+        self.view.addItem(self.x_arrow)
+
+        # Y axis (blue) at left edge, pointing in +Y direction
+        y_axis_points = np.array([
+            [edge_offset, edge_offset, z],
+            [edge_offset, edge_offset + axis_length, z],
+        ])
+        y_arrow_head = np.array([
+            [edge_offset, edge_offset + axis_length, z],
+            [edge_offset + arrow_head_size * 0.4, edge_offset + axis_length - arrow_head_size, z],
+            [edge_offset, edge_offset + axis_length, z],
+            [edge_offset - arrow_head_size * 0.4, edge_offset + axis_length - arrow_head_size, z],
+        ])
+        self.y_axis = gl.GLLinePlotItem(
+            pos=y_axis_points,
+            color=(0.3, 0.5, 1.0, 1.0),  # Blue
+            width=2.5,
+            antialias=True
+        )
+        self.y_arrow = gl.GLLinePlotItem(
+            pos=y_arrow_head,
+            color=(0.3, 0.5, 1.0, 1.0),  # Blue
+            width=2.5,
+            antialias=True
+        )
+        self.view.addItem(self.y_axis)
+        self.view.addItem(self.y_arrow)
+
+        # Add axis labels with mm units (GLTextItem if available)
+        try:
+            self.x_label = gl.GLTextItem(
+                pos=(x_start + axis_length + 10, edge_offset, z),
+                text='X (mm)',
+                color=(1.0, 0.3, 0.3, 1.0)
+            )
+            self.y_label = gl.GLTextItem(
+                pos=(edge_offset, edge_offset + axis_length + 10, z),
+                text='Y (mm)',
+                color=(0.3, 0.5, 1.0, 1.0)
+            )
+            self.view.addItem(self.x_label)
+            self.view.addItem(self.y_label)
+        except (AttributeError, TypeError):
+            # GLTextItem may not be available in all pyqtgraph versions
+            pass
+
+    def _setup_grid(self) -> None:
+        """Add reference grid at platform level."""
+        grid = gl.GLGridItem()
+        grid.setSize(400, 400)  # 400mm x 400mm
+        grid.setSpacing(50, 50)  # 50mm grid spacing
+        grid.translate(0, 0, self.platform_home_z)
+        self.view.addItem(grid)
+
+    def _setup_platform(self) -> None:
+        """Create platform disc mesh."""
+        # Create cylinder vertices for disc
+        n_segments = 32
+        radius = self.PLATFORM_DIAMETER_MM / 2
+        thickness = self.PLATFORM_THICKNESS_MM
+
+        # Generate cylinder mesh data
+        theta = np.linspace(0, 2 * np.pi, n_segments + 1)
+        x = radius * np.cos(theta)
+        y = radius * np.sin(theta)
+
+        # Top circle vertices
+        top_verts = np.column_stack([x, y, np.full_like(x, 0)])
+        # Bottom circle vertices
+        bottom_verts = np.column_stack([x, y, np.full_like(x, -thickness)])
+
+        # Create faces for cylinder
+        faces = []
+
+        # Top face (fan from center)
+        top_center_idx = len(top_verts) + len(bottom_verts)
+        bottom_center_idx = top_center_idx + 1
+
+        # All vertices: top circle, bottom circle, top center, bottom center
+        all_verts = np.vstack([
+            top_verts,
+            bottom_verts,
+            [[0, 0, 0]],  # top center
+            [[0, 0, -thickness]]  # bottom center
+        ])
+
+        # Top cap faces
+        for i in range(n_segments):
+            faces.append([top_center_idx, i, (i + 1) % (n_segments + 1)])
+
+        # Bottom cap faces
+        for i in range(n_segments):
+            faces.append([bottom_center_idx, n_segments + 1 + (i + 1) % (n_segments + 1), n_segments + 1 + i])
+
+        # Side faces
+        for i in range(n_segments):
+            i1 = i
+            i2 = (i + 1) % (n_segments + 1)
+            i3 = n_segments + 1 + i
+            i4 = n_segments + 1 + (i + 1) % (n_segments + 1)
+            faces.append([i1, i2, i4])
+            faces.append([i1, i4, i3])
+
+        faces = np.array(faces)
+
+        # Platform color (dark gray)
+        colors_arr = np.ones((len(faces), 4)) * [0.3, 0.3, 0.35, 0.9]
+
+        self.platform_mesh = gl.GLMeshItem(
+            vertexes=all_verts,
+            faces=faces,
+            faceColors=colors_arr,
+            smooth=False,
+            drawEdges=True,
+            edgeColor=(0.5, 0.5, 0.5, 1)
+        )
+        self.platform_mesh.translate(0, 0, self.platform_home_z)
+        self.view.addItem(self.platform_mesh)
+
+        # Store initial transform
+        self.platform_base_transform = self.platform_mesh.transform()
+
+    def _setup_ball(self) -> None:
+        """Create ball sphere mesh."""
+        # Create sphere mesh data
+        md = gl.MeshData.sphere(rows=16, cols=16, radius=self.BALL_RADIUS_MM)
+
+        # Soft red ball color
+        self.ball_mesh = gl.GLMeshItem(
+            meshdata=md,
+            smooth=True,
+            color=(0.9, 0.4, 0.4, 1.0),  # Soft red
+            shader='shaded'
+        )
+        # Initial position at platform center
+        self.ball_mesh.translate(0, 0, self.platform_home_z + self.BALL_RADIUS_MM)
+        self.view.addItem(self.ball_mesh)
+
+    def _setup_trail(self) -> None:
+        """Create trail line and scatter plot for ball trajectory."""
+        # Trail line connecting ball positions
+        self.trail_line = gl.GLLinePlotItem(
+            pos=np.zeros((2, 3)),
+            color=(1.0, 0.6, 0.2, 0.9),  # Orange
+            width=2.5,
+            antialias=True
+        )
+        self.view.addItem(self.trail_line)
+
+        # Trail scatter points (endpoint markers)
+        self.trail_scatter = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3)),
+            color=(1, 0.5, 0, 0.5),
+            size=5,
+            pxMode=True
+        )
+        self.view.addItem(self.trail_scatter)
+
+    def _setup_trajectory(self) -> None:
+        """Create trajectory path line on platform surface."""
+        # Initialize with empty line (will be updated when pattern is set)
+        self.trajectory_line = gl.GLLinePlotItem(
+            pos=np.zeros((2, 3)),
+            color=(0.0, 0.8, 0.2, 0.8),  # Green
+            width=self.TRAJECTORY_LINE_WIDTH,
+            antialias=True
+        )
+        self.view.addItem(self.trajectory_line)
+
+    def _setup_target_marker(self) -> None:
+        """Create target position marker."""
+        # Small sphere for current target position
+        md = gl.MeshData.sphere(rows=8, cols=8, radius=self.TARGET_MARKER_RADIUS_MM)
+        self.target_marker = gl.GLMeshItem(
+            meshdata=md,
+            smooth=True,
+            color=(0.0, 1.0, 0.0, 1.0),  # Bright green
+            shader='shaded'
+        )
+        # Start at platform center
+        self.target_marker.translate(0, 0, self.platform_home_z)
+        self.view.addItem(self.target_marker)
+
+    def _generate_pattern_points(self, pattern_type: str, params: Dict[str, float],
+                                  n_points: int = 64) -> np.ndarray:
+        """Generate points for trajectory pattern visualization."""
+        z = self.platform_home_z  # Pattern is on platform surface
+
+        if pattern_type == 'Static':
+            # Single point at center
+            return np.array([[0, 0, z]])
+
+        elif pattern_type == 'Circle':
+            radius = params.get('radius', 50.0)
+            theta = np.linspace(0, 2 * np.pi, n_points)
+            x = radius * np.cos(theta)
+            y = radius * np.sin(theta)
+            points = np.column_stack([x, y, np.full(n_points, z)])
+            return points
+
+        elif pattern_type == 'Figure-8':
+            width = params.get('width', 60.0)
+            height = params.get('height', 40.0)
+            t = np.linspace(0, 2 * np.pi, n_points)
+            x = width * np.sin(t)
+            y = height * np.sin(2 * t)
+            points = np.column_stack([x, y, np.full(n_points, z)])
+            return points
+
+        elif pattern_type == 'Star':
+            radius = params.get('radius', 60.0)
+            # Star pattern: 5 points on a circle, visited in order 0→2→4→1→3
+            # This creates the star shape when connecting the points
+            num_vertices = 5
+            visit_order = [0, 2, 4, 1, 3, 0]  # Close the star
+
+            # Compute vertex positions (evenly spaced, starting at top)
+            vertex_positions = []
+            for i in range(num_vertices):
+                angle = np.pi / 2 - i * (2 * np.pi / num_vertices)  # Start at top, go CCW
+                x = radius * np.cos(angle)
+                y = radius * np.sin(angle)
+                vertex_positions.append([x, y, z])
+
+            # Build path in visit order
+            star_points = [vertex_positions[i] for i in visit_order]
+            points = np.array(star_points)
+            return points
+
+        else:
+            # Default: single point
+            return np.array([[0, 0, z]])
+
+    def _update_trajectory(self, pattern_type: str, params: Dict[str, float],
+                           rx_deg: float, ry_deg: float) -> None:
+        """Update trajectory path with current pattern and platform rotation."""
+        # Check if pattern changed
+        if pattern_type != self.current_pattern_type or params != self.current_pattern_params:
+            self.current_pattern_type = pattern_type
+            self.current_pattern_params = params.copy()
+
+        # Generate pattern points
+        points = self._generate_pattern_points(pattern_type, params)
+
+        if len(points) < 2:
+            # Hide line for static pattern
+            self.trajectory_line.setData(pos=np.zeros((2, 3)))
+            return
+
+        # Apply platform rotation to points
+        rotated_points = self._rotate_points(points, rx_deg, ry_deg)
+        self.trajectory_line.setData(pos=rotated_points)
+
+    def _update_target_marker(self, target_x: float, target_y: float,
+                               rx_deg: float, ry_deg: float) -> None:
+        """Update target marker position with platform rotation."""
+        # Target is on platform surface
+        z = self.platform_home_z
+
+        # Create point and apply rotation
+        point = np.array([[target_x, target_y, z]])
+        rotated = self._rotate_points(point, rx_deg, ry_deg)
+
+        self.target_marker.resetTransform()
+        self.target_marker.translate(rotated[0, 0], rotated[0, 1], rotated[0, 2])
+
+    def _rotate_points(self, points: np.ndarray, rx_deg: float, ry_deg: float) -> np.ndarray:
+        """Rotate points around platform center based on tilt angles."""
+        if rx_deg == 0 and ry_deg == 0:
+            return points
+
+        # Convert to radians
+        rx = np.radians(rx_deg)
+        ry = np.radians(ry_deg)
+
+        # Rotation matrices
+        cos_rx, sin_rx = np.cos(rx), np.sin(rx)
+        cos_ry, sin_ry = np.cos(ry), np.sin(ry)
+
+        # Translate to origin (relative to platform center at home_z)
+        centered = points.copy()
+        centered[:, 2] -= self.platform_home_z
+
+        # Apply rotations (Rx then Ry)
+        rotated = np.zeros_like(centered)
+        for i, p in enumerate(centered):
+            x, y, z = p
+            # Rotate around X axis
+            y1 = y * cos_rx - z * sin_rx
+            z1 = y * sin_rx + z * cos_rx
+            # Rotate around Y axis
+            x2 = x * cos_ry + z1 * sin_ry
+            z2 = -x * sin_ry + z1 * cos_ry
+            rotated[i] = [x2, y1, z2]
+
+        # Translate back
+        rotated[:, 2] += self.platform_home_z
+
+        return rotated
+
+    def update(self, state: Dict[str, Any]) -> None:
+        """
+        Update 3D visualization with current state.
+
+        Expected state keys:
+            ball_x, ball_y, ball_z: Ball position in mm (platform frame)
+            platform_rx, platform_ry: Platform tilt angles in degrees
+            target_x, target_y: Current target position in mm
+            pattern_type: Trajectory pattern type (Circle, Figure-8, Star, Static)
+            pattern_params: Dict with pattern parameters (radius, width, height, etc.)
+        """
+        if not HAS_OPENGL or self.view is None:
+            return
+
+        ball_x = state.get('ball_x', 0.0)
+        ball_y = state.get('ball_y', 0.0)
+        ball_z = state.get('ball_z', self.platform_home_z + self.BALL_RADIUS_MM)
+        platform_x = state.get('platform_x', 0.0)  # mm
+        platform_y = state.get('platform_y', 0.0)  # mm
+        platform_z = state.get('platform_z', self.platform_home_z)  # mm
+        platform_rx = state.get('platform_rx', 0.0)  # degrees
+        platform_ry = state.get('platform_ry', 0.0)  # degrees
+        ball_detected = state.get('ball_detected', True)
+
+        # Trajectory info
+        target_x = state.get('target_x', 0.0)
+        target_y = state.get('target_y', 0.0)
+        pattern_type = state.get('pattern_type', 'Static')
+        pattern_params = state.get('pattern_params', {})
+
+        # Update ball position (ball_z is already the ball center position)
+        if ball_detected:
+            self.ball_mesh.resetTransform()
+            self.ball_mesh.translate(ball_x, ball_y, ball_z)
+
+            # Update trail
+            self._update_trail(ball_x, ball_y, ball_z)
+
+        # Update platform pose (position and rotation)
+        self._update_platform_pose(platform_x, platform_y, platform_z, platform_rx, platform_ry)
+
+        # Update trajectory path (rotates with platform)
+        self._update_trajectory(pattern_type, pattern_params, platform_rx, platform_ry)
+
+        # Update target marker (rotates with platform)
+        self._update_target_marker(target_x, target_y, platform_rx, platform_ry)
+
+    def _update_trail(self, x: float, y: float, z: float) -> None:
+        """Update ball trail with new position."""
+        self.trail_positions.append([x, y, z])
+
+        # Keep only last N positions
+        if len(self.trail_positions) > self.TRAIL_LENGTH:
+            self.trail_positions = self.trail_positions[-self.TRAIL_LENGTH:]
+
+        if len(self.trail_positions) > 1:
+            pos = np.array(self.trail_positions)
+
+            # Update trail line
+            self.trail_line.setData(pos=pos)
+
+            # Create fading colors for scatter (newer = brighter)
+            n = len(pos)
+            alphas = np.linspace(0.1, 0.8, n)
+            colors = np.zeros((n, 4))
+            colors[:, 0] = 1.0  # Red
+            colors[:, 1] = 0.5  # Green (orange)
+            colors[:, 2] = 0.0  # Blue
+            colors[:, 3] = alphas  # Alpha (fading)
+
+            # Sizes decrease with age
+            sizes = np.linspace(2, 8, n)
+
+            self.trail_scatter.setData(pos=pos, color=colors, size=sizes)
+
+    def _update_platform_pose(self, x: float, y: float, z: float,
+                               rx_deg: float, ry_deg: float) -> None:
+        """Update platform position and orientation."""
+        # Reset to base transform
+        self.platform_mesh.resetTransform()
+
+        # Apply rotations (rx = roll around X, ry = pitch around Y)
+        self.platform_mesh.rotate(rx_deg, 1, 0, 0)  # Rotate around X axis
+        self.platform_mesh.rotate(ry_deg, 0, 1, 0)  # Rotate around Y axis
+
+        # Translate to position (x, y relative to center, z is absolute height)
+        self.platform_mesh.translate(x, y, z)
+
+    def get_widget(self) -> Optional[QWidget]:
+        """Return the 3D view widget."""
+        return self.view if self.view else self.widget
+
+    def clear_trail(self) -> None:
+        """Clear the ball trail."""
+        self.trail_positions = []
+        if HAS_OPENGL:
+            if hasattr(self, 'trail_line'):
+                self.trail_line.setData(pos=np.zeros((2, 3)))
+            if hasattr(self, 'trail_scatter'):
+                self.trail_scatter.setData(pos=np.zeros((1, 3)))

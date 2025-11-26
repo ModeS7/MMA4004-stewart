@@ -517,8 +517,29 @@ class StereoCameraConfig:
     # Ball detection parameters
     CROP_SIZE = 128  # CNN input size (must match trained model)
     CONFIDENCE_THRESHOLD = 0.5  # Detection confidence threshold
-    MODEL_PATH = 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned_int8.onnx'  # Path to trained model
-    USE_GPU = False  # Use GPU acceleration (DirectML)
+
+    # =========================================================================
+    # MODEL SELECTION - Change these to test different models
+    # =========================================================================
+    # Available models (set MODEL_SELECT to one of these):
+    #   1 = mobileLiteV3_pruned  (396 params, fastest)
+    #   2 = mobileLiteV3         (1M params, full MobileNetV3-Small)
+    #   3 = CustomCNN            (custom architecture)
+    #   4 = shufflenetV2         (ShuffleNetV2 x0.5)
+    MODEL_SELECT = 2  # <-- Change this to switch models
+    USE_INT8 = False  # <-- Set True to use INT8 quantized version
+
+    # Model paths (auto-selected based on MODEL_SELECT and USE_INT8)
+    _MODEL_PATHS = {
+        1: 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned',
+        2: 'ball_detection/models/mobileLiteV3/mobileLiteV3',
+        3: 'ball_detection/models/CustomCNN/CustomCNN',
+        4: 'ball_detection/models/shufflenetV2/shufflenetV2',
+    }
+    MODEL_PATH = _MODEL_PATHS[MODEL_SELECT] + ('_int8.onnx' if USE_INT8 else '.onnx')
+    # =========================================================================
+
+    USE_GPU = True  # Use GPU acceleration (DirectML)
 
     # Stereo triangulation noise characteristics
     NOISE_STD_XY_MM = 1.0   # X/Y measurement noise (mm) - operational estimate
