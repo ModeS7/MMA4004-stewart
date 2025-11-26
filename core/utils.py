@@ -517,8 +517,8 @@ class StereoCameraConfig:
     # Ball detection parameters
     CROP_SIZE = 128  # CNN input size (must match trained model)
     CONFIDENCE_THRESHOLD = 0.5  # Detection confidence threshold
-    MODEL_PATH = 'ball_detection/models/mobileLiteV3/mobileLiteV3.onnx'  # Path to trained model
-    USE_GPU = True  # Use GPU acceleration (DirectML)
+    MODEL_PATH = 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned_int8.onnx'  # Path to trained model
+    USE_GPU = False  # Use GPU acceleration (DirectML)
 
     # Stereo triangulation noise characteristics
     NOISE_STD_XY_MM = 1.0   # X/Y measurement noise (mm) - operational estimate

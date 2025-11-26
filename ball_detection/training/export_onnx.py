@@ -33,7 +33,7 @@ def count_onnx_params(model_path):
     return total
 
 
-def optimize_onnx_graph(model_path, output_path=None):
+def optimize_onnx_graph(model_path, output_path=None, for_quantization=False):
     """
     Optimize ONNX graph using ONNX Runtime's built-in optimizer.
 
@@ -43,11 +43,12 @@ def optimize_onnx_graph(model_path, output_path=None):
     Args:
         model_path: Path to input ONNX model
         output_path: Path to save optimized model (defaults to overwriting input)
+        for_quantization: If True, use basic optimization to maintain
+                         compatibility with INT8 quantization
 
     Returns:
         Path to optimized model
     """
-    import tempfile
     import shutil
 
     if output_path is None:
@@ -58,7 +59,15 @@ def optimize_onnx_graph(model_path, output_path=None):
 
     # Use ONNX Runtime session with optimization to create optimized model
     sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    # For INT8 quantization: use basic optimization only
+    # ORT_ENABLE_ALL creates NCHWC-format nodes incompatible with ConvInteger
+    if for_quantization:
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        print(f"  Using BASIC optimization (for INT8 quantization compatibility)")
+    else:
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
     sess_options.optimized_model_filepath = str(output_path) + ".tmp"
 
     try:
@@ -94,6 +103,7 @@ def quantize_to_int8(model_path, output_path=None):
     Returns:
         Path to quantized model
     """
+    import onnx
     from onnxruntime.quantization import quantize_dynamic, QuantType
 
     if output_path is None:
@@ -103,7 +113,8 @@ def quantize_to_int8(model_path, output_path=None):
     quantize_dynamic(
         model_input=str(model_path),
         model_output=str(output_path),
-        weight_type=QuantType.QInt8
+        weight_type=QuantType.QInt8,
+        extra_options={'DefaultTensorType': onnx.TensorProto.FLOAT}
     )
 
     print(f"  INT8 model saved: {output_path}")
@@ -529,7 +540,9 @@ def main():
         print("\n" + "=" * 60)
         print("ONNX GRAPH OPTIMIZATION")
         print("=" * 60)
-        optimize_onnx_graph(onnx_path)
+        # Use basic optimization if INT8 quantization is requested
+        # (NCHWC transforms are incompatible with ConvInteger operators)
+        optimize_onnx_graph(onnx_path, for_quantization=(args.quantize == 'int8'))
 
     # Quantize to INT8
     if args.quantize == 'int8':
