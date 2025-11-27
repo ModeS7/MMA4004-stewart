@@ -383,12 +383,12 @@ class MaskReviewTool:
         # Check for pending changes
         if filename in self.pending_changes:
             change = self.pending_changes[filename]
-            if change == 'delete':
+            if isinstance(change, np.ndarray):
+                return img, change, 'CORRECTED'
+            elif change == 'delete':
                 return img, None, 'MARKED FOR DELETION'
             elif change == 'no_ball':
                 return img, np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8), 'NO BALL'
-            elif isinstance(change, np.ndarray):
-                return img, change, 'CORRECTED'
 
         # Load mask from file
         if mask_path.exists():
