@@ -13,9 +13,9 @@ from tqdm import tqdm
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
-IMAGES_DIR = "./ball_detection/data/new_labels/images"
-MASKS_DIR = "./ball_detection/data/new_labels/auto_labeled/masks"
-OUTPUT_VIDEO = "./ball_detection/segmentation_workflow/mask_review_stereo.mp4"
+IMAGES_DIR = "./ball_detection/data/old_labels/images"
+MASKS_DIR = "./ball_detection/data/old_labels/auto_labeled/masks"
+OUTPUT_VIDEO = "./ball_detection/segmentation_workflow/mask_review_old.mp4"
 FPS = 20  # Frames per second for output video
 # ============================================================
 

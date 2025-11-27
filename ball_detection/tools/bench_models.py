@@ -130,6 +130,293 @@ def create_squeezenet1_1():
 
 
 # ============================================================================
+# STEREO MODELS (6-channel input: RGB_left + RGB_right)
+# ============================================================================
+
+class StereoFullFrameUltra(nn.Module):
+    """
+    6-channel stereo detector using PixelUnshuffle for zero-compute downsampling.
+
+    Input: (B, 6, 720, 1280) - left+right RGB concatenated
+    Output: (x_left, y_left, conf_left, x_right, y_right, conf_right) - 6 values
+
+    Architecture:
+    - PixelUnshuffle(8): 1280x720x6 → 160x90x384 (zero compute!)
+    - 1x1 conv: 384 → 32 channels
+    - Depthwise-separable backbone (same as BallDetectorFullFrameUltra)
+    - Global pooling + regression head
+    """
+
+    def __init__(self, base_channels=32):
+        super().__init__()
+
+        # PixelUnshuffle: 6ch → 384ch at 160x90
+        self.pixel_unshuffle = nn.PixelUnshuffle(8)
+
+        # Channel reduction: 384 → base_channels
+        self.channel_reduce = nn.Sequential(
+            nn.Conv2d(384, base_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Depthwise-separable backbone
+        self.backbone = nn.Sequential(
+            self._make_block(base_channels, base_channels * 2, stride=2),      # 160x90 → 80x45
+            self._make_block(base_channels * 2, base_channels * 4, stride=2),  # 80x45 → 40x23
+            self._make_block(base_channels * 4, base_channels * 8, stride=2),  # 40x23 → 20x12
+            self._make_block(base_channels * 8, base_channels * 8, stride=2),  # 20x12 → 10x6
+        )
+
+        # Regression head - 6 outputs for stereo
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(base_channels * 8, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 6)  # x_l, y_l, conf_l, x_r, y_r, conf_r
+        )
+
+    def _make_block(self, in_ch, out_ch, stride):
+        """Depthwise separable conv block."""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        x = self.pixel_unshuffle(x)
+        x = self.channel_reduce(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        return torch.sigmoid(x)
+
+    def get_feature_size(self):
+        """Return feature size before head (for temporal models)."""
+        return 256  # base_channels * 8
+
+    def extract_features(self, x):
+        """Extract features without final head (for temporal models)."""
+        x = self.pixel_unshuffle(x)
+        x = self.channel_reduce(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)
+
+
+class StereoMobileNetLite(nn.Module):
+    """
+    6-channel stereo detector with partial MobileNetV3 backbone.
+
+    Input: (B, 6, 720, 1280) - left+right RGB concatenated
+    Output: 6 values (x_l, y_l, conf_l, x_r, y_r, conf_r)
+
+    Architecture:
+    - PixelUnshuffle(8): 6ch → 384ch at 160x90
+    - Depthwise stride-2 + pointwise: 384 → 16ch at 80x45
+    - Partial MobileNetV3 backbone (layers 1-4)
+    - Global pooling + regression head
+    """
+
+    def __init__(self, pretrained=True, num_layers=4):
+        super().__init__()
+        from torchvision import models
+
+        self.pixel_unshuffle = nn.PixelUnshuffle(8)  # 160x90x384
+
+        # Depthwise stride-2 + pointwise channel reduction
+        self.stem = nn.Sequential(
+            nn.Conv2d(384, 384, kernel_size=3, stride=2, padding=1, groups=384, bias=False),
+            nn.BatchNorm2d(384),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(384, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True),
+        )
+
+        # Load partial MobileNetV3-Small backbone
+        mobilenet = models.mobilenet_v3_small(pretrained=pretrained)
+        self.backbone = nn.Sequential(*list(mobilenet.features.children())[1:num_layers+1])
+
+        # Output channels based on num_layers
+        layer_channels = {1: 16, 2: 24, 3: 24, 4: 40, 5: 40, 6: 40}
+        self.out_channels = layer_channels.get(num_layers, 40)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(self.out_channels, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 6)  # 6 outputs for stereo
+        )
+
+    def forward(self, x):
+        x = self.pixel_unshuffle(x)
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        return torch.sigmoid(x)
+
+    def get_feature_size(self):
+        """Return feature size before head."""
+        return self.out_channels
+
+    def extract_features(self, x):
+        """Extract features without final head."""
+        x = self.pixel_unshuffle(x)
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)
+
+
+# ============================================================================
+# TEMPORAL MODELS (Stereo + GRU for frame history)
+# ============================================================================
+
+class TemporalStereoGRU(nn.Module):
+    """
+    Stereo detector with GRU for temporal context.
+
+    Uses StereoFullFrameUltra as feature extractor, then GRU to process
+    feature sequences from multiple frames.
+
+    Input: (B, T, 6, 720, 1280) - T frames of stereo input
+    Output: (B, 6) - predictions for the last frame
+
+    For inference, can maintain hidden state between calls for streaming.
+    """
+
+    def __init__(self, history_length=3, hidden_size=128, base_channels=32):
+        super().__init__()
+        self.history_length = history_length
+        self.hidden_size = hidden_size
+
+        # Feature extractor (shared across frames)
+        self.feature_extractor = StereoFullFrameUltra(base_channels=base_channels)
+        feature_size = self.feature_extractor.get_feature_size()
+
+        # GRU for temporal processing
+        self.gru = nn.GRU(feature_size, hidden_size, batch_first=True)
+
+        # Final head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 6)
+        )
+
+    def forward(self, x, hidden=None):
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (B, T, 6, H, W) or (B, 6, H, W) for single frame
+            hidden: Optional hidden state for streaming inference
+
+        Returns:
+            output: (B, 6) predictions
+            hidden: Updated hidden state
+        """
+        # Handle single frame input
+        if x.dim() == 4:
+            x = x.unsqueeze(1)  # (B, 1, 6, H, W)
+
+        B, T, C, H, W = x.shape
+
+        # Extract features for each frame
+        features = []
+        for t in range(T):
+            feat = self.feature_extractor.extract_features(x[:, t])
+            features.append(feat)
+
+        # Stack features: (B, T, feature_size)
+        features = torch.stack(features, dim=1)
+
+        # GRU processing
+        gru_out, hidden = self.gru(features, hidden)
+
+        # Use last output for prediction
+        last_out = gru_out[:, -1]  # (B, hidden_size)
+
+        # Final prediction
+        output = self.head(last_out)
+        return torch.sigmoid(output), hidden
+
+    def forward_single(self, x, hidden=None):
+        """Optimized forward for single frame (streaming inference)."""
+        feat = self.feature_extractor.extract_features(x)
+        feat = feat.unsqueeze(1)  # (B, 1, feature_size)
+        gru_out, hidden = self.gru(feat, hidden)
+        output = self.head(gru_out[:, -1])
+        return torch.sigmoid(output), hidden
+
+
+class TemporalStereoMobileNet(nn.Module):
+    """
+    6-channel MobileNet with GRU for temporal context.
+
+    Uses StereoMobileNetLite as feature extractor with GRU temporal processing.
+    Can leverage pretrained MobileNetV3 weights.
+
+    Input: (B, T, 6, 720, 1280) - T frames of stereo input
+    Output: (B, 6) - predictions for the last frame
+    """
+
+    def __init__(self, history_length=3, hidden_size=128, pretrained=True, num_layers=4):
+        super().__init__()
+        self.history_length = history_length
+        self.hidden_size = hidden_size
+
+        # Feature extractor
+        self.feature_extractor = StereoMobileNetLite(pretrained=pretrained, num_layers=num_layers)
+        feature_size = self.feature_extractor.get_feature_size()
+
+        # GRU for temporal processing
+        self.gru = nn.GRU(feature_size, hidden_size, batch_first=True)
+
+        # Final head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 6)
+        )
+
+    def forward(self, x, hidden=None):
+        """Forward pass with sequence input."""
+        if x.dim() == 4:
+            x = x.unsqueeze(1)
+
+        B, T, C, H, W = x.shape
+
+        features = []
+        for t in range(T):
+            feat = self.feature_extractor.extract_features(x[:, t])
+            features.append(feat)
+
+        features = torch.stack(features, dim=1)
+        gru_out, hidden = self.gru(features, hidden)
+        last_out = gru_out[:, -1]
+        output = self.head(last_out)
+        return torch.sigmoid(output), hidden
+
+    def forward_single(self, x, hidden=None):
+        """Optimized forward for single frame."""
+        feat = self.feature_extractor.extract_features(x)
+        feat = feat.unsqueeze(1)
+        gru_out, hidden = self.gru(feat, hidden)
+        output = self.head(gru_out[:, -1])
+        return torch.sigmoid(output), hidden
+
+
+# ============================================================================
 # ONNX CONVERSION & QUANTIZATION
 # ============================================================================
 
@@ -830,53 +1117,361 @@ def run_fullframe_benchmark():
     print()
 
 
+def run_stereo_benchmark():
+    """
+    Benchmark stereo (6-channel) and temporal models at 1280x720.
+
+    Compares:
+    - Baseline: 2x sequential mono inferences (current approach)
+    - Stereo models: Single 6-channel inference
+    - Temporal models: Stereo + GRU with varying history lengths
+    """
+
+    print("=" * 80)
+    print("STEREO & TEMPORAL MODEL BENCHMARK (1280x720)")
+    print("=" * 80)
+    print()
+
+    num_iterations = 100
+    H, W = 720, 1280
+
+    # Test configurations
+    stereo_configs = [
+        ("Baseline (2x FullFrame-Ultra)", "baseline_ultra"),
+        ("Baseline (2x MobileNet-Lite)", "baseline_mnlite"),
+        ("Stereo-Ultra", lambda: StereoFullFrameUltra()),
+        ("Stereo-MNLite", lambda: StereoMobileNetLite(pretrained=False)),
+        ("Temporal-Ultra-2", lambda: TemporalStereoGRU(history_length=2)),
+        ("Temporal-Ultra-3", lambda: TemporalStereoGRU(history_length=3)),
+        ("Temporal-Ultra-5", lambda: TemporalStereoGRU(history_length=5)),
+        ("Temporal-MN-2", lambda: TemporalStereoMobileNet(history_length=2, pretrained=False)),
+        ("Temporal-MN-3", lambda: TemporalStereoMobileNet(history_length=3, pretrained=False)),
+        ("Temporal-MN-5", lambda: TemporalStereoMobileNet(history_length=5, pretrained=False)),
+    ]
+
+    print(f"Configuration:")
+    print(f"  Input: {W}x{H} (stereo: left + right)")
+    print(f"  Iterations: {num_iterations}")
+    print(f"  Backend: CPU + GPU (if available)")
+    print()
+
+    results = []
+    baseline_cpu = None
+    baseline_gpu = None
+
+    for name, model_fn in stereo_configs:
+        print(f"\nTesting: {name}")
+        print("-" * 60)
+
+        try:
+            if model_fn == "baseline_ultra":
+                # Baseline: 2x mono FullFrameUltra inferences
+                model = BallDetectorFullFrameUltra()
+                model.eval()
+                params = count_parameters(model)
+                print(f"  Params: {params:,} (x2 for stereo)")
+
+                # Export mono model
+                buffer = io.BytesIO()
+                dummy = torch.randn(1, 3, H, W)
+                torch.onnx.export(model, dummy, buffer, input_names=['input'],
+                                output_names=['output'], opset_version=14, do_constant_folding=True)
+                buffer.seek(0)
+                onnx_bytes = buffer.read()
+
+                # CPU benchmark (2x inference)
+                print("  CPU (2x): ", end="", flush=True)
+                cpu_session = create_inference_session(onnx_bytes)
+                input_name = cpu_session.get_inputs()[0].name
+                dummy_np = np.random.randn(1, 3, H, W).astype(np.float32)
+
+                for _ in range(10):  # Warmup
+                    cpu_session.run(None, {input_name: dummy_np})
+                    cpu_session.run(None, {input_name: dummy_np})
+
+                times = []
+                for _ in range(num_iterations):
+                    start = time.perf_counter()
+                    cpu_session.run(None, {input_name: dummy_np})
+                    cpu_session.run(None, {input_name: dummy_np})
+                    times.append((time.perf_counter() - start) * 1000)
+
+                cpu_ms = np.mean(times)
+                cpu_fps = 1000 / cpu_ms
+                baseline_cpu = cpu_ms
+                print(f"{cpu_ms:.2f}ms ({cpu_fps:.1f} FPS)")
+
+                # GPU benchmark
+                print("  GPU (2x): ", end="", flush=True)
+                try:
+                    gpu_session = ort.InferenceSession(
+                        onnx_bytes,
+                        providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+                    )
+
+                    for _ in range(10):
+                        gpu_session.run(None, {input_name: dummy_np})
+                        gpu_session.run(None, {input_name: dummy_np})
+
+                    times = []
+                    for _ in range(num_iterations):
+                        start = time.perf_counter()
+                        gpu_session.run(None, {input_name: dummy_np})
+                        gpu_session.run(None, {input_name: dummy_np})
+                        times.append((time.perf_counter() - start) * 1000)
+
+                    gpu_ms = np.mean(times)
+                    gpu_fps = 1000 / gpu_ms
+                    baseline_gpu = gpu_ms
+                    print(f"{gpu_ms:.2f}ms ({gpu_fps:.1f} FPS)")
+                except Exception as e:
+                    print(f"N/A ({e})")
+                    gpu_ms = -1
+                    gpu_fps = 0
+
+                results.append({
+                    'name': name, 'params': params * 2,
+                    'cpu_ms': cpu_ms, 'cpu_fps': cpu_fps,
+                    'gpu_ms': gpu_ms, 'gpu_fps': gpu_fps,
+                    'speedup_cpu': 1.0, 'speedup_gpu': 1.0
+                })
+
+            elif model_fn == "baseline_mnlite":
+                # Baseline: 2x mono MobileNetLite inferences
+                model = BallDetectorFullFrameMobileNetLite(pretrained=False)
+                model.eval()
+                params = count_parameters(model)
+                print(f"  Params: {params:,} (x2 for stereo)")
+
+                buffer = io.BytesIO()
+                dummy = torch.randn(1, 3, H, W)
+                torch.onnx.export(model, dummy, buffer, input_names=['input'],
+                                output_names=['output'], opset_version=14, do_constant_folding=True)
+                buffer.seek(0)
+                onnx_bytes = buffer.read()
+
+                print("  CPU (2x): ", end="", flush=True)
+                cpu_session = create_inference_session(onnx_bytes)
+                input_name = cpu_session.get_inputs()[0].name
+                dummy_np = np.random.randn(1, 3, H, W).astype(np.float32)
+
+                for _ in range(10):
+                    cpu_session.run(None, {input_name: dummy_np})
+                    cpu_session.run(None, {input_name: dummy_np})
+
+                times = []
+                for _ in range(num_iterations):
+                    start = time.perf_counter()
+                    cpu_session.run(None, {input_name: dummy_np})
+                    cpu_session.run(None, {input_name: dummy_np})
+                    times.append((time.perf_counter() - start) * 1000)
+
+                cpu_ms = np.mean(times)
+                cpu_fps = 1000 / cpu_ms
+                print(f"{cpu_ms:.2f}ms ({cpu_fps:.1f} FPS)")
+
+                print("  GPU (2x): ", end="", flush=True)
+                try:
+                    gpu_session = ort.InferenceSession(
+                        onnx_bytes,
+                        providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+                    )
+
+                    for _ in range(10):
+                        gpu_session.run(None, {input_name: dummy_np})
+                        gpu_session.run(None, {input_name: dummy_np})
+
+                    times = []
+                    for _ in range(num_iterations):
+                        start = time.perf_counter()
+                        gpu_session.run(None, {input_name: dummy_np})
+                        gpu_session.run(None, {input_name: dummy_np})
+                        times.append((time.perf_counter() - start) * 1000)
+
+                    gpu_ms = np.mean(times)
+                    gpu_fps = 1000 / gpu_ms
+                    print(f"{gpu_ms:.2f}ms ({gpu_fps:.1f} FPS)")
+                except Exception as e:
+                    print(f"N/A ({e})")
+                    gpu_ms = -1
+                    gpu_fps = 0
+
+                results.append({
+                    'name': name, 'params': params * 2,
+                    'cpu_ms': cpu_ms, 'cpu_fps': cpu_fps,
+                    'gpu_ms': gpu_ms, 'gpu_fps': gpu_fps,
+                    'speedup_cpu': baseline_cpu / cpu_ms if baseline_cpu else 1.0,
+                    'speedup_gpu': baseline_gpu / gpu_ms if baseline_gpu and gpu_ms > 0 else 1.0
+                })
+
+            else:
+                # Stereo/Temporal models
+                model = model_fn()
+                model.eval()
+                params = count_parameters(model)
+                print(f"  Params: {params:,}")
+
+                # Determine if temporal model
+                is_temporal = "Temporal" in name
+                history = int(name.split("-")[-1]) if is_temporal else 1
+
+                # Export to ONNX
+                print("  Exporting ONNX...", end=" ", flush=True)
+                buffer = io.BytesIO()
+
+                if is_temporal:
+                    # Temporal model: input is (B, T, 6, H, W)
+                    dummy = torch.randn(1, history, 6, H, W)
+
+                    # Create wrapper for ONNX export (no hidden state)
+                    class TemporalWrapper(nn.Module):
+                        def __init__(self, model):
+                            super().__init__()
+                            self.model = model
+                        def forward(self, x):
+                            out, _ = self.model(x)
+                            return out
+
+                    wrapper = TemporalWrapper(model)
+                    wrapper.eval()
+                    torch.onnx.export(wrapper, dummy, buffer, input_names=['input'],
+                                    output_names=['output'], opset_version=14, do_constant_folding=True)
+                else:
+                    # Stereo model: input is (B, 6, H, W)
+                    dummy = torch.randn(1, 6, H, W)
+                    torch.onnx.export(model, dummy, buffer, input_names=['input'],
+                                    output_names=['output'], opset_version=14, do_constant_folding=True)
+
+                buffer.seek(0)
+                onnx_bytes = buffer.read()
+                print(f"OK ({len(onnx_bytes)/1024:.0f} KB)")
+
+                # CPU benchmark
+                print("  CPU: ", end="", flush=True)
+                cpu_session = create_inference_session(onnx_bytes)
+                input_name = cpu_session.get_inputs()[0].name
+
+                if is_temporal:
+                    dummy_np = np.random.randn(1, history, 6, H, W).astype(np.float32)
+                else:
+                    dummy_np = np.random.randn(1, 6, H, W).astype(np.float32)
+
+                for _ in range(10):
+                    cpu_session.run(None, {input_name: dummy_np})
+
+                times = []
+                for _ in range(num_iterations):
+                    start = time.perf_counter()
+                    cpu_session.run(None, {input_name: dummy_np})
+                    times.append((time.perf_counter() - start) * 1000)
+
+                cpu_ms = np.mean(times)
+                cpu_fps = 1000 / cpu_ms
+                speedup_cpu = baseline_cpu / cpu_ms if baseline_cpu else 1.0
+                print(f"{cpu_ms:.2f}ms ({cpu_fps:.1f} FPS)", end="")
+                if baseline_cpu:
+                    print(f" [{speedup_cpu:.2f}x vs baseline]")
+                else:
+                    print()
+
+                # GPU benchmark
+                print("  GPU: ", end="", flush=True)
+                try:
+                    gpu_session = ort.InferenceSession(
+                        onnx_bytes,
+                        providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+                    )
+
+                    for _ in range(10):
+                        gpu_session.run(None, {input_name: dummy_np})
+
+                    times = []
+                    for _ in range(num_iterations):
+                        start = time.perf_counter()
+                        gpu_session.run(None, {input_name: dummy_np})
+                        times.append((time.perf_counter() - start) * 1000)
+
+                    gpu_ms = np.mean(times)
+                    gpu_fps = 1000 / gpu_ms
+                    speedup_gpu = baseline_gpu / gpu_ms if baseline_gpu else 1.0
+                    print(f"{gpu_ms:.2f}ms ({gpu_fps:.1f} FPS)", end="")
+                    if baseline_gpu:
+                        print(f" [{speedup_gpu:.2f}x vs baseline]")
+                    else:
+                        print()
+                except Exception as e:
+                    print(f"N/A ({e})")
+                    gpu_ms = -1
+                    gpu_fps = 0
+                    speedup_gpu = 0
+
+                results.append({
+                    'name': name, 'params': params,
+                    'cpu_ms': cpu_ms, 'cpu_fps': cpu_fps,
+                    'gpu_ms': gpu_ms, 'gpu_fps': gpu_fps,
+                    'speedup_cpu': speedup_cpu, 'speedup_gpu': speedup_gpu
+                })
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Summary
+    print("\n" + "=" * 80)
+    print("SUMMARY (sorted by CPU time)")
+    print("=" * 80)
+    print(f"\n{'Model':<30} {'Params':>10} {'CPU ms':>10} {'GPU ms':>10} {'CPU speedup':>12} {'GPU speedup':>12}")
+    print("-" * 90)
+
+    for r in sorted(results, key=lambda x: x['cpu_ms']):
+        gpu_str = f"{r['gpu_ms']:.2f}" if r['gpu_ms'] > 0 else "N/A"
+        speedup_gpu_str = f"{r['speedup_gpu']:.2f}x" if r['gpu_ms'] > 0 else "N/A"
+        print(f"{r['name']:<30} {r['params']:>10,} {r['cpu_ms']:>10.2f} {gpu_str:>10} "
+              f"{r['speedup_cpu']:>11.2f}x {speedup_gpu_str:>12}")
+
+    print()
+
+    # Find best
+    if results:
+        best_cpu = min(results, key=lambda x: x['cpu_ms'])
+        print(f"Best CPU: {best_cpu['name']} @ {best_cpu['cpu_fps']:.1f} FPS ({best_cpu['speedup_cpu']:.2f}x vs baseline)")
+
+        gpu_results = [r for r in results if r['gpu_ms'] > 0]
+        if gpu_results:
+            best_gpu = min(gpu_results, key=lambda x: x['gpu_ms'])
+            print(f"Best GPU: {best_gpu['name']} @ {best_gpu['gpu_fps']:.1f} FPS ({best_gpu['speedup_gpu']:.2f}x vs baseline)")
+
+    print()
+    print("=" * 80)
+    print()
+
+
 if __name__ == "__main__":
-    import argparse
+    try:
+        print("\n" + "=" * 80)
+        print("RUNNING ALL BENCHMARKS")
+        print("=" * 80 + "\n")
 
-    parser = argparse.ArgumentParser(description='Benchmark CNN models for ball detection')
-    parser.add_argument('--quick', action='store_true',
-                       help='Quick comprehensive test (fewer iterations and sizes)')
-    parser.add_argument('--onnx', nargs='*', metavar='PATH',
-                       help='Quick ONNX benchmark mode: test existing ONNX models (provide paths or use defaults)')
-    parser.add_argument('--fullframe', action='store_true',
-                       help='Benchmark full-frame 1280x720 models vs 128x128 crop models')
+        # 1. Comprehensive benchmark (small input sizes)
+        print("\n>>> PART 1: Comprehensive Model Benchmark (various input sizes)")
+        run_comprehensive_benchmark()
 
-    args = parser.parse_args()
+        # 2. Full-frame benchmark (1280x720 mono)
+        print("\n>>> PART 2: Full-Frame Benchmark (1280x720 mono)")
+        run_fullframe_benchmark()
 
-    if args.fullframe:
-        try:
-            run_fullframe_benchmark()
-        except KeyboardInterrupt:
-            print("\n\nBenchmark interrupted by user")
-        except Exception as e:
-            print(f"\n\nFatal error: {e}")
-            import traceback
-            traceback.print_exc()
-    elif args.onnx is not None:
-        # ONNX benchmark mode (replaces quick_bench.py functionality)
-        model_paths = args.onnx if args.onnx else None
-        try:
-            run_onnx_benchmark(model_paths)
-        except KeyboardInterrupt:
-            print("\n\nBenchmark interrupted by user")
-        except Exception as e:
-            print(f"\n\nFatal error: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        # Comprehensive benchmark mode (default)
-        if args.quick:
-            print("Quick mode: Testing only 64x64 and 128x128 with 50 iterations")
-            # Modify globals (hacky but works for demo)
-            import __main__
-            __main__.input_sizes = [64, 128]
-            __main__.num_iterations = 50
+        # 3. Stereo & Temporal benchmark (1280x720 stereo)
+        print("\n>>> PART 3: Stereo & Temporal Benchmark (1280x720 stereo)")
+        run_stereo_benchmark()
 
-        try:
-            run_comprehensive_benchmark()
-        except KeyboardInterrupt:
-            print("\n\nBenchmark interrupted by user")
-        except Exception as e:
-            print(f"\n\nFatal error: {e}")
-            import traceback
-            traceback.print_exc()
+        print("\n" + "=" * 80)
+        print("ALL BENCHMARKS COMPLETE")
+        print("=" * 80 + "\n")
+
+    except KeyboardInterrupt:
+        print("\n\nBenchmark interrupted by user")
+    except Exception as e:
+        print(f"\n\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()

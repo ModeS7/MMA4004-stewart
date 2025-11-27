@@ -29,8 +29,8 @@ from tqdm import tqdm
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
-IMAGES_DIR = "./ball_detection/data/new_labels/images"
-MASKS_DIR = "./ball_detection/data/new_labels/auto_labeled/masks"
+IMAGES_DIR = "./ball_detection/data/old_labels/images"
+MASKS_DIR = "./ball_detection/data/old_labels/auto_labeled/masks"
 OUTPUT_VIDEO = "./ball_detection/segmentation_workflow/mask_review.mp4"
 MASK_RADIUS = 20  # Radius for generated circular masks when correcting
 FPS = 15  # Video playback speed
@@ -542,7 +542,13 @@ class MaskReviewTool:
             img_path = self.images_dir / filename
             mask_path = self.masks_dir / filename
 
-            if change == 'delete':
+            if isinstance(change, np.ndarray):
+                # Save corrected mask
+                cv2.imwrite(str(mask_path), change)
+                corrected += 1
+                print(f"  Corrected: {filename}")
+
+            elif change == 'delete':
                 # Delete both image and mask
                 if img_path.exists():
                     img_path.unlink()
@@ -558,19 +564,12 @@ class MaskReviewTool:
                 no_ball += 1
                 print(f"  No ball: {filename}")
 
-            elif isinstance(change, np.ndarray):
-                # Save corrected mask
-                cv2.imwrite(str(mask_path), change)
-                corrected += 1
-                print(f"  Corrected: {filename}")
-
         print(f"\nSaved: {deleted} deleted, {no_ball} no-ball, {corrected} corrected")
         self.pending_changes.clear()
 
         # Reload frames after deletion
         if deleted > 0:
-            self.frames.clear()
-            self._load_frames()
+            self.frames = load_frames(self.images_dir, self.masks_dir)
             self.current_idx = min(self.current_idx, len(self.frames) - 1)
             if self.current_idx < 0:
                 self.current_idx = 0
