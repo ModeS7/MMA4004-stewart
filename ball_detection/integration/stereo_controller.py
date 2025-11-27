@@ -388,9 +388,9 @@ class StereoCameraController:
                 t_split = time.perf_counter()
 
                 # Run ball detection on raw (unrectified) frames
-                result_left = self.detector.detect(left_frame)
+                result_left, timing_left = self.detector.detect_with_timing(left_frame)
                 t_detect_left = time.perf_counter()
-                result_right = self.detector.detect(right_frame)
+                result_right, timing_right = self.detector.detect_with_timing(right_frame)
                 t_detect_right = time.perf_counter()
                 t_rectify = t_detect_right  # Default (no rectification if no detection)
 
@@ -459,6 +459,8 @@ class StereoCameraController:
                           f"get: {get_frame_ms:.1f} | split: {split_ms:.1f} | "
                           f"detect_L: {detect_l_ms:.1f} | detect_R: {detect_r_ms:.1f} | "
                           f"pt_rect: {rectify_ms:.1f} | rest: {rest_ms:.1f} | grabber: {self.grabber_fps:.1f}fps")
+                    print(f"  L: roi={timing_left['roi_ms']:.1f} prep={timing_left['preprocess_ms']:.1f} cnn={timing_left['inference_ms']:.1f} | "
+                          f"R: roi={timing_right['roi_ms']:.1f} prep={timing_right['preprocess_ms']:.1f} cnn={timing_right['inference_ms']:.1f}")
 
                 # Put in queue (non-blocking, drop oldest if full)
                 if self.ball_data_queue.full():
