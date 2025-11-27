@@ -18,13 +18,13 @@ import segmentation_models_pytorch as smp
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
-IMAGES_DIR = "./ball_detection/training_data/images"  # Directory with extracted images
-MODEL_PATH = "./ball_detection/models/segmentation/best_segmentation.pth"
-OUTPUT_DIR = "./ball_detection/auto_labeled"
+IMAGES_DIR = "./ball_detection/data/new_labels/images"  # Directory with extracted images
+MODEL_PATH = "./ball_detection/models/segmentation/best_interval_200-300.pth"
+OUTPUT_DIR = "./ball_detection/data/new_labels/auto_labeled"
 IMAGE_WIDTH = 1280
 IMAGE_HEIGHT = 720
 DEVICE = "cuda"
-BATCH_SIZE = 32  # Process multiple images at once for speed
+BATCH_SIZE = 4  # Process multiple images at once for speed
 # ============================================================
 
 
@@ -77,8 +77,12 @@ def main():
 
     # Load model
     print("Loading model...")
-    model = smp.Unet(encoder_name='efficientnet-b4', encoder_weights=None, classes=2, activation=None)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model = smp.Unet(encoder_name='efficientnet-b0', encoder_weights=None, classes=2, activation=None)
+    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+    # Handle torch.compile saved models (remove _orig_mod prefix if present)
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model = model.to(DEVICE)
     model.eval()
     print(f"Model loaded on {DEVICE}")

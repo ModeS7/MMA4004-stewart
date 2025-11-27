@@ -13,9 +13,9 @@ from tqdm import tqdm
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
-IMAGES_DIR = "./ball_detection/training_data/images"
-MASKS_DIR = "./ball_detection/auto_labeled/masks"
-OUTPUT_VIDEO = "./ball_detection/mask_review.mp4"
+IMAGES_DIR = "./ball_detection/data/new_labels/images"
+MASKS_DIR = "./ball_detection/data/new_labels/auto_labeled/masks"
+OUTPUT_VIDEO = "./ball_detection/segmentation_workflow/mask_review_stereo.mp4"
 FPS = 20  # Frames per second for output video
 # ============================================================
 
@@ -61,14 +61,15 @@ def main():
     images_dir = Path(IMAGES_DIR)
     masks_dir = Path(MASKS_DIR)
 
-    # Group images by frame number
+    # Group images by frame number (supports prefix_000001_left.jpg naming)
     left_files = {}
     right_files = {}
 
-    for img_path in images_dir.glob("*.jpg"):
+    all_images = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
+    for img_path in all_images:
         name = img_path.name
         if "_left" in name:
-            # Extract frame number
+            # Extract frame identifier (e.g., "prefix_000001" from "prefix_000001_left.jpg")
             frame_num = name.split("_left")[0]
             left_files[frame_num] = img_path
         elif "_right" in name:

@@ -290,7 +290,417 @@ class BallDetectorShuffleNetV2(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained=True, use_shufflenet=False):
+class BallDetectorFullFrame(nn.Module):
+    """
+    Full-frame ball detector for 1280x720 input with sub-pixel regression.
+
+    Architecture designed for speed on large inputs:
+    - Aggressive downsampling stem (stride 4 + stride 2 = 8x reduction early)
+    - Lightweight MobileNetV3-Small backbone (modified)
+    - Global pooling + regression head
+    - Outputs: x, y (normalized 0-1), confidence (ball present 0-1)
+
+    Input: 1280x720 RGB
+    Output: (x, y, confidence) where x,y are normalized to image space
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        # Aggressive downsampling stem for 1280x720 -> 160x90
+        # This reduces computation before the backbone
+        self.stem = nn.Sequential(
+            # 1280x720 -> 320x180 (stride 4)
+            nn.Conv2d(3, 24, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.BatchNorm2d(24),
+            nn.ReLU(inplace=True),
+            # 320x180 -> 160x90 (stride 2)
+            nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Load MobileNetV3-Small backbone
+        mobilenet = models.mobilenet_v3_small(pretrained=pretrained)
+
+        # Modify first conv to accept 32 channels from our stem (instead of 3)
+        # Original: Conv2d(3, 16, kernel_size=3, stride=2, padding=1)
+        # We replace it with a 1x1 conv to adapt channels
+        self.adapt = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True),
+        )
+
+        # Use MobileNetV3 features starting from layer 1 (skip first conv)
+        # features[0] is the first conv block, we skip it
+        self.backbone = nn.Sequential(*list(mobilenet.features.children())[1:])
+
+        # MobileNetV3-Small outputs 576 channels
+        # Regression head with 3 outputs: x, y, confidence
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 3)  # x, y, confidence
+        )
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, 3, 720, 1280)
+
+        Returns:
+            Output tensor of shape (batch, 3):
+                - [:, 0]: x_normalized in [0, 1] (multiply by 1280 for pixels)
+                - [:, 1]: y_normalized in [0, 1] (multiply by 720 for pixels)
+                - [:, 2]: confidence in [0, 1] (ball present probability)
+        """
+        # Aggressive downsampling: 1280x720 -> 160x90
+        x = self.stem(x)
+
+        # Adapt channels for backbone: 32 -> 16
+        x = self.adapt(x)
+
+        # MobileNetV3 backbone
+        x = self.backbone(x)
+
+        # Global pooling
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Regression head
+        x = self.head(x)
+
+        # Sigmoid for normalized outputs
+        x = torch.sigmoid(x)
+
+        return x
+
+    def count_parameters(self):
+        """Count total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class BallDetectorFullFrameTiny(nn.Module):
+    """
+    Ultra-lightweight full-frame detector for maximum speed.
+
+    Even more aggressive downsampling + custom tiny backbone.
+    Target: < 500K parameters, < 5ms inference on GPU.
+
+    Input: 1280x720 RGB
+    Output: (x, y, confidence)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Very aggressive stem: 1280x720 -> 80x45 (16x reduction)
+        self.stem = nn.Sequential(
+            # 1280x720 -> 320x180
+            nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            # 320x180 -> 80x45
+            nn.Conv2d(16, 32, kernel_size=5, stride=4, padding=2, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Tiny backbone
+        self.backbone = nn.Sequential(
+            # 80x45 -> 40x23
+            self._make_block(32, 64, stride=2),
+            # 40x23 -> 20x12
+            self._make_block(64, 128, stride=2),
+            # 20x12 -> 10x6
+            self._make_block(128, 256, stride=2),
+            # Refine
+            self._make_block(256, 256, stride=1),
+        )
+
+        # Regression head
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 3)  # x, y, confidence
+        )
+
+    def _make_block(self, in_ch, out_ch, stride):
+        """Depthwise separable conv block for efficiency."""
+        return nn.Sequential(
+            # Depthwise
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            nn.ReLU(inplace=True),
+            # Pointwise
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        x = torch.sigmoid(x)
+        return x
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class BallDetectorFullFrameUltra(nn.Module):
+    """
+    Maximum efficiency full-frame detector using PixelUnshuffle.
+
+    Uses PixelUnshuffle for zero-compute spatial reduction, then
+    lightweight depthwise-separable backbone.
+
+    Architecture:
+    - PixelUnshuffle(8): 1280x720x3 → 160x90x192 (FREE! just reshape)
+    - 1x1 conv: 192 → 32 channels (cheap channel reduction)
+    - Tiny depthwise-separable backbone
+    - Global pooling + regression head
+
+    Input: 1280x720 RGB
+    Output: (x, y, confidence)
+    """
+
+    def __init__(self, base_channels=32):
+        super().__init__()
+
+        # PixelUnshuffle stem - ZERO compute for 8x spatial reduction!
+        # 1280x720x3 → 160x90x192
+        self.pixel_unshuffle = nn.PixelUnshuffle(8)
+
+        # Channel reduction: 192 → base_channels
+        self.channel_reduce = nn.Sequential(
+            nn.Conv2d(192, base_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Tiny backbone with depthwise-separable convs
+        # 160x90 → 80x45 → 40x23 → 20x12 → 10x6
+        self.backbone = nn.Sequential(
+            self._make_block(base_channels, base_channels * 2, stride=2),      # 160x90 → 80x45
+            self._make_block(base_channels * 2, base_channels * 4, stride=2),  # 80x45 → 40x23
+            self._make_block(base_channels * 4, base_channels * 8, stride=2),  # 40x23 → 20x12
+            self._make_block(base_channels * 8, base_channels * 8, stride=2),  # 20x12 → 10x6
+        )
+
+        # Regression head
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(base_channels * 8, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 3)  # x, y, confidence
+        )
+
+    def _make_block(self, in_ch, out_ch, stride):
+        """Depthwise separable conv block."""
+        return nn.Sequential(
+            # Depthwise conv
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            nn.ReLU(inplace=True),
+            # Pointwise conv
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        # PixelUnshuffle: 1280x720x3 → 160x90x192 (zero compute!)
+        x = self.pixel_unshuffle(x)
+
+        # Reduce channels: 192 → 32
+        x = self.channel_reduce(x)
+
+        # Backbone
+        x = self.backbone(x)
+
+        # Global pooling + head
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        x = torch.sigmoid(x)
+
+        return x
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class BallDetectorFullFrameMobileNet(nn.Module):
+    """
+    Full-frame detector combining PixelUnshuffle with MobileNetV3 backbone.
+
+    Uses PixelUnshuffle for zero-compute spatial reduction, then feeds into
+    pretrained MobileNetV3-Small for feature extraction.
+
+    Architecture:
+    - PixelUnshuffle(8): 1280x720x3 → 160x90x192 (FREE reshape, 8x reduction)
+    - 1x1 conv: 192 → 16 channels (match MobileNetV3 first conv output)
+    - MobileNetV3 features[1:]: pretrained backbone (skip first conv)
+    - Global pooling + regression head
+
+    Benefits:
+    - Zero-compute downsampling via PixelUnshuffle
+    - ImageNet pretrained features from MobileNetV3
+    - ~1M parameters with strong feature extraction
+
+    Input: 1280x720 RGB
+    Output: (x, y, confidence)
+    """
+
+    def __init__(self, pretrained=True, unshuffle_factor=8):
+        super().__init__()
+
+        self.unshuffle_factor = unshuffle_factor
+
+        # PixelUnshuffle for zero-compute spatial reduction
+        # factor=4: 1280x720x3 → 320x180x48
+        # factor=8: 1280x720x3 → 160x90x192
+        self.pixel_unshuffle = nn.PixelUnshuffle(unshuffle_factor)
+        in_channels = 3 * (unshuffle_factor ** 2)  # 48 for factor=4, 192 for factor=8
+
+        # Channel adaptation to match MobileNetV3's expected input (16 channels after first conv)
+        # MobileNetV3 first conv: 3 → 16 with stride 2
+        # We skip that and directly provide 16 channels
+        self.channel_adapt = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True),
+        )
+
+        # Load MobileNetV3-Small and use features[1:] (skip first conv)
+        mobilenet = models.mobilenet_v3_small(pretrained=pretrained)
+        self.backbone = nn.Sequential(*list(mobilenet.features.children())[1:])
+
+        # MobileNetV3-Small outputs 576 channels
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 3)  # x, y, confidence
+        )
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, 3, 720, 1280)
+
+        Returns:
+            Output tensor of shape (batch, 3):
+                - [:, 0]: x_normalized in [0, 1]
+                - [:, 1]: y_normalized in [0, 1]
+                - [:, 2]: confidence in [0, 1]
+        """
+        # PixelUnshuffle: 1280x720x3 → 320x180x48 (zero compute!)
+        x = self.pixel_unshuffle(x)
+
+        # Adapt channels: 48 → 16
+        x = self.channel_adapt(x)
+
+        # MobileNetV3 backbone (pretrained)
+        x = self.backbone(x)
+
+        # Global pooling + head
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        x = torch.sigmoid(x)
+
+        return x
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class BallDetectorFullFrameMobileNetLite(nn.Module):
+    """
+    Lightweight full-frame detector with partial MobileNetV3 backbone.
+
+    Optimized for ~5-8ms CPU inference while retaining pretrained features.
+
+    Architecture:
+    - PixelUnshuffle(8): 1280x720x3 → 160x90x192 (zero-compute)
+    - Depthwise stride-2: 160x90 → 80x45 (fast spatial reduction)
+    - Pointwise: 192 → 16 channels
+    - MobileNetV3 layers 1-4: pretrained inverted residuals (40ch output)
+    - Global pooling + small head
+
+    Benefits:
+    - ~5-8ms CPU, ~1ms GPU
+    - ~30K parameters
+    - Pretrained ImageNet features (partial)
+
+    Input: 1280x720 RGB
+    Output: (x, y, confidence)
+    """
+
+    def __init__(self, pretrained=True, num_layers=4):
+        super().__init__()
+
+        self.pixel_unshuffle = nn.PixelUnshuffle(8)  # 160x90x192
+
+        # Depthwise stride-2 + pointwise channel reduction
+        self.stem = nn.Sequential(
+            nn.Conv2d(192, 192, kernel_size=3, stride=2, padding=1, groups=192, bias=False),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(192, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True),
+        )
+
+        # Load partial MobileNetV3-Small backbone
+        mobilenet = models.mobilenet_v3_small(pretrained=pretrained)
+        self.backbone = nn.Sequential(*list(mobilenet.features.children())[1:num_layers+1])
+
+        # Output channels based on num_layers: 1->16, 2->24, 3->24, 4->40
+        layer_channels = {1: 16, 2: 24, 3: 24, 4: 40, 5: 40, 6: 40}
+        out_channels = layer_channels.get(num_layers, 40)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(out_channels, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 3)
+        )
+
+    def forward(self, x):
+        x = self.pixel_unshuffle(x)
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        return torch.sigmoid(x)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained=True, use_shufflenet=False, use_fullframe=False, use_fullframe_tiny=False, use_fullframe_ultra=False, use_fullframe_mobilenet=False, use_fullframe_mobilenet_lite=False):
     """
     Create ball detector model.
 
@@ -299,11 +709,26 @@ def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained
         use_mobilenet: If True, use MobileNetV3-Small backbone
         mobilenet_pretrained: If True and use_mobilenet/use_shufflenet=True, load ImageNet pretrained weights
         use_shufflenet: If True, use ShuffleNetV2 x0.5 backbone (faster than MobileNetV3)
+        use_fullframe: If True, use full-frame detector (1280x720 input)
+        use_fullframe_tiny: If True, use ultra-lightweight full-frame detector
+        use_fullframe_ultra: If True, use PixelUnshuffle-based ultra-efficient detector
+        use_fullframe_mobilenet: If True, use PixelUnshuffle + MobileNetV3 hybrid
+        use_fullframe_mobilenet_lite: If True, use lightweight partial MobileNetV3 (~30K params, ~5-8ms CPU)
 
     Returns:
-        BallDetectorCNN, BallDetectorMobileNetV3, or BallDetectorShuffleNetV2 model
+        Ball detector model
     """
-    if use_shufflenet:
+    if use_fullframe_mobilenet_lite:
+        model = BallDetectorFullFrameMobileNetLite(pretrained=mobilenet_pretrained)
+    elif use_fullframe_mobilenet:
+        model = BallDetectorFullFrameMobileNet(pretrained=mobilenet_pretrained)
+    elif use_fullframe_ultra:
+        model = BallDetectorFullFrameUltra()
+    elif use_fullframe_tiny:
+        model = BallDetectorFullFrameTiny()
+    elif use_fullframe:
+        model = BallDetectorFullFrame(pretrained=mobilenet_pretrained)
+    elif use_shufflenet:
         model = BallDetectorShuffleNetV2(pretrained=mobilenet_pretrained)
     elif use_mobilenet:
         model = BallDetectorMobileNetV3(pretrained=mobilenet_pretrained)
@@ -325,30 +750,48 @@ def create_model(pretrained_path=None, use_mobilenet=False, mobilenet_pretrained
 if __name__ == "__main__":
     # Test all model architectures
     batch_size = 2
-    dummy_input = torch.randn(batch_size, 3, 128, 128)
 
-    models_to_test = [
+    # Crop-based models (128x128 input)
+    crop_input = torch.randn(batch_size, 3, 128, 128)
+    crop_models = [
         ("BallDetectorCNN", BallDetectorCNN()),
         ("BallDetectorMobileNetV3", BallDetectorMobileNetV3(pretrained=False)),
         ("BallDetectorShuffleNetV2", BallDetectorShuffleNetV2(pretrained=False)),
     ]
 
-    for name, model in models_to_test:
-        print("=" * 60)
-        print(f"Testing {name}...")
-        print("=" * 60)
+    print("=" * 60)
+    print("CROP-BASED MODELS (128x128 input)")
+    print("=" * 60)
 
+    for name, model in crop_models:
         model.eval()
         param_count = model.count_parameters()
-        print(f"Parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
-
-        # Forward pass
         with torch.no_grad():
-            output = model(dummy_input)
+            output = model(crop_input)
+        print(f"{name}: {param_count:,} params, output shape: {output.shape}")
 
-        print(f"Input shape: {dummy_input.shape}")
-        print(f"Output shape: {output.shape}")
-        print(f"Example output: x={output[0, 0]:.4f}, y={output[0, 1]:.4f}")
-        print()
+    # Full-frame models (1280x720 input)
+    fullframe_input = torch.randn(batch_size, 3, 720, 1280)
+    fullframe_models = [
+        ("BallDetectorFullFrame", BallDetectorFullFrame(pretrained=False)),
+        ("BallDetectorFullFrameTiny", BallDetectorFullFrameTiny()),
+        ("BallDetectorFullFrameUltra", BallDetectorFullFrameUltra()),
+        ("BallDetectorFullFrameMobileNet", BallDetectorFullFrameMobileNet(pretrained=False)),
+        ("BallDetectorFullFrameMobileNetLite", BallDetectorFullFrameMobileNetLite(pretrained=False)),
+    ]
 
+    print()
+    print("=" * 60)
+    print("FULL-FRAME MODELS (1280x720 input)")
+    print("=" * 60)
+
+    for name, model in fullframe_models:
+        model.eval()
+        param_count = model.count_parameters()
+        with torch.no_grad():
+            output = model(fullframe_input)
+        print(f"{name}: {param_count:,} params, output shape: {output.shape}")
+        print(f"  Output: x={output[0, 0]:.4f}, y={output[0, 1]:.4f}, conf={output[0, 2]:.4f}")
+
+    print()
     print("All model tests successful!")

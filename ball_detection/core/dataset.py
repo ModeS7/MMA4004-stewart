@@ -16,6 +16,60 @@ from albumentations.pytorch import ToTensorV2
 from functools import lru_cache
 
 
+class ImageTearing(A.ImageOnlyTransform):
+    """
+    Simulate realistic camera tearing artifact - 1-2 horizontal frame splits.
+
+    When applied, the image becomes invalid for detection (confidence should be 0).
+    """
+    def __init__(self, always_apply=False, p=0.5):
+        super().__init__(always_apply, p)
+
+    def apply(self, img, **params):
+        h, w = img.shape[:2]
+        result = img.copy()
+
+        # 1-2 tear lines (usually just 1)
+        num_tears = np.random.choice([1, 1, 1, 2])  # 75% chance of 1 tear
+
+        # Generate tear positions
+        if num_tears == 1:
+            tear_y = np.random.randint(int(h * 0.1), int(h * 0.9))
+            tear_positions = [tear_y]
+        else:
+            tear1 = np.random.randint(int(h * 0.15), int(h * 0.45))
+            tear2 = np.random.randint(int(h * 0.55), int(h * 0.85))
+            tear_positions = [tear1, tear2]
+
+        # Shift for crops (scaled to crop size)
+        min_shift = max(20, w // 6)
+        max_shift = max(40, w // 3)
+
+        # Apply shifts to sections
+        prev_y = 0
+        for i, tear_y in enumerate(tear_positions + [h]):
+            if i > 0:
+                shift = np.random.randint(min_shift, max_shift + 1)
+                if np.random.random() > 0.5:
+                    shift = -shift
+
+                result[prev_y:tear_y] = np.roll(result[prev_y:tear_y], shift, axis=1)
+
+                if np.random.random() > 0.5:
+                    brightness = np.random.randint(-30, 31)
+                    result[prev_y:tear_y] = np.clip(
+                        result[prev_y:tear_y].astype(np.int16) + brightness,
+                        0, 255
+                    ).astype(np.uint8)
+
+            prev_y = tear_y
+
+        return result
+
+    def get_transform_init_args_names(self):
+        return ()
+
+
 class BallDetectionDataset(Dataset):
     """
     Dataset for ball center detection training.
@@ -47,7 +101,9 @@ class BallDetectionDataset(Dataset):
     """
 
     def __init__(self, data_dir, labels_file='labels.json',
-                 crop_size=128, use_spatial_aug=True, use_appearance_aug=True, split='train', disable_normalize=False):
+                 crop_size=128, use_spatial_aug=True, use_appearance_aug=True,
+                 use_color_invariance_aug=False, use_tearing_aug=False, tearing_probability=0.05,
+                 split='train', disable_normalize=False):
         """
         Initialize dataset.
 
@@ -57,6 +113,9 @@ class BallDetectionDataset(Dataset):
             crop_size: Crop size (scale variation handled by ShiftScaleRotate augmentation)
             use_spatial_aug: Enable spatial augmentations (offset, rotate, scale, shift)
             use_appearance_aug: Enable appearance augmentations (brightness, hue, blur, noise)
+            use_color_invariance_aug: Enable color invariance augmentations (hue shift, channel shuffle, grayscale)
+            use_tearing_aug: Enable tearing augmentation (simulates camera tearing, sets confidence=0)
+            tearing_probability: Probability of applying tearing (default 5%)
             split: 'train' or 'val' (affects augmentation)
             disable_normalize: If True, skip normalization (for GPU augmentations)
         """
@@ -64,6 +123,9 @@ class BallDetectionDataset(Dataset):
         self.crop_size = crop_size
         self.use_spatial_aug = use_spatial_aug and (split == 'train')
         self.use_appearance_aug = use_appearance_aug and (split == 'train')
+        self.use_color_invariance_aug = use_color_invariance_aug and (split == 'train')
+        self.use_tearing_aug = use_tearing_aug and (split == 'train')
+        self.tearing_probability = tearing_probability
         self.disable_normalize = disable_normalize
 
         # Check for images in subdirectory or root
@@ -100,6 +162,7 @@ class BallDetectionDataset(Dataset):
 
         # Setup augmentation pipelines (separate for spatial and appearance)
         self.spatial_transform = self._get_spatial_transforms()
+        self.color_invariance_transform = self._get_color_invariance_transforms()
         self.appearance_transform = self._get_appearance_transforms()
 
     def _get_spatial_transforms(self):
@@ -120,6 +183,43 @@ class BallDetectionDataset(Dataset):
                 border_mode=cv2.BORDER_CONSTANT  # Black padding (default)
             ),
         ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def _get_normalize_transform(self):
+        """Get normalize-only transform (for difficult samples that skip appearance aug)."""
+        transforms_list = []
+        if self.disable_normalize:
+            transforms_list.append(A.ToFloat(max_value=255.0))
+        else:
+            transforms_list.append(A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+        transforms_list.append(ToTensorV2())
+        return A.Compose(transforms_list)
+
+    def _get_color_invariance_transforms(self):
+        """Create color invariance augmentation pipeline (train model to work with any color ball).
+
+        Applies aggressive color changes:
+        - Full hue rotation (red -> any color)
+        - Channel shuffle (swap R, G, B channels)
+        - Random grayscale (force shape-based detection)
+        """
+        if not self.use_color_invariance_aug:
+            return A.Compose([])  # No-op transform
+
+        return A.Compose([
+            # Full hue rotation - covers entire color spectrum (70% chance)
+            # hue_shift_limit=180 means ±180° which covers all colors
+            A.HueSaturationValue(
+                hue_shift_limit=180,  # Full spectrum rotation
+                sat_shift_limit=30,   # Mild saturation change
+                val_shift_limit=20,   # Mild value change
+                p=0.7
+            ),
+            # Channel shuffle - swaps RGB channels (30% chance)
+            # Red ball becomes green or blue instantly
+            A.ChannelShuffle(p=0.3),
+            # Random grayscale - forces model to learn shape, not color (20% chance)
+            A.ToGray(p=0.2),
+        ])
 
     def _get_appearance_transforms(self):
         """Create appearance augmentation pipeline (applied to crop after spatial aug)."""
@@ -224,13 +324,17 @@ class BallDetectionDataset(Dataset):
         Get training sample with NEW two-stage augmentation pipeline:
         1. Apply spatial augmentations to FULL image (shift/scale/rotate)
         2. Crop centered on augmented ball position (no padding)
-        3. Apply appearance augmentations to crop
+        3. Apply color invariance augmentations (if enabled)
+        4. Apply appearance augmentations to crop (skipped for difficult samples)
 
         Returns:
             image: Tensor of shape (3, H, W)
             target: Tensor of shape (2,) containing (x_norm, y_norm)
         """
         img_path, label = self.samples[idx]
+
+        # Check if sample is marked as difficult (skip appearance augmentations)
+        is_difficult = label.get('difficult', False)
 
         # Load image
         image = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
@@ -331,15 +435,39 @@ class BallDetectionDataset(Dataset):
             f"Crop size error: got {crop.shape}, expected ({self.crop_size}, {self.crop_size}). " \
             f"y1={y1}, y2={y2}, x1={x1}, x2={x2}, aug_size=({aug_height}, {aug_width})"
 
-        # STAGE 3: Apply appearance augmentations to crop
-        # For validation: seed for deterministic augmentation
-        if not self.use_spatial_aug:
-            seed_val = int(idx) + 2000  # Different seed than spatial/crop
-            np.random.seed(seed_val)
-            import random
-            random.seed(seed_val)
+        # Default confidence is 1.0 (valid detection)
+        confidence = 1.0
 
-        appearance_transformed = self.appearance_transform(image=crop)
+        # STAGE 3: Apply tearing BEFORE other augmentations (on raw uint8 image)
+        # This avoids expensive denormalize/renormalize operations
+        if self.use_tearing_aug and np.random.random() < self.tearing_probability:
+            tearing = ImageTearing(p=1.0)
+            crop = tearing(image=crop)['image']
+            confidence = 0.0  # Torn image = invalid
+
+        # STAGE 4: Apply color invariance augmentations (before appearance)
+        # Color invariance is OK for difficult samples (doesn't reduce visibility)
+        if self.use_color_invariance_aug:
+            color_transformed = self.color_invariance_transform(image=crop)
+            crop = color_transformed['image']
+
+        # STAGE 5: Apply appearance augmentations to crop
+        # Skip for difficult samples (they're already hard to detect)
+        if is_difficult and self.use_appearance_aug:
+            # Difficult sample: only normalize and convert to tensor (skip augmentations)
+            normalize_only = self._get_normalize_transform()
+            appearance_transformed = normalize_only(image=crop)
+        else:
+            # Normal sample: apply full appearance augmentations
+            # For validation: seed for deterministic augmentation
+            if not self.use_spatial_aug:
+                seed_val = int(idx) + 2000  # Different seed than spatial/crop
+                np.random.seed(seed_val)
+                import random
+                random.seed(seed_val)
+
+            appearance_transformed = self.appearance_transform(image=crop)
+
         image_tensor = appearance_transformed['image']
 
         # Reset seed
@@ -352,14 +480,17 @@ class BallDetectionDataset(Dataset):
         x_norm = np.clip(ball_x_in_crop / self.crop_size, 0.0, 1.0)
         y_norm = np.clip(ball_y_in_crop / self.crop_size, 0.0, 1.0)
 
-        # Create target tensor: (x_norm, y_norm)
-        target = torch.tensor([x_norm, y_norm], dtype=torch.float32)
+        # Create target tensor: (x_norm, y_norm, confidence)
+        target = torch.tensor([x_norm, y_norm, confidence], dtype=torch.float32)
 
         return image_tensor, target
 
 
 def create_dataloaders(data_dir, batch_size=32, crop_size=128,
-                       train_split=0.8, num_workers=4, use_spatial_augmentation=True, use_appearance_augmentation=True, disable_normalize=False):
+                       train_split=0.8, num_workers=4, use_spatial_augmentation=True,
+                       use_appearance_augmentation=True, use_color_invariance_augmentation=False,
+                       use_tearing_augmentation=False, tearing_probability=0.05,
+                       disable_normalize=False):
     """
     Create train and validation dataloaders.
 
@@ -371,6 +502,9 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         num_workers: Number of workers for data loading
         use_spatial_augmentation: Enable spatial augmentations (offset, rotate, scale, shift)
         use_appearance_augmentation: Enable appearance augmentations (brightness, hue, blur, noise)
+        use_color_invariance_augmentation: Enable color invariance augmentations (hue shift, channel shuffle, grayscale)
+        use_tearing_augmentation: Enable tearing augmentation (simulates camera tearing, sets confidence=0)
+        tearing_probability: Probability of applying tearing (default 5%)
         disable_normalize: If True, skip normalization (for GPU augmentations)
 
     Returns:
@@ -400,6 +534,9 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         crop_size=crop_size,
         use_spatial_aug=use_spatial_augmentation,
         use_appearance_aug=use_appearance_augmentation,
+        use_color_invariance_aug=use_color_invariance_augmentation,
+        use_tearing_aug=use_tearing_augmentation,
+        tearing_probability=tearing_probability,
         split='train',
         disable_normalize=disable_normalize
     )
@@ -410,6 +547,8 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         crop_size=crop_size,
         use_spatial_aug=False,
         use_appearance_aug=False,
+        use_color_invariance_aug=False,
+        use_tearing_aug=False,
         split='val',
         disable_normalize=disable_normalize
     )

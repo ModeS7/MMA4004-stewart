@@ -16,20 +16,196 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import torch
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
-from ball_detection.core.dataset import BallDetectionDataset
+from ball_detection.core.dataset import BallDetectionDataset, ImageTearing
+
+
+class FullFrameDataset:
+    """Simple full-frame dataset for visualization (no cropping)."""
+
+    def __init__(self, data_dir, width=1280, height=720,
+                 use_spatial_aug=True, use_appearance_aug=True,
+                 use_color_invariance_aug=False, use_tearing_aug=False,
+                 tearing_probability=0.05, split='train'):
+        self.data_dir = Path(data_dir)
+        self.width = width
+        self.height = height
+        self.use_spatial_aug = use_spatial_aug and (split == 'train')
+        self.use_appearance_aug = use_appearance_aug and (split == 'train')
+        self.use_color_invariance_aug = use_color_invariance_aug and (split == 'train')
+        self.use_tearing_aug = use_tearing_aug and (split == 'train')
+        self.tearing_probability = tearing_probability
+
+        # Find images
+        if (self.data_dir / 'images').exists():
+            self.image_dir = self.data_dir / 'images'
+        else:
+            self.image_dir = self.data_dir
+
+        # Load labels
+        labels_path = self.data_dir / 'labels.json'
+        with open(labels_path, 'r') as f:
+            self.labels = json.load(f)
+
+        self.samples = []
+        for img_name, label in self.labels.items():
+            if not label.get('valid', True):
+                continue
+            img_path = self.image_dir / img_name
+            if img_path.exists():
+                self.samples.append((str(img_path), label))
+
+        # Build augmentation pipeline
+        self.transform = self._build_transform()
+
+    def _build_transform(self):
+        transforms = []
+
+        if self.use_spatial_aug:
+            transforms.append(A.ShiftScaleRotate(
+                shift_limit=0.05, scale_limit=0.1, rotate_limit=10, p=0.7,
+                border_mode=cv2.BORDER_CONSTANT
+            ))
+
+        if self.use_color_invariance_aug:
+            transforms.extend([
+                A.HueSaturationValue(hue_shift_limit=180, sat_shift_limit=30, val_shift_limit=20, p=0.7),
+                A.ChannelShuffle(p=0.3),
+                A.ToGray(p=0.2),
+            ])
+
+        if self.use_appearance_aug:
+            transforms.extend([
+                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
+                A.OneOf([
+                    A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                    A.MotionBlur(blur_limit=5, p=1.0),
+                ], p=0.3),
+                A.GaussNoise(std_range=(0.01, 0.05), p=0.3),
+            ])
+
+        transforms.extend([
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ])
+
+        return A.Compose(transforms, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def _apply_tearing(self, img):
+        """Apply realistic tearing effect - 1-2 horizontal splits between frames."""
+        h, w = img.shape[:2]
+        result = img.copy()
+
+        # 1-2 tear lines (usually just 1)
+        num_tears = np.random.choice([1, 1, 1, 2])  # 75% chance of 1 tear
+
+        # Generate tear positions (where frame splits occur)
+        if num_tears == 1:
+            # Single tear somewhere in middle 80% of image
+            tear_y = np.random.randint(int(h * 0.1), int(h * 0.9))
+            tear_positions = [tear_y]
+        else:
+            # Two tears - divide image into 3 sections
+            tear1 = np.random.randint(int(h * 0.15), int(h * 0.45))
+            tear2 = np.random.randint(int(h * 0.55), int(h * 0.85))
+            tear_positions = [tear1, tear2]
+
+        # Apply shifts to sections between tears
+        prev_y = 0
+        for i, tear_y in enumerate(tear_positions + [h]):
+            if i > 0:  # Don't shift first section (it's the "correct" frame)
+                # Large horizontal shift (simulates different frame position)
+                shift = np.random.randint(100, 300)
+                if np.random.random() > 0.5:
+                    shift = -shift
+
+                # Shift this entire section
+                result[prev_y:tear_y] = np.roll(result[prev_y:tear_y], shift, axis=1)
+
+                # Optional slight brightness difference (different frame exposure)
+                if np.random.random() > 0.5:
+                    brightness = np.random.randint(-30, 31)
+                    result[prev_y:tear_y] = np.clip(
+                        result[prev_y:tear_y].astype(np.int16) + brightness,
+                        0, 255
+                    ).astype(np.uint8)
+
+            prev_y = tear_y
+
+        return result
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+
+        # Load and resize image
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (self.width, self.height))
+
+        # Get ball coordinates and scale to new size
+        orig_h, orig_w = cv2.imread(img_path).shape[:2]
+        ball_x = label['x'] * self.width / orig_w
+        ball_y = label['y'] * self.height / orig_h
+
+        # Apply augmentations
+        transformed = self.transform(image=image, keypoints=[(ball_x, ball_y)])
+        image_tensor = transformed['image']
+
+        if len(transformed['keypoints']) > 0:
+            aug_x, aug_y = transformed['keypoints'][0]
+        else:
+            aug_x, aug_y = self.width / 2, self.height / 2
+
+        # Normalize coordinates
+        x_norm = np.clip(aug_x / self.width, 0.0, 1.0)
+        y_norm = np.clip(aug_y / self.height, 0.0, 1.0)
+        confidence = 1.0
+
+        # Apply tearing
+        if self.use_tearing_aug and np.random.random() < self.tearing_probability:
+            # Denormalize
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            img_np = image_tensor.numpy().transpose(1, 2, 0)
+            img_np = (img_np * std + mean) * 255
+            img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+
+            # Apply tearing directly (larger params for full frame)
+            img_np = self._apply_tearing(img_np)
+
+            # Re-normalize
+            img_np = img_np.astype(np.float32) / 255.0
+            img_np = (img_np - mean) / std
+            image_tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).float()
+            confidence = 0.0
+
+        target = torch.tensor([x_norm, y_norm, confidence], dtype=torch.float32)
+        return image_tensor, target
+
 
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
 DATA_DIR = "./ball_detection/data/final"
-CROP_SIZE = 128
+FULLFRAME_MODE = True  # True for 1280x720 full frames, False for 128x128 crops
+CROP_SIZE = 128  # Only used when FULLFRAME_MODE = False
+FULLFRAME_WIDTH = 1280
+FULLFRAME_HEIGHT = 720
 MODE = "train"  # "train" or "val" - choose which dataset to visualize
 USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (train only)
 USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
-NUM_SAMPLES = 5  # Number of different images to show
-NUM_AUGMENTATIONS = 7  # Number of augmented versions per image
-FIGSIZE = (16, 10)  # Figure size for display
+USE_COLOR_INVARIANCE_AUGMENTATION = True  # Hue shift, channel shuffle, grayscale (any-color ball)
+USE_TEARING_AUGMENTATION = True  # Camera tearing simulation (set high prob to see it)
+TEARING_PROBABILITY = 0.5  # High probability for visualization (normally 0.01-0.05)
+NUM_SAMPLES = 3  # Number of different images to show (fewer for full frame)
+NUM_AUGMENTATIONS = 4  # Number of augmented versions per image (fewer for full frame)
+FIGSIZE = (20, 12)  # Figure size for display
 SAVE_OUTPUT = True  # Save visualization to file
 OUTPUT_PATH = "./ball_detection/augmentation_examples.png"
 # ============================================================
@@ -47,15 +223,26 @@ def denormalize(img):
     return img
 
 
-def draw_keypoint(img, x, y, color=(0, 255, 0), radius=2, thickness=-1):
+def draw_keypoint(img, x, y, color=(0, 255, 0), fullframe=False):
     """Draw keypoint on image."""
     img = img.copy()
     x_pixel = int(x * img.shape[1])
     y_pixel = int(y * img.shape[0])
-    cv2.circle(img, (x_pixel, y_pixel), radius, color, thickness)
+
+    # Scale sizes for fullframe
+    if fullframe:
+        radius = 8
+        crosshair = 20
+        thickness = 2
+    else:
+        radius = 2
+        crosshair = 5
+        thickness = 1
+
+    cv2.circle(img, (x_pixel, y_pixel), radius, color, -1)
     # Draw crosshair
-    cv2.line(img, (x_pixel - 5, y_pixel), (x_pixel + 5, y_pixel), color, 1)
-    cv2.line(img, (x_pixel, y_pixel - 5), (x_pixel, y_pixel + 5), color, 1)
+    cv2.line(img, (x_pixel - crosshair, y_pixel), (x_pixel + crosshair, y_pixel), color, thickness)
+    cv2.line(img, (x_pixel, y_pixel - crosshair), (x_pixel, y_pixel + crosshair), color, thickness)
     return img
 
 
@@ -66,41 +253,79 @@ def main():
     print("=" * 60)
     print(f"Data: {DATA_DIR}")
     print(f"Mode: {MODE.upper()}")
-    print(f"Crop size: {CROP_SIZE}x{CROP_SIZE}")
+    if FULLFRAME_MODE:
+        print(f"Full frame: {FULLFRAME_WIDTH}x{FULLFRAME_HEIGHT}")
+    else:
+        print(f"Crop size: {CROP_SIZE}x{CROP_SIZE}")
 
     # Validation mode: force no spatial augmentation
     if MODE == "val":
         spatial_aug = False
         appearance_aug = USE_APPEARANCE_AUGMENTATION
+        color_invariance_aug = False
+        tearing_aug = False
         print(f"Spatial augmentation: Disabled (validation mode)")
         print(f"Appearance augmentation: {'Enabled' if appearance_aug else 'Disabled'}")
+        print(f"Color invariance augmentation: Disabled (validation mode)")
+        print(f"Tearing augmentation: Disabled (validation mode)")
     else:
         spatial_aug = USE_SPATIAL_AUGMENTATION
         appearance_aug = USE_APPEARANCE_AUGMENTATION
+        color_invariance_aug = USE_COLOR_INVARIANCE_AUGMENTATION
+        tearing_aug = USE_TEARING_AUGMENTATION
         print(f"Spatial augmentation: {'Enabled' if spatial_aug else 'Disabled'}")
         print(f"Appearance augmentation: {'Enabled' if appearance_aug else 'Disabled'}")
+        print(f"Color invariance augmentation: {'Enabled' if color_invariance_aug else 'Disabled'}")
+        print(f"Tearing augmentation: {'Enabled' if tearing_aug else 'Disabled'}" + (f" ({TEARING_PROBABILITY*100:.0f}%)" if tearing_aug else ""))
 
     print(f"Samples: {NUM_SAMPLES}")
     print(f"Augmentations per sample: {NUM_AUGMENTATIONS}")
     print("=" * 60)
     print()
 
-    # Create datasets
-    dataset_no_aug = BallDetectionDataset(
-        data_dir=DATA_DIR,
-        crop_size=CROP_SIZE,
-        use_spatial_aug=False,
-        use_appearance_aug=False,
-        split=MODE
-    )
+    # Create datasets based on mode
+    if FULLFRAME_MODE:
+        dataset_no_aug = FullFrameDataset(
+            data_dir=DATA_DIR,
+            width=FULLFRAME_WIDTH,
+            height=FULLFRAME_HEIGHT,
+            use_spatial_aug=False,
+            use_appearance_aug=False,
+            use_color_invariance_aug=False,
+            use_tearing_aug=False,
+            split=MODE
+        )
 
-    dataset_with_aug = BallDetectionDataset(
-        data_dir=DATA_DIR,
-        crop_size=CROP_SIZE,
-        use_spatial_aug=spatial_aug,
-        use_appearance_aug=appearance_aug,
-        split=MODE
-    )
+        dataset_with_aug = FullFrameDataset(
+            data_dir=DATA_DIR,
+            width=FULLFRAME_WIDTH,
+            height=FULLFRAME_HEIGHT,
+            use_spatial_aug=spatial_aug,
+            use_appearance_aug=appearance_aug,
+            use_color_invariance_aug=color_invariance_aug,
+            use_tearing_aug=tearing_aug,
+            tearing_probability=TEARING_PROBABILITY,
+            split=MODE
+        )
+    else:
+        dataset_no_aug = BallDetectionDataset(
+            data_dir=DATA_DIR,
+            crop_size=CROP_SIZE,
+            use_spatial_aug=False,
+            use_appearance_aug=False,
+            split=MODE
+        )
+
+        dataset_with_aug = BallDetectionDataset(
+            data_dir=DATA_DIR,
+            crop_size=CROP_SIZE,
+            use_spatial_aug=spatial_aug,
+            use_appearance_aug=appearance_aug,
+            use_color_invariance_aug=color_invariance_aug,
+            use_tearing_aug=tearing_aug,
+            tearing_probability=TEARING_PROBABILITY,
+            split=MODE
+        )
 
     print(f"Dataset loaded: {len(dataset_no_aug)} samples")
     print()
@@ -121,7 +346,8 @@ def main():
         img_orig_display = draw_keypoint(
             img_orig_display,
             target_orig[0].item(),
-            target_orig[1].item()
+            target_orig[1].item(),
+            fullframe=FULLFRAME_MODE
         )
 
         # Display original
@@ -141,11 +367,18 @@ def main():
             img_aug, target_aug = dataset_with_aug[idx]
 
             img_aug_display = denormalize(img_aug.numpy())
-            img_aug_display = draw_keypoint(
-                img_aug_display,
-                target_aug[0].item(),
-                target_aug[1].item()
-            )
+
+            # Check confidence (3rd value) - if 0, image is torn/invalid
+            confidence = target_aug[2].item() if len(target_aug) > 2 else 1.0
+            is_torn = confidence < 0.5
+
+            if not is_torn:
+                img_aug_display = draw_keypoint(
+                    img_aug_display,
+                    target_aug[0].item(),
+                    target_aug[1].item(),
+                    fullframe=FULLFRAME_MODE
+                )
 
             # Display augmented
             if NUM_SAMPLES == 1:
@@ -154,7 +387,10 @@ def main():
                 ax = axes[row, col + 1]
 
             ax.imshow(img_aug_display)
-            ax.set_title(f'Aug {col + 1}', fontsize=10)
+            title = f'Aug {col + 1}'
+            if is_torn:
+                title += ' [TORN]'
+            ax.set_title(title, fontsize=10, color='red' if is_torn else 'black')
             ax.axis('off')
 
         print(f"Processed sample {row + 1}/{NUM_SAMPLES}")

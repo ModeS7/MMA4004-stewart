@@ -27,9 +27,11 @@ from pathlib import Path
 class BallLabelingTool:
     """Interactive tool for labeling ball centers."""
 
-    def __init__(self, input_path, output_dir=None, crop_size=64):
+    def __init__(self, input_path, output_dir=None, crop_size=64, prefix=None):
         self.input_path = Path(input_path)
         self.crop_size = crop_size
+        # Use video filename as prefix if not specified
+        self.prefix = prefix if prefix else self.input_path.stem
 
         # Setup output directory
         if output_dir is None:
@@ -112,8 +114,8 @@ class BallLabelingTool:
             left_frame = frame[:, 0:1280]
             right_frame = frame[:, 1280:2560]
 
-            # Save left frame
-            left_name = f"frame_{frame_idx:06d}_left.jpg"
+            # Save left frame (use prefix to avoid overwrites between videos)
+            left_name = f"{self.prefix}_{frame_idx:06d}_left.jpg"
             left_path = self.image_dir / left_name
             if not left_path.exists():
                 cv2.imwrite(str(left_path), left_frame)
@@ -121,7 +123,7 @@ class BallLabelingTool:
             self.image_names.append(left_name)
 
             # Save right frame
-            right_name = f"frame_{frame_idx:06d}_right.jpg"
+            right_name = f"{self.prefix}_{frame_idx:06d}_right.jpg"
             right_path = self.image_dir / right_name
             if not right_path.exists():
                 cv2.imwrite(str(right_path), right_frame)
@@ -418,13 +420,16 @@ def main():
                         help='Output directory for labeled data')
     parser.add_argument('--crop-size', type=int, default=64,
                         help='Crop size for visualization')
+    parser.add_argument('--prefix', type=str, default=None,
+                        help='Prefix for frame names (default: video filename)')
 
     args = parser.parse_args()
 
     tool = BallLabelingTool(
         input_path=args.input,
         output_dir=args.output,
-        crop_size=args.crop_size
+        crop_size=args.crop_size,
+        prefix=args.prefix
     )
 
     tool.run()

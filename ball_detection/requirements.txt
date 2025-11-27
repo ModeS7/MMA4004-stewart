@@ -1,8 +1,13 @@
 # Ball Detection CNN - Requirements
+# Note: Install PyTorch separately from pytorch.org with your CUDA version
 
 # Core ML
 onnx>=1.14.0
 onnxruntime-directml>=1.16.0  # AMD GPU support via DirectML
+
+# Segmentation
+segmentation-models-pytorch>=0.3.0
+pycocotools>=2.0.0
 
 # Computer Vision
 opencv-python>=4.8.0
@@ -11,10 +16,8 @@ albumentations>=1.3.0  # Data augmentation
 # Utilities
 numpy>=1.24.0
 Pillow>=10.0.0
+tqdm>=4.65.0
 
 # Training visualization
 tensorboard>=2.13.0
 matplotlib>=3.7.0
-
-
-albumentations

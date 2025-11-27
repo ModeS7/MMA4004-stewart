@@ -19,9 +19,8 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 
-from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2, create_model
+from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2, BallDetectorFullFrame, BallDetectorFullFrameTiny, BallDetectorFullFrameUltra, BallDetectorFullFrameMobileNet, BallDetectorFullFrameMobileNetLite, create_model
 from ..core.dataset import create_dataloaders
-from ..core.gpu_augmentations import GPUAugmentationsWithTargets
 from ..core.cached_dataset import CachedAugmentationDataset
 
 # ============================================================
@@ -44,12 +43,21 @@ USE_SHUFFLENET = True  # Use ShuffleNetV2 x0.5 (faster than MobileNetV3, ~350K p
 PRETRAINED_BACKBONE = True  # Load ImageNet pretrained weights for MobileNetV3/ShuffleNet
 USE_SPATIAL_AUGMENTATION = True  # Offset, rotate, scale, shift (simulate CV detection error)
 USE_APPEARANCE_AUGMENTATION = True  # Brightness, hue, blur, noise
+USE_COLOR_INVARIANCE_AUGMENTATION = True  # Hue shift, channel shuffle, grayscale (train for any-color ball)
+USE_TEARING_AUGMENTATION = True  # Simulate camera tearing (model learns confidence=0 for torn images)
+TEARING_PROBABILITY = 0.01  # 1% chance of tearing per sample
 
 # ============================================================
-# GPU AUGMENTATION SETTINGS (Kornia - Much faster than CPU)
+# FULL-FRAME MODE (1280x720 input instead of crops)
 # ============================================================
-USE_GPU_AUGMENTATIONS = False   # Use Kornia GPU augmentations instead of Albumentations
-# When enabled, CPU augmentations (Albumentations) are disabled for max speed
+USE_FULLFRAME = False  # Full-frame detection (1280x720 input, outputs x,y,confidence)
+USE_FULLFRAME_TINY = False  # Ultra-lightweight full-frame model (~150K params)
+USE_FULLFRAME_ULTRA = False  # PixelUnshuffle-based model (~138K params, best for GPU)
+USE_FULLFRAME_MOBILENET = False  # PixelUnshuffle + MobileNetV3 (~1M params, pretrained, 6.3ms GPU)
+USE_FULLFRAME_MOBILENET_LITE = False  # Partial MobileNetV3 (~30K params, pretrained, ~5-8ms CPU)
+FULLFRAME_WIDTH = 1280
+FULLFRAME_HEIGHT = 720
+
 
 # ============================================================
 # CACHED AUGMENTATION SETTINGS (For Maximum GPU Utilization)
@@ -129,11 +137,9 @@ def calculate_pixel_error(pred, target, crop_size=128):
     return distances.mean().item()
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gpu_aug=None):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     """Train for one epoch with AMP bf16."""
     model.train()
-    if gpu_aug is not None:
-        gpu_aug.train()
 
     total_loss = 0
     total_pixel_error = 0
@@ -144,10 +150,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, gpu_aug=
     for images, targets in pbar:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-
-        # Apply GPU augmentations (if enabled)
-        if gpu_aug is not None:
-            images, targets = gpu_aug(images, targets)
 
         # Forward pass with AMP bf16 (only on CUDA)
         if use_amp:
@@ -404,13 +406,23 @@ def main():
     from datetime import datetime
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_name = f"run_{timestamp}"
-    if USE_SHUFFLENET:
+    if USE_FULLFRAME_MOBILENET_LITE:
+        run_name += "_fullframe_mobilenet_lite"
+    elif USE_FULLFRAME_MOBILENET:
+        run_name += "_fullframe_mobilenet"
+    elif USE_FULLFRAME_ULTRA:
+        run_name += "_fullframe_ultra"
+    elif USE_FULLFRAME_TINY:
+        run_name += "_fullframe_tiny"
+    elif USE_FULLFRAME:
+        run_name += "_fullframe"
+    elif USE_SHUFFLENET:
         run_name += "_shufflenetv2"
     elif USE_MOBILENET:
         run_name += "_mobilenetv3"
     else:
         run_name += "_customcnn"
-    if ENABLE_PRUNING and not USE_SHUFFLENET:  # Pruning not supported for ShuffleNet
+    if ENABLE_PRUNING and not USE_SHUFFLENET and not USE_FULLFRAME and not USE_FULLFRAME_TINY and not USE_FULLFRAME_ULTRA and not USE_FULLFRAME_MOBILENET and not USE_FULLFRAME_MOBILENET_LITE:
         run_name += "_pruning"
 
     # Each run gets its own directory under models/
@@ -437,6 +449,9 @@ def main():
         'pretrained_backbone': PRETRAINED_BACKBONE,
         'use_spatial_augmentation': USE_SPATIAL_AUGMENTATION,
         'use_appearance_augmentation': USE_APPEARANCE_AUGMENTATION,
+        'use_color_invariance_augmentation': USE_COLOR_INVARIANCE_AUGMENTATION,
+        'use_tearing_augmentation': USE_TEARING_AUGMENTATION,
+        'tearing_probability': TEARING_PROBABILITY,
         'enable_pruning': ENABLE_PRUNING,
         'enable_tensorboard': ENABLE_TENSORBOARD,
     }
@@ -447,7 +462,9 @@ def main():
     if ENABLE_TENSORBOARD:
         tensorboard_base = Path(OUTPUT_DIR) / 'tensorboard_logs'
         tensorboard_dir = tensorboard_base / run_name
-        writer = SummaryWriter(log_dir=tensorboard_dir)
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        # High queue + long flush interval = single event file
+        writer = SummaryWriter(log_dir=str(tensorboard_dir), max_queue=10000, flush_secs=300)
         print(f"TensorBoard:")
         print(f"  Logs: {tensorboard_dir}")
         print(f"  Command: tensorboard --logdir={tensorboard_base}")
@@ -458,9 +475,9 @@ def main():
     # Create dataloaders
     print(f"Loading data from: {DATA_DIR}")
 
-    # Disable CPU augmentations if using GPU augmentations or cached augmentations
-    cpu_spatial_aug = USE_SPATIAL_AUGMENTATION and not USE_GPU_AUGMENTATIONS and not USE_CACHED_AUGMENTATIONS
-    cpu_appearance_aug = USE_APPEARANCE_AUGMENTATION and not USE_GPU_AUGMENTATIONS and not USE_CACHED_AUGMENTATIONS
+    # Disable CPU augmentations if using cached augmentations
+    cpu_spatial_aug = USE_SPATIAL_AUGMENTATION and not USE_CACHED_AUGMENTATIONS
+    cpu_appearance_aug = USE_APPEARANCE_AUGMENTATION and not USE_CACHED_AUGMENTATIONS
 
     if USE_CACHED_AUGMENTATIONS:
         print(f"Cached augmentations: Enabled")
@@ -532,22 +549,11 @@ def main():
             drop_last=False
         )
 
-    elif USE_GPU_AUGMENTATIONS:
-        print(f"GPU augmentations (Kornia): Enabled")
-        print(f"  CPU augmentations: Disabled (for max speed)")
-        train_loader, val_loader = create_dataloaders(
-            data_dir=DATA_DIR,
-            batch_size=BATCH_SIZE,
-            crop_size=CROP_SIZE,
-            train_split=TRAIN_SPLIT,
-            num_workers=NUM_WORKERS,
-            use_spatial_augmentation=cpu_spatial_aug,
-            use_appearance_augmentation=cpu_appearance_aug,
-            disable_normalize=USE_GPU_AUGMENTATIONS
-        )
     else:
         print(f"CPU Spatial augmentation: {'Enabled' if cpu_spatial_aug else 'Disabled'}")
         print(f"CPU Appearance augmentation: {'Enabled' if cpu_appearance_aug else 'Disabled'}")
+        print(f"CPU Color invariance augmentation: {'Enabled' if USE_COLOR_INVARIANCE_AUGMENTATION else 'Disabled'}")
+        print(f"CPU Tearing augmentation: {'Enabled' if USE_TEARING_AUGMENTATION else 'Disabled'}" + (f" ({TEARING_PROBABILITY*100:.0f}%)" if USE_TEARING_AUGMENTATION else ""))
         train_loader, val_loader = create_dataloaders(
             data_dir=DATA_DIR,
             batch_size=BATCH_SIZE,
@@ -556,12 +562,30 @@ def main():
             num_workers=NUM_WORKERS,
             use_spatial_augmentation=cpu_spatial_aug,
             use_appearance_augmentation=cpu_appearance_aug,
+            use_color_invariance_augmentation=USE_COLOR_INVARIANCE_AUGMENTATION,
+            use_tearing_augmentation=USE_TEARING_AUGMENTATION,
+            tearing_probability=TEARING_PROBABILITY,
             disable_normalize=False
         )
 
     # Create model
     print("\nCreating model...")
-    if USE_SHUFFLENET:
+    if USE_FULLFRAME_MOBILENET_LITE:
+        print(f"Using BallDetectorFullFrameMobileNetLite (1280x720 input, ~30K params, partial MobileNetV3)")
+        model = BallDetectorFullFrameMobileNetLite(pretrained=PRETRAINED_BACKBONE)
+    elif USE_FULLFRAME_MOBILENET:
+        print(f"Using BallDetectorFullFrameMobileNet (1280x720 input, ~1M params, PixelUnshuffle+MobileNetV3)")
+        model = BallDetectorFullFrameMobileNet(pretrained=PRETRAINED_BACKBONE)
+    elif USE_FULLFRAME_ULTRA:
+        print(f"Using BallDetectorFullFrameUltra (1280x720 input, ~138K params, PixelUnshuffle)")
+        model = BallDetectorFullFrameUltra()
+    elif USE_FULLFRAME_TINY:
+        print(f"Using BallDetectorFullFrameTiny (1280x720 input, ~150K params)")
+        model = BallDetectorFullFrameTiny()
+    elif USE_FULLFRAME:
+        print(f"Using BallDetectorFullFrame (1280x720 input, pretrained: {PRETRAINED_BACKBONE})")
+        model = BallDetectorFullFrame(pretrained=PRETRAINED_BACKBONE)
+    elif USE_SHUFFLENET:
         print(f"Using ShuffleNetV2 x0.5 (pretrained: {PRETRAINED_BACKBONE})")
         model = BallDetectorShuffleNetV2(pretrained=PRETRAINED_BACKBONE)
     elif USE_MOBILENET:
@@ -572,13 +596,6 @@ def main():
         model = BallDetectorCNN()
 
     model = model.to(device)
-
-    # Create GPU augmentation module
-    if USE_GPU_AUGMENTATIONS:
-        gpu_aug = GPUAugmentationsWithTargets(crop_size=CROP_SIZE).to(device)
-        print(f"GPU augmentations: Initialized on {device}")
-    else:
-        gpu_aug = None
 
     # Disable torch.compile for small models/datasets (overhead > benefit)
     # model = torch.compile(model)
@@ -721,7 +738,7 @@ def main():
 
         # Train
         train_loss, train_pixel_err = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, gpu_aug
+            model, train_loader, criterion, optimizer, device, epoch
         )
 
         # Validate only every N epochs (reduce sync overhead)
@@ -800,6 +817,10 @@ def main():
                         writer.add_histogram(f'Weights/{name}', param, epoch)
                         if param.grad is not None:
                             writer.add_histogram(f'Gradients/{name}', param.grad, epoch)
+
+            # Flush periodically to keep single file but ensure data is saved
+            if epoch % 50 == 0:
+                writer.flush()
 
         # Pruning logic
         if enable_pruning and pruning_active:
@@ -1043,11 +1064,20 @@ def main():
     print("=" * 60)
     try:
         onnx_path = output_dir / f"{run_name}.onnx"
-        dummy_input = torch.randn(1, 3, CROP_SIZE, CROP_SIZE).to(device)
+
+        # Use correct input shape for model type
+        if USE_FULLFRAME or USE_FULLFRAME_TINY or USE_FULLFRAME_ULTRA or USE_FULLFRAME_MOBILENET or USE_FULLFRAME_MOBILENET_LITE:
+            dummy_input = torch.randn(1, 3, FULLFRAME_HEIGHT, FULLFRAME_WIDTH).to(device)
+            input_h, input_w = FULLFRAME_HEIGHT, FULLFRAME_WIDTH
+            output_size = 3  # x, y, confidence
+        else:
+            dummy_input = torch.randn(1, 3, CROP_SIZE, CROP_SIZE).to(device)
+            input_h, input_w = CROP_SIZE, CROP_SIZE
+            output_size = 2  # x, y
 
         print(f"Exporting model to: {onnx_path}")
-        print(f"  Input shape: (1, 3, {CROP_SIZE}, {CROP_SIZE})")
-        print(f"  Output shape: (1, 2)")
+        print(f"  Input shape: (1, 3, {input_h}, {input_w})")
+        print(f"  Output shape: (1, {output_size})")
 
         torch.onnx.export(
             model,
