@@ -353,7 +353,10 @@ class MaskReviewTool:
         print(f"\nControls:")
         print("  Click: Set new ball center (generates circular mask)")
         print("  TAB: Switch between left/right camera")
-        print("  n/p: Next/previous frame pair")
+        print("  n/p: Next/previous frame")
+        print("  ./,: Jump +10/-10 frames")
+        print("  ]/[: Jump +100/-100 frames")
+        print("  g: Go to specific frame number")
         print("  d: Delete current frame (image + mask)")
         print("  x: Mark 'no ball' (delete mask only)")
         print("  u: Undo pending change")
@@ -604,6 +607,42 @@ class MaskReviewTool:
                 if self.current_idx > 0:
                     self.current_idx -= 1
                     print(f"Frame {self.current_idx + 1}/{len(self.frames)}")
+
+            elif key == ord('.'):
+                # Jump +10 frames
+                self.current_idx = min(self.current_idx + 10, len(self.frames) - 1)
+                print(f"Frame {self.current_idx + 1}/{len(self.frames)}")
+
+            elif key == ord(','):
+                # Jump -10 frames
+                self.current_idx = max(self.current_idx - 10, 0)
+                print(f"Frame {self.current_idx + 1}/{len(self.frames)}")
+
+            elif key == ord(']'):
+                # Jump +100 frames
+                self.current_idx = min(self.current_idx + 100, len(self.frames) - 1)
+                print(f"Frame {self.current_idx + 1}/{len(self.frames)}")
+
+            elif key == ord('['):
+                # Jump -100 frames
+                self.current_idx = max(self.current_idx - 100, 0)
+                print(f"Frame {self.current_idx + 1}/{len(self.frames)}")
+
+            elif key == ord('g'):
+                # Go to specific frame
+                cv2.destroyWindow(window_name)
+                try:
+                    frame_input = input(f"Go to frame (1-{len(self.frames)}): ")
+                    frame_num = int(frame_input)
+                    if 1 <= frame_num <= len(self.frames):
+                        self.current_idx = frame_num - 1
+                        print(f"Jumped to frame {self.current_idx + 1}")
+                    else:
+                        print(f"Invalid frame number")
+                except ValueError:
+                    print("Invalid input")
+                cv2.namedWindow(window_name)
+                cv2.setMouseCallback(window_name, self._mouse_callback)
 
             elif key == 9:  # TAB
                 # Switch camera
