@@ -146,6 +146,15 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             rx, ry = self.controller.update(ball_pos_filtered, target_pos_mm, dt)
         elif "LQR" in controller_name:
             rx, ry = self.controller.update(ball_pos_filtered, ball_vel_filtered, target_pos_mm)
+        elif "MPC" in controller_name:
+            # MPC uses same interface as LQR (position + velocity in mm)
+            # Pass actual dt for adaptive QP rebuild on timing variations
+            rx, ry = self.controller.update(
+                ball_pos_mm=ball_pos_filtered,
+                ball_vel_mm_s=ball_vel_filtered,
+                target_pos_mm=target_pos_mm,
+                actual_dt=dt
+            )
         elif self.controller_type_selection == 'RL':
             platform_tilt = (self.prev_effective_angles['rx'], self.prev_effective_angles['ry'])
             rx, ry = self.controller.update(
@@ -703,6 +712,17 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
             if self.controller_enabled:
                 self.log(f"LQR weights updated: Q_pos={Q_pos:.6f}, Q_vel={Q_vel:.6f}, R={R:.6f}")
+
+        elif self.controller_type_selection == 'MPC':
+            Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+            Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+            R_pos = self.controller_config.get_scaled_param('R_pos', sliders, scalar_vars)
+            R_vel = self.controller_config.get_scaled_param('R_vel', sliders, scalar_vars)
+
+            self.controller.set_weights(Q_pos=Q_pos, Q_vel=Q_vel, R_pos=R_pos, R_vel=R_vel)
+
+            if self.controller_enabled:
+                self.log(f"MPC weights updated: Q_pos={Q_pos:.2e}, Q_vel={Q_vel:.2e}, R_pos={R_pos:.2e}, R_vel={R_vel:.2e}")
 
     # ============================================================================
     # Mode switching

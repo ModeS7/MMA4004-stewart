@@ -5,13 +5,13 @@ Stewart Platform Control Core
 Controllers:
 - PIDController: PID control for ball balancing
 - LQRController: Linear Quadratic Regulator for optimal control
+- MPCController: Model Predictive Control for optimal control with constraints
 - RLController: Reinforcement Learning (SAC) policy for ball balancing
 - KalmanFilter: Linear Kalman Filter for ball state estimation
 - OrientationKalmanFilter: EKF for IMU-based orientation estimation
 """
 import time
-import warnings
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import numpy as np
 from scipy import linalg
 
@@ -422,6 +422,311 @@ class RLController:
         """Update tracked platform tilt (call with IMU/FK feedback)."""
         self.current_rx = rx
         self.current_ry = ry
+
+
+class MPCController:
+    """
+    Model Predictive Controller (MPC) for ball position control.
+
+    Uses OSQP to solve the constrained QP at each timestep. Provides proper
+    constraint handling and rate penalties that LQR cannot offer.
+
+    Advantages over LQR:
+    - Constraints are part of optimization (not just clipping)
+    - Rate penalty properly integrated into cost
+    - Can preview future reference trajectories (not implemented yet)
+
+    State: [pos_x, pos_y, vel_x, vel_y] (meters, m/s)
+    Control: [tilt_ry, tilt_rx] (degrees)
+
+    Requires: pip install osqp scipy
+    """
+
+    def __init__(self, N: int = 40, dt: float = 0.04,
+                 Q_pos: float = 1.0, Q_vel: float = 1.0,
+                 R_pos: float = 0.01, R_vel: float = 0.01,
+                 output_limit: float = MAX_CONTROLLER_OUTPUT_DEG,
+                 ball_physics_params: Optional[Dict] = None) -> None:
+        """
+        Initialize MPC controller.
+
+        Args:
+            N: Prediction horizon (number of steps)
+            dt: Time step for MPC (seconds)
+            Q_pos: Position error cost weight
+            Q_vel: Velocity cost weight
+            R_pos: Control effort cost weight
+            R_vel: Control rate (smoothness) cost weight
+            output_limit: Maximum tilt angle in degrees
+            ball_physics_params: Physics parameters dict
+        """
+        try:
+            import osqp
+            import scipy.sparse as sparse
+            self._osqp = osqp
+            self._sparse = sparse
+        except ImportError:
+            raise ImportError("OSQP required for MPC controller. Install with: pip install osqp")
+
+        self.dt = dt
+        self.N = N
+        self.output_limit = output_limit
+
+        self.Q_pos = Q_pos
+        self.Q_vel = Q_vel
+        self.R_pos = R_pos
+        self.R_vel = R_vel
+
+        # Ball physics (same as LQR)
+        if ball_physics_params is None:
+            ball_physics_params = {
+                'radius': 0.02,
+                'mass': 0.0027,
+                'gravity': 9.81,
+                'mass_factor': 1.667
+            }
+
+        self.g = ball_physics_params['gravity']
+        self.mass_factor = ball_physics_params['mass_factor']
+
+        # Linearized gain: acceleration = k * tilt_angle (degrees)
+        self.k = (self.g / self.mass_factor) * (np.pi / 180.0)
+
+        # Previous control for rate penalty
+        self.u_prev = np.zeros(2)
+
+        # For adaptive dt: rebuild QP if dt changes by more than this fraction
+        self._dt_tolerance = 0.15  # 15% tolerance
+        self._last_build_dt = dt
+        self._qp_initialized = False
+        self.solver = None
+
+        # Build QP matrices
+        self._build_qp()
+
+    def _build_qp(self):
+        """Build condensed QP matrices for MPC."""
+        try:
+            self._build_qp_internal()
+        except Exception as e:
+            print(f"[MPC] QP build failed: {e}")
+            self._qp_initialized = False
+
+    def _build_qp_internal(self):
+        """Internal QP matrix construction."""
+        sparse = self._sparse
+        N = self.N
+        nx = 4  # State dimension
+        nu = 2  # Control dimension
+        dt = self.dt
+        k = self.k
+
+        # Discrete-time dynamics: x_{k+1} = A @ x_k + B @ u_k
+        A = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+
+        B = np.array([
+            [0.5 * k * dt**2, 0],
+            [0, -0.5 * k * dt**2],
+            [k * dt, 0],
+            [0, -k * dt]
+        ])
+
+        self.A = A
+        self.B = B
+
+        # Build prediction matrices: X = Sx @ x0 + Su @ U
+        # where X = [x_1; x_2; ...; x_N] and U = [u_0; u_1; ...; u_{N-1}]
+        Sx = np.zeros((N * nx, nx))
+        Su = np.zeros((N * nx, N * nu))
+
+        A_pow = np.eye(nx)
+        for i in range(N):
+            A_pow = A_pow @ A
+            Sx[i*nx:(i+1)*nx, :] = A_pow
+
+            for j in range(i + 1):
+                A_pow_j = np.linalg.matrix_power(A, i - j)
+                Su[i*nx:(i+1)*nx, j*nu:(j+1)*nu] = A_pow_j @ B
+
+        self.Sx = Sx
+        self.Su = Su
+
+        # Cost matrices
+        Q = np.diag([self.Q_pos, self.Q_pos, self.Q_vel, self.Q_vel])
+        R = np.eye(nu) * self.R_pos
+
+        # Build block diagonal Q and R for full horizon
+        Q_bar = np.kron(np.eye(N), Q)
+        R_bar = np.kron(np.eye(N), R)
+
+        # Rate penalty: penalize (u_k - u_{k-1})^2
+        # Build difference matrix D such that D @ U = [u_0 - u_prev; u_1 - u_0; ...]
+        D = np.eye(N * nu)
+        for i in range(1, N):
+            D[i*nu:(i+1)*nu, (i-1)*nu:i*nu] = -np.eye(nu)
+        R_rate = np.eye(N * nu) * self.R_vel
+
+        # QP cost: 0.5 * U' @ H @ U + f' @ U
+        # J = (Sx @ x0 + Su @ U)' @ Q_bar @ (Sx @ x0 + Su @ U) + U' @ R_bar @ U + (D @ U)' @ R_rate @ (D @ U)
+        # Expanding: J = 0.5 * U' @ H @ U + f' @ U + const
+        # H = Su' @ Q_bar @ Su + R_bar + D' @ R_rate @ D
+        # f = Su' @ Q_bar @ Sx @ x0 - D' @ R_rate @ [u_prev; 0; 0; ...]
+
+        self.H_base = Su.T @ Q_bar @ Su + R_bar + D.T @ R_rate @ D
+        self.f_coef = Su.T @ Q_bar @ Sx  # f = f_coef @ x0 + f_rate_term
+
+        # Rate penalty term for u_prev (only affects first control)
+        self.D = D
+        self.R_rate = R_rate
+
+        # Control bounds
+        u_max = self.output_limit
+        self.u_min = -u_max * np.ones(N * nu)
+        self.u_max = u_max * np.ones(N * nu)
+
+        # Setup OSQP solver
+        H_sparse = sparse.csc_matrix(self.H_base)
+
+        # Constraint matrix for bounds: I @ U (identity)
+        A_constr = sparse.eye(N * nu, format='csc')
+
+        # Create solver
+        self.solver = self._osqp.OSQP()
+        self.solver.setup(
+            P=H_sparse,
+            q=np.zeros(N * nu),  # Will be updated each solve
+            A=A_constr,
+            l=self.u_min,
+            u=self.u_max,
+            verbose=False,
+            warm_start=True,
+            eps_abs=1e-4,
+            eps_rel=1e-4,
+            max_iter=100
+        )
+
+        self._qp_initialized = True
+
+    def update(self, ball_pos_mm: Tuple[float, float], ball_vel_mm_s: Tuple[float, float],
+               target_pos_mm: Tuple[float, float] = (0.0, 0.0),
+               actual_dt: Optional[float] = None) -> Tuple[float, float]:
+        """
+        Compute MPC control output by solving QP.
+
+        Args:
+            ball_pos_mm: Current ball position (x, y) in mm
+            ball_vel_mm_s: Current ball velocity (vx, vy) in mm/s
+            target_pos_mm: Target position (x, y) in mm
+            actual_dt: Actual time step (if different from nominal, QP is rebuilt)
+
+        Returns:
+            (rx, ry): Platform tilt angles in degrees
+        """
+        # Safety checks for None inputs
+        if ball_pos_mm is None or ball_vel_mm_s is None:
+            return 0.0, 0.0
+        if target_pos_mm is None:
+            target_pos_mm = (0.0, 0.0)
+
+        # Check solver is initialized
+        if not self._qp_initialized or self.solver is None:
+            return 0.0, 0.0
+
+        # Adaptive dt: rebuild QP if actual dt differs significantly
+        if actual_dt is not None and actual_dt > 0:
+            dt_ratio = abs(actual_dt - self._last_build_dt) / self._last_build_dt
+            if dt_ratio > self._dt_tolerance:
+                self.dt = actual_dt
+                try:
+                    self._build_qp()
+                    self._last_build_dt = actual_dt
+                except Exception:
+                    # If rebuild fails, continue with old QP
+                    pass
+
+        # Convert to meters
+        x_error = (ball_pos_mm[0] - target_pos_mm[0]) / 1000.0
+        y_error = (ball_pos_mm[1] - target_pos_mm[1]) / 1000.0
+        vx = ball_vel_mm_s[0] / 1000.0
+        vy = ball_vel_mm_s[1] / 1000.0
+
+        x0 = np.array([x_error, y_error, vx, vy])
+
+        # Compute linear term: f = f_coef @ x0 + rate_term
+        f = self.f_coef @ x0
+
+        # Add rate penalty for u_prev (penalize u_0 - u_prev)
+        if self.R_vel > 0:
+            # The rate term affects the linear cost for u_0
+            f[:2] -= self.R_vel * self.u_prev
+
+        # Update QP and solve
+        try:
+            self.solver.update(q=f)
+            result = self.solver.solve()
+        except Exception:
+            # Solver error - return previous control
+            return self.u_prev[1], self.u_prev[0]
+
+        if result.info.status not in ['solved', 'solved_inaccurate']:
+            # Fallback to previous control if QP fails
+            return self.u_prev[1], self.u_prev[0]  # rx, ry
+
+        # Extract first control action
+        U_opt = result.x
+        if U_opt is None:
+            return self.u_prev[1], self.u_prev[0]
+
+        u0 = U_opt[:2]  # [tilt_ry, tilt_rx]
+
+        ry_deg = u0[0]
+        rx_deg = u0[1]
+
+        # Store for next rate penalty
+        self.u_prev = np.array([ry_deg, rx_deg])
+
+        return rx_deg, ry_deg
+
+    def reset(self) -> None:
+        """Reset MPC state."""
+        self.u_prev = np.zeros(2)
+
+    def set_weights(self, Q_pos: Optional[float] = None, Q_vel: Optional[float] = None,
+                    R_pos: Optional[float] = None, R_vel: Optional[float] = None) -> None:
+        """Update cost weights and rebuild QP."""
+        if Q_pos is not None:
+            self.Q_pos = Q_pos
+        if Q_vel is not None:
+            self.Q_vel = Q_vel
+        if R_pos is not None:
+            self.R_pos = R_pos
+        if R_vel is not None:
+            self.R_vel = R_vel
+
+        # Rebuild QP with new weights
+        self._build_qp()
+
+    def set_horizon(self, N: int) -> None:
+        """Update prediction horizon and rebuild QP."""
+        self.N = N
+        self._build_qp()
+
+    def get_weights(self) -> Dict[str, float]:
+        """Get current cost weights."""
+        return {
+            'Q_pos': self.Q_pos,
+            'Q_vel': self.Q_vel,
+            'R_pos': self.R_pos,
+            'R_vel': self.R_vel
+        }
+
+
+# ============================================================================
 
 
 class KalmanFilter:

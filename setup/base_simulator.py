@@ -22,7 +22,7 @@ from core.utils import (
     MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG, PLATFORM_RADIUS_MM, PLATFORM_HALF_SIZE_MM, PLATFORM_VERSION,
     SimulationConfig, IKZOptimizationConfig, Pixy2CameraConfig,
     StewartPlatformConfig, ColorScheme, BallPhysicsConfig, VisualizationConfig,
-    PIDConfig, LQRConfig, ManualPoseControlConfig, BallControlConfig, GUIConfig,
+    PIDConfig, LQRConfig, MPCConfig, ManualPoseControlConfig, BallControlConfig, GUIConfig,
     format_time, format_error_context,
     GUI_FONT_SANS, GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL,
     GUI_VALUE_LABEL_WIDTH_SMALL
@@ -388,6 +388,18 @@ class BaseStewartSimulator(QMainWindow):
                 ('Q_pos', 'Q Position Weight', weights['Q_pos'], scalar_indices['Q_pos']),
                 ('Q_vel', 'Q Velocity Weight', weights['Q_vel'], scalar_indices['Q_vel']),
                 ('R', 'R Control Weight', weights['R'], scalar_indices['R'])
+            ]
+        elif "MPC" in controller_name:
+            # Get defaults from MPCConfig
+            weights = MPCConfig.DEFAULT_WEIGHTS
+            scalar_indices = MPCConfig.DEFAULT_SCALAR_INDICES
+
+            self.param_definitions = [
+                ('N', 'N (Horizon)', weights['N'], scalar_indices['N']),
+                ('Q_pos', 'Q Position Weight', weights['Q_pos'], scalar_indices['Q_pos']),
+                ('Q_vel', 'Q Velocity Weight', weights['Q_vel'], scalar_indices['Q_vel']),
+                ('R_pos', 'R Control Weight', weights['R_pos'], scalar_indices['R_pos']),
+                ('R_vel', 'R Rate Weight', weights['R_vel'], scalar_indices['R_vel'])
             ]
         else:
             self.param_definitions = []

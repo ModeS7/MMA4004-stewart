@@ -31,7 +31,14 @@ warnings.filterwarnings('ignore')
 
 # Add parent directory to path to import model
 sys.path.insert(0, str(Path(__file__).parent))
-from ball_detection.core.model import BallDetectorCNN
+from ball_detection.core.model import (
+    BallDetectorCNN,
+    BallDetectorFullFrame,
+    BallDetectorFullFrameTiny,
+    BallDetectorFullFrameUltra,
+    BallDetectorFullFrameMobileNet,
+    BallDetectorFullFrameMobileNetLite,
+)
 
 
 # ============================================================================
@@ -700,6 +707,129 @@ def run_onnx_benchmark(model_paths=None):
     print("=" * 80)
 
 
+def run_fullframe_benchmark():
+    """Benchmark full-frame 1280x720 models vs 128x128 crop models."""
+
+    print("=" * 80)
+    print("FULL-FRAME (1280x720) vs CROP (128x128) BENCHMARK")
+    print("=" * 80)
+    print()
+
+    num_iterations = 100
+
+    # Crop models (128x128)
+    crop_models = [
+        ("BallDetectorCNN (128x128)", 128, 128, BallDetectorCNN),
+        ("MobileNetV3-Small (128x128)", 128, 128, create_mobilenet_v3_small),
+    ]
+
+    # Full-frame models (1280x720)
+    fullframe_models = [
+        ("FullFrame-MobileNet", 720, 1280, lambda: BallDetectorFullFrame(pretrained=False)),
+        ("FullFrame-Tiny", 720, 1280, BallDetectorFullFrameTiny),
+        ("FullFrame-Ultra", 720, 1280, BallDetectorFullFrameUltra),
+        ("FullFrame-MobileNet-PS", 720, 1280, lambda: BallDetectorFullFrameMobileNet(pretrained=False)),
+        ("FullFrame-MobileNet-Lite", 720, 1280, lambda: BallDetectorFullFrameMobileNetLite(pretrained=False)),
+    ]
+
+    all_models = crop_models + fullframe_models
+    results = []
+
+    for name, h, w, model_fn in all_models:
+        print(f"\nTesting: {name}")
+        print("-" * 60)
+
+        try:
+            model = model_fn()
+            model.eval()
+            params = count_parameters(model)
+
+            # Export to ONNX
+            print(f"  Params: {params:,}")
+            print("  Exporting to ONNX...", end=" ", flush=True)
+
+            buffer = io.BytesIO()
+            dummy = torch.randn(1, 3, h, w)
+            torch.onnx.export(model, dummy, buffer, input_names=['input'],
+                            output_names=['output'], opset_version=14, do_constant_folding=True)
+            buffer.seek(0)
+            onnx_bytes = buffer.read()
+            print(f"OK ({len(onnx_bytes)/1024:.0f} KB)")
+
+            # CPU benchmark
+            print("  CPU: ", end="", flush=True)
+            try:
+                cpu_session = create_inference_session(onnx_bytes)
+                input_name = cpu_session.get_inputs()[0].name
+                dummy_np = np.random.randn(1, 3, h, w).astype(np.float32)
+
+                # Warmup
+                for _ in range(10):
+                    cpu_session.run(None, {input_name: dummy_np})
+
+                # Benchmark
+                times = []
+                for _ in range(num_iterations):
+                    start = time.perf_counter()
+                    cpu_session.run(None, {input_name: dummy_np})
+                    times.append((time.perf_counter() - start) * 1000)
+
+                cpu_stats = {'mean': np.mean(times), 'fps': 1000 / np.mean(times)}
+                print(f"{cpu_stats['mean']:.2f}ms ({cpu_stats['fps']:.1f} FPS)")
+            except Exception as e:
+                print(f"FAILED: {e}")
+                cpu_stats = {'mean': -1, 'fps': 0}
+
+            # GPU benchmark (DirectML)
+            print("  GPU: ", end="", flush=True)
+            try:
+                gpu_session = ort.InferenceSession(
+                    onnx_bytes,
+                    providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+                )
+                input_name = gpu_session.get_inputs()[0].name
+                dummy_np = np.random.randn(1, 3, h, w).astype(np.float32)
+
+                # Warmup
+                for _ in range(10):
+                    gpu_session.run(None, {input_name: dummy_np})
+
+                # Benchmark
+                times = []
+                for _ in range(num_iterations):
+                    start = time.perf_counter()
+                    gpu_session.run(None, {input_name: dummy_np})
+                    times.append((time.perf_counter() - start) * 1000)
+
+                gpu_stats = {'mean': np.mean(times), 'fps': 1000 / np.mean(times)}
+                print(f"{gpu_stats['mean']:.2f}ms ({gpu_stats['fps']:.1f} FPS)")
+            except Exception as e:
+                print(f"FAILED: {e}")
+                gpu_stats = {'mean': -1, 'fps': 0}
+
+            results.append({
+                'name': name, 'size': f"{w}x{h}", 'params': params,
+                'cpu_ms': cpu_stats['mean'], 'cpu_fps': cpu_stats['fps'],
+                'gpu_ms': gpu_stats['mean'], 'gpu_fps': gpu_stats['fps']
+            })
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+
+    # Summary
+    print("\n" + "=" * 80)
+    print("SUMMARY (sorted by GPU time)")
+    print("=" * 80)
+    print(f"\n{'Model':<30} {'Size':<12} {'Params':>10} {'CPU ms':>10} {'GPU ms':>10} {'GPU FPS':>10}")
+    print("-" * 90)
+
+    for r in sorted(results, key=lambda x: x['gpu_ms'] if x['gpu_ms'] > 0 else 9999):
+        print(f"{r['name']:<30} {r['size']:<12} {r['params']:>10,} "
+              f"{r['cpu_ms']:>10.2f} {r['gpu_ms']:>10.2f} {r['gpu_fps']:>10.1f}")
+
+    print()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -708,10 +838,21 @@ if __name__ == "__main__":
                        help='Quick comprehensive test (fewer iterations and sizes)')
     parser.add_argument('--onnx', nargs='*', metavar='PATH',
                        help='Quick ONNX benchmark mode: test existing ONNX models (provide paths or use defaults)')
+    parser.add_argument('--fullframe', action='store_true',
+                       help='Benchmark full-frame 1280x720 models vs 128x128 crop models')
 
     args = parser.parse_args()
 
-    if args.onnx is not None:
+    if args.fullframe:
+        try:
+            run_fullframe_benchmark()
+        except KeyboardInterrupt:
+            print("\n\nBenchmark interrupted by user")
+        except Exception as e:
+            print(f"\n\nFatal error: {e}")
+            import traceback
+            traceback.print_exc()
+    elif args.onnx is not None:
         # ONNX benchmark mode (replaces quick_bench.py functionality)
         model_paths = args.onnx if args.onnx else None
         try:

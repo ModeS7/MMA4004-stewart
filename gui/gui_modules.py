@@ -31,7 +31,7 @@ from core.utils import (
     # GUI constants
     GUI_FONT_MONOSPACE, GUI_FONT_SANS,
     GUI_FONT_SIZE_TINY, GUI_FONT_SIZE_SMALL, GUI_FONT_SIZE_NORMAL, GUI_FONT_SIZE_LARGE,
-    GUI_BUTTON_WIDTH_SMALL, GUI_BUTTON_WIDTH_MEDIUM, GUI_BUTTON_WIDTH_LARGE,
+    GUI_BUTTON_WIDTH_XSMALL, GUI_BUTTON_WIDTH_SMALL, GUI_BUTTON_WIDTH_MEDIUM, GUI_BUTTON_WIDTH_LARGE,
     GUI_BUTTON_HEIGHT_NORMAL, GUI_BUTTON_HEIGHT_LARGE,
     GUI_VALUE_LABEL_WIDTH_SMALL, GUI_VALUE_LABEL_WIDTH_MEDIUM, GUI_VALUE_LABEL_WIDTH_LARGE,
     GUI_SLIDER_SCALE_COARSE, GUI_SLIDER_SCALE_FINE,
@@ -1696,28 +1696,35 @@ class ControllerSelectionModule(GUIModule):
 
         self.pid_btn = QPushButton("PID")
         self.pid_btn.setCheckable(True)
-        self.pid_btn.setMinimumWidth(GUI_BUTTON_WIDTH_SMALL)
+        self.pid_btn.setMinimumWidth(GUI_BUTTON_WIDTH_XSMALL)
         self.pid_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.pid_btn.clicked.connect(lambda: self._on_controller_select('PID'))
         btn_layout.addWidget(self.pid_btn)
 
         self.lqr_btn = QPushButton("LQR")
         self.lqr_btn.setCheckable(True)
-        self.lqr_btn.setMinimumWidth(GUI_BUTTON_WIDTH_SMALL)
+        self.lqr_btn.setMinimumWidth(GUI_BUTTON_WIDTH_XSMALL)
         self.lqr_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.lqr_btn.clicked.connect(lambda: self._on_controller_select('LQR'))
         btn_layout.addWidget(self.lqr_btn)
 
         self.rl_btn = QPushButton("RL")
         self.rl_btn.setCheckable(True)
-        self.rl_btn.setMinimumWidth(GUI_BUTTON_WIDTH_SMALL)
+        self.rl_btn.setMinimumWidth(GUI_BUTTON_WIDTH_XSMALL)
         self.rl_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.rl_btn.clicked.connect(lambda: self._on_controller_select('RL'))
         btn_layout.addWidget(self.rl_btn)
 
+        self.mpc_btn = QPushButton("MPC")
+        self.mpc_btn.setCheckable(True)
+        self.mpc_btn.setMinimumWidth(GUI_BUTTON_WIDTH_XSMALL)
+        self.mpc_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
+        self.mpc_btn.clicked.connect(lambda: self._on_controller_select('MPC'))
+        btn_layout.addWidget(self.mpc_btn)
+
         self.manual_btn = QPushButton("Manual")
         self.manual_btn.setCheckable(True)
-        self.manual_btn.setMinimumWidth(GUI_BUTTON_WIDTH_SMALL)
+        self.manual_btn.setMinimumWidth(GUI_BUTTON_WIDTH_XSMALL)
         self.manual_btn.setMinimumHeight(GUI_BUTTON_HEIGHT_NORMAL)
         self.manual_btn.clicked.connect(lambda: self._on_controller_select('Manual'))
         btn_layout.addWidget(self.manual_btn)
@@ -1733,6 +1740,8 @@ class ControllerSelectionModule(GUIModule):
             self.lqr_btn.setChecked(True)
         elif self.current_controller == 'RL':
             self.rl_btn.setChecked(True)
+        elif self.current_controller == 'MPC':
+            self.mpc_btn.setChecked(True)
         else:
             self.manual_btn.setChecked(True)
 
@@ -1751,6 +1760,7 @@ class ControllerSelectionModule(GUIModule):
         self.pid_btn.setChecked(controller == 'PID')
         self.lqr_btn.setChecked(controller == 'LQR')
         self.rl_btn.setChecked(controller == 'RL')
+        self.mpc_btn.setChecked(controller == 'MPC')
         self.manual_btn.setChecked(controller == 'Manual')
 
         if self.callbacks.get('controller_type_change'):

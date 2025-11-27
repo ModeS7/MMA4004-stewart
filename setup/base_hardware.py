@@ -20,11 +20,12 @@ import sys
 import ctypes
 from typing import Dict, Any, Optional, Tuple, List
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import QWidget, QApplication
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtWidgets import QWidget, QApplication, QComboBox, QLabel, QGridLayout, QSlider, QVBoxLayout
+from PyQt6.QtGui import QFont
 
 from setup.base_simulator import BaseStewartSimulator, ControllerConfig
-from core.control_core import PIDController, LQRController, KalmanFilter, clip_tilt_vector
+from core.control_core import PIDController, LQRController, MPCController, KalmanFilter, clip_tilt_vector
 from core.utils import (ControlLoopConfig, Pixy2CameraConfig, StereoCameraConfig, BallPhysicsConfig,
                          VisualizationConfig, HardwareConnectionConfig, PIDConfig, KalmanFilterConfig,
                          PerformanceConfig, get_controller_defaults, SerialConfig, CAMERA_TYPE)
@@ -635,6 +636,119 @@ class RLControllerConfig(ControllerConfig):
         return self.scalar_values
 
 
+class MPCControllerConfig(ControllerConfig):
+    """MPC controller configuration for both simulation and hardware modes."""
+
+    def __init__(self, mode: str = 'simulation') -> None:
+        """
+        Initialize MPC configuration.
+
+        Args:
+            mode: 'simulation' or 'hardware'
+        """
+        config = get_controller_defaults('MPC', mode)
+        self.scalar_values: List[float] = config['scalar_values']
+        self.n_scalar_values: List[int] = config['n_scalar_values']
+        self.default_weights: Dict[str, float] = config['weights']
+        self.default_scalar_indices: Dict[str, int] = config['scalar_indices']
+        self.output_limit: float = config['output_limit']
+        self.dt: float = config['dt']
+        self.ball_physics_params: Dict[str, float] = BallPhysicsConfig.as_dict()
+        self.controller_ref: Optional[Any] = None
+        self.mode: str = mode
+
+    def get_controller_name(self) -> str:
+        """Get controller name."""
+        return "MPC"
+
+    def create_controller(self, **kwargs) -> MPCController:
+        """Create MPC controller instance."""
+        return MPCController(
+            N=int(kwargs.get('N', self.default_weights['N'])),
+            dt=kwargs.get('dt', self.dt),
+            Q_pos=kwargs.get('Q_pos', self.default_weights['Q_pos']),
+            Q_vel=kwargs.get('Q_vel', self.default_weights['Q_vel']),
+            R_pos=kwargs.get('R_pos', self.default_weights['R_pos']),
+            R_vel=kwargs.get('R_vel', self.default_weights['R_vel']),
+            output_limit=kwargs.get('output_limit', self.output_limit),
+            ball_physics_params=self.ball_physics_params
+        )
+
+    def get_scalar_values(self) -> List[float]:
+        """Get list of scalar values for parameter adjustment."""
+        return self.scalar_values
+
+    def get_n_scalar_values(self) -> List[int]:
+        """Get list of scalar values for N (horizon) parameter."""
+        return self.n_scalar_values
+
+    def get_scaled_param(self, param_name: str, sliders, scalar_vars) -> float:
+        """Extract and scale a parameter value from widgets.
+
+        Overrides base class to handle 'N' parameter specially - N uses
+        n_scalar_values list and ignores slider (direct selection).
+        """
+        if param_name == 'N':
+            # N parameter: directly select from n_scalar_values (ignore slider)
+            idx = scalar_vars.get('N', 5)  # Default to index 5 (N=40)
+            idx = min(idx, len(self.n_scalar_values) - 1)  # Bounds check
+            return self.n_scalar_values[idx]
+        else:
+            # Other params: use standard slider * scalar approach
+            raw = sliders[param_name].value() / 100.0
+            idx = scalar_vars.get(param_name, 0)
+            idx = min(idx, len(self.scalar_values) - 1)  # Bounds check
+            scalar = self.scalar_values[idx]
+            return raw * scalar
+
+    def create_parameter_slider(self, parent_layout: QVBoxLayout, param_name: str, label: str,
+                                default: float, sliders: Dict[str, QSlider],
+                                value_labels: Dict[str, QLabel], scalar_vars: Dict[str, int],
+                                on_change_callback) -> None:
+        """Create parameter widget - integer dropdown for N, standard slider for others."""
+        from core.utils import GUI_FONT_SANS, GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL
+
+        if param_name == 'N':
+            # N parameter: simple dropdown with integer values (no slider)
+            grid = QGridLayout()
+
+            label_widget = QLabel(label)
+            label_widget.setFont(QFont(GUI_FONT_SANS, GUI_FONT_SIZE_NORMAL))
+            grid.addWidget(label_widget, 0, 0, Qt.AlignmentFlag.AlignLeft)
+
+            # Dropdown showing integer N values
+            n_combo = QComboBox()
+            n_combo.addItems([f'N = {n}' for n in self.n_scalar_values])
+            default_idx = self.default_scalar_indices.get('N', 5)
+            n_combo.setCurrentIndex(default_idx)
+            n_combo.setMinimumWidth(100)
+            grid.addWidget(n_combo, 0, 1)
+
+            # Store the index in scalar_vars (slider not used for N)
+            scalar_vars[param_name] = default_idx
+            # Create dummy slider (required by interface but not displayed)
+            dummy_slider = QSlider(Qt.Orientation.Horizontal)
+            dummy_slider.setValue(100)  # Fixed value, not used
+            sliders[param_name] = dummy_slider
+
+            # Dummy value label (not displayed)
+            value_labels[param_name] = QLabel("")
+
+            def on_n_change(idx):
+                scalar_vars['N'] = idx
+                on_change_callback()
+
+            n_combo.currentIndexChanged.connect(on_n_change)
+            grid.setColumnStretch(1, 1)
+            parent_layout.addLayout(grid)
+        else:
+            # Other parameters: use standard slider implementation
+            super().create_parameter_slider(
+                parent_layout, param_name, label, default,
+                sliders, value_labels, scalar_vars, on_change_callback
+            )
+
+
 # ============================================================================
 # HARDWARE CONTROLLER BASE CLASS
 # ============================================================================
@@ -756,6 +870,11 @@ class HardwareControllerBase(BaseStewartSimulator):
         elif self.controller_type_selection == 'RL':
             # RL controller has no tunable parameters
             return RLControllerConfig()
+        elif self.controller_type_selection == 'MPC':
+            if self.operation_mode == 'real':
+                return MPCControllerConfig(mode='hardware')
+            else:
+                return MPCControllerConfig(mode='simulation')
         else:
             # Manual mode uses default configuration
             return HardwareControllerConfig()
@@ -775,6 +894,9 @@ class HardwareControllerBase(BaseStewartSimulator):
             self.controller = None
             return
         if "LQR" in controller_name and 'Q_pos' not in sliders:
+            self.controller = None
+            return
+        if "MPC" in controller_name and 'Q_pos' not in sliders:
             self.controller = None
             return
 
@@ -821,6 +943,27 @@ class HardwareControllerBase(BaseStewartSimulator):
                 self.log(f"RL initialization failed: {str(e)}")
                 self.controller = None
 
+        elif "MPC" in controller_name:
+            N = self.controller_config.get_scaled_param('N', sliders, scalar_vars)
+            Q_pos = self.controller_config.get_scaled_param('Q_pos', sliders, scalar_vars)
+            Q_vel = self.controller_config.get_scaled_param('Q_vel', sliders, scalar_vars)
+            R_pos = self.controller_config.get_scaled_param('R_pos', sliders, scalar_vars)
+            R_vel = self.controller_config.get_scaled_param('R_vel', sliders, scalar_vars)
+
+            try:
+                self.controller = MPCController(
+                    N=int(N),
+                    Q_pos=Q_pos,
+                    Q_vel=Q_vel,
+                    R_pos=R_pos,
+                    R_vel=R_vel,
+                    output_limit=15.0
+                )
+                self.log(f"MPC initialized: N={int(N)}, Q_pos={Q_pos:.2e}, Q_vel={Q_vel:.2e}, R_pos={R_pos:.2e}, R_vel={R_vel:.2e}")
+            except Exception as e:
+                self.log(f"MPC initialization failed: {str(e)}")
+                self.controller = None
+
     def _update_controller(self, ball_pos_mm, ball_vel_mm_s, target_pos_mm, dt):
         """Update controller with current ball state."""
         if self.controller is None:
@@ -842,6 +985,15 @@ class HardwareControllerBase(BaseStewartSimulator):
             ])
 
             rx, ry = self.controller.update(state, target, dt)
+        elif isinstance(self.controller, MPCController):
+            # MPC expects mm and mm/s (converts internally)
+            # Pass actual dt for adaptive QP rebuild on timing variations
+            rx, ry = self.controller.update(
+                ball_pos_mm=ball_pos_mm,
+                ball_vel_mm_s=ball_vel_mm_s,
+                target_pos_mm=target_pos_mm,
+                actual_dt=dt
+            )
         else:
             return 0.0, 0.0
 
@@ -870,6 +1022,16 @@ class HardwareControllerBase(BaseStewartSimulator):
                 self.controller.R = value
             self.controller.recompute_lqr_gain()
             self.log(f"LQR {param_name}: {value:.2f}")
+        elif isinstance(self.controller, MPCController):
+            # MPC weight updates require rebuilding the MPC solver
+            weights = self.controller.get_weights()
+            if param_name == 'N':
+                # N change requires full rebuild (not supported via set_weights)
+                self.log(f"MPC N change requires restart: {int(value)}")
+            elif param_name in ['Q_pos', 'Q_vel', 'R_pos', 'R_vel']:
+                weights[param_name] = value
+                self.controller.set_weights(**weights)
+                self.log(f"MPC {param_name}: {value:.2e}")
 
     # ============================================================================
     # HARDWARE COMMUNICATION

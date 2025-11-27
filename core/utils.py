@@ -28,7 +28,7 @@ CAMERA_TYPE = 'STEREO'  # Options: 'PIXY2' or 'STEREO'
 # ============================================================================
 # DEBUG OPTIONS
 # ============================================================================
-DEBUG_DETECTION_TIMING = True   # Print detection timing breakdown (ROI, prep, CNN)
+DEBUG_DETECTION_TIMING = False   # Print detection timing breakdown (ROI, prep, CNN)
 DEBUG_TIMING_INTERVAL = 100     # Print timing every N frames
 
 # ============================================================================
@@ -92,6 +92,7 @@ GUI_FONT_SIZE_NORMAL = 9  # Normal font size (labels, values)
 GUI_FONT_SIZE_LARGE = 10  # Large font size (headings, status)
 
 # GUI widget dimension constants
+GUI_BUTTON_WIDTH_XSMALL = 55  # Extra small button width (Controller selection)
 GUI_BUTTON_WIDTH_SMALL = 80  # Small button width (Reset, Refresh)
 GUI_BUTTON_WIDTH_MEDIUM = 100  # Medium button width (Start, Stop)
 GUI_BUTTON_WIDTH_LARGE = 120  # Large button width (Reset Ball, Home)
@@ -309,6 +310,43 @@ class LQRConfig:
 
     # Controller limits
     OUTPUT_LIMIT = MAX_CONTROLLER_OUTPUT_DEG  # Maximum controller output (degrees)
+
+
+class MPCConfig:
+    """Default MPC controller parameters."""
+
+    # Default slider values (0-10 range, multiplied by scalar to get actual value)
+    DEFAULT_WEIGHTS = {
+        'N': 40,        # Prediction horizon (integer, from N_SCALAR_VALUES)
+        'Q_pos': 10.0,  # Slider position (actual = 10.0 * 100 = 1000)
+        'Q_vel': 1.0,   # Slider position (actual = 1.0 * 0.01 = 0.01)
+        'R_pos': 1.0,   # Slider position (actual = 1.0 * 0.1 = 0.1)
+        'R_vel': 1.0    # Slider position (actual = 1.0 * 0.1 = 0.1)
+    }
+
+    # Scalar multiplier values for GUI sliders
+    SCALAR_VALUES = [
+        0.0000001, 0.000001, 0.00001, 0.0001,
+        0.001, 0.01, 0.1, 1.0, 10.0, 100.0
+    ]
+
+    # N uses different scalar (integer range 10-100)
+    N_SCALAR_VALUES = [1, 2, 5, 10, 20, 40, 60, 80, 100]
+
+    # Default scalar indices (index into SCALAR_VALUES)
+    # Indices: 0=1e-7, 1=1e-6, 2=1e-5, 3=1e-4, 4=0.001, 5=0.01, 6=0.1, 7=1.0, 8=10, 9=100
+    DEFAULT_SCALAR_INDICES = {
+        'N': 5,       # 40 (from N_SCALAR_VALUES)
+        'Q_pos': 9,   # ×100
+        'Q_vel': 5,   # ×0.01
+        'R_pos': 6,   # ×0.1
+        'R_vel': 6    # ×0.1
+    }
+
+    # Controller limits
+    OUTPUT_LIMIT = MAX_CONTROLLER_OUTPUT_DEG
+    DT = 0.04  # MPC time step (50 Hz)
+
 
 class TrajectoryPatternConfig:
     """Trajectory pattern parameters for target tracking."""
@@ -868,6 +906,18 @@ def get_controller_defaults(controller_type: str = 'PID', mode: str = 'simulatio
             'scalar_indices': LQRConfig.DEFAULT_SCALAR_INDICES.copy(),
             'scalar_values': LQRConfig.SCALAR_VALUES.copy(),
             'output_limit': LQRConfig.OUTPUT_LIMIT,
+            'ball_physics': BallPhysicsConfig.as_dict()
+        }
+
+    elif controller_type.upper() == 'MPC':
+        # MPC defaults (same for sim and hardware)
+        return {
+            'weights': MPCConfig.DEFAULT_WEIGHTS.copy(),
+            'scalar_indices': MPCConfig.DEFAULT_SCALAR_INDICES.copy(),
+            'scalar_values': MPCConfig.SCALAR_VALUES.copy(),
+            'n_scalar_values': MPCConfig.N_SCALAR_VALUES.copy(),
+            'output_limit': MPCConfig.OUTPUT_LIMIT,
+            'dt': MPCConfig.DT,
             'ball_physics': BallPhysicsConfig.as_dict()
         }
 
