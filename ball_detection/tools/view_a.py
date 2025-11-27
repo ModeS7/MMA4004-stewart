@@ -95,45 +95,73 @@ class FullFrameDataset:
         return A.Compose(transforms, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
 
     def _apply_tearing(self, img):
-        """Apply realistic tearing effect - 1-2 horizontal splits between frames."""
+        """Apply realistic tearing effect - horizontal and/or vertical frame splits."""
         h, w = img.shape[:2]
         result = img.copy()
 
-        # 1-2 tear lines (usually just 1)
-        num_tears = np.random.choice([1, 1, 1, 2])  # 75% chance of 1 tear
+        # Random direction: 50% horizontal, 30% vertical, 20% both
+        direction = np.random.choice(['horizontal', 'vertical', 'both'], p=[0.5, 0.3, 0.2])
 
-        # Generate tear positions (where frame splits occur)
+        if direction in ['horizontal', 'both']:
+            result = self._apply_horizontal_tears(result)
+        if direction in ['vertical', 'both']:
+            result = self._apply_vertical_tears(result)
+
+        return result
+
+    def _apply_horizontal_tears(self, img):
+        """Apply 1-2 horizontal tears (row-wise splits with horizontal shifts)."""
+        h, w = img.shape[:2]
+        result = img.copy()
+
+        # 1-2 tear lines (75% chance of 1 tear)
+        num_tears = np.random.choice([1, 1, 1, 2])
+
         if num_tears == 1:
-            # Single tear somewhere in middle 80% of image
             tear_y = np.random.randint(int(h * 0.1), int(h * 0.9))
             tear_positions = [tear_y]
         else:
-            # Two tears - divide image into 3 sections
             tear1 = np.random.randint(int(h * 0.15), int(h * 0.45))
             tear2 = np.random.randint(int(h * 0.55), int(h * 0.85))
             tear_positions = [tear1, tear2]
 
-        # Apply shifts to sections between tears
         prev_y = 0
         for i, tear_y in enumerate(tear_positions + [h]):
-            if i > 0:  # Don't shift first section (it's the "correct" frame)
-                # Large horizontal shift (simulates different frame position)
+            if i > 0:
+                # Large horizontal shift for full frame (100-300px)
                 shift = np.random.randint(100, 300)
                 if np.random.random() > 0.5:
                     shift = -shift
-
-                # Shift this entire section
                 result[prev_y:tear_y] = np.roll(result[prev_y:tear_y], shift, axis=1)
-
-                # Optional slight brightness difference (different frame exposure)
-                if np.random.random() > 0.5:
-                    brightness = np.random.randint(-30, 31)
-                    result[prev_y:tear_y] = np.clip(
-                        result[prev_y:tear_y].astype(np.int16) + brightness,
-                        0, 255
-                    ).astype(np.uint8)
-
             prev_y = tear_y
+
+        return result
+
+    def _apply_vertical_tears(self, img):
+        """Apply 1-2 vertical tears (column-wise splits with vertical shifts)."""
+        h, w = img.shape[:2]
+        result = img.copy()
+
+        # 1-2 tear lines (75% chance of 1 tear)
+        num_tears = np.random.choice([1, 1, 1, 2])
+
+        if num_tears == 1:
+            tear_x = np.random.randint(int(w * 0.1), int(w * 0.9))
+            tear_positions = [tear_x]
+        else:
+            tear1 = np.random.randint(int(w * 0.15), int(w * 0.45))
+            tear2 = np.random.randint(int(w * 0.55), int(w * 0.85))
+            tear_positions = [tear1, tear2]
+
+        prev_x = 0
+        for i, tear_x in enumerate(tear_positions + [w]):
+            if i > 0:
+                # Large vertical shift for full frame (50-150px)
+                shift = np.random.randint(50, 150)
+                if np.random.random() > 0.5:
+                    shift = -shift
+                result[:, prev_x:tear_x] = np.roll(result[:, prev_x:tear_x], shift, axis=0)
+            prev_x = tear_x
 
         return result
 

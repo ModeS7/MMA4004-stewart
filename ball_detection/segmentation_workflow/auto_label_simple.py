@@ -19,13 +19,86 @@ import segmentation_models_pytorch as smp
 # SETTINGS - Edit these
 # ============================================================
 IMAGES_DIR = "./ball_detection/data/new_labels/images"  # Directory with extracted images
-MODEL_PATH = "./ball_detection/models/segmentation/best_interval_200-300.pth"
 OUTPUT_DIR = "./ball_detection/data/new_labels/auto_labeled"
 IMAGE_WIDTH = 1280
 IMAGE_HEIGHT = 720
 DEVICE = "cuda"
-BATCH_SIZE = 4  # Process multiple images at once for speed
+BATCH_SIZE = 32  # Process multiple images at once for speed
+
+# Model settings - single model or averaged checkpoints
+USE_CHECKPOINT_AVERAGING = True  # Set to False to use single MODEL_PATH
+MODEL_PATH = "./ball_detection/models/segmentation/best_segmentation.pth"  # Single model path
+CHECKPOINT_PATHS = [  # Paths for checkpoint averaging
+    "./ball_detection/models/segmentation/v2/best_segmentation.pth",
+    "./ball_detection/models/segmentation/best_interval_600-700.pth",
+    "./ball_detection/models/segmentation/best_interval_800-900.pth",
+]
+
+# Post-processing
+KEEP_LARGEST_BLOB = True  # Filter out small detections, keep only largest
+MIN_BLOB_AREA = 100  # Minimum blob area in pixels (ignore smaller)
 # ============================================================
+
+
+def average_checkpoints(paths, device):
+    """Average weights from multiple checkpoint files."""
+    print(f"Averaging {len(paths)} checkpoints...")
+    state_dicts = []
+
+    for path in paths:
+        if not Path(path).exists():
+            print(f"  Warning: {path} not found, skipping")
+            continue
+        sd = torch.load(path, map_location=device)
+        # Handle torch.compile saved models
+        if any(k.startswith('_orig_mod.') for k in sd.keys()):
+            sd = {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
+        state_dicts.append(sd)
+        print(f"  Loaded: {path}")
+
+    if len(state_dicts) == 0:
+        raise ValueError("No valid checkpoints found!")
+
+    if len(state_dicts) == 1:
+        print("  Only 1 checkpoint found, using as-is")
+        return state_dicts[0]
+
+    # Average all weights
+    avg_state = {}
+    for key in state_dicts[0].keys():
+        tensors = [sd[key].float() for sd in state_dicts]
+        avg_state[key] = torch.stack(tensors).mean(0)
+
+    print(f"  Averaged {len(state_dicts)} checkpoints")
+    return avg_state
+
+
+def keep_largest_blob(mask, min_area=100):
+    """Keep only the largest connected component in a binary mask."""
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    if num_labels <= 1:  # Only background
+        return mask, None
+
+    # Find largest component (skip label 0 = background)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_idx = np.argmax(areas)
+    largest_area = areas[largest_idx]
+
+    if largest_area < min_area:
+        return np.zeros_like(mask), None  # Too small = no ball
+
+    largest_label = largest_idx + 1
+
+    # Get centroid of largest blob
+    centroid = centroids[largest_label]
+
+    # Create mask with only largest component
+    result = np.zeros_like(mask)
+    result[labels == largest_label] = 255
+
+    return result, centroid
 
 
 def predict_masks_batch(model, images, device):
@@ -64,9 +137,11 @@ def main():
     print("AUTO-LABELING WITH SEGMENTATION MODEL")
     print("=" * 60)
     print(f"Images: {IMAGES_DIR}")
-    print(f"Model: {MODEL_PATH}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Resolution: {IMAGE_WIDTH}x{IMAGE_HEIGHT}")
+    print(f"Checkpoint averaging: {'Enabled' if USE_CHECKPOINT_AVERAGING else 'Disabled'}")
+    print(f"Keep largest blob: {'Enabled' if KEEP_LARGEST_BLOB else 'Disabled'}" +
+          (f" (min area: {MIN_BLOB_AREA}px)" if KEEP_LARGEST_BLOB else ""))
     print("=" * 60)
     print()
 
@@ -78,10 +153,16 @@ def main():
     # Load model
     print("Loading model...")
     model = smp.Unet(encoder_name='efficientnet-b0', encoder_weights=None, classes=2, activation=None)
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    # Handle torch.compile saved models (remove _orig_mod prefix if present)
-    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    if USE_CHECKPOINT_AVERAGING:
+        state_dict = average_checkpoints(CHECKPOINT_PATHS, DEVICE)
+    else:
+        print(f"Loading single model: {MODEL_PATH}")
+        state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+        # Handle torch.compile saved models (remove _orig_mod prefix if present)
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
     model.load_state_dict(state_dict)
     model = model.to(DEVICE)
     model.eval()
@@ -127,6 +208,10 @@ def main():
 
         # Save masks
         for mask, img_path in zip(masks, valid_paths):
+            # Apply largest blob filter if enabled
+            if KEEP_LARGEST_BLOB:
+                mask, centroid = keep_largest_blob(mask, min_area=MIN_BLOB_AREA)
+
             # Check if mask has any detections
             if np.sum(mask > 127) > 0:
                 detected_count += 1
