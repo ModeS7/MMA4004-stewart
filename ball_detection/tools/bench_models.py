@@ -133,6 +133,81 @@ def create_squeezenet1_1():
 # STEREO MODELS (6-channel input: RGB_left + RGB_right)
 # ============================================================================
 
+class StereoTiny(nn.Module):
+    """
+    Fast 6-channel stereo detector based on FullFrame-Tiny.
+
+    Uses aggressive strided convolutions (not PixelUnshuffle) for speed.
+    Expected: ~1.5-2ms for stereo (similar to mono Tiny).
+
+    Input: (B, 6, 720, 1280) - left+right RGB concatenated
+    Output: 6 values (x_l, y_l, conf_l, x_r, y_r, conf_r)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Very aggressive stem: 1280x720 -> 80x45 (16x reduction)
+        # Same as FullFrame-Tiny but with 6 input channels
+        self.stem = nn.Sequential(
+            # 1280x720 -> 320x180
+            nn.Conv2d(6, 16, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            # 320x180 -> 80x45
+            nn.Conv2d(16, 32, kernel_size=5, stride=4, padding=2, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Tiny backbone with depthwise-separable blocks
+        self.backbone = nn.Sequential(
+            self._make_block(32, 64, stride=2),    # 80x45 -> 40x23
+            self._make_block(64, 128, stride=2),   # 40x23 -> 20x12
+            self._make_block(128, 256, stride=2),  # 20x12 -> 10x6
+            self._make_block(256, 256, stride=1),  # refine
+        )
+
+        self.out_channels = 256
+
+        # Regression head - 6 outputs for stereo
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 6)
+        )
+
+    def _make_block(self, in_ch, out_ch, stride):
+        """Depthwise separable conv block."""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        return torch.sigmoid(x)
+
+    def get_feature_size(self):
+        return self.out_channels
+
+    def extract_features(self, x):
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)
+
+
 class StereoFullFrameUltra(nn.Module):
     """
     6-channel stereo detector using PixelUnshuffle for zero-compute downsampling.
@@ -478,13 +553,13 @@ class TemporalStereoMobileNet(nn.Module):
     Output: (B, 6) - predictions for the last frame
     """
 
-    def __init__(self, history_length=3, hidden_size=128, pretrained=True, num_layers=4):
+    def __init__(self, history_length=3, hidden_size=128, pretrained=True):
         super().__init__()
         self.history_length = history_length
         self.hidden_size = hidden_size
 
         # Feature extractor
-        self.feature_extractor = StereoMobileNetLite(pretrained=pretrained, num_layers=num_layers)
+        self.feature_extractor = StereoMobileNet(pretrained=pretrained)
         feature_size = self.feature_extractor.get_feature_size()
 
         # GRU for temporal processing
@@ -1243,14 +1318,15 @@ def run_stereo_benchmark():
     num_iterations = 100
     H, W = 720, 1280
 
-    # Test configurations
+    # Test configurations - use string keys for special handling, tuples for models
     stereo_configs = [
         ("Baseline (2x FullFrame-MobileNet)", "baseline_mobilenet"),
         ("Baseline (2x FullFrame-Tiny)", "baseline_tiny"),
-        ("Stereo-MobileNet", lambda: StereoMobileNet(pretrained=False)),
-        ("Stereo-Ultra", lambda: StereoFullFrameUltra()),
-        ("Efficient-Temporal-8 (streaming)", "efficient_temporal_8"),
-        ("Efficient-Temporal-4 (streaming)", "efficient_temporal_4"),
+        ("Stereo-Tiny", "stereo_tiny"),
+        ("Stereo-MobileNet", "stereo_mobilenet"),
+        ("Stereo-Ultra", "stereo_ultra"),
+        ("EfficientTemporal-Tiny-8", "efficient_tiny_8"),
+        ("EfficientTemporal-Tiny-4", "efficient_tiny_4"),
     ]
 
     print(f"Configuration:")
@@ -1406,93 +1482,15 @@ def run_stereo_benchmark():
                     'speedup_gpu': baseline_gpu / gpu_ms if baseline_gpu and gpu_ms > 0 else 1.0
                 })
 
-            elif model_fn.startswith("efficient_temporal"):
-                # Efficient Temporal model - benchmark STREAMING mode (single frame)
-                history = int(model_fn.split("_")[-1])
-                model = EfficientTemporalStereo(history_length=history, pretrained=False)
-                model.eval()
-                params = count_parameters(model)
-                print(f"  Params: {params:,}")
-                print(f"  History: {history} frames (cached, not recomputed)")
-
-                # For streaming benchmark, we test the encoder + GRU on single frame
-                # This simulates real-world usage where features are cached
-                print("  Exporting encoder only (streaming)...", end=" ", flush=True)
-                buffer = io.BytesIO()
-                dummy = torch.randn(1, 6, H, W)
-
-                # Export just the encoder part for benchmark
-                torch.onnx.export(model.encoder, dummy, buffer, input_names=['input'],
-                                output_names=['output'], opset_version=14, do_constant_folding=True)
-                buffer.seek(0)
-                encoder_bytes = buffer.read()
-                print(f"OK ({len(encoder_bytes)/1024:.0f} KB)")
-
-                # CPU benchmark (encoder only - GRU is negligible)
-                print("  CPU (streaming): ", end="", flush=True)
-                cpu_session = create_inference_session(encoder_bytes)
-                input_name = cpu_session.get_inputs()[0].name
-                dummy_np = np.random.randn(1, 6, H, W).astype(np.float32)
-
-                for _ in range(10):
-                    cpu_session.run(None, {input_name: dummy_np})
-
-                times = []
-                for _ in range(num_iterations):
-                    start = time.perf_counter()
-                    cpu_session.run(None, {input_name: dummy_np})
-                    times.append((time.perf_counter() - start) * 1000)
-
-                cpu_ms = np.mean(times)
-                cpu_fps = 1000 / cpu_ms
-                speedup_cpu = baseline_cpu / cpu_ms if baseline_cpu else 1.0
-                print(f"{cpu_ms:.2f}ms ({cpu_fps:.1f} FPS)", end="")
-                if baseline_cpu:
-                    print(f" [{speedup_cpu:.2f}x vs baseline]")
-                else:
-                    print()
-
-                # GPU benchmark
-                print("  GPU (streaming): ", end="", flush=True)
-                try:
-                    gpu_session = ort.InferenceSession(
-                        encoder_bytes,
-                        providers=['DmlExecutionProvider', 'CPUExecutionProvider']
-                    )
-
-                    for _ in range(10):
-                        gpu_session.run(None, {input_name: dummy_np})
-
-                    times = []
-                    for _ in range(num_iterations):
-                        start = time.perf_counter()
-                        gpu_session.run(None, {input_name: dummy_np})
-                        times.append((time.perf_counter() - start) * 1000)
-
-                    gpu_ms = np.mean(times)
-                    gpu_fps = 1000 / gpu_ms
-                    speedup_gpu = baseline_gpu / gpu_ms if baseline_gpu else 1.0
-                    print(f"{gpu_ms:.2f}ms ({gpu_fps:.1f} FPS)", end="")
-                    if baseline_gpu:
-                        print(f" [{speedup_gpu:.2f}x vs baseline]")
-                    else:
-                        print()
-                except Exception as e:
-                    print(f"N/A ({e})")
-                    gpu_ms = -1
-                    gpu_fps = 0
-                    speedup_gpu = 0
-
-                results.append({
-                    'name': name, 'params': params,
-                    'cpu_ms': cpu_ms, 'cpu_fps': cpu_fps,
-                    'gpu_ms': gpu_ms, 'gpu_fps': gpu_fps,
-                    'speedup_cpu': speedup_cpu, 'speedup_gpu': speedup_gpu
-                })
-
-            else:
+            elif model_fn in ("stereo_tiny", "stereo_mobilenet", "stereo_ultra"):
                 # Stereo models (single 6-channel inference)
-                model = model_fn()
+                if model_fn == "stereo_tiny":
+                    model = StereoTiny()
+                elif model_fn == "stereo_mobilenet":
+                    model = StereoMobileNet(pretrained=False)
+                else:
+                    model = StereoFullFrameUltra()
+
                 model.eval()
                 params = count_parameters(model)
                 print(f"  Params: {params:,}")
@@ -1536,6 +1534,101 @@ def run_stereo_benchmark():
                 try:
                     gpu_session = ort.InferenceSession(
                         onnx_bytes,
+                        providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+                    )
+
+                    for _ in range(10):
+                        gpu_session.run(None, {input_name: dummy_np})
+
+                    times = []
+                    for _ in range(num_iterations):
+                        start = time.perf_counter()
+                        gpu_session.run(None, {input_name: dummy_np})
+                        times.append((time.perf_counter() - start) * 1000)
+
+                    gpu_ms = np.mean(times)
+                    gpu_fps = 1000 / gpu_ms
+                    speedup_gpu = baseline_gpu / gpu_ms if baseline_gpu else 1.0
+                    print(f"{gpu_ms:.2f}ms ({gpu_fps:.1f} FPS)", end="")
+                    if baseline_gpu:
+                        print(f" [{speedup_gpu:.2f}x vs baseline]")
+                    else:
+                        print()
+                except Exception as e:
+                    print(f"N/A ({e})")
+                    gpu_ms = -1
+                    gpu_fps = 0
+                    speedup_gpu = 0
+
+                results.append({
+                    'name': name, 'params': params,
+                    'cpu_ms': cpu_ms, 'cpu_fps': cpu_fps,
+                    'gpu_ms': gpu_ms, 'gpu_fps': gpu_fps,
+                    'speedup_cpu': speedup_cpu, 'speedup_gpu': speedup_gpu
+                })
+
+            elif model_fn.startswith("efficient_tiny"):
+                # Efficient Temporal with StereoTiny encoder (fast!)
+                history = int(model_fn.split("_")[-1])
+
+                # Create temporal model with StereoTiny encoder
+                class EfficientTemporalTiny(nn.Module):
+                    def __init__(self, history_length=8):
+                        super().__init__()
+                        self.encoder = StereoTiny()
+                        feature_size = self.encoder.get_feature_size()
+                        self.gru = nn.GRU(feature_size, 128, batch_first=True)
+                        self.head = nn.Sequential(
+                            nn.Linear(128, 32),
+                            nn.ReLU(inplace=True),
+                            nn.Linear(32, 6)
+                        )
+
+                model = EfficientTemporalTiny(history_length=history)
+                model.eval()
+                params = count_parameters(model)
+                print(f"  Params: {params:,}")
+                print(f"  History: {history} frames (cached, not recomputed)")
+
+                # Benchmark encoder only (streaming mode)
+                print("  Exporting encoder only...", end=" ", flush=True)
+                buffer = io.BytesIO()
+                dummy = torch.randn(1, 6, H, W)
+                torch.onnx.export(model.encoder, dummy, buffer, input_names=['input'],
+                                output_names=['output'], opset_version=14, do_constant_folding=True)
+                buffer.seek(0)
+                encoder_bytes = buffer.read()
+                print(f"OK ({len(encoder_bytes)/1024:.0f} KB)")
+
+                # CPU benchmark
+                print("  CPU (streaming): ", end="", flush=True)
+                cpu_session = create_inference_session(encoder_bytes)
+                input_name = cpu_session.get_inputs()[0].name
+                dummy_np = np.random.randn(1, 6, H, W).astype(np.float32)
+
+                for _ in range(10):
+                    cpu_session.run(None, {input_name: dummy_np})
+
+                times = []
+                for _ in range(num_iterations):
+                    start = time.perf_counter()
+                    cpu_session.run(None, {input_name: dummy_np})
+                    times.append((time.perf_counter() - start) * 1000)
+
+                cpu_ms = np.mean(times)
+                cpu_fps = 1000 / cpu_ms
+                speedup_cpu = baseline_cpu / cpu_ms if baseline_cpu else 1.0
+                print(f"{cpu_ms:.2f}ms ({cpu_fps:.1f} FPS)", end="")
+                if baseline_cpu:
+                    print(f" [{speedup_cpu:.2f}x vs baseline]")
+                else:
+                    print()
+
+                # GPU benchmark
+                print("  GPU (streaming): ", end="", flush=True)
+                try:
+                    gpu_session = ort.InferenceSession(
+                        encoder_bytes,
                         providers=['DmlExecutionProvider', 'CPUExecutionProvider']
                     )
 
