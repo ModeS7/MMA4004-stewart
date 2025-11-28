@@ -635,6 +635,69 @@ class BallDetectorFullFrameMobileNet(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class StereoMobileNet(nn.Module):
+    """
+    6-channel stereo detector using PixelUnshuffle + MobileNetV3 backbone.
+
+    Input: (B, 6, 720, 1280) - left+right RGB concatenated
+    Output: (B, 6) - (x_l, y_l, conf_l, x_r, y_r, conf_r)
+
+    Architecture:
+    - PixelUnshuffle(8): 1280x720x6 → 160x90x384 (FREE reshape)
+    - 1x1 conv: 384 → 16 channels (match MobileNetV3)
+    - MobileNetV3 backbone (pretrained)
+    - Global pooling + regression head → 6 outputs
+    """
+
+    def __init__(self, pretrained=True, unshuffle_factor=8):
+        super().__init__()
+
+        self.unshuffle_factor = unshuffle_factor
+
+        # PixelUnshuffle: 6ch → 6*64=384ch at 160x90
+        self.pixel_unshuffle = nn.PixelUnshuffle(unshuffle_factor)
+        in_channels = 6 * (unshuffle_factor ** 2)  # 384 for stereo
+
+        # Channel adaptation: 384 → 16
+        self.channel_adapt = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True),
+        )
+
+        # MobileNetV3-Small backbone (skip first conv)
+        mobilenet = models.mobilenet_v3_small(weights='IMAGENET1K_V1' if pretrained else None)
+        self.backbone = nn.Sequential(*list(mobilenet.features.children())[1:])
+
+        # MobileNetV3-Small outputs 576 channels
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(576, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 6)  # x_l, y_l, conf_l, x_r, y_r, conf_r
+        )
+
+    def forward(self, x):
+        # PixelUnshuffle: 1280x720x6 → 160x90x384
+        x = self.pixel_unshuffle(x)
+        # Adapt channels: 384 → 16
+        x = self.channel_adapt(x)
+        # MobileNetV3 backbone
+        x = self.backbone(x)
+        # Global pooling + head
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        x = torch.sigmoid(x)
+        return x
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class BallDetectorFullFrameMobileNetLite(nn.Module):
     """
     Lightweight full-frame detector with partial MobileNetV3 backbone.

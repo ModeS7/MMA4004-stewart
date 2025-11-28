@@ -52,13 +52,16 @@ class RewardConfig:
 
     # Penalties (negative)
     k_position = 0.001  # Position error: -k * (x^2 + y^2) in mm^2
-    k_velocity = 0.0001  # Velocity penalty: -k * (vx^2 + vy^2)
+    k_velocity = 0.001  # Velocity penalty: -k * (vx^2 + vy^2) [increased 10x]
     k_tilt = 0.01  # Tilt penalty: -k * (rx^2 + ry^2)
-    k_action = 0.001  # Action smoothness: -k * (a^2)
+    k_action = 0.001  # Action magnitude: -k * (a^2)
+    k_action_rate = 0.1  # Action rate penalty: -k * (da^2) [NEW: penalize jerky moves]
 
     # Bonus (positive)
     k_center_bonus = 1.0  # Bonus for being centered
     center_threshold_mm = 10.0  # Distance to get full bonus
+    k_stability_bonus = 0.5  # Bonus for being centered AND slow [NEW]
+    stability_vel_threshold = 20.0  # Velocity threshold for stability bonus (mm/s)
 
     # Termination
     out_of_bounds_penalty = -100.0  # Ball fell off

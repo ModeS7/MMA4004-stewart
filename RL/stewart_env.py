@@ -248,6 +248,9 @@ class StewartBallEnv:
         self.step_count = np.zeros(num_envs, dtype=np.int32)
         self.episode_reward = np.zeros(num_envs, dtype=np.float32)
 
+        # Track previous actions for action rate penalty
+        self.prev_actions = np.zeros((num_envs, 2), dtype=np.float32)
+
         # Pre-compile Numba functions
         self._warmup_numba()
 
@@ -296,6 +299,9 @@ class StewartBallEnv:
         self.step_count[indices] = 0
         self.episode_reward[indices] = 0.0
 
+        # Reset previous actions
+        self.prev_actions[indices] = 0.0
+
         return self._get_observation()
 
     def step(self, actions):
@@ -325,8 +331,11 @@ class StewartBallEnv:
             self.g, self.mass_factor, self.mu_roll, self.servo_tau
         )
 
-        # Compute rewards
+        # Compute rewards (needs current and previous actions for rate penalty)
         rewards = self._compute_reward(actions, fell_off)
+
+        # Store current actions as previous for next step
+        self.prev_actions = actions.astype(np.float32).copy()
 
         # Update step count
         self.step_count += 1
@@ -377,8 +386,10 @@ class StewartBallEnv:
         2. Velocity penalty: -k * (vx^2 + vy^2)
         3. Tilt penalty: -k * (rx^2 + ry^2)
         4. Action penalty: -k * (a^2)
-        5. Center bonus: +k * exp(-dist/threshold)
-        6. Fall penalty: -100 if ball fell off
+        5. Action rate penalty: -k * (da^2) [penalize jerky movements]
+        6. Center bonus: +k * exp(-dist/threshold)
+        7. Stability bonus: +k if centered AND slow
+        8. Fall penalty: -100 if ball fell off
         """
         cfg = self.reward_cfg
 
@@ -391,6 +402,7 @@ class StewartBallEnv:
         vel_x_mm_s = self.ball_vx * 1000.0
         vel_y_mm_s = self.ball_vy * 1000.0
         vel_sq = vel_x_mm_s ** 2 + vel_y_mm_s ** 2
+        speed_mm_s = np.sqrt(vel_sq)
 
         # Tilt (in degrees)
         rx_deg = np.degrees(self.platform_rx)
@@ -400,17 +412,26 @@ class StewartBallEnv:
         # Action magnitude
         action_sq = actions[:, 0] ** 2 + actions[:, 1] ** 2
 
+        # Action rate (change from previous action)
+        action_delta = actions - self.prev_actions
+        action_rate_sq = action_delta[:, 0] ** 2 + action_delta[:, 1] ** 2
+
         # Penalties
         reward = np.zeros(self.num_envs, dtype=np.float32)
         reward -= cfg.k_position * pos_error_sq
         reward -= cfg.k_velocity * vel_sq
         reward -= cfg.k_tilt * tilt_sq
         reward -= cfg.k_action * action_sq
+        reward -= cfg.k_action_rate * action_rate_sq  # Penalize jerky movements
 
         # Center bonus (exponential decay from center)
         dist_mm = np.sqrt(pos_error_sq)
         center_bonus = cfg.k_center_bonus * np.exp(-dist_mm / cfg.center_threshold_mm)
         reward += center_bonus
+
+        # Stability bonus: reward being centered AND slow (the goal state)
+        stability_mask = (dist_mm < cfg.center_threshold_mm) & (speed_mm_s < cfg.stability_vel_threshold)
+        reward += cfg.k_stability_bonus * stability_mask.astype(np.float32)
 
         # Fall penalty
         reward[fell_off] = cfg.out_of_bounds_penalty
