@@ -524,6 +524,178 @@ class BallDetectionDataset(Dataset):
         return image_tensor, target
 
 
+class FullFrameDataset(Dataset):
+    """
+    Dataset for full-frame ball detection (no cropping).
+
+    Loads full 1280x720 images and optionally resizes to target resolution.
+    Returns (x, y, confidence) normalized to [0, 1].
+    """
+
+    def __init__(self, data_dir, labels_file='labels.json',
+                 target_size=(1280, 720), use_augmentation=True, split='train'):
+        """
+        Args:
+            data_dir: Directory containing images and labels
+            labels_file: Name of labels JSON file
+            target_size: (width, height) to resize images to
+            use_augmentation: Enable augmentations
+            split: 'train' or 'val'
+        """
+        self.data_dir = Path(data_dir)
+        self.target_width, self.target_height = target_size
+        self.use_augmentation = use_augmentation and (split == 'train')
+
+        # Check for images in subdirectory or root
+        if (self.data_dir / 'images').exists():
+            self.image_dir = self.data_dir / 'images'
+        else:
+            self.image_dir = self.data_dir
+
+        # Load labels
+        labels_path = self.data_dir / labels_file
+        with open(labels_path, 'r') as f:
+            self.labels = json.load(f)
+
+        # Filter valid samples
+        self.samples = []
+        for img_name, label in self.labels.items():
+            if not label.get('valid', True):
+                continue
+            img_path = self.image_dir / img_name
+            if img_path.exists():
+                self.samples.append((str(img_path), label))
+
+        print(f"FullFrameDataset: {len(self.samples)} samples, target {self.target_width}x{self.target_height}")
+
+        # Augmentation pipeline
+        self.transform = self._get_transforms()
+
+    def _get_transforms(self):
+        """Create augmentation pipeline."""
+        transforms_list = []
+
+        if self.use_augmentation:
+            transforms_list.extend([
+                # Spatial augmentations
+                A.ShiftScaleRotate(
+                    shift_limit=0.05,
+                    scale_limit=0.1,
+                    rotate_limit=10,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    p=0.5
+                ),
+                # Appearance augmentations
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
+            ])
+
+        # Normalize and convert to tensor
+        transforms_list.extend([
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+
+        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+
+        # Load image
+        image = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image.shape[:2]
+
+        # Get ball coordinates (at original resolution)
+        ball_x = label['x']
+        ball_y = label['y']
+
+        # Resize image if needed
+        if orig_w != self.target_width or orig_h != self.target_height:
+            image = cv2.resize(image, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
+            # Scale coordinates
+            ball_x = ball_x * self.target_width / orig_w
+            ball_y = ball_y * self.target_height / orig_h
+
+        # Apply augmentations
+        transformed = self.transform(image=image, keypoints=[(ball_x, ball_y)])
+        image_tensor = transformed['image']
+
+        # Get augmented coordinates
+        if len(transformed['keypoints']) > 0:
+            aug_x, aug_y = transformed['keypoints'][0]
+        else:
+            aug_x, aug_y = self.target_width / 2, self.target_height / 2
+
+        # Normalize coordinates to [0, 1]
+        x_norm = np.clip(aug_x / self.target_width, 0.0, 1.0)
+        y_norm = np.clip(aug_y / self.target_height, 0.0, 1.0)
+        confidence = 1.0
+
+        target = torch.tensor([x_norm, y_norm, confidence], dtype=torch.float32)
+        return image_tensor, target
+
+
+def create_fullframe_dataloaders(data_dir, batch_size=16, target_size=(320, 180),
+                                  train_split=0.8, num_workers=4):
+    """
+    Create train and validation dataloaders for full-frame detection.
+
+    Args:
+        data_dir: Directory containing images and labels
+        batch_size: Batch size
+        target_size: (width, height) to resize images to
+        train_split: Fraction for training
+        num_workers: Number of data loading workers
+
+    Returns:
+        train_loader, val_loader
+    """
+    # Load to get sample list
+    full_dataset = FullFrameDataset(data_dir, target_size=target_size, use_augmentation=False, split='val')
+
+    # Split
+    dataset_size = len(full_dataset)
+    train_size = int(train_split * dataset_size)
+    train_indices = list(range(train_size))
+    val_indices = list(range(train_size, dataset_size))
+
+    # Create datasets
+    train_dataset = FullFrameDataset(data_dir, target_size=target_size, use_augmentation=True, split='train')
+    train_dataset.samples = [full_dataset.samples[i] for i in train_indices]
+
+    val_dataset = FullFrameDataset(data_dir, target_size=target_size, use_augmentation=False, split='val')
+    val_dataset.samples = [full_dataset.samples[i] for i in val_indices]
+
+    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers // 2 if num_workers > 0 else 0,
+        pin_memory=True,
+        drop_last=False
+    )
+
+    return train_loader, val_loader
+
+
 def create_dataloaders(data_dir, batch_size=32, crop_size=128,
                        train_split=0.8, num_workers=4, use_spatial_augmentation=True,
                        use_appearance_augmentation=True, use_color_invariance_augmentation=False,

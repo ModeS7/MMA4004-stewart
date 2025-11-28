@@ -201,10 +201,10 @@ def step_physics_batch(ball_x, ball_y, ball_vx, ball_vy,
 
 class StewartBallEnv:
     """
-    Stewart Platform Ball Balancing Environment.
+    Stewart Platform Ball Balancing Environment with LSTM support.
 
-    State: [ball_x, ball_y, ball_vx, ball_vy, platform_rx, platform_ry]
-           Positions in mm, velocities in mm/s, angles in degrees
+    Observation: Sequence of [ball_x, ball_y, platform_rx, platform_ry] with camera noise.
+                 Shape: (seq_length, obs_per_step) - LSTM will infer velocity/acceleration.
 
     Action: [rx_target, ry_target] in [-1, 1], scaled to [-max_tilt, max_tilt]
 
@@ -251,6 +251,13 @@ class StewartBallEnv:
         # Track previous actions for action rate penalty
         self.prev_actions = np.zeros((num_envs, 2), dtype=np.float32)
 
+        # Observation history buffer for LSTM
+        # Shape: (num_envs, seq_length, obs_per_step)
+        self.obs_history = np.zeros(
+            (num_envs, self.cfg.seq_length, self.cfg.obs_per_step),
+            dtype=np.float32
+        )
+
         # Pre-compile Numba functions
         self._warmup_numba()
 
@@ -274,7 +281,7 @@ class StewartBallEnv:
                     If None, resets all environments.
 
         Returns:
-            observations: (num_envs, state_dim) array
+            observations: (num_envs, seq_length, obs_per_step) array for LSTM
         """
         if indices is None:
             indices = np.arange(self.num_envs)
@@ -302,7 +309,14 @@ class StewartBallEnv:
         # Reset previous actions
         self.prev_actions[indices] = 0.0
 
-        return self._get_observation()
+        # Initialize observation history with current (noisy) observation
+        # Fill entire history with initial state (all timesteps same)
+        initial_obs = self._get_single_observation()  # (num_envs, obs_per_step)
+        for i in indices:
+            for t in range(self.cfg.seq_length):
+                self.obs_history[i, t, :] = initial_obs[i]
+
+        return self.obs_history.copy()
 
     def step(self, actions):
         """
@@ -312,7 +326,7 @@ class StewartBallEnv:
             actions: (num_envs, 2) array of [rx_target, ry_target] in [-1, 1]
 
         Returns:
-            observations: (num_envs, state_dim)
+            observations: (num_envs, seq_length, obs_per_step) for LSTM
             rewards: (num_envs,)
             dones: (num_envs,)
             infos: dict with additional info
@@ -344,6 +358,11 @@ class StewartBallEnv:
         # Check done conditions
         dones = (self.step_count >= self.cfg.max_steps) | fell_off
 
+        # Update observation history (shift left, add new observation)
+        new_obs = self._get_single_observation()  # (num_envs, obs_per_step)
+        self.obs_history[:, :-1, :] = self.obs_history[:, 1:, :]  # Shift left
+        self.obs_history[:, -1, :] = new_obs  # Add newest at end
+
         # Info
         infos = {
             'fell_off': fell_off,
@@ -351,31 +370,51 @@ class StewartBallEnv:
             'step_count': self.step_count.copy()
         }
 
-        return self._get_observation(), rewards, dones, infos
+        return self.obs_history.copy(), rewards, dones, infos
 
-    def _get_observation(self):
+    def _get_single_observation(self):
         """
-        Get observation for all environments.
+        Get single-timestep observation for all environments with camera noise.
 
         Returns:
-            obs: (num_envs, 6) array
-                 [ball_x_mm, ball_y_mm, ball_vx_mm_s, ball_vy_mm_s, rx_deg, ry_deg]
+            obs: (num_envs, obs_per_step) array
+                 [ball_x, ball_y, platform_rx, platform_ry] - all normalized
+                 Ball position has ZED camera noise added (x10 for robustness).
         """
-        obs = np.zeros((self.num_envs, self.cfg.state_dim), dtype=np.float32)
+        obs = np.zeros((self.num_envs, self.cfg.obs_per_step), dtype=np.float32)
 
-        # Ball position in mm, normalized to [-1, 1] based on platform size
-        obs[:, 0] = self.ball_x * 1000.0 / self.cfg.platform_radius_mm
-        obs[:, 1] = self.ball_y * 1000.0 / self.cfg.platform_radius_mm
+        # True ball position in mm
+        ball_x_mm = self.ball_x * 1000.0
+        ball_y_mm = self.ball_y * 1000.0
 
-        # Ball velocity in mm/s, normalized (typical max ~500 mm/s)
-        obs[:, 2] = self.ball_vx * 1000.0 / 500.0
-        obs[:, 3] = self.ball_vy * 1000.0 / 500.0
+        # Add ZED camera noise if enabled
+        if self.cfg.use_camera_noise:
+            # Base noise (ZED typical ~1.5mm, x10 = 15mm std)
+            noise_x = np.random.normal(0, self.cfg.position_noise_std_mm, self.num_envs)
+            noise_y = np.random.normal(0, self.cfg.position_noise_std_mm, self.num_envs)
 
-        # Platform angles normalized to [-1, 1]
-        obs[:, 4] = np.degrees(self.platform_rx) / self.cfg.max_tilt_deg
-        obs[:, 5] = np.degrees(self.platform_ry) / self.cfg.max_tilt_deg
+            # Depth-dependent noise (further from center = more noise)
+            dist_from_center = np.sqrt(ball_x_mm**2 + ball_y_mm**2)
+            depth_noise_scale = 1.0 + dist_from_center * self.cfg.noise_depth_scale
+            noise_x *= depth_noise_scale
+            noise_y *= depth_noise_scale
+
+            ball_x_mm = ball_x_mm + noise_x.astype(np.float32)
+            ball_y_mm = ball_y_mm + noise_y.astype(np.float32)
+
+        # Normalize position to [-1, 1] based on platform size
+        obs[:, 0] = ball_x_mm / self.cfg.platform_radius_mm
+        obs[:, 1] = ball_y_mm / self.cfg.platform_radius_mm
+
+        # Platform angles normalized to [-1, 1] (these are known from servos, no noise)
+        obs[:, 2] = np.degrees(self.platform_rx) / self.cfg.max_tilt_deg
+        obs[:, 3] = np.degrees(self.platform_ry) / self.cfg.max_tilt_deg
 
         return obs
+
+    def _get_observation(self):
+        """Get full observation sequence for LSTM."""
+        return self.obs_history.copy()
 
     def _compute_reward(self, actions, fell_off):
         """

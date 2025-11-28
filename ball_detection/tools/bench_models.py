@@ -33,11 +33,11 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, str(Path(__file__).parent))
 from ball_detection.core.model import (
     BallDetectorCNN,
-    BallDetectorFullFrame,
+    BallDetectorMobileNetV3,
+    BallDetectorShuffleNetV2,
     BallDetectorFullFrameTiny,
     BallDetectorFullFrameUltra,
     BallDetectorFullFrameMobileNet,
-    BallDetectorFullFrameMobileNetLite,
 )
 
 
@@ -743,15 +743,18 @@ def run_fullframe_benchmark():
         (720, 1280),   # Full-frame
     ]
 
-    # All models to test
+    # All models to test (matching train.py)
+    # CROP MODE: cnn, mobilenet, shufflenet
+    # FULLFRAME MODE: tiny, ultra, mobilenet
     models = {
-        'BallDetectorCNN': BallDetectorCNN,
-        'MobileNetV2-0.35': create_mobilenet_v2_035,
-        'MobileNetV3-Small': create_mobilenet_v3_small,
-        'ShuffleNetV2-0.5x': create_shufflenet_v2_x0_5,
-        'FullFrame-Tiny': BallDetectorFullFrameTiny,
-        'FullFrame-Ultra': BallDetectorFullFrameUltra,
-        'FullFrame-MobileNet-Lite': lambda: BallDetectorFullFrameMobileNetLite(pretrained=False),
+        # Crop models (128x128)
+        'cnn': BallDetectorCNN,
+        'mobilenet-crop': lambda: BallDetectorMobileNetV3(pretrained=False),
+        'shufflenet': lambda: BallDetectorShuffleNetV2(pretrained=False),
+        # Fullframe models (320x180, 1280x720)
+        'tiny': BallDetectorFullFrameTiny,
+        'ultra': BallDetectorFullFrameUltra,
+        'mobilenet-fullframe': lambda: BallDetectorFullFrameMobileNet(pretrained=False),
     }
 
     # Build all combinations
@@ -878,7 +881,7 @@ if __name__ == "__main__":
     try:
         print("\n" + "=" * 80)
         print("BALL DETECTION MODEL BENCHMARK")
-        print("7 models x 3 resolutions = 21 tests")
+        print("6 models x 3 resolutions = 18 tests")
         print("=" * 80 + "\n")
 
         run_fullframe_benchmark()

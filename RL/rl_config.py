@@ -17,7 +17,7 @@ class EnvConfig:
 
     # Physics
     dt = 0.01  # Time step (10ms, 100Hz control)
-    max_steps = 500  # Steps per episode (5 seconds)
+    max_steps = 1000  # Steps per episode (10 seconds) - longer for stability learning
 
     # Platform limits (from core/utils.py)
     platform_radius_mm = 150.0  # Platform radius in mm
@@ -27,8 +27,13 @@ class EnvConfig:
     ball_radius_m = 0.02  # 20mm radius
     ball_mass_kg = 0.0027  # 2.7g
 
-    # State space: [ball_x, ball_y, ball_vx, ball_vy, platform_rx, platform_ry]
-    state_dim = 6
+    # LSTM sequence settings
+    seq_length = 10  # Number of timesteps in history for LSTM
+
+    # State space per timestep: [ball_x, ball_y, platform_rx, platform_ry]
+    # No velocity - LSTM will infer from position history
+    obs_per_step = 4  # Observation dimension per timestep
+    state_dim = obs_per_step  # For compatibility (actual input is seq_length x obs_per_step)
 
     # Action space: [rx_target, ry_target] normalized to [-1, 1]
     action_dim = 2
@@ -37,6 +42,13 @@ class EnvConfig:
     # Initial state randomization
     init_pos_range_mm = 50.0  # Ball starts within [-50, 50] mm
     init_vel_range_mm_s = 30.0  # Initial velocity range
+
+    # Camera noise (ZED camera model x10 for robustness)
+    # ZED typical noise: ~1-2mm at close range, we use 10x
+    use_camera_noise = True
+    position_noise_std_mm = 15.0  # ~1.5mm base * 10x = 15mm std
+    # Noise can also scale with distance from camera (depth-dependent)
+    noise_depth_scale = 0.1  # Additional noise = distance * scale * 10x
 
     # Domain randomization (for sim-to-real transfer)
     use_domain_randomization = False
@@ -51,17 +63,17 @@ class RewardConfig:
     """Reward function weights."""
 
     # Penalties (negative)
-    k_position = 0.001  # Position error: -k * (x^2 + y^2) in mm^2
-    k_velocity = 0.001  # Velocity penalty: -k * (vx^2 + vy^2) [increased 10x]
+    k_position = 0.002  # Position error: -k * (x^2 + y^2) in mm^2 [increased]
+    k_velocity = 0.005  # Velocity penalty: -k * (vx^2 + vy^2) [increased 50x from original]
     k_tilt = 0.01  # Tilt penalty: -k * (rx^2 + ry^2)
     k_action = 0.001  # Action magnitude: -k * (a^2)
-    k_action_rate = 0.1  # Action rate penalty: -k * (da^2) [NEW: penalize jerky moves]
+    k_action_rate = 0.2  # Action rate penalty: -k * (da^2) [increased for smoother control]
 
     # Bonus (positive)
     k_center_bonus = 1.0  # Bonus for being centered
     center_threshold_mm = 10.0  # Distance to get full bonus
-    k_stability_bonus = 0.5  # Bonus for being centered AND slow [NEW]
-    stability_vel_threshold = 20.0  # Velocity threshold for stability bonus (mm/s)
+    k_stability_bonus = 1.0  # Bonus for being centered AND slow [increased]
+    stability_vel_threshold = 10.0  # Velocity threshold for stability bonus (mm/s) [tighter]
 
     # Termination
     out_of_bounds_penalty = -100.0  # Ball fell off
@@ -76,6 +88,8 @@ class SACConfig:
 
     # Network architecture
     hidden_dim = 256  # Hidden layer size
+    lstm_hidden_dim = 128  # LSTM hidden state size
+    lstm_layers = 1  # Number of LSTM layers
 
     # Learning rates
     lr = 3e-4  # Learning rate for all networks
@@ -88,7 +102,7 @@ class SACConfig:
 
     # Replay buffer
     buffer_size = 100_000
-    batch_size = 512
+    batch_size = 256  # Reduced for sequence data
 
     # Training
     warmup_steps = 1000  # Random actions before training
