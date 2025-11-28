@@ -843,22 +843,7 @@ def run_fullframe_benchmark():
         except Exception as e:
             print(f"  ERROR: {e}")
 
-    # Summary table
-    print("\n" + "=" * 80)
-    print("ALL RESULTS (sorted by GPU time)")
-    print("=" * 80)
-    print(f"\n{'Model':<35} {'Size':<12} {'Params':>10} {'CPU ms':>10} {'GPU ms':>10} {'GPU FPS':>10}")
-    print("-" * 95)
-
-    for r in sorted(results, key=lambda x: x['gpu_ms'] if x['gpu_ms'] > 0 else 9999):
-        print(f"{r['name']:<35} {r['size']:<12} {r['params']:>10,} "
-              f"{r['cpu_ms']:>10.2f} {r['gpu_ms']:>10.2f} {r['gpu_fps']:>10.1f}")
-
-    # Best models per resolution
-    print("\n" + "=" * 80)
-    print("BEST MODELS PER RESOLUTION")
-    print("=" * 80)
-
+    # Rankings per resolution
     resolutions = [(128, 128), (180, 320), (720, 1280)]
 
     for h, w in resolutions:
@@ -866,17 +851,25 @@ def run_fullframe_benchmark():
         if not res_results:
             continue
 
-        print(f"\n>> {w}x{h}:")
+        print("\n" + "=" * 80)
+        print(f"RANKING: {w}x{h}")
+        print("=" * 80)
 
-        # Best CPU
-        best_cpu = min(res_results, key=lambda x: x['cpu_ms'])
-        print(f"   CPU:  {best_cpu['model_name']:<25} {best_cpu['cpu_ms']:>6.2f}ms ({best_cpu['cpu_fps']:>6.1f} FPS)")
+        # CPU ranking
+        print(f"\n  CPU (fastest first):")
+        print(f"  {'#':<3} {'Model':<28} {'Time':>10} {'FPS':>10} {'Params':>12}")
+        print(f"  " + "-" * 70)
+        for i, r in enumerate(sorted(res_results, key=lambda x: x['cpu_ms']), 1):
+            print(f"  {i:<3} {r['model_name']:<28} {r['cpu_ms']:>8.2f}ms {r['cpu_fps']:>9.1f} {r['params']:>12,}")
 
-        # Best GPU
+        # GPU ranking
         gpu_results = [r for r in res_results if r['gpu_ms'] > 0]
         if gpu_results:
-            best_gpu = min(gpu_results, key=lambda x: x['gpu_ms'])
-            print(f"   GPU:  {best_gpu['model_name']:<25} {best_gpu['gpu_ms']:>6.2f}ms ({best_gpu['gpu_fps']:>6.1f} FPS)")
+            print(f"\n  GPU (fastest first):")
+            print(f"  {'#':<3} {'Model':<28} {'Time':>10} {'FPS':>10} {'Params':>12}")
+            print(f"  " + "-" * 70)
+            for i, r in enumerate(sorted(gpu_results, key=lambda x: x['gpu_ms']), 1):
+                print(f"  {i:<3} {r['model_name']:<28} {r['gpu_ms']:>8.2f}ms {r['gpu_fps']:>9.1f} {r['params']:>12,}")
 
     print()
 
