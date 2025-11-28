@@ -758,10 +758,10 @@ def run_fullframe_benchmark():
     all_models = []
     for model_name, model_fn in models.items():
         for h, w in resolutions:
-            all_models.append((f"{model_name} ({w}x{h})", h, w, model_fn))
+            all_models.append((f"{model_name} ({w}x{h})", model_name, h, w, model_fn))
     results = []
 
-    for name, h, w, model_fn in all_models:
+    for name, model_name, h, w, model_fn in all_models:
         print(f"\nTesting: {name}")
         print("-" * 60)
 
@@ -834,7 +834,8 @@ def run_fullframe_benchmark():
                 gpu_stats = {'mean': -1, 'fps': 0}
 
             results.append({
-                'name': name, 'size': f"{w}x{h}", 'params': params,
+                'name': name, 'model_name': model_name, 'size': f"{w}x{h}",
+                'h': h, 'w': w, 'params': params,
                 'cpu_ms': cpu_stats['mean'], 'cpu_fps': cpu_stats['fps'],
                 'gpu_ms': gpu_stats['mean'], 'gpu_fps': gpu_stats['fps']
             })
@@ -842,16 +843,40 @@ def run_fullframe_benchmark():
         except Exception as e:
             print(f"  ERROR: {e}")
 
-    # Summary
+    # Summary table
     print("\n" + "=" * 80)
-    print("SUMMARY (sorted by GPU time)")
+    print("ALL RESULTS (sorted by GPU time)")
     print("=" * 80)
-    print(f"\n{'Model':<30} {'Size':<12} {'Params':>10} {'CPU ms':>10} {'GPU ms':>10} {'GPU FPS':>10}")
-    print("-" * 90)
+    print(f"\n{'Model':<35} {'Size':<12} {'Params':>10} {'CPU ms':>10} {'GPU ms':>10} {'GPU FPS':>10}")
+    print("-" * 95)
 
     for r in sorted(results, key=lambda x: x['gpu_ms'] if x['gpu_ms'] > 0 else 9999):
-        print(f"{r['name']:<30} {r['size']:<12} {r['params']:>10,} "
+        print(f"{r['name']:<35} {r['size']:<12} {r['params']:>10,} "
               f"{r['cpu_ms']:>10.2f} {r['gpu_ms']:>10.2f} {r['gpu_fps']:>10.1f}")
+
+    # Best models per resolution
+    print("\n" + "=" * 80)
+    print("BEST MODELS PER RESOLUTION")
+    print("=" * 80)
+
+    resolutions = [(128, 128), (180, 320), (720, 1280)]
+
+    for h, w in resolutions:
+        res_results = [r for r in results if r['h'] == h and r['w'] == w]
+        if not res_results:
+            continue
+
+        print(f"\n>> {w}x{h}:")
+
+        # Best CPU
+        best_cpu = min(res_results, key=lambda x: x['cpu_ms'])
+        print(f"   CPU:  {best_cpu['model_name']:<25} {best_cpu['cpu_ms']:>6.2f}ms ({best_cpu['cpu_fps']:>6.1f} FPS)")
+
+        # Best GPU
+        gpu_results = [r for r in res_results if r['gpu_ms'] > 0]
+        if gpu_results:
+            best_gpu = min(gpu_results, key=lambda x: x['gpu_ms'])
+            print(f"   GPU:  {best_gpu['model_name']:<25} {best_gpu['gpu_ms']:>6.2f}ms ({best_gpu['gpu_fps']:>6.1f} FPS)")
 
     print()
 
