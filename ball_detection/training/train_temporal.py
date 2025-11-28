@@ -34,13 +34,13 @@ DATA_DIRS = [
 OUTPUT_DIR = "./ball_detection/models"
 
 # Training
-EPOCHS = 500
-SEQUENCE_LENGTH = 30        # Stereo frames per sequence
-BATCH_SIZE = 4              # Number of sequences per batch
+EPOCHS = 100
+SEQUENCE_LENGTH = 32        # Stereo frames per sequence
+BATCH_SIZE = 4              # Number of sequences per batch (reduce if OOM)
 LEARNING_RATE = 0.001
 WARMUP_EPOCHS = 10
 WEIGHT_DECAY = 1e-4
-SAVE_INTERVAL = 50
+SAVE_INTERVAL = 10
 
 # Model
 HISTORY_LENGTH = 8          # GRU history (internal buffer for streaming)
@@ -53,8 +53,10 @@ FRAME_SKIP_PROB = 0.1       # 10% random frame skipping during training
 IMAGE_HEIGHT = 720
 IMAGE_WIDTH = 1280
 
-# TensorBoard
+# Options (for debugging/speed)
+ENABLE_AUGMENTATION = False  # Set False for faster training/debugging
 ENABLE_TENSORBOARD = True
+USE_TORCH_COMPILE = True    # Set False if experiencing crashes
 # ============================================================
 
 
@@ -205,7 +207,7 @@ def calculate_pixel_error_batch(pred, target, image_width=1280, image_height=720
     return sum_error_left, sum_error_right, valid_left_count, valid_right_count
 
 
-def train_epoch(model, data_loader, dataset, criterion, optimizer, device, epoch, use_amp=False):
+def train_epoch(model, data_loader, dataset, criterion, optimizer, device, epoch, use_amp=False, profile_batches=5):
     """Train for one epoch with sequence batching and AMP."""
     model.train()
 
@@ -224,18 +226,38 @@ def train_epoch(model, data_loader, dataset, criterion, optimizer, device, epoch
         'tp_right': 0, 'fp_right': 0, 'tn_right': 0, 'fn_right': 0,
     }
 
+    # Profiling timers (first epoch only)
+    if epoch == 1 and profile_batches > 0:
+        import time as _time
+        profile_times = {'data': [], 'transfer': [], 'forward': [], 'backward': [], 'total': []}
+    else:
+        profile_times = None
+
     # Reshuffle sequences for this epoch
     dataset.reshuffle_epoch()
 
     # Process batches of sequences via DataLoader
     pbar = tqdm(data_loader, desc=f'Epoch {epoch} Training')
+    batch_idx = 0
+    t_batch_end = None  # For measuring data loading time
 
     for frames, targets, lengths in pbar:
+        if profile_times is not None and batch_idx < profile_batches:
+            torch.cuda.synchronize()
+            t_after_data = _time.perf_counter()
+            # Data loading time = time since last batch ended
+            if t_batch_end is not None:
+                profile_times['data'].append(t_after_data - t_batch_end)
         # frames: (B, T_max, 6, H, W), targets: (B, T_max, 6), lengths: (B,)
         # Non-blocking transfer to GPU
         frames = frames.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         lengths = lengths.to(device, non_blocking=True)
+
+        if profile_times is not None and batch_idx < profile_batches:
+            torch.cuda.synchronize()
+            t_transfer_end = _time.perf_counter()
+            profile_times['transfer'].append(t_transfer_end - t_after_data)
 
         B, T_max = frames.shape[:2]
 
@@ -288,6 +310,10 @@ def train_epoch(model, data_loader, dataset, criterion, optimizer, device, epoch
                 batch_conf_loss = batch_conf_loss + conf_loss
                 num_valid_frames += mask_t.sum().item()
 
+        if profile_times is not None and batch_idx < profile_batches:
+            torch.cuda.synchronize()
+            t_forward_end = _time.perf_counter()
+
         # Backprop through entire batch of sequences
         optimizer.zero_grad()
         batch_loss.backward()
@@ -296,6 +322,32 @@ def train_epoch(model, data_loader, dataset, criterion, optimizer, device, epoch
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         optimizer.step()
+
+        if profile_times is not None and batch_idx < profile_batches:
+            torch.cuda.synchronize()
+            t_backward_end = _time.perf_counter()
+            profile_times['forward'].append(t_forward_end - t_transfer_end)
+            profile_times['backward'].append(t_backward_end - t_forward_end)
+            t_batch_end = t_backward_end  # For next iteration's data loading measurement
+
+            # Print profiling summary immediately after collecting enough samples
+            if batch_idx == profile_batches - 1:
+                print("\n" + "="*60)
+                print(f"PROFILING SUMMARY (first {profile_batches} batches)")
+                print("="*60)
+                avg_data = sum(profile_times['data']) / len(profile_times['data']) if profile_times['data'] else 0
+                avg_transfer = sum(profile_times['transfer']) / len(profile_times['transfer']) if profile_times['transfer'] else 0
+                avg_forward = sum(profile_times['forward']) / len(profile_times['forward'])
+                avg_backward = sum(profile_times['backward']) / len(profile_times['backward'])
+                avg_total = avg_data + avg_transfer + avg_forward + avg_backward
+                print(f"Data Loading:  {avg_data:.3f}s ({100*avg_data/avg_total:.1f}%)")
+                print(f"GPU Transfer:  {avg_transfer:.3f}s ({100*avg_transfer/avg_total:.1f}%)")
+                print(f"Forward Pass:  {avg_forward:.3f}s ({100*avg_forward/avg_total:.1f}%)")
+                print(f"Backward Pass: {avg_backward:.3f}s ({100*avg_backward/avg_total:.1f}%)")
+                print(f"TOTAL:         {avg_total:.3f}s per batch")
+                print("="*60 + "\n")
+
+        batch_idx += 1
 
         # === SINGLE SYNC POINT: extract metrics ===
         with torch.no_grad():
@@ -371,6 +423,23 @@ def train_epoch(model, data_loader, dataset, criterion, optimizer, device, epoch
         'recall': recall,
         'f1': f1,
     }
+
+    # Print profiling summary
+    if profile_times is not None and len(profile_times['forward']) > 0:
+        print("\n" + "="*60)
+        print("PROFILING SUMMARY (first {} batches)".format(len(profile_times['forward'])))
+        print("="*60)
+        avg_data = sum(profile_times['data']) / len(profile_times['data']) if profile_times['data'] else 0
+        avg_transfer = sum(profile_times['transfer']) / len(profile_times['transfer']) if profile_times['transfer'] else 0
+        avg_forward = sum(profile_times['forward']) / len(profile_times['forward'])
+        avg_backward = sum(profile_times['backward']) / len(profile_times['backward'])
+        avg_total = avg_data + avg_transfer + avg_forward + avg_backward
+        print(f"  Data Loading: {avg_data*1000:7.1f}ms ({100*avg_data/avg_total:5.1f}%)")
+        print(f"  GPU Transfer: {avg_transfer*1000:7.1f}ms ({100*avg_transfer/avg_total:5.1f}%)")
+        print(f"  Forward:      {avg_forward*1000:7.1f}ms ({100*avg_forward/avg_total:5.1f}%)")
+        print(f"  Backward:     {avg_backward*1000:7.1f}ms ({100*avg_backward/avg_total:5.1f}%)")
+        print(f"  TOTAL:        {avg_total*1000:7.1f}ms per batch")
+        print("="*60 + "\n")
 
     return metrics
 
@@ -561,15 +630,19 @@ def main():
     else:
         writer = None
 
-    # Create datasets
+    # Create datasets with proper train/val split by video segments
     print("Loading temporal datasets...")
+    print(f"Augmentation: {'ON' if ENABLE_AUGMENTATION else 'OFF'}")
     train_dataset = MultiTemporalDataset(
         DATA_DIRS,
         sequence_length=SEQUENCE_LENGTH,
-        use_augmentation=True,
-        frame_skip_prob=FRAME_SKIP_PROB,
+        use_augmentation=ENABLE_AUGMENTATION,
+        frame_skip_prob=FRAME_SKIP_PROB if ENABLE_AUGMENTATION else 0.0,
         image_height=IMAGE_HEIGHT,
-        image_width=IMAGE_WIDTH
+        image_width=IMAGE_WIDTH,
+        split='train',      # Use ~80% of video segments
+        val_ratio=0.2,
+        use_memmap=True     # Use preprocessed memmap (instant loading)
     )
 
     val_dataset = MultiTemporalDataset(
@@ -578,21 +651,22 @@ def main():
         use_augmentation=False,
         frame_skip_prob=0.0,  # No skipping for validation
         image_height=IMAGE_HEIGHT,
-        image_width=IMAGE_WIDTH
+        image_width=IMAGE_WIDTH,
+        split='val',        # Use ~20% of video segments (different from train!)
+        val_ratio=0.2,
+        use_memmap=True     # Use preprocessed memmap (instant loading)
     )
 
     print(f"\nTrain sequences: {len(train_dataset)}")
     print(f"Val sequences: {len(val_dataset)}")
 
-    # DataLoaders with workers for prefetching
+    # DataLoaders (num_workers=0 for WSL2 compatibility)
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,  # Dataset handles via reshuffle_epoch()
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
         collate_fn=temporal_collate_fn,
         drop_last=True  # Drop incomplete batches for consistent tensor shapes
     )
@@ -601,10 +675,8 @@ def main():
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
         collate_fn=temporal_collate_fn
     )
 
@@ -615,6 +687,11 @@ def main():
     print("\nCreating EfficientTemporalTiny...")
     model = EfficientTemporalTiny(history_length=HISTORY_LENGTH, hidden_size=HIDDEN_SIZE)
     model = model.to(device)
+
+    # Compile model for faster training (PyTorch 2.0+)
+    if USE_TORCH_COMPILE and hasattr(torch, 'compile') and device.type == 'cuda':
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model, mode='reduce-overhead')
 
     param_count = model.count_parameters()
     print(f"Parameters: {param_count:,}")
