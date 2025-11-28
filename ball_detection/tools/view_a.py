@@ -9,6 +9,9 @@ Usage:
 
 To view validation examples:
     Set MODE = "val" in the settings below
+
+For temporal stereo mode:
+    Set TEMPORAL_STEREO_MODE = True
 """
 
 import cv2
@@ -21,6 +24,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from ball_detection.core.dataset import BallDetectionDataset, ImageTearing
+from ball_detection.core.stereo_dataset import TemporalStereoDataset
 
 
 class FullFrameDataset:
@@ -220,7 +224,8 @@ class FullFrameDataset:
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
-DATA_DIR = "./ball_detection/data/final"
+DATA_DIR = "./ball_detection/data/full_dataset"
+TEMPORAL_STEREO_MODE = True  # True for temporal stereo sequences
 FULLFRAME_MODE = True  # True for 1280x720 full frames, False for 128x128 crops
 CROP_SIZE = 128  # Only used when FULLFRAME_MODE = False
 FULLFRAME_WIDTH = 1280
@@ -236,6 +241,12 @@ NUM_AUGMENTATIONS = 4  # Number of augmented versions per image (fewer for full 
 FIGSIZE = (20, 12)  # Figure size for display
 SAVE_OUTPUT = True  # Save visualization to file
 OUTPUT_PATH = "./ball_detection/augmentation_examples.png"
+
+# Temporal stereo settings
+SEQUENCE_LENGTH = 30
+FRAME_SKIP_PROB = 0.1
+REVERSE_PROB = 0.5
+TEMPORAL_FRAMES_TO_SHOW = [0, 10, 20, 29]  # Which frames in sequence to display
 # ============================================================
 
 
@@ -274,8 +285,174 @@ def draw_keypoint(img, x, y, color=(0, 255, 0), fullframe=False):
     return img
 
 
+def main_temporal_stereo():
+    """Visualize temporal stereo augmentations."""
+    print("=" * 60)
+    print("TEMPORAL STEREO AUGMENTATION VISUALIZATION")
+    print("=" * 60)
+    print(f"Data: {DATA_DIR}")
+    print(f"Sequence length: {SEQUENCE_LENGTH}")
+    print(f"Frame skip prob: {FRAME_SKIP_PROB*100:.0f}%")
+    print(f"Reverse prob: {REVERSE_PROB*100:.0f}%")
+    print(f"Frames to show: {TEMPORAL_FRAMES_TO_SHOW}")
+    print("=" * 60)
+    print()
+
+    # Create datasets
+    dataset_aug = TemporalStereoDataset(
+        DATA_DIR,
+        sequence_length=SEQUENCE_LENGTH,
+        use_augmentation=True,
+        frame_skip_prob=FRAME_SKIP_PROB,
+        reverse_prob=REVERSE_PROB
+    )
+
+    dataset_no_aug = TemporalStereoDataset(
+        DATA_DIR,
+        sequence_length=SEQUENCE_LENGTH,
+        use_augmentation=False,
+        frame_skip_prob=0.0,
+        reverse_prob=0.0
+    )
+
+    # IMPORTANT: Sync sequence_starts so both datasets use the same sequences
+    dataset_no_aug.sequence_starts = dataset_aug.sequence_starts.copy()
+
+    print(f"Dataset loaded: {len(dataset_aug)} sequences")
+    print()
+
+    # Create figure - 6 rows: original L/R, augmented A L/R, augmented B L/R
+    # Columns: frames at different time points
+    num_frames = len(TEMPORAL_FRAMES_TO_SHOW)
+    fig, axes = plt.subplots(6, num_frames, figsize=(num_frames * 5, 24))
+
+    seq_idx = 0  # Use first sequence
+
+    # Row 0: Original sequence (no augmentation) - left camera
+    frames_orig, targets_orig = dataset_no_aug[seq_idx]
+    print(f"Original sequence: {frames_orig.shape[0]} frames")
+
+    for col, t in enumerate(TEMPORAL_FRAMES_TO_SHOW):
+        if t < len(frames_orig):
+            # Left camera (first 3 channels)
+            img = denormalize(frames_orig[t, :3].numpy())
+            img = draw_keypoint_stereo(img, targets_orig[t], 'left')
+            axes[0, col].imshow(img)
+            axes[0, col].set_title(f"Original Left - Frame {t}", fontsize=10)
+        axes[0, col].axis('off')
+
+    # Row 1: Original right camera
+    for col, t in enumerate(TEMPORAL_FRAMES_TO_SHOW):
+        if t < len(frames_orig):
+            # Right camera (last 3 channels)
+            img = denormalize(frames_orig[t, 3:].numpy())
+            img = draw_keypoint_stereo(img, targets_orig[t], 'right')
+            axes[1, col].imshow(img)
+            axes[1, col].set_title(f"Original Right - Frame {t}", fontsize=10)
+        axes[1, col].axis('off')
+
+    # Get augmented version A of the SAME sequence
+    frames_aug_a, targets_aug_a = dataset_aug[seq_idx]
+    actual_len_a = frames_aug_a.shape[0]
+    print(f"Augmented A sequence: {actual_len_a} frames")
+
+    # Row 2: Augmented A left camera
+    for col, t in enumerate(TEMPORAL_FRAMES_TO_SHOW):
+        t_adj = min(t, actual_len_a - 1)
+        img = denormalize(frames_aug_a[t_adj, :3].numpy())
+        img = draw_keypoint_stereo(img, targets_aug_a[t_adj], 'left')
+        axes[2, col].imshow(img)
+        title = f"Aug A Left - Frame {t_adj}"
+        if actual_len_a < SEQUENCE_LENGTH:
+            title += f" (skipped {SEQUENCE_LENGTH - actual_len_a})"
+        axes[2, col].set_title(title, fontsize=10)
+        axes[2, col].axis('off')
+
+    # Row 3: Augmented A right camera
+    for col, t in enumerate(TEMPORAL_FRAMES_TO_SHOW):
+        t_adj = min(t, actual_len_a - 1)
+        img = denormalize(frames_aug_a[t_adj, 3:].numpy())
+        img = draw_keypoint_stereo(img, targets_aug_a[t_adj], 'right')
+        axes[3, col].imshow(img)
+        title = f"Aug A Right - Frame {t_adj}"
+        axes[3, col].set_title(title, fontsize=10)
+        axes[3, col].axis('off')
+
+    # Get augmented version B of the SAME sequence (different random augmentation)
+    frames_aug_b, targets_aug_b = dataset_aug[seq_idx]
+    actual_len_b = frames_aug_b.shape[0]
+    print(f"Augmented B sequence: {actual_len_b} frames")
+
+    # Row 4: Augmented B left camera
+    for col, t in enumerate(TEMPORAL_FRAMES_TO_SHOW):
+        t_adj = min(t, actual_len_b - 1)
+        img = denormalize(frames_aug_b[t_adj, :3].numpy())
+        img = draw_keypoint_stereo(img, targets_aug_b[t_adj], 'left')
+        axes[4, col].imshow(img)
+        title = f"Aug B Left - Frame {t_adj}"
+        if actual_len_b < SEQUENCE_LENGTH:
+            title += f" (skipped {SEQUENCE_LENGTH - actual_len_b})"
+        axes[4, col].set_title(title, fontsize=10)
+        axes[4, col].axis('off')
+
+    # Row 5: Augmented B right camera
+    for col, t in enumerate(TEMPORAL_FRAMES_TO_SHOW):
+        t_adj = min(t, actual_len_b - 1)
+        img = denormalize(frames_aug_b[t_adj, 3:].numpy())
+        img = draw_keypoint_stereo(img, targets_aug_b[t_adj], 'right')
+        axes[5, col].imshow(img)
+        title = f"Aug B Right - Frame {t_adj}"
+        axes[5, col].set_title(title, fontsize=10)
+        axes[5, col].axis('off')
+
+    plt.suptitle(
+        "Temporal Stereo Augmentation\n"
+        "Same augmentation across all frames in sequence | Green circle = ball position\n"
+        f"Frame skip: {FRAME_SKIP_PROB*100:.0f}% | Reverse: {REVERSE_PROB*100:.0f}%",
+        fontsize=14
+    )
+    plt.tight_layout()
+
+    output_path = OUTPUT_PATH.replace('.png', '_temporal.png')
+    if SAVE_OUTPUT:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print()
+        print(f"Saved visualization to: {output_path}")
+    else:
+        plt.show()
+
+    print("=" * 60)
+
+
+def draw_keypoint_stereo(img, target, camera='left'):
+    """Draw keypoint for stereo target (6 values)."""
+    img = img.copy()
+
+    if camera == 'left':
+        x, y, conf = target[0].item(), target[1].item(), target[2].item()
+    else:
+        x, y, conf = target[3].item(), target[4].item(), target[5].item()
+
+    if conf < 0.5:
+        return img  # No ball detected
+
+    x_pixel = int(x * img.shape[1])
+    y_pixel = int(y * img.shape[0])
+
+    # Draw circle and crosshair
+    cv2.circle(img, (x_pixel, y_pixel), 12, (0, 255, 0), 3)
+    cv2.line(img, (x_pixel - 25, y_pixel), (x_pixel + 25, y_pixel), (0, 255, 0), 2)
+    cv2.line(img, (x_pixel, y_pixel - 25), (x_pixel, y_pixel + 25), (0, 255, 0), 2)
+
+    return img
+
+
 def main():
     """Visualize augmentations."""
+    if TEMPORAL_STEREO_MODE:
+        main_temporal_stereo()
+        return
+
     print("=" * 60)
     print("AUGMENTATION VISUALIZATION")
     print("=" * 60)
