@@ -15,6 +15,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from ..core.model import (
@@ -24,15 +25,16 @@ from ..core.model import (
     BallDetectorFullFrameTiny,
     BallDetectorFullFrameUltra,
     BallDetectorFullFrameMobileNet,
+    BallDetectorFullFrameShuffleNet,
 )
-from ..core.dataset import create_dataloaders, create_fullframe_dataloaders
+from ..core.dataset import create_dataloaders, create_fullframe_dataloaders, create_fullframe_memmap_dataloaders
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
 # Mode: "crop" or "fullframe"
-MODE = "crop"
+MODE = "fullframe"
 
 # Model selection (depends on mode):
 #
@@ -42,12 +44,14 @@ MODE = "crop"
 #   "shufflenet" - ShuffleNetV2 x0.5 backbone
 #
 # FULLFRAME MODE (1280x720 or 320x180 input → x, y, confidence output):
-#   "tiny"     - Custom lightweight backbone (~150K params)
-#                Aggressive downsampling, depthwise separable convs
-#   "ultra"    - PixelUnshuffle + custom backbone (~138K params)
-#                Zero-compute 8x spatial reduction, very fast on GPU
-#   "mobilenet"- PixelUnshuffle + MobileNetV3-Small (~1M params)
-#                ImageNet pretrained, best fullframe accuracy
+#   "tiny"      - Custom lightweight backbone (~150K params)
+#                 Aggressive downsampling, depthwise separable convs
+#   "ultra"     - PixelUnshuffle + custom backbone (~138K params)
+#                 Zero-compute 8x spatial reduction, very fast on GPU
+#   "shufflenet"- PixelUnshuffle + ShuffleNetV2 x0.5 (~400K params)
+#                 ImageNet pretrained, fast inference
+#   "mobilenet" - PixelUnshuffle + MobileNetV3-Small (~1M params)
+#                 ImageNet pretrained, best fullframe accuracy
 #
 MODEL = "shufflenet"
 
@@ -65,8 +69,16 @@ NUM_WORKERS = 8
 TRAIN_SPLIT = 0.8
 
 # Data
-DATA_DIR = "./ball_detection/data/final"
+DATA_DIR = "./ball_detection/data/full_dataset/training_data_full"
 OUTPUT_DIR = "./ball_detection/models"
+
+# Memmap (fullframe mode only - faster loading)
+USE_MEMMAP = True
+MEMMAP_DIR = "./ball_detection/data/fullframe_memmap"
+
+# Caching (fullframe + memmap only - pre-augmented images in RAM)
+USE_CACHE = True
+CACHE_MULTIPLIER = 3  # Cache size = dataset_size * multiplier
 
 # Augmentation (crop mode only)
 USE_SPATIAL_AUG = True
@@ -110,10 +122,12 @@ def create_model(mode: str, model_name: str, pretrained: bool = True):
             return BallDetectorFullFrameTiny()
         elif model_name == "ultra":
             return BallDetectorFullFrameUltra()
+        elif model_name == "shufflenet":
+            return BallDetectorFullFrameShuffleNet(pretrained=pretrained)
         elif model_name == "mobilenet":
             return BallDetectorFullFrameMobileNet(pretrained=pretrained)
         else:
-            raise ValueError(f"Unknown fullframe model: {model_name}. Use 'tiny', 'ultra', or 'mobilenet'")
+            raise ValueError(f"Unknown fullframe model: {model_name}. Use 'tiny', 'ultra', 'shufflenet', or 'mobilenet'")
 
     else:
         raise ValueError(f"Unknown mode: {mode}. Use 'crop' or 'fullframe'")
@@ -279,10 +293,12 @@ def main():
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
-    # Create dataloaders
-    print(f"Loading data from: {DATA_DIR}")
+    # TensorBoard
+    writer = SummaryWriter(log_dir=output_dir / 'tensorboard')
 
+    # Create dataloaders
     if MODE == "crop":
+        print(f"Loading data from: {DATA_DIR}")
         train_loader, val_loader = create_dataloaders(
             data_dir=DATA_DIR,
             batch_size=BATCH_SIZE,
@@ -298,13 +314,27 @@ def main():
         pixel_size = 128
         criterion = CropLoss()
     else:  # fullframe
-        train_loader, val_loader = create_fullframe_dataloaders(
-            data_dir=DATA_DIR,
-            batch_size=BATCH_SIZE,
-            target_size=RESOLUTION,
-            train_split=TRAIN_SPLIT,
-            num_workers=NUM_WORKERS,
-        )
+        if USE_MEMMAP:
+            print(f"Loading memmap data from: {MEMMAP_DIR}")
+            if USE_CACHE:
+                print(f"Using cached augmentation (multiplier={CACHE_MULTIPLIER})")
+            train_loader, val_loader = create_fullframe_memmap_dataloaders(
+                data_dir=MEMMAP_DIR,
+                batch_size=BATCH_SIZE,
+                train_split=TRAIN_SPLIT,
+                num_workers=NUM_WORKERS,
+                use_cache=USE_CACHE,
+                cache_multiplier=CACHE_MULTIPLIER,
+            )
+        else:
+            print(f"Loading data from: {DATA_DIR}")
+            train_loader, val_loader = create_fullframe_dataloaders(
+                data_dir=DATA_DIR,
+                batch_size=BATCH_SIZE,
+                target_size=RESOLUTION,
+                train_split=TRAIN_SPLIT,
+                num_workers=NUM_WORKERS,
+            )
         # Use diagonal for pixel error (accounts for both dimensions)
         pixel_size = (RESOLUTION[0]**2 + RESOLUTION[1]**2) ** 0.5
         criterion = FullframeLoss()
@@ -374,6 +404,14 @@ def main():
             'lr': current_lr,
         })
 
+        # TensorBoard logging
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('PixelError/train', train_px_err, epoch)
+        writer.add_scalar('LearningRate', current_lr, epoch)
+        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('PixelError/val', val_px_err, epoch)
+
         # Save best models (only on validation epochs)
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
             if val_loss < best_val_loss:
@@ -440,6 +478,9 @@ def main():
 
     except Exception as e:
         print(f"ONNX export failed: {e}")
+
+    # Close TensorBoard
+    writer.close()
 
     # Summary
     print("\n" + "=" * 60)

@@ -30,12 +30,10 @@ class ImageTearing(A.ImageOnlyTransform):
         h, w = img.shape[:2]
         result = img.copy()
 
-        # Random direction: 50% horizontal, 30% vertical, 20% both
-        direction = np.random.choice(['horizontal', 'vertical', 'both'], p=[0.5, 0.3, 0.2])
-
-        if direction in ['horizontal', 'both']:
+        # Random direction: 50% horizontal, 50% vertical
+        if np.random.random() < 0.5:
             result = self._apply_horizontal_tears(result)
-        if direction in ['vertical', 'both']:
+        else:
             result = self._apply_vertical_tears(result)
 
         return result
@@ -639,6 +637,263 @@ class FullFrameDataset(Dataset):
 
         target = torch.tensor([x_norm, y_norm, confidence], dtype=torch.float32)
         return image_tensor, target
+
+
+class FullFrameMemmapDataset(Dataset):
+    """
+    Fullframe dataset using pre-processed memmap files for fast loading.
+
+    Expects:
+        data_dir/images.npy  - (N, H, W, 3) uint8
+        data_dir/labels.npy  - (N, 3) float32 [x_norm, y_norm, valid]
+    """
+
+    # ImageNet normalization
+    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    def __init__(self, data_dir, use_augmentation=True, indices=None):
+        self.data_dir = Path(data_dir)
+        self.use_augmentation = use_augmentation
+
+        # Load memmap arrays
+        self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
+        self.labels = np.load(self.data_dir / "labels.npy", mmap_mode='r')
+
+        self.n_samples, self.height, self.width, _ = self.images.shape
+
+        # Use subset if indices provided
+        self.indices = indices if indices is not None else list(range(self.n_samples))
+
+        print(f"FullFrameMemmapDataset: {len(self.indices)} samples, {self.width}x{self.height}")
+
+        # Augmentation
+        self.transform = self._get_transforms()
+
+    def _get_transforms(self):
+        transforms_list = []
+
+        if self.use_augmentation:
+            transforms_list.extend([
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
+                                   border_mode=cv2.BORDER_CONSTANT, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
+            ])
+
+        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+
+        # Load from memmap (already RGB, already resized)
+        image = np.array(self.images[real_idx])  # Copy from memmap
+        label = self.labels[real_idx]
+
+        x_norm, y_norm, valid = label[0], label[1], label[2]
+
+        # Convert normalized coords to pixel coords for augmentation
+        ball_x = x_norm * self.width
+        ball_y = y_norm * self.height
+
+        # Apply augmentations
+        if self.use_augmentation:
+            transformed = self.transform(image=image, keypoints=[(ball_x, ball_y)])
+            image = transformed['image']
+            if len(transformed['keypoints']) > 0:
+                ball_x, ball_y = transformed['keypoints'][0]
+
+        # Back to normalized
+        x_norm = np.clip(ball_x / self.width, 0.0, 1.0)
+        y_norm = np.clip(ball_y / self.height, 0.0, 1.0)
+
+        # Convert to tensor and normalize
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        image_tensor = (image_tensor - self.MEAN) / self.STD
+
+        target = torch.tensor([x_norm, y_norm, valid], dtype=torch.float32)
+        return image_tensor, target
+
+
+class CachedFullFrameMemmapDataset(Dataset):
+    """
+    Cached fullframe dataset with pre-augmented images in RAM.
+
+    Background thread continuously refreshes cache with new augmented versions.
+    Maximizes GPU utilization by eliminating CPU augmentation bottleneck.
+    """
+
+    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    def __init__(self, data_dir, indices=None, cache_multiplier=3, max_reuse=2):
+        """
+        Args:
+            data_dir: Path to memmap data
+            indices: Subset of indices to use
+            cache_multiplier: Cache size = len(indices) * multiplier
+            max_reuse: Refresh item after N uses
+        """
+        import threading
+        import queue
+
+        self.data_dir = Path(data_dir)
+
+        # Load memmap
+        self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
+        self.labels = np.load(self.data_dir / "labels.npy", mmap_mode='r')
+        self.n_samples, self.height, self.width, _ = self.images.shape
+
+        self.indices = indices if indices is not None else list(range(self.n_samples))
+        self.cache_multiplier = cache_multiplier
+        self.max_reuse = max_reuse
+
+        # Cache storage
+        self.cache_size = len(self.indices) * cache_multiplier
+        self.cache_images = torch.zeros(self.cache_size, 3, self.height, self.width, dtype=torch.float32)
+        self.cache_labels = torch.zeros(self.cache_size, 3, dtype=torch.float32)
+        self.cache_use_count = np.zeros(self.cache_size, dtype=np.int32)
+        self.cache_lock = threading.Lock()
+
+        # Augmentation
+        self.transform = A.Compose([
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
+                               border_mode=cv2.BORDER_CONSTANT, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+        # Fill cache initially
+        print(f"CachedFullFrameMemmapDataset: {len(self.indices)} samples, cache={self.cache_size}")
+        print("Filling cache...", end=" ", flush=True)
+        for i in range(self.cache_size):
+            self._refresh_cache_item(i)
+        print("done")
+
+        # Background refresh thread
+        self.refresh_queue = queue.Queue()
+        self.stop_flag = threading.Event()
+        self.refresh_thread = threading.Thread(target=self._refresh_worker, daemon=True)
+        self.refresh_thread.start()
+
+    def _augment_sample(self, idx):
+        """Augment a single sample."""
+        real_idx = self.indices[idx % len(self.indices)]
+        image = np.array(self.images[real_idx])
+        label = self.labels[real_idx]
+
+        x_norm, y_norm, valid = label[0], label[1], label[2]
+        ball_x, ball_y = x_norm * self.width, y_norm * self.height
+
+        transformed = self.transform(image=image, keypoints=[(ball_x, ball_y)])
+        image = transformed['image']
+        if len(transformed['keypoints']) > 0:
+            ball_x, ball_y = transformed['keypoints'][0]
+
+        x_norm = np.clip(ball_x / self.width, 0.0, 1.0)
+        y_norm = np.clip(ball_y / self.height, 0.0, 1.0)
+
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        image_tensor = (image_tensor - self.MEAN) / self.STD
+
+        return image_tensor, torch.tensor([x_norm, y_norm, valid], dtype=torch.float32)
+
+    def _refresh_cache_item(self, cache_idx):
+        """Refresh a single cache item."""
+        source_idx = np.random.randint(0, len(self.indices))
+        img, lbl = self._augment_sample(source_idx)
+        with self.cache_lock:
+            self.cache_images[cache_idx] = img
+            self.cache_labels[cache_idx] = lbl
+            self.cache_use_count[cache_idx] = 0
+
+    def _refresh_worker(self):
+        """Background thread that refreshes stale cache items."""
+        while not self.stop_flag.is_set():
+            try:
+                cache_idx = self.refresh_queue.get(timeout=0.1)
+                self._refresh_cache_item(cache_idx)
+            except:
+                pass
+
+    def __len__(self):
+        return self.cache_size
+
+    def __getitem__(self, idx):
+        cache_idx = idx % self.cache_size
+
+        with self.cache_lock:
+            img = self.cache_images[cache_idx].clone()
+            lbl = self.cache_labels[cache_idx].clone()
+            self.cache_use_count[cache_idx] += 1
+
+            if self.cache_use_count[cache_idx] >= self.max_reuse:
+                self.refresh_queue.put(cache_idx)
+
+        return img, lbl
+
+    def __del__(self):
+        self.stop_flag.set()
+
+
+def create_fullframe_memmap_dataloaders(data_dir, batch_size=128, train_split=0.8, num_workers=8, use_cache=False, cache_multiplier=3):
+    """
+    Create dataloaders from memmap dataset.
+
+    Args:
+        use_cache: If True, use cached pre-augmented dataset (faster, uses more RAM)
+        cache_multiplier: Cache size = dataset_size * multiplier
+    """
+    # Get total samples
+    images = np.load(Path(data_dir) / "images.npy", mmap_mode='r')
+    n_samples = len(images)
+    del images
+
+    # Split indices
+    train_size = int(train_split * n_samples)
+    all_indices = list(range(n_samples))
+    np.random.seed(42)
+    np.random.shuffle(all_indices)
+
+    train_indices = all_indices[:train_size]
+    val_indices = all_indices[train_size:]
+
+    # Create datasets
+    if use_cache:
+        train_dataset = CachedFullFrameMemmapDataset(
+            data_dir, indices=train_indices, cache_multiplier=cache_multiplier
+        )
+        # Validation never uses cache (no augmentation needed)
+        val_dataset = FullFrameMemmapDataset(data_dir, use_augmentation=False, indices=val_indices)
+        # Cached dataset handles augmentation internally, use fewer workers
+        train_workers = 0
+    else:
+        train_dataset = FullFrameMemmapDataset(data_dir, use_augmentation=True, indices=train_indices)
+        val_dataset = FullFrameMemmapDataset(data_dir, use_augmentation=False, indices=val_indices)
+        train_workers = num_workers
+
+    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=train_workers, pin_memory=True,
+        persistent_workers=train_workers > 0, drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers // 2 if num_workers > 0 else 0,
+        pin_memory=True, drop_last=False
+    )
+
+    return train_loader, val_loader
 
 
 def create_fullframe_dataloaders(data_dir, batch_size=16, target_size=(320, 180),

@@ -37,6 +37,7 @@ from ball_detection.core.model import (
     BallDetectorShuffleNetV2,
     BallDetectorFullFrameTiny,
     BallDetectorFullFrameUltra,
+    BallDetectorFullFrameShuffleNet,
     BallDetectorFullFrameMobileNet,
 )
 
@@ -745,15 +746,16 @@ def run_fullframe_benchmark():
 
     # All models to test (matching train.py)
     # CROP MODE: cnn, mobilenet, shufflenet
-    # FULLFRAME MODE: tiny, ultra, mobilenet
+    # FULLFRAME MODE: tiny, ultra, shufflenet, mobilenet
     models = {
         # Crop models (128x128)
         'cnn': BallDetectorCNN,
         'mobilenet-crop': lambda: BallDetectorMobileNetV3(pretrained=False),
-        'shufflenet': lambda: BallDetectorShuffleNetV2(pretrained=False),
+        'shufflenet-crop': lambda: BallDetectorShuffleNetV2(pretrained=False),
         # Fullframe models (320x180, 1280x720)
         'tiny': BallDetectorFullFrameTiny,
         'ultra': BallDetectorFullFrameUltra,
+        'shufflenet-fullframe': lambda: BallDetectorFullFrameShuffleNet(pretrained=False),
         'mobilenet-fullframe': lambda: BallDetectorFullFrameMobileNet(pretrained=False),
     }
 
@@ -881,7 +883,7 @@ if __name__ == "__main__":
     try:
         print("\n" + "=" * 80)
         print("BALL DETECTION MODEL BENCHMARK")
-        print("6 models x 3 resolutions = 18 tests")
+        print("7 models x 3 resolutions = 21 tests")
         print("=" * 80 + "\n")
 
         run_fullframe_benchmark()

@@ -15,9 +15,9 @@ from tqdm import tqdm
 # ============================================================
 # SETTINGS - Edit these
 # ============================================================
-MASKS_DIR = "./ball_detection/auto_labeled/masks"
-SOURCE_IMAGES_DIR = "./ball_detection/training_data/images"
-OUTPUT_DIR = "./ball_detection/training_data_full"
+MASKS_DIR = "./ball_detection/data/full_dataset/auto_labeled/masks"
+SOURCE_IMAGES_DIR = "./ball_detection/data/full_dataset/images"
+OUTPUT_DIR = "./ball_detection/data/full_dataset/training_data_full"
 MIN_AREA = 50  # Minimum mask area to be considered valid
 # ============================================================
 

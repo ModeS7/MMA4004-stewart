@@ -635,6 +635,68 @@ class BallDetectorFullFrameMobileNet(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class BallDetectorFullFrameShuffleNet(nn.Module):
+    """
+    ShuffleNetV2 x0.5 for fullframe detection with 3 outputs.
+
+    Same as BallDetectorShuffleNetV2 but outputs (x, y, confidence).
+    Works on any input size due to AdaptiveAvgPool2d.
+
+    Total Parameters: ~355K
+    Input: Any size (e.g., 320x180, 1280x720)
+    Output: (x, y, confidence)
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        # Load ShuffleNetV2 x0.5 with pretrained weights
+        if pretrained:
+            weights = models.ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+
+        shufflenet = models.shufflenet_v2_x0_5(weights=weights)
+
+        # Extract feature extractor (everything except fc)
+        self.conv1 = shufflenet.conv1
+        self.maxpool = shufflenet.maxpool
+        self.stage2 = shufflenet.stage2
+        self.stage3 = shufflenet.stage3
+        self.stage4 = shufflenet.stage4
+        self.conv5 = shufflenet.conv5
+
+        # ShuffleNetV2 x0.5 outputs 1024 channels after conv5
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(1024, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 3)  # (x, y, confidence)
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.conv5(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        x = torch.sigmoid(x)
+
+        return x
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class BallDetectorFullFrameMobileNetLite(nn.Module):
     """
     Lightweight full-frame detector with partial MobileNetV3 backbone.
