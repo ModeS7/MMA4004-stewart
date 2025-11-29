@@ -26,6 +26,13 @@ PLATFORM_VERSION = 'V2'  # Options: 'V1' (200x200mm square) or 'V2' (larger plat
 CAMERA_TYPE = 'STEREO'  # Options: 'PIXY2' or 'STEREO'
 
 # ============================================================================
+# DETECTION MODE (for STEREO camera type)
+# ============================================================================
+# 'ROI_CNN'    - Old pipeline: HSV color ROI extraction + 128x128 CNN refinement
+# 'STEREO_NN'  - New pipeline: tiny_stereo (320x180) + optional 128x128 refinement
+DETECTION_MODE = 'STEREO_NN'
+
+# ============================================================================
 # DEBUG OPTIONS
 # ============================================================================
 DEBUG_DETECTION_TIMING = False   # Print detection timing breakdown (ROI, prep, CNN)

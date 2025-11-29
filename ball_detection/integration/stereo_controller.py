@@ -18,7 +18,10 @@ import sys
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 
-from core.utils import StereoCameraConfig, StereoDetectionConfig, DEBUG_DETECTION_TIMING, DEBUG_TIMING_INTERVAL
+from core.utils import (
+    StereoCameraConfig, StereoDetectionConfig,
+    DEBUG_DETECTION_TIMING, DEBUG_TIMING_INTERVAL, DETECTION_MODE
+)
 from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
 from ball_detection.utils.calibration import load_stereo_calibration
 from ball_detection.utils.coordinate_transform import load_platform_transform, apply_platform_transform
@@ -185,16 +188,31 @@ class StereoCameraController:
             self.frame_width = width
             self.frame_height = height
 
-            # Initialize stereo ball detector
-            print(f"Initializing stereo ball detector...")
-            from ball_detection.core.detector import StereoBallDetector
-            self.detector = StereoBallDetector(
-                stereo_model_path=StereoDetectionConfig.STEREO_MODEL_PATH,
-                crop_model_path=StereoDetectionConfig.CROP_MODEL_PATH if StereoDetectionConfig.USE_REFINEMENT else None,
-                use_gpu=StereoDetectionConfig.USE_GPU,
-                confidence_threshold=StereoDetectionConfig.CONFIDENCE_THRESHOLD,
-                use_refinement=StereoDetectionConfig.USE_REFINEMENT
-            )
+            # Initialize ball detector based on DETECTION_MODE
+            self.detection_mode = DETECTION_MODE
+            print(f"Detection mode: {self.detection_mode}")
+
+            if self.detection_mode == 'STEREO_NN':
+                # New pipeline: tiny_stereo + optional refinement
+                print(f"Initializing stereo neural network detector...")
+                from ball_detection.core.detector import StereoBallDetector
+                self.detector = StereoBallDetector(
+                    stereo_model_path=StereoDetectionConfig.STEREO_MODEL_PATH,
+                    crop_model_path=StereoDetectionConfig.CROP_MODEL_PATH if StereoDetectionConfig.USE_REFINEMENT else None,
+                    use_gpu=StereoDetectionConfig.USE_GPU,
+                    confidence_threshold=StereoDetectionConfig.CONFIDENCE_THRESHOLD,
+                    use_refinement=StereoDetectionConfig.USE_REFINEMENT
+                )
+            else:  # ROI_CNN
+                # Old pipeline: ROI extraction + CNN
+                print(f"Initializing ROI + CNN detector...")
+                from ball_detection.core.detector import BallDetector
+                self.detector = BallDetector(
+                    onnx_model_path=self.model_path,
+                    use_gpu=self.use_gpu,
+                    crop_size=StereoCameraConfig.CROP_SIZE,
+                    confidence_threshold=StereoCameraConfig.CONFIDENCE_THRESHOLD
+                )
 
             # Start frame grabber thread (continuously reads frames)
             self.running = True
@@ -386,12 +404,6 @@ class StereoCameraController:
                 right_frame = frame[:, width//2:]
                 t_split = time.perf_counter()
 
-                # Run stereo ball detection (both frames at once)
-                detection_result = self.detector.detect_stereo(left_frame, right_frame)
-                t_detect = time.perf_counter()
-                timing = detection_result['timing']
-                t_rectify = t_detect  # Default (no rectification if no detection)
-
                 # Build ball data
                 ball_data = {
                     'timestamp': time.time(),
@@ -404,67 +416,111 @@ class StereoCameraController:
                     'confidence': 0.0
                 }
 
-                # Check if we have stereo detection
-                if detection_result['detected']:
-                    self.stereo_pair_count += 1
+                # Run detection based on mode
+                if self.detection_mode == 'STEREO_NN':
+                    # New pipeline: stereo neural network
+                    detection_result = self.detector.detect_stereo(left_frame, right_frame)
+                    t_detect = time.perf_counter()
+                    timing = detection_result['timing']
+                    t_rectify = t_detect
 
-                    x_left = detection_result['x_left']
-                    y_left = detection_result['y_left']
-                    x_right = detection_result['x_right']
-                    y_right = detection_result['y_right']
-                    confidence = detection_result['confidence']
-
-                    # Rectify detected point coordinates (instead of full-frame rectification)
-                    left_rectified = self._rectify_point((x_left, y_left), 'left')
-                    right_rectified = self._rectify_point((x_right, y_right), 'right')
-                    t_rectify = time.perf_counter()
-
-                    # Triangulate 3D point using rectified coordinates
-                    point_3d = self._triangulate_3d_point(
-                        left_rectified,
-                        right_rectified
-                    )
-
-                    if point_3d is not None:
-                        self.triangulation_count += 1
-
-                        # Apply platform transformation if available
-                        if self.platform_transform is not None:
-                            R, T = self.platform_transform
-                            point_3d = apply_platform_transform(point_3d, R, T)
-
-                        ball_data = {
-                            'timestamp': time.time(),
-                            'x': float(point_3d[0]),
-                            'y': float(point_3d[1]),
-                            'z': float(point_3d[2]),
-                            'detected': True,
-                            'error_x': 0.0,
-                            'error_y': 0.0,
-                            'confidence': confidence
-                        }
-                        self.detection_count += 1
-
-                # Timing debug output
-                t_end = time.perf_counter()
-                if debug_timing and self.frame_count % timing_interval == 0:
-                    total_ms = (t_end - loop_start) * 1000
-                    get_frame_ms = (t_get_frame - loop_start) * 1000
-                    split_ms = (t_split - t_get_frame) * 1000
-                    detect_ms = (t_detect - t_split) * 1000
-                    rectify_ms = (t_rectify - t_detect) * 1000
-                    rest_ms = (t_end - t_rectify) * 1000
-
-                    print(f"[Frame {self.frame_count}] Total: {total_ms:.1f}ms | "
-                          f"stereo: {timing['stereo_ms']:.1f} | refine_L: {timing['refine_L_ms']:.1f} | "
-                          f"refine_R: {timing['refine_R_ms']:.1f} | tri: {rectify_ms + rest_ms:.1f} | "
-                          f"grabber: {self.grabber_fps:.1f}fps")
                     if detection_result['detected']:
-                        print(f"  conf={detection_result['confidence']:.2f} | "
-                              f"L: ({detection_result['x_left']:.0f}, {detection_result['y_left']:.0f}) | "
-                              f"R: ({detection_result['x_right']:.0f}, {detection_result['y_right']:.0f})")
-                    else:
-                        print(f"  No detection (conf={detection_result['confidence']:.2f})")
+                        self.stereo_pair_count += 1
+                        x_left, y_left = detection_result['x_left'], detection_result['y_left']
+                        x_right, y_right = detection_result['x_right'], detection_result['y_right']
+                        confidence = detection_result['confidence']
+
+                        # Rectify and triangulate
+                        left_rectified = self._rectify_point((x_left, y_left), 'left')
+                        right_rectified = self._rectify_point((x_right, y_right), 'right')
+                        t_rectify = time.perf_counter()
+
+                        point_3d = self._triangulate_3d_point(left_rectified, right_rectified)
+                        if point_3d is not None:
+                            self.triangulation_count += 1
+                            if self.platform_transform is not None:
+                                R, T = self.platform_transform
+                                point_3d = apply_platform_transform(point_3d, R, T)
+                            ball_data = {
+                                'timestamp': time.time(),
+                                'x': float(point_3d[0]),
+                                'y': float(point_3d[1]),
+                                'z': float(point_3d[2]),
+                                'detected': True,
+                                'error_x': 0.0,
+                                'error_y': 0.0,
+                                'confidence': confidence
+                            }
+                            self.detection_count += 1
+
+                    # Debug output for STEREO_NN mode
+                    t_end = time.perf_counter()
+                    if debug_timing and self.frame_count % timing_interval == 0:
+                        total_ms = (t_end - loop_start) * 1000
+                        rectify_ms = (t_rectify - t_detect) * 1000
+                        rest_ms = (t_end - t_rectify) * 1000
+                        print(f"[Frame {self.frame_count}] Total: {total_ms:.1f}ms | "
+                              f"stereo: {timing['stereo_ms']:.1f} | refine_L: {timing['refine_L_ms']:.1f} | "
+                              f"refine_R: {timing['refine_R_ms']:.1f} | tri: {rectify_ms + rest_ms:.1f} | "
+                              f"grabber: {self.grabber_fps:.1f}fps")
+                        if detection_result['detected']:
+                            print(f"  conf={detection_result['confidence']:.2f} | "
+                                  f"L: ({detection_result['x_left']:.0f}, {detection_result['y_left']:.0f}) | "
+                                  f"R: ({detection_result['x_right']:.0f}, {detection_result['y_right']:.0f})")
+                        else:
+                            print(f"  No detection (conf={detection_result['confidence']:.2f})")
+
+                else:  # ROI_CNN mode
+                    # Old pipeline: ROI extraction + CNN
+                    result_left, timing_left = self.detector.detect_with_timing(left_frame)
+                    t_detect_left = time.perf_counter()
+                    result_right, timing_right = self.detector.detect_with_timing(right_frame)
+                    t_detect_right = time.perf_counter()
+                    t_rectify = t_detect_right
+
+                    if result_left is not None and result_right is not None:
+                        self.stereo_pair_count += 1
+                        x_left, y_left, conf_left = result_left
+                        x_right, y_right, conf_right = result_right
+
+                        left_rectified = self._rectify_point((x_left, y_left), 'left')
+                        right_rectified = self._rectify_point((x_right, y_right), 'right')
+                        t_rectify = time.perf_counter()
+
+                        point_3d = self._triangulate_3d_point(left_rectified, right_rectified)
+                        if point_3d is not None:
+                            self.triangulation_count += 1
+                            if self.platform_transform is not None:
+                                R, T = self.platform_transform
+                                point_3d = apply_platform_transform(point_3d, R, T)
+                            ball_data = {
+                                'timestamp': time.time(),
+                                'x': float(point_3d[0]),
+                                'y': float(point_3d[1]),
+                                'z': float(point_3d[2]),
+                                'detected': True,
+                                'error_x': 0.0,
+                                'error_y': 0.0,
+                                'confidence': min(conf_left, conf_right)
+                            }
+                            self.detection_count += 1
+
+                    # Debug output for ROI_CNN mode
+                    t_end = time.perf_counter()
+                    if debug_timing and self.frame_count % timing_interval == 0:
+                        total_ms = (t_end - loop_start) * 1000
+                        get_frame_ms = (t_get_frame - loop_start) * 1000
+                        split_ms = (t_split - t_get_frame) * 1000
+                        detect_l_ms = (t_detect_left - t_split) * 1000
+                        detect_r_ms = (t_detect_right - t_detect_left) * 1000
+                        rectify_ms = (t_rectify - t_detect_right) * 1000
+                        rest_ms = (t_end - t_rectify) * 1000
+                        print(f"[Frame {self.frame_count}] Total: {total_ms:.1f}ms | "
+                              f"get: {get_frame_ms:.1f} | split: {split_ms:.1f} | "
+                              f"detect_L: {detect_l_ms:.1f} | detect_R: {detect_r_ms:.1f} | "
+                              f"pt_rect: {rectify_ms:.1f} | rest: {rest_ms:.1f} | grabber: {self.grabber_fps:.1f}fps")
+                        print(f"  L: roi={timing_left['roi_ms']:.1f} prep={timing_left['preprocess_ms']:.1f} cnn={timing_left['inference_ms']:.1f} | "
+                              f"R: roi={timing_right['roi_ms']:.1f} prep={timing_right['preprocess_ms']:.1f} cnn={timing_right['inference_ms']:.1f}")
 
                 # Put in queue (non-blocking, drop oldest if full)
                 if self.ball_data_queue.full():
