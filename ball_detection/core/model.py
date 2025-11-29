@@ -460,6 +460,80 @@ class BallDetectorFullFrameTiny(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class BallDetectorFullFrameTinyStereo(nn.Module):
+    """
+    Stereo version of BallDetectorFullFrameTiny.
+
+    Takes 6-channel input (left RGB + right RGB) and outputs 5 values:
+    (x_left, y_left, x_right, y_right, confidence)
+
+    Input: (batch, 6, H, W) - left RGB concatenated with right RGB
+    Output: (batch, 5) - normalized coordinates for both views + confidence
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Very aggressive stem: 1280x720 -> 80x45 (16x reduction)
+        # Modified to accept 6 channels instead of 3
+        self.stem = nn.Sequential(
+            # 1280x720 -> 320x180
+            nn.Conv2d(6, 16, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            # 320x180 -> 80x45
+            nn.Conv2d(16, 32, kernel_size=5, stride=4, padding=2, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Tiny backbone (same as non-stereo)
+        self.backbone = nn.Sequential(
+            # 80x45 -> 40x23
+            self._make_block(32, 64, stride=2),
+            # 40x23 -> 20x12
+            self._make_block(64, 128, stride=2),
+            # 20x12 -> 10x6
+            self._make_block(128, 256, stride=2),
+            # Refine
+            self._make_block(256, 256, stride=1),
+        )
+
+        # Regression head - 5 outputs instead of 3
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 5)  # x_left, y_left, x_right, y_right, confidence
+        )
+
+    def _make_block(self, in_ch, out_ch, stride):
+        """Depthwise separable conv block for efficiency."""
+        return nn.Sequential(
+            # Depthwise
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            nn.ReLU(inplace=True),
+            # Pointwise
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        x = torch.sigmoid(x)
+        return x
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class BallDetectorFullFrameUltra(nn.Module):
     """
     Maximum efficiency full-frame detector using PixelUnshuffle.
@@ -842,6 +916,12 @@ if __name__ == "__main__":
         ("BallDetectorFullFrameMobileNetLite", BallDetectorFullFrameMobileNetLite(pretrained=False)),
     ]
 
+    # Stereo models (6-channel input)
+    stereo_input = torch.randn(batch_size, 6, 720, 1280)
+    stereo_models = [
+        ("BallDetectorFullFrameTinyStereo", BallDetectorFullFrameTinyStereo()),
+    ]
+
     print()
     print("=" * 60)
     print("FULL-FRAME MODELS (1280x720 input)")
@@ -854,6 +934,19 @@ if __name__ == "__main__":
             output = model(fullframe_input)
         print(f"{name}: {param_count:,} params, output shape: {output.shape}")
         print(f"  Output: x={output[0, 0]:.4f}, y={output[0, 1]:.4f}, conf={output[0, 2]:.4f}")
+
+    print()
+    print("=" * 60)
+    print("STEREO MODELS (6-channel input)")
+    print("=" * 60)
+
+    for name, model in stereo_models:
+        model.eval()
+        param_count = model.count_parameters()
+        with torch.no_grad():
+            output = model(stereo_input)
+        print(f"{name}: {param_count:,} params, output shape: {output.shape}")
+        print(f"  Output: x_l={output[0, 0]:.4f}, y_l={output[0, 1]:.4f}, x_r={output[0, 2]:.4f}, y_r={output[0, 3]:.4f}, conf={output[0, 4]:.4f}")
 
     print()
     print("All model tests successful!")

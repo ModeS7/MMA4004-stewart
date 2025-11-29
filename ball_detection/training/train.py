@@ -27,6 +27,7 @@ from ..core.model import (
     BallDetectorMobileNetV3,
     BallDetectorShuffleNetV2,
     BallDetectorFullFrameTiny,
+    BallDetectorFullFrameTinyStereo,
     BallDetectorFullFrameUltra,
     BallDetectorFullFrameMobileNet,
     BallDetectorFullFrameShuffleNet,
@@ -36,6 +37,7 @@ from ..core.dataset import (
     create_fullframe_dataloaders,
     create_fullframe_memmap_dataloaders,
     create_crop_memmap_dataloaders,
+    create_stereo_memmap_dataloaders,
 )
 
 # ============================================================
@@ -62,6 +64,10 @@ MODEL = "tiny"
 
 # Resolution for fullframe mode (width, height)
 RESOLUTION = (320, 180)
+
+# Stereo mode (uses left+right pairs, 6-channel input)
+USE_STEREO = False
+STEREO_MEMMAP_DIR = "./ball_detection/data/stereo_memmap"
 
 # Training parameters
 EPOCHS = 500
@@ -117,7 +123,7 @@ TENSORBOARD_HISTOGRAM_INTERVAL = 100
 # MODEL FACTORY
 # ============================================================
 
-def create_model(mode: str, model_name: str, pretrained: bool = True):
+def create_model(mode: str, model_name: str, pretrained: bool = True, stereo: bool = False):
     """Create model based on mode and name."""
     if mode == "crop":
         if model_name == "cnn":
@@ -130,6 +136,14 @@ def create_model(mode: str, model_name: str, pretrained: bool = True):
             raise ValueError(f"Unknown crop model: {model_name}")
 
     elif mode == "fullframe":
+        # Stereo mode uses special model
+        if stereo:
+            if model_name == "tiny":
+                return BallDetectorFullFrameTinyStereo()
+            else:
+                raise ValueError(f"Stereo mode only supports 'tiny' model, got: {model_name}")
+
+        # Non-stereo models
         if model_name == "tiny":
             return BallDetectorFullFrameTiny()
         elif model_name == "ultra":
@@ -205,6 +219,84 @@ class FullframeLoss(nn.Module):
             if outlier_mask.any():
                 # Quadratic penalty for how much they exceed tolerance
                 excess = distances[outlier_mask] - self.tolerance
+                outlier_loss = (excess ** 2).mean()
+            else:
+                outlier_loss = torch.tensor(0.0, device=pred.device)
+        else:
+            coord_loss = torch.tensor(0.0, device=pred.device)
+            outlier_loss = torch.tensor(0.0, device=pred.device)
+
+        self.last_conf_loss = conf_loss.item()
+        self.last_coord_loss = coord_loss.item() if torch.is_tensor(coord_loss) else coord_loss
+        self.last_outlier_loss = outlier_loss.item() if torch.is_tensor(outlier_loss) else outlier_loss
+
+        total = (self.conf_weight * conf_loss +
+                 self.coord_weight * coord_loss +
+                 self.outlier_weight * outlier_loss)
+
+        return total
+
+
+class StereoFullframeLoss(nn.Module):
+    """
+    Stereo fullframe loss for 5-output model.
+
+    Inputs:
+        pred: (batch, 5) - [x_left, y_left, x_right, y_right, confidence]
+        target: (batch, 5) - [x_left, y_left, x_right, y_right, confidence]
+
+    Loss:
+        - BCE on confidence (index 4)
+        - Coordinate loss for all 4 coords when confidence > 0.5
+        - Outlier penalty for large errors
+    """
+    def __init__(self, resolution=(320, 180), tolerance_px=10, conf_weight=2.0, coord_weight=1.0, outlier_weight=5.0):
+        super().__init__()
+        self.bce = nn.BCELoss()
+        self.conf_weight = conf_weight
+        self.coord_weight = coord_weight
+        self.outlier_weight = outlier_weight
+
+        # Normalize tolerance to [0,1] range
+        avg_size = (resolution[0] + resolution[1]) / 2
+        self.tolerance = tolerance_px / avg_size
+
+        # Store for logging
+        self.last_coord_loss = 0
+        self.last_conf_loss = 0
+        self.last_outlier_loss = 0
+
+    def forward(self, pred, target):
+        # Confidence loss (index 4)
+        conf_loss = self.bce(pred[:, 4], target[:, 4])
+
+        # Only compute coord loss for positive samples (confidence > 0.5)
+        positive_mask = target[:, 4] > 0.5
+
+        if positive_mask.any():
+            # Left coordinates (indices 0, 1)
+            pred_left = pred[positive_mask, :2]
+            target_left = target[positive_mask, :2]
+
+            # Right coordinates (indices 2, 3)
+            pred_right = pred[positive_mask, 2:4]
+            target_right = target[positive_mask, 2:4]
+
+            # Coordinate errors for both
+            diff_left = pred_left - target_left
+            diff_right = pred_right - target_right
+
+            dist_left = torch.sqrt((diff_left ** 2).sum(dim=1) + 1e-8)
+            dist_right = torch.sqrt((diff_right ** 2).sum(dim=1) + 1e-8)
+
+            # Base coord loss (MSE-like)
+            coord_loss = (diff_left ** 2).mean() + (diff_right ** 2).mean()
+
+            # Outlier penalty for both views
+            all_distances = torch.cat([dist_left, dist_right])
+            outlier_mask = all_distances > self.tolerance
+            if outlier_mask.any():
+                excess = all_distances[outlier_mask] - self.tolerance
                 outlier_loss = (excess ** 2).mean()
             else:
                 outlier_loss = torch.tensor(0.0, device=pred.device)
@@ -373,7 +465,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, pixel_si
     return avg_loss, avg_pixel_error
 
 
-def validate(model, dataloader, criterion, device, pixel_size):
+def validate(model, dataloader, criterion, device, pixel_size, stereo=False):
     """Validate model. Returns avg_loss, avg_pixel_error, worst_pixel_error, p98_pixel_error."""
     model.eval()
     total_loss = 0
@@ -395,22 +487,43 @@ def validate(model, dataloader, criterion, device, pixel_size):
             outputs = model(images)
             loss = criterion(outputs, targets)
 
-            # Calculate per-sample pixel errors
-            pred_pixels = outputs[:, :2] * scale
-            target_pixels = targets[:, :2] * scale
-            diff = pred_pixels - target_pixels
-            distances = torch.sqrt((diff ** 2).sum(dim=1))
+            if stereo:
+                # Stereo mode: pool left and right errors together
+                # targets: [x_left, y_left, x_right, y_right, confidence]
+                positive_mask = targets[:, 4] > 0.5
 
-            # Fullframe mode: only count positive samples (confidence > 0.5)
-            # Crop mode: all samples are positive (ball always visible in crop)
-            if targets.shape[1] > 2:
-                positive_mask = targets[:, 2] > 0.5
                 if positive_mask.any():
-                    valid_errors = distances[positive_mask]
+                    # Left errors
+                    pred_left = outputs[positive_mask, :2] * scale
+                    target_left = targets[positive_mask, :2] * scale
+                    dist_left = torch.sqrt(((pred_left - target_left) ** 2).sum(dim=1))
+
+                    # Right errors
+                    pred_right = outputs[positive_mask, 2:4] * scale
+                    target_right = targets[positive_mask, 2:4] * scale
+                    dist_right = torch.sqrt(((pred_right - target_right) ** 2).sum(dim=1))
+
+                    # Pool all errors together
+                    valid_errors = torch.cat([dist_left, dist_right])
                 else:
                     valid_errors = None
             else:
-                valid_errors = distances
+                # Non-stereo mode (original logic)
+                pred_pixels = outputs[:, :2] * scale
+                target_pixels = targets[:, :2] * scale
+                diff = pred_pixels - target_pixels
+                distances = torch.sqrt((diff ** 2).sum(dim=1))
+
+                # Fullframe mode: only count positive samples (confidence > 0.5)
+                # Crop mode: all samples are positive (ball always visible in crop)
+                if targets.shape[1] > 2:
+                    positive_mask = targets[:, 2] > 0.5
+                    if positive_mask.any():
+                        valid_errors = distances[positive_mask]
+                    else:
+                        valid_errors = None
+                else:
+                    valid_errors = distances
 
             if valid_errors is not None and len(valid_errors) > 0:
                 max_error = valid_errors.max().item()
@@ -449,6 +562,8 @@ def main():
     print(f"Model: {MODEL}")
     if MODE == "fullframe":
         print(f"Resolution: {RESOLUTION[0]}x{RESOLUTION[1]}")
+        if USE_STEREO:
+            print(f"Stereo: Enabled (6-channel input)")
     print(f"Device: {device}")
     print(f"Epochs: {EPOCHS}")
     print(f"Batch size: {BATCH_SIZE}")
@@ -461,6 +576,8 @@ def main():
     run_name = f"run_{timestamp}_{MODEL}"
     if MODE == "fullframe":
         run_name += f"_{RESOLUTION[0]}x{RESOLUTION[1]}"
+        if USE_STEREO:
+            run_name += "_stereo"
     if ENABLE_PRUNING:
         run_name += "_pruning"
 
@@ -473,6 +590,7 @@ def main():
         'mode': MODE,
         'model': MODEL,
         'resolution': RESOLUTION if MODE == "fullframe" else (128, 128),
+        'stereo': USE_STEREO if MODE == "fullframe" else False,
         'epochs': EPOCHS,
         'batch_size': BATCH_SIZE,
         'learning_rate': LEARNING_RATE,
@@ -522,7 +640,17 @@ def main():
         input_size = (128, 128)
         criterion = CropLoss()
     else:
-        if USE_MEMMAP:
+        # Fullframe mode - check for stereo
+        if USE_STEREO:
+            print(f"Loading stereo memmap data from: {STEREO_MEMMAP_DIR}")
+            train_loader, val_loader = create_stereo_memmap_dataloaders(
+                data_dir=STEREO_MEMMAP_DIR,
+                batch_size=BATCH_SIZE,
+                train_split=TRAIN_SPLIT,
+                num_workers=NUM_WORKERS,
+            )
+            criterion = StereoFullframeLoss(resolution=RESOLUTION, tolerance_px=5)
+        elif USE_MEMMAP:
             print(f"Loading memmap data from: {MEMMAP_DIR}")
             train_loader, val_loader = create_fullframe_memmap_dataloaders(
                 data_dir=MEMMAP_DIR,
@@ -530,6 +658,7 @@ def main():
                 train_split=TRAIN_SPLIT,
                 num_workers=NUM_WORKERS,
             )
+            criterion = FullframeLoss(resolution=RESOLUTION, tolerance_px=5)
         else:
             print(f"Loading data from: {DATA_DIR}")
             train_loader, val_loader = create_fullframe_dataloaders(
@@ -539,13 +668,13 @@ def main():
                 train_split=TRAIN_SPLIT,
                 num_workers=NUM_WORKERS,
             )
+            criterion = FullframeLoss(resolution=RESOLUTION, tolerance_px=5)
         pixel_size = RESOLUTION  # (width, height) tuple
         input_size = RESOLUTION
-        criterion = FullframeLoss(resolution=RESOLUTION, tolerance_px=5)
 
     # Create model
     print(f"\nCreating model: {MODEL}")
-    model = create_model(MODE, MODEL, pretrained=True)
+    model = create_model(MODE, MODEL, pretrained=True, stereo=USE_STEREO and MODE == "fullframe")
     model = model.to(device)
 
     original_param_count = count_model_parameters(model)
@@ -594,7 +723,7 @@ def main():
 
         # Validate
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
-            val_loss, val_pixel_err, val_worst_px_err, val_p98_px_err = validate(model, val_loader, criterion, device, pixel_size)
+            val_loss, val_pixel_err, val_worst_px_err, val_p98_px_err = validate(model, val_loader, criterion, device, pixel_size, stereo=USE_STEREO and MODE == "fullframe")
 
         scheduler.step()
         epoch_time = time.time() - epoch_start

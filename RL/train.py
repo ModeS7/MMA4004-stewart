@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rl_config import EnvConfig, SACConfig, RewardConfig, TrainingConfig
 from env import StewartEnv
+from env_gpu import StewartEnvGPU
 from agent import SACAgent, ReplayBuffer
 
 
@@ -28,6 +29,7 @@ from agent import SACAgent, ReplayBuffer
 NUM_ENVS = 10           # Number of parallel environments
 MAX_EPISODES = 1500     # Total training episodes
 DEVICE = "cuda"         # "cuda" or "cpu"
+USE_GPU_ENV = True      # Use GPU-accelerated environment (faster physics)
 CHECKPOINT = None       # Path to checkpoint to resume from, or None
 
 # Logging
@@ -40,12 +42,21 @@ SAVE_INTERVAL = 100     # Save checkpoint every N episodes
 
 def evaluate(agent, env_config, reward_config, num_episodes=10):
     """Evaluate agent on fresh environments."""
-    eval_env = StewartEnv(
-        num_envs=num_episodes,
-        config=env_config,
-        reward_config=reward_config,
-        use_domain_randomization=False  # Fixed physics for evaluation
-    )
+    if USE_GPU_ENV:
+        eval_env = StewartEnvGPU(
+            num_envs=num_episodes,
+            config=env_config,
+            reward_config=reward_config,
+            device=DEVICE,
+            use_domain_randomization=False  # Fixed physics for evaluation
+        )
+    else:
+        eval_env = StewartEnv(
+            num_envs=num_episodes,
+            config=env_config,
+            reward_config=reward_config,
+            use_domain_randomization=False  # Fixed physics for evaluation
+        )
 
     obs, _ = eval_env.reset()
     episode_rewards = np.zeros(num_episodes)
@@ -102,13 +113,23 @@ def train():
     print(f"  Camera noise: {env_cfg.use_camera_noise} (std={env_cfg.position_noise_std_mm}mm)")
 
     # Create environment
-    env = StewartEnv(
-        num_envs=NUM_ENVS,
-        config=env_cfg,
-        reward_config=reward_cfg,
-        use_domain_randomization=env_cfg.use_domain_randomization
-    )
-    print(f"\nEnvironment created with {NUM_ENVS} parallel envs")
+    if USE_GPU_ENV:
+        env = StewartEnvGPU(
+            num_envs=NUM_ENVS,
+            config=env_cfg,
+            reward_config=reward_cfg,
+            device=DEVICE,
+            use_domain_randomization=env_cfg.use_domain_randomization
+        )
+        print(f"\nGPU Environment created with {NUM_ENVS} parallel envs on {DEVICE}")
+    else:
+        env = StewartEnv(
+            num_envs=NUM_ENVS,
+            config=env_cfg,
+            reward_config=reward_cfg,
+            use_domain_randomization=env_cfg.use_domain_randomization
+        )
+        print(f"\nCPU Environment created with {NUM_ENVS} parallel envs")
 
     # Create agent
     agent = SACAgent(
@@ -195,36 +216,33 @@ def train():
             # Step environment
             next_obs, rewards, dones, truncated, step_info = env.step(actions)
 
-            # Store transitions (only for non-done envs)
-            for i in range(NUM_ENVS):
-                if not done_mask[i]:
-                    buffer.push(
-                        obs[i],
-                        actions[i],
-                        rewards[i],
-                        next_obs[i],
-                        float(dones[i]),
-                        physics_gt[i]  # Physics ground truth for auxiliary loss
-                    )
+            # Store transitions (vectorized, only for non-done envs)
+            buffer.push_batch(
+                obs, actions, rewards, next_obs, dones.astype(np.float32),
+                physics_gt, mask=~done_mask
+            )
 
-            # Update agent
-            if total_steps >= sac_cfg.warmup_steps and len(buffer) >= sac_cfg.batch_size:
+            # Update agent (every N steps to speed up training)
+            update_every = getattr(sac_cfg, 'update_every', 1)
+            if (total_steps >= sac_cfg.warmup_steps and
+                len(buffer) >= sac_cfg.batch_size and
+                total_steps % update_every == 0):
                 for _ in range(sac_cfg.updates_per_step):
                     update_info = agent.update(buffer, sac_cfg.batch_size)
 
-                    # Track losses (periodically)
-                    if total_steps % 100 == 0:
-                        losses['critic'].append(update_info['critic_loss'])
-                        losses['actor'].append(update_info['actor_loss'])
-                        losses['physics'].append(update_info['physics_loss'])
-                        losses['alpha'].append(update_info['alpha'])
+                # Track losses (periodically)
+                if total_steps % 100 == 0:
+                    losses['critic'].append(update_info['critic_loss'])
+                    losses['actor'].append(update_info['actor_loss'])
+                    losses['physics'].append(update_info['physics_loss'])
+                    losses['alpha'].append(update_info['alpha'])
 
-                        # TensorBoard logging
-                        writer.add_scalar("loss/critic", update_info['critic_loss'], total_steps)
-                        writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
-                        writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
-                        writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
-                        writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
+                    # TensorBoard logging
+                    writer.add_scalar("loss/critic", update_info['critic_loss'], total_steps)
+                    writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
+                    writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
+                    writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
+                    writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
 
             # Accumulate rewards
             episode_reward += rewards * (~done_mask)

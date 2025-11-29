@@ -169,6 +169,61 @@ class ReplayBuffer:
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
+    def push_batch(self, states, actions, rewards, next_states, dones, physics_gt=None, mask=None):
+        """Add multiple transitions at once (vectorized)."""
+        if mask is not None:
+            # Filter by mask
+            indices = np.where(mask)[0]
+            states = states[indices]
+            actions = actions[indices]
+            rewards = rewards[indices]
+            next_states = next_states[indices]
+            dones = dones[indices]
+            if physics_gt is not None:
+                physics_gt = physics_gt[indices]
+
+        n = len(states)
+        if n == 0:
+            return
+
+        # Handle wrap-around
+        end_pos = self.position + n
+        if end_pos <= self.capacity:
+            # No wrap
+            self.states[self.position:end_pos] = states
+            self.actions[self.position:end_pos] = actions
+            self.rewards[self.position:end_pos] = rewards.reshape(-1, 1)
+            self.next_states[self.position:end_pos] = next_states
+            self.dones[self.position:end_pos] = dones.reshape(-1, 1)
+            if physics_gt is not None:
+                self.physics_gt[self.position:end_pos] = physics_gt
+        else:
+            # Wrap around
+            first_part = self.capacity - self.position
+            second_part = n - first_part
+
+            self.states[self.position:] = states[:first_part]
+            self.states[:second_part] = states[first_part:]
+
+            self.actions[self.position:] = actions[:first_part]
+            self.actions[:second_part] = actions[first_part:]
+
+            self.rewards[self.position:] = rewards[:first_part].reshape(-1, 1)
+            self.rewards[:second_part] = rewards[first_part:].reshape(-1, 1)
+
+            self.next_states[self.position:] = next_states[:first_part]
+            self.next_states[:second_part] = next_states[first_part:]
+
+            self.dones[self.position:] = dones[:first_part].reshape(-1, 1)
+            self.dones[:second_part] = dones[first_part:].reshape(-1, 1)
+
+            if physics_gt is not None:
+                self.physics_gt[self.position:] = physics_gt[:first_part]
+                self.physics_gt[:second_part] = physics_gt[first_part:]
+
+        self.position = end_pos % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
     def sample(self, batch_size):
         """Sample a batch of transitions."""
         indices = np.random.randint(0, self.size, size=batch_size)

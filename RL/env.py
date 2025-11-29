@@ -138,6 +138,12 @@ class StewartEnv:
         self.jitter_prob = 0.002         # 0.2% chance of jitter
         self.jitter_dt = 0.050           # 50ms jitter when it occurs
 
+        # Platform placement offset (simulates non-level surface)
+        # Random 0-2 degree tilt in random direction, set once per env
+        self.platform_offset_max_deg = 2.0
+        self.platform_offset_rx = np.zeros(num_envs, dtype=np.float32)
+        self.platform_offset_ry = np.zeros(num_envs, dtype=np.float32)
+
         # State arrays
         self.ball_x = np.zeros(num_envs, dtype=np.float32)
         self.ball_y = np.zeros(num_envs, dtype=np.float32)
@@ -145,6 +151,11 @@ class StewartEnv:
         self.ball_vy = np.zeros(num_envs, dtype=np.float32)
         self.platform_rx = np.zeros(num_envs, dtype=np.float32)
         self.platform_ry = np.zeros(num_envs, dtype=np.float32)
+
+        # Target position (where ball should go, normalized)
+        # For now always 0,0 (center), later can be trajectories
+        self.target_x = np.zeros(num_envs, dtype=np.float32)
+        self.target_y = np.zeros(num_envs, dtype=np.float32)
 
         # Episode tracking
         self.step_count = np.zeros(num_envs, dtype=np.int32)
@@ -168,6 +179,23 @@ class StewartEnv:
         """Pre-compile Numba functions."""
         _ = rk4_step(0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                      self.cfg.dt, self.g, self.default_mass_factor, self.default_mu_roll)
+
+    def _randomize_platform_offset(self, indices):
+        """Randomize platform placement offset (non-level surface simulation)."""
+        n = len(indices)
+
+        if self.cfg.use_domain_randomization:
+            # Random magnitude 0 to max_deg
+            magnitude = np.random.uniform(0, self.platform_offset_max_deg, n)
+            # Random direction (angle in radians)
+            direction = np.random.uniform(0, 2 * np.pi, n)
+
+            # Convert to rx, ry offsets
+            self.platform_offset_rx[indices] = np.radians(magnitude * np.sin(direction)).astype(np.float32)
+            self.platform_offset_ry[indices] = np.radians(magnitude * np.cos(direction)).astype(np.float32)
+        else:
+            self.platform_offset_rx[indices] = 0.0
+            self.platform_offset_ry[indices] = 0.0
 
     def _randomize_physics(self, indices):
         """Randomize physics parameters for specified environments."""
@@ -262,8 +290,9 @@ class StewartEnv:
 
         n = len(indices)
 
-        # Randomize physics for these environments
+        # Randomize physics and platform offset for these environments
         self._randomize_physics(indices)
+        self._randomize_platform_offset(indices)
 
         # Random initial position
         init_pos_m = self.cfg.init_pos_range_mm / 1000.0
@@ -305,7 +334,7 @@ class StewartEnv:
         """
         Get single frame observation for all environments.
 
-        Returns: (num_envs, obs_per_frame) array [x, y, rx, ry, dt]
+        Returns: (num_envs, obs_per_frame) array [x, y, rx, ry, dt, target_x, target_y]
         """
         obs = np.zeros((self.num_envs, self.cfg.obs_per_frame), dtype=np.float32)
 
@@ -334,6 +363,10 @@ class StewartEnv:
         # dt normalized (nominal dt = 0.01s = 10ms)
         # actual_dt varies per environment and per step
         obs[:, 4] = self.actual_dt / 0.01  # Normalized so 10ms = 1.0
+
+        # Target position (normalized, currently always 0,0)
+        obs[:, 5] = self.target_x
+        obs[:, 6] = self.target_y
 
         return obs
 
@@ -387,10 +420,14 @@ class StewartEnv:
             self.platform_ry[i] = new_ry
 
             # Ball physics (using per-env dt)
+            # Add platform offset to simulate non-level surface
+            effective_rx = new_rx + self.platform_offset_rx[i]
+            effective_ry = new_ry + self.platform_offset_ry[i]
+
             bx, by, bvx, bvy = rk4_step(
                 self.ball_x[i], self.ball_y[i],
                 self.ball_vx[i], self.ball_vy[i],
-                new_rx, new_ry, dt_i,
+                effective_rx, effective_ry, dt_i,
                 self.g, self.mass_factor[i], self.mu_roll[i]
             )
 

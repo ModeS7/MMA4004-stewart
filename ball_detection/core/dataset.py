@@ -896,6 +896,155 @@ def create_fullframe_memmap_dataloaders(data_dir, batch_size=128, train_split=0.
     return train_loader, val_loader
 
 
+class StereoMemmapDataset(Dataset):
+    """
+    Stereo dataset using pre-processed memmap files for fast loading.
+
+    Expects:
+        data_dir/images.npy  - (N, H, W, 6) uint8 [left_RGB + right_RGB]
+        data_dir/labels.npy  - (N, 5) float32 [x_left, y_left, x_right, y_right, confidence]
+
+    Applies same augmentations as FullFrameMemmapDataset but to 6-channel input.
+    """
+
+    # ImageNet normalization (applied to each RGB triplet)
+    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    def __init__(self, data_dir, use_augmentation=True, indices=None):
+        self.data_dir = Path(data_dir)
+        self.use_augmentation = use_augmentation
+
+        # Load memmap arrays
+        self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
+        self.labels = np.load(self.data_dir / "labels.npy", mmap_mode='r')
+
+        self.n_samples, self.height, self.width, _ = self.images.shape
+
+        # Use subset if indices provided
+        self.indices = indices if indices is not None else list(range(self.n_samples))
+
+        print(f"StereoMemmapDataset: {len(self.indices)} samples, {self.width}x{self.height}, 6 channels")
+
+        # Augmentation - same as FullFrameMemmapDataset
+        self.transform = self._get_transforms()
+
+    def _get_transforms(self):
+        transforms_list = []
+
+        if self.use_augmentation:
+            transforms_list.extend([
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
+                                   border_mode=cv2.BORDER_CONSTANT, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
+            ])
+
+        # Keypoints for both left and right coordinates
+        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+
+        # Load from memmap (6 channels: left_R, left_G, left_B, right_R, right_G, right_B)
+        image = np.array(self.images[real_idx])  # Copy from memmap
+        label = self.labels[real_idx]
+
+        x_left, y_left, x_right, y_right, confidence = label
+
+        # Convert normalized coords to pixel coords for augmentation
+        left_x_px = x_left * self.width
+        left_y_px = y_left * self.height
+        right_x_px = x_right * self.width
+        right_y_px = y_right * self.height
+
+        # Apply augmentations to 6-channel image
+        # Albumentations handles multi-channel images automatically
+        if self.use_augmentation:
+            transformed = self.transform(
+                image=image,
+                keypoints=[(left_x_px, left_y_px), (right_x_px, right_y_px)]
+            )
+            image = transformed['image']
+            if len(transformed['keypoints']) >= 2:
+                left_x_px, left_y_px = transformed['keypoints'][0]
+                right_x_px, right_y_px = transformed['keypoints'][1]
+
+        # Back to normalized
+        x_left = np.clip(left_x_px / self.width, 0.0, 1.0)
+        y_left = np.clip(left_y_px / self.height, 0.0, 1.0)
+        x_right = np.clip(right_x_px / self.width, 0.0, 1.0)
+        y_right = np.clip(right_y_px / self.height, 0.0, 1.0)
+
+        # Convert to tensor: (H, W, 6) -> (6, H, W)
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+
+        # Normalize each RGB triplet separately
+        left_rgb = image_tensor[:3]  # First 3 channels
+        right_rgb = image_tensor[3:]  # Last 3 channels
+
+        left_rgb = (left_rgb - self.MEAN) / self.STD
+        right_rgb = (right_rgb - self.MEAN) / self.STD
+
+        image_tensor = torch.cat([left_rgb, right_rgb], dim=0)
+
+        target = torch.tensor([x_left, y_left, x_right, y_right, confidence], dtype=torch.float32)
+        return image_tensor, target
+
+
+def create_stereo_memmap_dataloaders(data_dir, batch_size=128, train_split=0.8, num_workers=8):
+    """
+    Create dataloaders from stereo memmap dataset.
+
+    Args:
+        data_dir: Path to stereo memmap data (images.npy with 6 channels)
+        batch_size: Batch size
+        train_split: Fraction for training
+        num_workers: Number of data loading workers
+
+    Returns:
+        train_loader, val_loader
+    """
+    # Get total samples
+    images = np.load(Path(data_dir) / "images.npy", mmap_mode='r')
+    n_samples = len(images)
+    del images
+
+    # Split indices
+    train_size = int(train_split * n_samples)
+    all_indices = list(range(n_samples))
+    np.random.seed(42)
+    np.random.shuffle(all_indices)
+
+    train_indices = all_indices[:train_size]
+    val_indices = all_indices[train_size:]
+
+    # Create datasets
+    train_dataset = StereoMemmapDataset(data_dir, use_augmentation=True, indices=train_indices)
+    val_dataset = StereoMemmapDataset(data_dir, use_augmentation=False, indices=val_indices)
+
+    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=num_workers > 0, drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers // 2 if num_workers > 0 else 0,
+        pin_memory=True, drop_last=False
+    )
+
+    return train_loader, val_loader
+
+
 def create_fullframe_dataloaders(data_dir, batch_size=16, target_size=(320, 180),
                                   train_split=0.8, num_workers=4):
     """

@@ -36,6 +36,7 @@ from ball_detection.core.model import (
     BallDetectorMobileNetV3,
     BallDetectorShuffleNetV2,
     BallDetectorFullFrameTiny,
+    BallDetectorFullFrameTinyStereo,
     BallDetectorFullFrameUltra,
     BallDetectorFullFrameShuffleNet,
     BallDetectorFullFrameMobileNet,
@@ -747,6 +748,7 @@ def run_fullframe_benchmark():
     # All models to test (matching train.py)
     # CROP MODE: cnn, mobilenet, shufflenet
     # FULLFRAME MODE: tiny, ultra, shufflenet, mobilenet
+    # STEREO MODE: tiny-stereo (6-channel input)
     models = {
         # Crop models (128x128)
         'cnn': BallDetectorCNN,
@@ -757,7 +759,12 @@ def run_fullframe_benchmark():
         'ultra': BallDetectorFullFrameUltra,
         'shufflenet-fullframe': lambda: BallDetectorFullFrameShuffleNet(pretrained=False),
         'mobilenet-fullframe': lambda: BallDetectorFullFrameMobileNet(pretrained=False),
+        # Stereo models (6-channel input)
+        'tiny-stereo': BallDetectorFullFrameTinyStereo,
     }
+
+    # Models that use 6-channel input (stereo)
+    stereo_models = {'tiny-stereo'}
 
     # Build all combinations
     all_models = []
@@ -779,8 +786,11 @@ def run_fullframe_benchmark():
             print(f"  Params: {params:,}")
             print("  Exporting to ONNX...", end=" ", flush=True)
 
+            # Stereo models use 6 channels, others use 3
+            in_channels = 6 if model_name in stereo_models else 3
+
             buffer = io.BytesIO()
-            dummy = torch.randn(1, 3, h, w)
+            dummy = torch.randn(1, in_channels, h, w)
             torch.onnx.export(model, dummy, buffer, input_names=['input'],
                             output_names=['output'], opset_version=14, do_constant_folding=True)
             buffer.seek(0)
@@ -792,7 +802,7 @@ def run_fullframe_benchmark():
             try:
                 cpu_session = create_inference_session(onnx_bytes)
                 input_name = cpu_session.get_inputs()[0].name
-                dummy_np = np.random.randn(1, 3, h, w).astype(np.float32)
+                dummy_np = np.random.randn(1, in_channels, h, w).astype(np.float32)
 
                 # Warmup
                 for _ in range(10):
@@ -819,7 +829,7 @@ def run_fullframe_benchmark():
                     providers=['DmlExecutionProvider', 'CPUExecutionProvider']
                 )
                 input_name = gpu_session.get_inputs()[0].name
-                dummy_np = np.random.randn(1, 3, h, w).astype(np.float32)
+                dummy_np = np.random.randn(1, in_channels, h, w).astype(np.float32)
 
                 # Warmup
                 for _ in range(10):
@@ -883,7 +893,7 @@ if __name__ == "__main__":
     try:
         print("\n" + "=" * 80)
         print("BALL DETECTION MODEL BENCHMARK")
-        print("7 models x 3 resolutions = 21 tests")
+        print("8 models x 3 resolutions = 24 tests")
         print("=" * 80 + "\n")
 
         run_fullframe_benchmark()

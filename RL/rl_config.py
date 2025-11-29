@@ -29,8 +29,8 @@ class EnvConfig:
 
     # Frame history settings
     num_frames = 12  # Number of frames in history
-    obs_per_frame = 5  # [ball_x, ball_y, platform_rx, platform_ry, dt]
-    obs_dim = num_frames * obs_per_frame  # 12 * 5 = 60
+    obs_per_frame = 7  # [ball_x, ball_y, platform_rx, platform_ry, dt, target_x, target_y]
+    obs_dim = num_frames * obs_per_frame  # 12 * 7 = 84
 
     # Action space: [rx_target, ry_target] normalized to [-1, 1]
     action_dim = 2
@@ -107,7 +107,8 @@ class SACConfig:
 
     # Training
     warmup_steps = 1000  # Random actions before training
-    updates_per_step = 1
+    updates_per_step = 1  # Gradient updates per update call
+    update_every = 10  # Update every N environment steps (set higher for faster training)
 
 
 # ============================================================================
