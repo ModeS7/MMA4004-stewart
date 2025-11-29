@@ -106,6 +106,185 @@ class ImageTearing(A.ImageOnlyTransform):
         return ()
 
 
+# ============================================================
+# SHARED AUGMENTATION BUILDERS
+# ============================================================
+
+def build_spatial_transform(enabled=True, fullframe=False):
+    """
+    Build spatial augmentation pipeline.
+
+    Args:
+        enabled: Whether to apply augmentations
+        fullframe: If True, use milder settings for fullframe (less rotation)
+    """
+    if not enabled:
+        return A.Compose([], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    if fullframe:
+        # Milder for fullframe - less rotation to keep ball visible
+        return A.Compose([
+            A.ShiftScaleRotate(
+                shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
+                border_mode=cv2.BORDER_CONSTANT, p=0.7
+            ),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+    else:
+        # Full rotation for crops
+        return A.Compose([
+            A.ShiftScaleRotate(
+                shift_limit=0.1, scale_limit=0.1, rotate_limit=180,
+                border_mode=cv2.BORDER_CONSTANT, p=0.7
+            ),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+
+def build_color_invariance_transform(enabled=True):
+    """
+    Build color invariance augmentation pipeline.
+    Trains model to detect ball regardless of color.
+    """
+    if not enabled:
+        return A.Compose([])
+
+    return A.Compose([
+        # Full hue rotation - covers entire color spectrum
+        A.HueSaturationValue(
+            hue_shift_limit=180, sat_shift_limit=30, val_shift_limit=20, p=0.7
+        ),
+        # Channel shuffle - swaps RGB channels
+        A.ChannelShuffle(p=0.3),
+        # Grayscale - forces shape-based detection
+        A.ToGray(p=0.2),
+    ])
+
+
+def build_appearance_transform(enabled=True):
+    """
+    Build appearance augmentation pipeline.
+    Lighting, blur, noise, shadows, etc.
+    """
+    if not enabled:
+        return A.Compose([])
+
+    return A.Compose([
+        # Lighting variations
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
+        # Color temperature / white balance
+        A.OneOf([
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0),
+            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=25, p=1.0),
+            A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0),
+        ], p=0.8),
+        # Heavy augmentations - only ONE per sample
+        A.OneOf([
+            A.RandomShadow(shadow_roi=(0, 0.5, 1, 1), num_shadows_limit=(1, 2), shadow_dimension=5, p=1.0),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), num_flare_circles_range=(3, 6), src_radius=100, p=1.0),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.2), p=1.0),
+            A.Downscale(scale_range=(0.75, 0.95), interpolation_pair={'downscale': cv2.INTER_LINEAR, 'upscale': cv2.INTER_LINEAR}, p=1.0),
+        ], p=0.4),
+        # Blur variations
+        A.OneOf([
+            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+            A.MotionBlur(blur_limit=5, p=1.0),
+            A.MedianBlur(blur_limit=3, p=1.0),
+        ], p=0.3),
+        # Noise
+        A.GaussNoise(std_range=(10.0/255, 20.0/255), p=0.3),
+        # Compression artifacts
+        A.ImageCompression(quality_range=(70, 100), p=0.2),
+    ])
+
+
+def build_replay_spatial_transform(enabled=True, fullframe=False):
+    """
+    Build spatial transform with replay capability for stereo.
+    Allows applying identical transform to both views.
+    """
+    if not enabled:
+        return A.ReplayCompose([], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    if fullframe:
+        return A.ReplayCompose([
+            A.ShiftScaleRotate(
+                shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
+                border_mode=cv2.BORDER_CONSTANT, p=0.7
+            ),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+    else:
+        return A.ReplayCompose([
+            A.ShiftScaleRotate(
+                shift_limit=0.1, scale_limit=0.1, rotate_limit=180,
+                border_mode=cv2.BORDER_CONSTANT, p=0.7
+            ),
+        ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+
+def build_replay_appearance_transform(enabled=True, heavy=False):
+    """
+    Build appearance transform with replay capability for stereo.
+
+    Args:
+        enabled: Whether to apply augmentations
+        heavy: If True, use heavy augmentations (shadows, flares, etc.)
+               If False, use lighter augmentations (just lighting/color/blur/noise)
+    """
+    if not enabled:
+        return A.ReplayCompose([])
+
+    if heavy:
+        # Heavy augmentations - includes shadows, flares, compression, etc.
+        return A.ReplayCompose([
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
+            A.OneOf([
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0),
+                A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=25, p=1.0),
+                A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0),
+            ], p=0.8),
+            A.OneOf([
+                A.RandomShadow(shadow_roi=(0, 0.5, 1, 1), num_shadows_limit=(1, 2), shadow_dimension=5, p=1.0),
+                A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), num_flare_circles_range=(3, 6), src_radius=100, p=1.0),
+                A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+                A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.2), p=1.0),
+                A.Downscale(scale_range=(0.75, 0.95), interpolation_pair={'downscale': cv2.INTER_LINEAR, 'upscale': cv2.INTER_LINEAR}, p=1.0),
+            ], p=0.4),
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                A.MotionBlur(blur_limit=5, p=1.0),
+                A.MedianBlur(blur_limit=3, p=1.0),
+            ], p=0.3),
+            A.GaussNoise(std_range=(10.0/255, 20.0/255), p=0.3),
+            A.ImageCompression(quality_range=(70, 100), p=0.2),
+        ])
+    else:
+        # Light augmentations - basic lighting, color, blur, noise
+        return A.ReplayCompose([
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
+        ])
+
+
+def build_replay_color_invariance_transform(enabled=True):
+    """
+    Build color invariance transform with replay capability for stereo.
+    """
+    if not enabled:
+        return A.ReplayCompose([])
+
+    return A.ReplayCompose([
+        A.HueSaturationValue(hue_shift_limit=180, sat_shift_limit=30, val_shift_limit=20, p=0.7),
+        A.ChannelShuffle(p=0.3),
+        A.ToGray(p=0.2),
+    ])
+
+
+# ============================================================
+# DATASETS
+# ============================================================
+
 class BallDetectionDataset(Dataset):
     """
     Dataset for ball center detection training.
@@ -138,10 +317,13 @@ class BallDetectionDataset(Dataset):
 
     def __init__(self, data_dir, labels_file='labels.json',
                  crop_size=128, use_spatial_aug=True, use_appearance_aug=True,
-                 use_color_invariance_aug=False, use_tearing_aug=False, tearing_probability=0.05,
+                 use_color_invariance_aug=False,
                  split='train', disable_normalize=False):
         """
         Initialize dataset.
+
+        Note: Tearing augmentation is NOT supported in crop mode.
+              Tearing is only for stereo mode where confidence output exists.
 
         Args:
             data_dir: Directory containing images and labels
@@ -150,8 +332,6 @@ class BallDetectionDataset(Dataset):
             use_spatial_aug: Enable spatial augmentations (offset, rotate, scale, shift)
             use_appearance_aug: Enable appearance augmentations (brightness, hue, blur, noise)
             use_color_invariance_aug: Enable color invariance augmentations (hue shift, channel shuffle, grayscale)
-            use_tearing_aug: Enable tearing augmentation (simulates camera tearing, sets confidence=0)
-            tearing_probability: Probability of applying tearing (default 5%)
             split: 'train' or 'val' (affects augmentation)
             disable_normalize: If True, skip normalization (for GPU augmentations)
         """
@@ -160,8 +340,6 @@ class BallDetectionDataset(Dataset):
         self.use_spatial_aug = use_spatial_aug and (split == 'train')
         self.use_appearance_aug = use_appearance_aug and (split == 'train')
         self.use_color_invariance_aug = use_color_invariance_aug and (split == 'train')
-        self.use_tearing_aug = use_tearing_aug and (split == 'train')
-        self.tearing_probability = tearing_probability
         self.disable_normalize = disable_normalize
 
         # Check for images in subdirectory or root
@@ -472,17 +650,7 @@ class BallDetectionDataset(Dataset):
             f"Crop size error: got {crop.shape}, expected ({self.crop_size}, {self.crop_size}). " \
             f"y1={y1}, y2={y2}, x1={x1}, x2={x2}, aug_size=({aug_height}, {aug_width})"
 
-        # Default confidence is 1.0 (valid detection)
-        confidence = 1.0
-
-        # STAGE 3: Apply tearing BEFORE other augmentations (on raw uint8 image)
-        # This avoids expensive denormalize/renormalize operations
-        if self.use_tearing_aug and np.random.random() < self.tearing_probability:
-            tearing = ImageTearing(p=1.0)
-            crop = tearing(image=crop)['image']
-            confidence = 0.0  # Torn image = invalid
-
-        # STAGE 4: Apply color invariance augmentations (before appearance)
+        # STAGE 3: Apply color invariance augmentations (before appearance)
         # Color invariance is OK for difficult samples (doesn't reduce visibility)
         if self.use_color_invariance_aug:
             color_transformed = self.color_invariance_transform(image=crop)
@@ -517,8 +685,9 @@ class BallDetectionDataset(Dataset):
         x_norm = np.clip(ball_x_in_crop / self.crop_size, 0.0, 1.0)
         y_norm = np.clip(ball_y_in_crop / self.crop_size, 0.0, 1.0)
 
-        # Create target tensor: (x_norm, y_norm, confidence)
-        target = torch.tensor([x_norm, y_norm, confidence], dtype=torch.float32)
+        # Create target tensor: (x_norm, y_norm)
+        # Crop mode only outputs coordinates (no confidence - all samples are valid)
+        target = torch.tensor([x_norm, y_norm], dtype=torch.float32)
 
         return image_tensor, target
 
@@ -652,9 +821,20 @@ class FullFrameMemmapDataset(Dataset):
     MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
     STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
-    def __init__(self, data_dir, use_augmentation=True, indices=None):
+    def __init__(self, data_dir, use_augmentation=True, indices=None,
+                 use_spatial_aug=True, use_appearance_aug=True,
+                 use_color_invariance_aug=False):
+        """
+        Fullframe dataset for non-stereo ball detection.
+
+        Note: Tearing augmentation is NOT supported in non-stereo fullframe mode.
+              Tearing is only for stereo mode.
+        """
         self.data_dir = Path(data_dir)
         self.use_augmentation = use_augmentation
+        self.use_spatial_aug = use_spatial_aug and use_augmentation
+        self.use_appearance_aug = use_appearance_aug and use_augmentation
+        self.use_color_invariance_aug = use_color_invariance_aug and use_augmentation
 
         # Load memmap arrays
         self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
@@ -666,24 +846,14 @@ class FullFrameMemmapDataset(Dataset):
         self.indices = indices if indices is not None else list(range(self.n_samples))
 
         print(f"FullFrameMemmapDataset: {len(self.indices)} samples, {self.width}x{self.height}")
+        if use_augmentation:
+            print(f"  Augmentations: spatial={use_spatial_aug}, appearance={use_appearance_aug}, "
+                  f"color_inv={use_color_invariance_aug}")
 
-        # Augmentation
-        self.transform = self._get_transforms()
-
-    def _get_transforms(self):
-        transforms_list = []
-
-        if self.use_augmentation:
-            transforms_list.extend([
-                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
-                                   border_mode=cv2.BORDER_CONSTANT, p=0.5),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
-                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-                A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
-            ])
-
-        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+        # Build augmentation pipelines using shared builders
+        self.spatial_transform = build_spatial_transform(self.use_spatial_aug, fullframe=True)
+        self.color_invariance_transform = build_color_invariance_transform(self.use_color_invariance_aug)
+        self.appearance_transform = build_appearance_transform(self.use_appearance_aug)
 
     def __len__(self):
         return len(self.indices)
@@ -701,12 +871,20 @@ class FullFrameMemmapDataset(Dataset):
         ball_x = x_norm * self.width
         ball_y = y_norm * self.height
 
-        # Apply augmentations
-        if self.use_augmentation:
-            transformed = self.transform(image=image, keypoints=[(ball_x, ball_y)])
+        # Apply spatial augmentations
+        if self.use_spatial_aug:
+            transformed = self.spatial_transform(image=image, keypoints=[(ball_x, ball_y)])
             image = transformed['image']
             if len(transformed['keypoints']) > 0:
                 ball_x, ball_y = transformed['keypoints'][0]
+
+        # Apply color invariance augmentations
+        if self.use_color_invariance_aug:
+            image = self.color_invariance_transform(image=image)['image']
+
+        # Apply appearance augmentations
+        if self.use_appearance_aug:
+            image = self.appearance_transform(image=image)['image']
 
         # Back to normalized
         x_norm = np.clip(ball_x / self.width, 0.0, 1.0)
@@ -905,18 +1083,25 @@ class StereoMemmapDataset(Dataset):
         data_dir/images.npy  - (N, H, W, 6) uint8 [left_BGR + right_BGR]
         data_dir/labels.npy  - (N, 5) float32 [x_left, y_left, x_right, y_right, confidence]
 
-    Applies same augmentations as FullFrameMemmapDataset but to 6-channel input.
-    Spatial augmentations are applied identically to both views.
-    Color augmentations are applied separately to each 3-channel BGR triplet.
+    Augmentations are applied identically to both views using ReplayCompose.
     """
 
     # BGR order normalization (applied to each BGR triplet)
     MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
     STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
-    def __init__(self, data_dir, use_augmentation=True, indices=None):
+    def __init__(self, data_dir, use_augmentation=True, indices=None,
+                 use_spatial_aug=True, use_appearance_aug=True,
+                 use_color_invariance_aug=False, use_tearing_aug=False,
+                 tearing_probability=0.05, use_heavy_aug=False):
         self.data_dir = Path(data_dir)
         self.use_augmentation = use_augmentation
+        self.use_spatial_aug = use_spatial_aug and use_augmentation
+        self.use_appearance_aug = use_appearance_aug and use_augmentation
+        self.use_color_invariance_aug = use_color_invariance_aug and use_augmentation
+        self.use_tearing_aug = use_tearing_aug and use_augmentation
+        self.tearing_probability = tearing_probability
+        self.use_heavy_aug = use_heavy_aug
 
         # Load memmap arrays
         self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
@@ -928,35 +1113,15 @@ class StereoMemmapDataset(Dataset):
         self.indices = indices if indices is not None else list(range(self.n_samples))
 
         print(f"StereoMemmapDataset: {len(self.indices)} samples, {self.width}x{self.height}, 6 channels")
+        if use_augmentation:
+            aug_mode = "heavy" if use_heavy_aug else "light"
+            print(f"  Augmentations: spatial={use_spatial_aug}, appearance={use_appearance_aug} ({aug_mode}), "
+                  f"color_inv={use_color_invariance_aug}, tearing={use_tearing_aug}")
 
-        # Augmentation pipelines
-        self.spatial_transform, self.color_transform = self._get_transforms()
-
-    def _get_transforms(self):
-        """Create separate spatial and color transform pipelines."""
-        spatial_transforms = []
-        color_transforms = []
-
-        if self.use_augmentation:
-            # Spatial transforms - applied to full 6-channel image
-            spatial_transforms.extend([
-                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
-                                   border_mode=cv2.BORDER_CONSTANT, p=0.5),
-                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-                A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
-            ])
-
-            # Color transforms - applied separately to each 3-channel image
-            color_transforms.extend([
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
-            ])
-
-        spatial_pipeline = A.Compose(spatial_transforms,
-                                     keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
-        color_pipeline = A.Compose(color_transforms)
-
-        return spatial_pipeline, color_pipeline
+        # Build augmentation pipelines using shared builders (with replay for stereo)
+        self.spatial_transform = build_replay_spatial_transform(self.use_spatial_aug, fullframe=True)
+        self.color_invariance_transform = build_replay_color_invariance_transform(self.use_color_invariance_aug)
+        self.appearance_transform = build_replay_appearance_transform(self.use_appearance_aug, heavy=use_heavy_aug)
 
     def __len__(self):
         return len(self.indices)
@@ -964,7 +1129,7 @@ class StereoMemmapDataset(Dataset):
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
 
-        # Load from memmap (6 channels: left_R, left_G, left_B, right_R, right_G, right_B)
+        # Load from memmap (6 channels: left_BGR + right_BGR)
         image = np.array(self.images[real_idx])  # Copy from memmap
         label = self.labels[real_idx]
 
@@ -976,59 +1141,73 @@ class StereoMemmapDataset(Dataset):
         right_x_px = x_right * self.width
         right_y_px = y_right * self.height
 
-        if self.use_augmentation:
-            # 1. Apply spatial augmentations to full 6-channel image
-            transformed = self.spatial_transform(
-                image=image,
-                keypoints=[(left_x_px, left_y_px), (right_x_px, right_y_px)]
+        # Split into left and right views
+        left_bgr = image[:, :, :3]
+        right_bgr = image[:, :, 3:]
+
+        # Apply tearing BEFORE other augmentations (on raw uint8 image)
+        # Apply same tearing to both views
+        if self.use_tearing_aug and np.random.random() < self.tearing_probability:
+            tearing = ImageTearing(p=1.0)
+            left_bgr = tearing(image=left_bgr)['image']
+            right_bgr = tearing(image=right_bgr)['image']
+            confidence = 0.0  # Torn image = invalid
+
+        # Apply spatial augmentations (same to both views via replay)
+        if self.use_spatial_aug:
+            left_result = self.spatial_transform(
+                image=left_bgr,
+                keypoints=[(left_x_px, left_y_px)]
             )
-            image = transformed['image']
-            if len(transformed['keypoints']) >= 2:
-                left_x_px, left_y_px = transformed['keypoints'][0]
-                right_x_px, right_y_px = transformed['keypoints'][1]
-
-            # 2. Apply color augmentations separately to each BGR triplet
-            # Use same random params for both views to keep them consistent
-            left_bgr = image[:, :, :3]
-            right_bgr = image[:, :, 3:]
-
-            # Apply same color transform to both
-            replay = A.ReplayCompose([
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
-            ])
-            left_result = replay(image=left_bgr)
-            right_result = A.ReplayCompose.replay(left_result['replay'], image=right_bgr)
-
             left_bgr = left_result['image']
+            if len(left_result['keypoints']) > 0:
+                left_x_px, left_y_px = left_result['keypoints'][0]
+
+            # Replay same transform on right view
+            right_result = A.ReplayCompose.replay(
+                left_result['replay'],
+                image=right_bgr,
+                keypoints=[(right_x_px, right_y_px)]
+            )
             right_bgr = right_result['image']
+            if len(right_result['keypoints']) > 0:
+                right_x_px, right_y_px = right_result['keypoints'][0]
 
-            # Recombine
-            image = np.concatenate([left_bgr, right_bgr], axis=2)
+        # Apply color invariance augmentations (same to both views via replay)
+        if self.use_color_invariance_aug:
+            left_result = self.color_invariance_transform(image=left_bgr)
+            left_bgr = left_result['image']
+            right_bgr = A.ReplayCompose.replay(left_result['replay'], image=right_bgr)['image']
 
-        # Back to normalized
+        # Apply appearance augmentations (same to both views via replay)
+        if self.use_appearance_aug:
+            left_result = self.appearance_transform(image=left_bgr)
+            left_bgr = left_result['image']
+            right_bgr = A.ReplayCompose.replay(left_result['replay'], image=right_bgr)['image']
+
+        # Back to normalized coords
         x_left = np.clip(left_x_px / self.width, 0.0, 1.0)
         y_left = np.clip(left_y_px / self.height, 0.0, 1.0)
         x_right = np.clip(right_x_px / self.width, 0.0, 1.0)
         y_right = np.clip(right_y_px / self.height, 0.0, 1.0)
 
-        # Convert to tensor: (H, W, 6) -> (6, H, W)
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        # Convert to tensors and normalize
+        left_tensor = torch.from_numpy(left_bgr).permute(2, 0, 1).float() / 255.0
+        right_tensor = torch.from_numpy(right_bgr).permute(2, 0, 1).float() / 255.0
 
-        # Normalize each BGR triplet separately
-        left_bgr = image_tensor[:3]  # First 3 channels
-        right_bgr = image_tensor[3:]  # Last 3 channels
+        left_tensor = (left_tensor - self.MEAN) / self.STD
+        right_tensor = (right_tensor - self.MEAN) / self.STD
 
-        left_bgr = (left_bgr - self.MEAN) / self.STD
-        right_bgr = (right_bgr - self.MEAN) / self.STD
-
-        image_tensor = torch.cat([left_bgr, right_bgr], dim=0)
+        image_tensor = torch.cat([left_tensor, right_tensor], dim=0)
 
         target = torch.tensor([x_left, y_left, x_right, y_right, confidence], dtype=torch.float32)
         return image_tensor, target
 
 
-def create_stereo_memmap_dataloaders(data_dir, batch_size=128, train_split=0.8, num_workers=8):
+def create_stereo_memmap_dataloaders(data_dir, batch_size=128, train_split=0.8, num_workers=8,
+                                      use_spatial_aug=True, use_appearance_aug=True,
+                                      use_color_invariance_aug=False, use_tearing_aug=False,
+                                      tearing_probability=0.05, use_heavy_aug=False):
     """
     Create dataloaders from stereo memmap dataset.
 
@@ -1037,6 +1216,12 @@ def create_stereo_memmap_dataloaders(data_dir, batch_size=128, train_split=0.8, 
         batch_size: Batch size
         train_split: Fraction for training
         num_workers: Number of data loading workers
+        use_spatial_aug: Enable spatial augmentations (shift, scale, rotate)
+        use_appearance_aug: Enable appearance augmentations (brightness, blur, etc.)
+        use_color_invariance_aug: Enable color invariance (hue rotation, channel shuffle)
+        use_tearing_aug: Enable tearing augmentation (simulates camera tearing)
+        tearing_probability: Probability of applying tearing
+        use_heavy_aug: Use heavy appearance augmentations (shadows, flares, compression, etc.)
 
     Returns:
         train_loader, val_loader
@@ -1056,7 +1241,15 @@ def create_stereo_memmap_dataloaders(data_dir, batch_size=128, train_split=0.8, 
     val_indices = all_indices[train_size:]
 
     # Create datasets
-    train_dataset = StereoMemmapDataset(data_dir, use_augmentation=True, indices=train_indices)
+    train_dataset = StereoMemmapDataset(
+        data_dir, use_augmentation=True, indices=train_indices,
+        use_spatial_aug=use_spatial_aug,
+        use_appearance_aug=use_appearance_aug,
+        use_color_invariance_aug=use_color_invariance_aug,
+        use_tearing_aug=use_tearing_aug,
+        tearing_probability=tearing_probability,
+        use_heavy_aug=use_heavy_aug,
+    )
     val_dataset = StereoMemmapDataset(data_dir, use_augmentation=False, indices=val_indices)
 
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
@@ -1134,10 +1327,12 @@ def create_fullframe_dataloaders(data_dir, batch_size=16, target_size=(320, 180)
 def create_dataloaders(data_dir, batch_size=32, crop_size=128,
                        train_split=0.8, num_workers=4, use_spatial_augmentation=True,
                        use_appearance_augmentation=True, use_color_invariance_augmentation=False,
-                       use_tearing_augmentation=False, tearing_probability=0.05,
                        disable_normalize=False):
     """
     Create train and validation dataloaders.
+
+    Note: Tearing augmentation is NOT supported in crop mode.
+          Tearing is only for stereo mode.
 
     Args:
         data_dir: Directory containing images and labels
@@ -1148,8 +1343,6 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         use_spatial_augmentation: Enable spatial augmentations (offset, rotate, scale, shift)
         use_appearance_augmentation: Enable appearance augmentations (brightness, hue, blur, noise)
         use_color_invariance_augmentation: Enable color invariance augmentations (hue shift, channel shuffle, grayscale)
-        use_tearing_augmentation: Enable tearing augmentation (simulates camera tearing, sets confidence=0)
-        tearing_probability: Probability of applying tearing (default 5%)
         disable_normalize: If True, skip normalization (for GPU augmentations)
 
     Returns:
@@ -1180,8 +1373,6 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         use_spatial_aug=use_spatial_augmentation,
         use_appearance_aug=use_appearance_augmentation,
         use_color_invariance_aug=use_color_invariance_augmentation,
-        use_tearing_aug=use_tearing_augmentation,
-        tearing_probability=tearing_probability,
         split='train',
         disable_normalize=disable_normalize
     )
@@ -1193,7 +1384,6 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
         use_spatial_aug=False,
         use_appearance_aug=False,
         use_color_invariance_aug=False,
-        use_tearing_aug=False,
         split='val',
         disable_normalize=disable_normalize
     )
@@ -1244,10 +1434,21 @@ class CropMemmapDataset(Dataset):
     MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
     STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
-    def __init__(self, data_dir, crop_size=128, use_augmentation=True, indices=None):
+    def __init__(self, data_dir, crop_size=128, use_augmentation=True, indices=None,
+                 use_spatial_aug=True, use_appearance_aug=True,
+                 use_color_invariance_aug=False):
+        """
+        Crop dataset for ball detection training.
+
+        Note: Tearing augmentation is NOT supported in crop mode.
+              Tearing is only for stereo/fullframe where confidence output exists.
+        """
         self.data_dir = Path(data_dir)
         self.crop_size = crop_size
         self.use_augmentation = use_augmentation
+        self.use_spatial_aug = use_spatial_aug and use_augmentation
+        self.use_appearance_aug = use_appearance_aug and use_augmentation
+        self.use_color_invariance_aug = use_color_invariance_aug and use_augmentation
 
         # Load memmap arrays
         self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
@@ -1259,27 +1460,14 @@ class CropMemmapDataset(Dataset):
         self.indices = indices if indices is not None else list(range(self.n_samples))
 
         print(f"CropMemmapDataset: {len(self.indices)} samples, memmap {self.memmap_size}x{self.memmap_size}, crop {crop_size}x{crop_size}")
+        if use_augmentation:
+            print(f"  Augmentations: spatial={use_spatial_aug}, appearance={use_appearance_aug}, "
+                  f"color_inv={use_color_invariance_aug}")
 
-        # Augmentation (applied to crop)
-        self.transform = self._get_transforms()
-
-    def _get_transforms(self):
-        transforms_list = []
-
-        if self.use_augmentation:
-            transforms_list.extend([
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=180,
-                                   border_mode=cv2.BORDER_CONSTANT, p=0.7),
-                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
-                A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=25, p=0.5),
-                A.OneOf([
-                    A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-                    A.MotionBlur(blur_limit=5, p=1.0),
-                ], p=0.3),
-                A.GaussNoise(std_range=(0.01, 0.05), p=0.3),
-            ])
-
-        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+        # Build augmentation pipelines using shared builders
+        self.spatial_transform = build_spatial_transform(self.use_spatial_aug, fullframe=False)
+        self.color_invariance_transform = build_color_invariance_transform(self.use_color_invariance_aug)
+        self.appearance_transform = build_appearance_transform(self.use_appearance_aug)
 
     def __len__(self):
         return len(self.indices)
@@ -1327,12 +1515,20 @@ class CropMemmapDataset(Dataset):
         ball_x_in_crop = ball_x - x1
         ball_y_in_crop = ball_y - y1
 
-        # Apply augmentations
-        if self.use_augmentation:
-            transformed = self.transform(image=crop, keypoints=[(ball_x_in_crop, ball_y_in_crop)])
+        # Apply spatial augmentations
+        if self.use_spatial_aug:
+            transformed = self.spatial_transform(image=crop, keypoints=[(ball_x_in_crop, ball_y_in_crop)])
             crop = transformed['image']
             if len(transformed['keypoints']) > 0:
                 ball_x_in_crop, ball_y_in_crop = transformed['keypoints'][0]
+
+        # Apply color invariance augmentations
+        if self.use_color_invariance_aug:
+            crop = self.color_invariance_transform(image=crop)['image']
+
+        # Apply appearance augmentations
+        if self.use_appearance_aug:
+            crop = self.appearance_transform(image=crop)['image']
 
         # Normalize to [0, 1]
         x_out = np.clip(ball_x_in_crop / self.crop_size, 0.0, 1.0)
@@ -1347,9 +1543,14 @@ class CropMemmapDataset(Dataset):
 
 
 def create_crop_memmap_dataloaders(data_dir, batch_size=32, crop_size=128,
-                                    train_split=0.8, num_workers=4):
+                                    train_split=0.8, num_workers=4,
+                                    use_spatial_aug=True, use_appearance_aug=True,
+                                    use_color_invariance_aug=False):
     """
     Create train and validation dataloaders from crop memmap.
+
+    Note: Tearing augmentation is NOT supported in crop mode.
+          Tearing is only for stereo/fullframe where confidence output exists.
 
     Args:
         data_dir: Directory containing images.npy and labels.npy
@@ -1357,6 +1558,9 @@ def create_crop_memmap_dataloaders(data_dir, batch_size=32, crop_size=128,
         crop_size: Final crop size for training (memmap is larger)
         train_split: Fraction for training
         num_workers: Data loading workers
+        use_spatial_aug: Enable spatial augmentations (shift, scale, rotate)
+        use_appearance_aug: Enable appearance augmentations (brightness, blur, etc.)
+        use_color_invariance_aug: Enable color invariance (hue rotation, channel shuffle)
 
     Returns:
         train_loader, val_loader
@@ -1372,12 +1576,15 @@ def create_crop_memmap_dataloaders(data_dir, batch_size=32, crop_size=128,
 
     train_dataset = CropMemmapDataset(
         data_dir, crop_size=crop_size,
-        use_augmentation=True, indices=train_indices
+        use_augmentation=True, indices=train_indices,
+        use_spatial_aug=use_spatial_aug,
+        use_appearance_aug=use_appearance_aug,
+        use_color_invariance_aug=use_color_invariance_aug,
     )
 
     val_dataset = CropMemmapDataset(
         data_dir, crop_size=crop_size,
-        use_augmentation=False, indices=val_indices
+        use_augmentation=False, indices=val_indices,
     )
 
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")

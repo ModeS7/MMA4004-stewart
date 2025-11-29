@@ -91,8 +91,9 @@ CROP_MEMMAP_DIR = "./ball_detection/data/crop_memmap"  # Crop mode
 USE_SPATIAL_AUG = True
 USE_APPEARANCE_AUG = True
 USE_COLOR_INVARIANCE_AUG = True
-USE_TEARING_AUG = True
+USE_TEARING_AUG = True  # Only applies to stereo mode
 TEARING_PROBABILITY = 0.01
+USE_HEAVY_AUG = True  # Heavy augmentations for stereo (shadows, flares, compression, etc.)
 
 # Checkpoints
 SAVE_INTERVAL = 50
@@ -247,10 +248,11 @@ class StereoFullframeLoss(nn.Module):
 
     Loss:
         - BCE on confidence (index 4)
-        - Coordinate loss for all 4 coords when confidence > 0.5
-        - Outlier penalty for large errors
+        - Coordinate loss (MSE) for all 4 coords when confidence > 0.5
+        - Outlier penalty for errors exceeding tolerance
     """
-    def __init__(self, resolution=(320, 180), tolerance_px=10, conf_weight=2.0, coord_weight=1.0, outlier_weight=5.0):
+    def __init__(self, resolution=(320, 180), tolerance_px=5,
+                 conf_weight=2.0, coord_weight=1.0, outlier_weight=5.0):
         super().__init__()
         self.bce = nn.BCELoss()
         self.conf_weight = conf_weight
@@ -286,20 +288,24 @@ class StereoFullframeLoss(nn.Module):
             diff_left = pred_left - target_left
             diff_right = pred_right - target_right
 
+            # Coord loss (MSE)
+            coord_loss = (diff_left ** 2).mean() + (diff_right ** 2).mean()
+
+            # Distances for outlier calculation
             dist_left = torch.sqrt((diff_left ** 2).sum(dim=1) + 1e-8)
             dist_right = torch.sqrt((diff_right ** 2).sum(dim=1) + 1e-8)
 
-            # Base coord loss (MSE-like)
-            coord_loss = (diff_left ** 2).mean() + (diff_right ** 2).mean()
+            # Outlier penalty: extra loss for samples > tolerance
+            outlier_mask_left = dist_left > self.tolerance
+            outlier_mask_right = dist_right > self.tolerance
 
-            # Outlier penalty for both views
-            all_distances = torch.cat([dist_left, dist_right])
-            outlier_mask = all_distances > self.tolerance
-            if outlier_mask.any():
-                excess = all_distances[outlier_mask] - self.tolerance
-                outlier_loss = (excess ** 2).mean()
-            else:
-                outlier_loss = torch.tensor(0.0, device=pred.device)
+            outlier_loss = torch.tensor(0.0, device=pred.device)
+            if outlier_mask_left.any():
+                excess_left = dist_left[outlier_mask_left] - self.tolerance
+                outlier_loss = outlier_loss + (excess_left ** 2).mean()
+            if outlier_mask_right.any():
+                excess_right = dist_right[outlier_mask_right] - self.tolerance
+                outlier_loss = outlier_loss + (excess_right ** 2).mean()
         else:
             coord_loss = torch.tensor(0.0, device=pred.device)
             outlier_loss = torch.tensor(0.0, device=pred.device)
@@ -589,9 +595,12 @@ def validate(model, dataloader, criterion, device, pixel_size, stereo=False):
 # MAIN
 # ============================================================
 
-def main(MODE):
+def main(MODE, enable_pruning=None):
     # Select model based on mode
     MODEL = MODEL_FULLFRAME if MODE == "fullframe" else MODEL_CROP
+
+    # Use passed pruning flag or fall back to module-level setting
+    pruning_enabled = enable_pruning if enable_pruning is not None else ENABLE_PRUNING
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -612,7 +621,7 @@ def main(MODE):
     print(f"Device: {device}")
     print(f"Epochs: {EPOCHS}")
     print(f"Batch size: {BATCH_SIZE}")
-    print(f"Pruning: {'Enabled' if ENABLE_PRUNING else 'Disabled'}")
+    print(f"Pruning: {'Enabled' if pruning_enabled else 'Disabled'}")
     print("=" * 60)
 
     # Create output directory
@@ -623,7 +632,7 @@ def main(MODE):
         run_name += f"_{RESOLUTION[0]}x{RESOLUTION[1]}"
         if USE_STEREO:
             run_name += "_stereo"
-    if ENABLE_PRUNING:
+    if pruning_enabled:
         run_name += "_pruning"
 
     output_dir = Path(OUTPUT_DIR) / run_name
@@ -640,7 +649,7 @@ def main(MODE):
         'batch_size': BATCH_SIZE,
         'learning_rate': LEARNING_RATE,
         'weight_decay': WEIGHT_DECAY,
-        'enable_pruning': ENABLE_PRUNING,
+        'enable_pruning': pruning_enabled,
     }
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
@@ -660,15 +669,20 @@ def main(MODE):
         # Crop mode: only positive samples (ball always visible)
         if USE_MEMMAP:
             print(f"Loading crop memmap from: {CROP_MEMMAP_DIR}")
+            # Note: Tearing not supported in crop mode (no confidence output)
             train_loader, val_loader = create_crop_memmap_dataloaders(
                 data_dir=CROP_MEMMAP_DIR,
                 batch_size=BATCH_SIZE,
                 crop_size=128,
                 train_split=TRAIN_SPLIT,
                 num_workers=NUM_WORKERS,
+                use_spatial_aug=USE_SPATIAL_AUG,
+                use_appearance_aug=USE_APPEARANCE_AUG,
+                use_color_invariance_aug=USE_COLOR_INVARIANCE_AUG,
             )
         else:
             print(f"Loading data from: {DATA_DIR}")
+            # Note: Tearing not supported in crop mode (no confidence output)
             train_loader, val_loader = create_dataloaders(
                 data_dir=DATA_DIR,
                 batch_size=BATCH_SIZE,
@@ -678,8 +692,6 @@ def main(MODE):
                 use_spatial_augmentation=USE_SPATIAL_AUG,
                 use_appearance_augmentation=USE_APPEARANCE_AUG,
                 use_color_invariance_augmentation=USE_COLOR_INVARIANCE_AUG,
-                use_tearing_augmentation=False,
-                tearing_probability=0,
             )
         pixel_size = 128
         input_size = (128, 128)
@@ -693,6 +705,12 @@ def main(MODE):
                 batch_size=BATCH_SIZE,
                 train_split=TRAIN_SPLIT,
                 num_workers=NUM_WORKERS,
+                use_spatial_aug=USE_SPATIAL_AUG,
+                use_appearance_aug=USE_APPEARANCE_AUG,
+                use_color_invariance_aug=USE_COLOR_INVARIANCE_AUG,
+                use_tearing_aug=USE_TEARING_AUG,
+                tearing_probability=TEARING_PROBABILITY,
+                use_heavy_aug=USE_HEAVY_AUG,
             )
             criterion = StereoFullframeLoss(resolution=RESOLUTION, tolerance_px=5)
         elif USE_MEMMAP:
@@ -744,7 +762,7 @@ def main(MODE):
     )
 
     # Pruning state
-    pruning_active = ENABLE_PRUNING
+    pruning_active = pruning_enabled
     pruning_limit_reached = False
     pixel_error_history = deque(maxlen=PRUNING_PATIENCE)
     current_sparsity_target = INITIAL_TARGET_SPARSITY
@@ -780,7 +798,7 @@ def main(MODE):
             print(f"  Train: loss={train_loss:.4f}, px_err={train_px_err:.3f}")
             print(f"  Val:   loss={val_loss:.4f}, px_err={val_pixel_err:.3f}, p98={val_p98_px_err:.3f}, worst={val_worst_px_err:.3f}")
             print(f"  LR: {current_lr:.6f}, Time: {epoch_time:.1f}s")
-            if ENABLE_PRUNING:
+            if pruning_enabled:
                 sparsity = get_model_sparsity(model, original_param_count)
                 print(f"  Sparsity: {sparsity:.1f}%")
         else:
@@ -794,11 +812,12 @@ def main(MODE):
                 writer.add_scalar('LearningRate/lr', current_lr, epoch)
                 writer.add_scalar('Performance/epoch_time', epoch_time, epoch)
 
-                # Fullframe mode: log coord, conf, and outlier losses separately
+                # Fullframe mode: log coord and conf losses separately
                 if MODE == "fullframe" and hasattr(criterion, 'last_coord_loss'):
                     writer.add_scalar('Loss/coord', criterion.last_coord_loss, epoch)
                     writer.add_scalar('Loss/conf', criterion.last_conf_loss, epoch)
-                    writer.add_scalar('Loss/outlier', criterion.last_outlier_loss, epoch)
+                    if hasattr(criterion, 'last_outlier_loss'):
+                        writer.add_scalar('Loss/outlier', criterion.last_outlier_loss, epoch)
 
                 if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
                     writer.add_scalar('Loss/val', val_loss, epoch)
@@ -806,7 +825,7 @@ def main(MODE):
                     writer.add_scalar('PixelError/val_p98', val_p98_px_err, epoch)
                     writer.add_scalar('PixelError/val_worst', val_worst_px_err, epoch)
 
-                if ENABLE_PRUNING:
+                if pruning_enabled:
                     sparsity = get_model_sparsity(model, original_param_count)
                     writer.add_scalar('Sparsity/global', sparsity, epoch)
 
@@ -832,7 +851,7 @@ def main(MODE):
                 writer.flush()
 
         # Pruning logic
-        if ENABLE_PRUNING and pruning_active and not pruning_limit_reached:
+        if pruning_enabled and pruning_active and not pruning_limit_reached:
             if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
                 pixel_error_history.append(val_pixel_err)
 
@@ -903,7 +922,7 @@ def main(MODE):
     print(f"Run: {run_name}")
     print(f"Best loss: {best_val_loss:.4f}")
     print(f"Best pixel error: {best_pixel_error:.3f}px")
-    if ENABLE_PRUNING:
+    if pruning_enabled:
         print(f"Final params: {count_model_parameters(model):,} ({get_model_sparsity(model, original_param_count):.1f}% reduction)")
     print(f"\nOutput: {output_dir}")
     if ENABLE_TENSORBOARD:
@@ -915,6 +934,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train ball detection model')
     parser.add_argument('--mode', type=str, choices=['crop', 'fullframe'],
                         default='fullframe', help='Training mode (default: fullframe)')
+    parser.add_argument('--pruning', action='store_true',
+                        help='Enable pruning (overrides ENABLE_PRUNING in script)')
     args = parser.parse_args()
 
-    main(args.mode)
+    # Pass pruning flag only if explicitly set, otherwise use script default
+    main(args.mode, enable_pruning=args.pruning if args.pruning else None)
