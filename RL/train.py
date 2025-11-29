@@ -26,7 +26,7 @@ from agent import SACAgent, ReplayBuffer
 # ============================================================================
 
 NUM_ENVS = 10           # Number of parallel environments
-MAX_EPISODES = 1000     # Total training episodes
+MAX_EPISODES = 1500     # Total training episodes
 DEVICE = "cuda"         # "cuda" or "cpu"
 CHECKPOINT = None       # Path to checkpoint to resume from, or None
 
