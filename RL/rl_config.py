@@ -87,28 +87,30 @@ class RewardConfig:
 # ============================================================================
 
 class SACConfig:
-    """SAC hyperparameters."""
+    """SAC hyperparameters - tuned for parallel GPU training (1000+ envs)."""
 
     # Network architecture
     hidden_dim = 256  # Hidden layer size
+    use_layer_norm = True  # LayerNorm on critic for stability
 
-    # Learning rates
-    lr = 3e-4  # Learning rate for all networks
+    # Learning rates (separate for actor/critic per CleanRL/research)
+    actor_lr = 3e-4  # Policy learning rate
+    critic_lr = 1e-3  # Q-network learning rate (higher for faster value learning)
 
-    # SAC parameters
-    gamma = 0.99  # Discount factor
-    tau = 0.005  # Soft update coefficient
+    # SAC parameters (tuned for parallel training)
+    gamma = 0.98  # Discount factor (lower for parallel - shorter horizon)
+    tau = 0.02  # Soft update coefficient (higher for faster target updates)
     alpha = 0.2  # Initial entropy coefficient
     automatic_entropy_tuning = True
 
     # Replay buffer (must be large enough to hold multiple episodes worth of data)
     # With 1000 envs × 800 steps = 800k transitions/episode
-    buffer_size = 1_000_000
+    buffer_size = 2_000_000  # 2M for better experience diversity
     batch_size = 1024  # Larger batch = more GPU utilization
 
-    # Training
+    # Training (tuned for parallel - more gradient steps)
     warmup_steps = 1000  # Random actions before training
-    updates_per_step = 4  # Gradient updates per update call (more GPU work per call)
+    updates_per_step = 32  # Gradient updates per update call (increased for parallel)
     update_every = 10  # Update every N environment steps
 
 

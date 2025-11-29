@@ -130,10 +130,11 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """
     Twin Q-networks with 1D CNN for temporal observation processing.
+    Uses LayerNorm for training stability in parallel environments.
     """
 
     def __init__(self, input_dim, action_dim, hidden_dim=256,
-                 num_frames=12, obs_per_frame=7):
+                 num_frames=12, obs_per_frame=7, use_layer_norm=True):
         super(Critic, self).__init__()
 
         self.num_frames = num_frames
@@ -152,23 +153,41 @@ class Critic(nn.Module):
         # CNN output: 64 × 5 = 320, plus action_dim
         cnn_out_dim = 64 * 5
 
-        # Q1 network (takes CNN features + action)
-        self.q1 = nn.Sequential(
-            nn.Linear(cnn_out_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-
-        # Q2 network (takes CNN features + action)
-        self.q2 = nn.Sequential(
-            nn.Linear(cnn_out_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
+        # Q1 network with LayerNorm for stability
+        if use_layer_norm:
+            self.q1 = nn.Sequential(
+                nn.Linear(cnn_out_dim + action_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+            self.q2 = nn.Sequential(
+                nn.Linear(cnn_out_dim + action_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+        else:
+            self.q1 = nn.Sequential(
+                nn.Linear(cnn_out_dim + action_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+            self.q2 = nn.Sequential(
+                nn.Linear(cnn_out_dim + action_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
 
     def forward(self, obs, action):
         """Forward pass through both Q networks."""
@@ -390,14 +409,16 @@ class SACAgent:
             physics_dim=3,    # [friction, servo_tau, mass_factor]
             num_frames=12,    # Number of frames in history
             obs_per_frame=7,  # Features per frame
-            lr=3e-4,
-            gamma=0.99,
-            tau=0.005,
+            actor_lr=3e-4,    # Policy learning rate
+            critic_lr=1e-3,   # Q-network learning rate (higher per research)
+            gamma=0.98,       # Discount factor (lower for parallel training)
+            tau=0.02,         # Soft update coefficient (higher for parallel)
             alpha=0.2,
             alpha_lr=1e-4,    # Slower learning rate for alpha (prevents collapse)
             alpha_min=0.15,   # Minimum alpha floor (keeps exploration active)
             physics_loss_weight=0.1,  # Weight for auxiliary physics loss
             automatic_entropy_tuning=True,
+            use_layer_norm=True,  # LayerNorm on critic for stability
             device="cpu",
             compile_model=False,  # Use torch.compile for speedup (PyTorch 2.0+)
             use_amp=False  # Use automatic mixed precision (bfloat16)
@@ -422,9 +443,9 @@ class SACAgent:
         self.actor = Actor(obs_dim, action_dim, hidden_dim, physics_dim,
                           num_frames, obs_per_frame).to(self.device)
         self.critic = Critic(obs_dim, action_dim, hidden_dim,
-                            num_frames, obs_per_frame).to(self.device)
+                            num_frames, obs_per_frame, use_layer_norm).to(self.device)
         self.critic_target = Critic(obs_dim, action_dim, hidden_dim,
-                                   num_frames, obs_per_frame).to(self.device)
+                                   num_frames, obs_per_frame, use_layer_norm).to(self.device)
 
         # Optional: compile networks for speedup (PyTorch 2.0+)
         if compile_model and hasattr(torch, 'compile'):
@@ -437,9 +458,9 @@ class SACAgent:
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(param.data)
 
-        # Optimizers
-        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr)
+        # Optimizers (separate learning rates for actor and critic)
+        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=critic_lr)
 
         # Automatic entropy tuning with slower learning rate
         if automatic_entropy_tuning:

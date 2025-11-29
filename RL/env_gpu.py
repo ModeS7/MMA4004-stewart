@@ -554,17 +554,34 @@ class StewartEnvGPU:
         )
 
     def _compute_reward(self, actions, fell_off):
-        """Compute reward - simplified: -distance + alive bonus."""
+        """
+        Compute reward - multiplicative form from IsaacGymEnvs BallBalance.
+
+        reward = 1/(1+dist) * 1/(1+speed)
+
+        This reward:
+        - Is bounded [0, 1] - no exploding rewards
+        - Naturally rewards both centering AND stopping
+        - Fall penalty only applied on fall
+        """
         # Distance from center in mm
         dist_mm = torch.sqrt((self.ball_x * 1000.0)**2 + (self.ball_y * 1000.0)**2)
 
-        # Simple: -distance (normalized) + alive bonus
-        max_dist = self.cfg.platform_radius_mm  # 150mm
-        reward = -dist_mm / max_dist  # Range: ~[-1.4, 0]
-        reward += 0.5  # Alive bonus (must be large enough to make survival valuable)
+        # Velocity magnitude in mm/s
+        speed_mm_s = torch.sqrt((self.ball_vx * 1000.0)**2 + (self.ball_vy * 1000.0)**2)
 
-        # Termination penalty (must be large enough to make falling worse than surviving)
-        reward = torch.where(fell_off, torch.full_like(reward, -100.0), reward)
+        # Multiplicative reward (bounded 0-1)
+        # Scale factors tuned for platform size (150mm) and typical speeds
+        dist_scale = 30.0   # ~30mm from center gives 0.5 distance factor
+        speed_scale = 50.0  # ~50mm/s gives 0.5 speed factor
+
+        dist_factor = 1.0 / (1.0 + dist_mm / dist_scale)
+        speed_factor = 1.0 / (1.0 + speed_mm_s / speed_scale)
+
+        reward = dist_factor * speed_factor  # Range: [0, 1]
+
+        # Termination penalty
+        reward = torch.where(fell_off, torch.full_like(reward, -10.0), reward)
 
         return reward
 

@@ -39,8 +39,8 @@ CHECKPOINT = None       # Path to checkpoint to resume from, or None
 
 # Logging
 LOG_INTERVAL = 1        # Print stats every N episodes
-EVAL_INTERVAL = 50      # Evaluate every N episodes
-SAVE_INTERVAL = 100     # Save checkpoint every N episodes
+EVAL_INTERVAL = 5      # Evaluate every N episodes
+SAVE_INTERVAL = 10     # Save checkpoint every N episodes
 
 # ============================================================================
 
@@ -144,12 +144,14 @@ def train():
         physics_dim=env_cfg.physics_dim,
         num_frames=env_cfg.num_frames,
         obs_per_frame=env_cfg.obs_per_frame,
-        lr=sac_cfg.lr,
+        actor_lr=sac_cfg.actor_lr,
+        critic_lr=sac_cfg.critic_lr,
         gamma=sac_cfg.gamma,
         tau=sac_cfg.tau,
         alpha=sac_cfg.alpha,
         physics_loss_weight=0.1,
         automatic_entropy_tuning=sac_cfg.automatic_entropy_tuning,
+        use_layer_norm=sac_cfg.use_layer_norm,
         device=train_cfg.device,
         compile_model=USE_COMPILE,
         use_amp=USE_AMP
@@ -199,7 +201,7 @@ def train():
 
     # Log hyperparameters
     writer.add_text("config/env", f"num_frames={env_cfg.num_frames}, obs_per_frame={env_cfg.obs_per_frame}")
-    writer.add_text("config/sac", f"hidden_dim={sac_cfg.hidden_dim}, lr={sac_cfg.lr}, gamma={sac_cfg.gamma}")
+    writer.add_text("config/sac", f"hidden_dim={sac_cfg.hidden_dim}, actor_lr={sac_cfg.actor_lr}, critic_lr={sac_cfg.critic_lr}, gamma={sac_cfg.gamma}, tau={sac_cfg.tau}")
     writer.add_text("config/training", f"num_envs={NUM_ENVS}, max_episodes={MAX_EPISODES}")
 
     # Training loop
