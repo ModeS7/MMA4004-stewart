@@ -320,20 +320,37 @@ class RLController:
         # Frame history buffer
         self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
 
-        # Build actor network (same architecture as training)
+        # Build actor network (1D CNN - same architecture as RL/agent.py)
         class Actor(nn.Module):
-            def __init__(self, input_dim=84, action_dim=2, hidden_dim=256, physics_dim=3):
+            def __init__(self, input_dim=84, action_dim=2, hidden_dim=256, physics_dim=3,
+                         num_frames=12, obs_per_frame=7):
                 super().__init__()
-                # Shared backbone
-                self.backbone = nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
+                self.num_frames = num_frames
+                self.obs_per_frame = obs_per_frame
+
+                # 1D CNN backbone: (batch, 7, 12) -> (batch, features)
+                self.conv = nn.Sequential(
+                    nn.Conv1d(obs_per_frame, 32, kernel_size=3, padding=1),  # (batch, 32, 12)
                     nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU()
+                    nn.Conv1d(32, 64, kernel_size=3, padding=1),             # (batch, 64, 12)
+                    nn.ReLU(),
+                    nn.Conv1d(64, 64, kernel_size=3, stride=2),              # (batch, 64, 5)
+                    nn.ReLU(),
                 )
+
+                # CNN output: 64 × 5 = 320
+                cnn_out_dim = 64 * 5
+
+                # MLP after CNN
+                self.fc = nn.Sequential(
+                    nn.Linear(cnn_out_dim, hidden_dim),
+                    nn.ReLU(),
+                )
+
                 # Action head
                 self.action_mean = nn.Linear(hidden_dim, action_dim)
                 self.action_log_std = nn.Linear(hidden_dim, action_dim)
+
                 # Physics head (not used for inference, but needed for loading weights)
                 self.physics_head = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim // 2),
@@ -343,7 +360,19 @@ class RLController:
                 )
 
             def forward(self, obs):
-                features = self.backbone(obs)
+                batch_size = obs.shape[0]
+                # Reshape: (batch, 84) -> (batch, 12, 7) -> (batch, 7, 12)
+                x = obs.view(batch_size, self.num_frames, self.obs_per_frame)
+                x = x.permute(0, 2, 1)  # (batch, 7, 12)
+
+                # CNN feature extraction
+                x = self.conv(x)
+                x = x.flatten(1)  # (batch, 320)
+
+                # MLP
+                features = self.fc(x)
+
+                # Action output
                 action_mean = torch.tanh(self.action_mean(features))
                 return action_mean
 

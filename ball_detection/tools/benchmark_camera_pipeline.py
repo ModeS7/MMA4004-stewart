@@ -527,10 +527,16 @@ def run_benchmark(args):
         else:
             fps = 0
 
-        # Progress
+        # Progress with detailed timing
         if loader.frame_count % 100 == 0:
-            print(f"  Frame {loader.frame_count}/{len(loader)}, "
-                  f"FPS: {fps:.1f}, Time: {frame_time:.1f}ms")
+            timing = result['timing']
+            if 'resize_ms' in timing:  # STEREO_NN mode
+                print(f"  Frame {loader.frame_count}/{len(loader)} | FPS: {fps:.1f} | Total: {frame_time:.1f}ms")
+                print(f"    resize: {timing.get('resize_ms', 0):.2f} | cvt: {timing.get('convert_ms', 0):.2f} | "
+                      f"norm: {timing.get('normalize_ms', 0):.2f} | stereo: {timing.get('stereo_ms', 0):.2f} | "
+                      f"refine_L: {timing.get('refine_L_ms', 0):.2f} | refine_R: {timing.get('refine_R_ms', 0):.2f}")
+            else:  # ROI_NN mode
+                print(f"  Frame {loader.frame_count}/{len(loader)} | FPS: {fps:.1f} | Total: {frame_time:.1f}ms")
 
         # Visualization
         if args.display:

@@ -457,13 +457,18 @@ class StereoCameraController:
                     t_end = time.perf_counter()
                     if debug_timing and self.frame_count % timing_interval == 0:
                         total_ms = (t_end - loop_start) * 1000
+                        get_frame_ms = (t_get_frame - loop_start) * 1000
+                        split_ms = (t_split - t_get_frame) * 1000
+                        detect_ms = (t_detect - t_split) * 1000
                         rectify_ms = (t_rectify - t_detect) * 1000
                         rest_ms = (t_end - t_rectify) * 1000
-                        prep_total = timing['resize_ms'] + timing['convert_ms'] + timing['normalize_ms']
                         print(f"[Frame {self.frame_count}] Total: {total_ms:.1f}ms | "
-                              f"prep: {prep_total:.1f} (resize:{timing['resize_ms']:.1f} cvt:{timing['convert_ms']:.1f} norm:{timing['normalize_ms']:.1f}) | "
-                              f"stereo: {timing['stereo_ms']:.1f} | refine_L: {timing['refine_L_ms']:.1f} | refine_R: {timing['refine_R_ms']:.1f} | "
-                              f"tri: {rectify_ms + rest_ms:.1f} | grabber: {self.grabber_fps:.1f}fps")
+                              f"get: {get_frame_ms:.1f} | split: {split_ms:.1f} | "
+                              f"detect: {detect_ms:.1f} | pt_rect: {rectify_ms:.1f} | rest: {rest_ms:.1f} | "
+                              f"grabber: {self.grabber_fps:.1f}fps")
+                        print(f"  resize: {timing['resize_ms']:.2f} | cvt: {timing['convert_ms']:.2f} | "
+                              f"norm: {timing['normalize_ms']:.2f} | stereo_nn: {timing['stereo_ms']:.2f} | "
+                              f"refine_L: {timing['refine_L_ms']:.2f} | refine_R: {timing['refine_R_ms']:.2f}")
                         if detection_result['detected']:
                             print(f"  conf={detection_result['confidence']:.2f} | "
                                   f"L: ({detection_result['x_left']:.0f}, {detection_result['y_left']:.0f}) | "
