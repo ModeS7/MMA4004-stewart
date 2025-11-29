@@ -20,7 +20,7 @@ Output:
 
     Stereo mode:
         data/stereo_memmap/
-            images.npy   - (N, 180, 320, 6) uint8 [left_RGB + right_RGB]
+            images.npy   - (N, 180, 320, 6) uint8 [left_BGR + right_BGR]
             labels.npy   - (N, 5) float32 [x_left, y_left, x_right, y_right, confidence]
             metadata.json
 """
@@ -93,9 +93,8 @@ def process_normal_mode(input_path, output_path, labels, image_dir):
 
         orig_h, orig_w = img.shape[:2]
 
-        # Resize
+        # Resize (keep BGR - no RGB conversion for faster inference)
         img = cv2.resize(img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_LINEAR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         images_memmap[i] = img
 
@@ -221,14 +220,11 @@ def process_stereo_mode(input_path, output_path, labels, image_dir):
 
         orig_h, orig_w = left_img.shape[:2]
 
-        # Resize both
+        # Resize both (keep BGR - no RGB conversion for faster inference)
         left_img = cv2.resize(left_img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_LINEAR)
-        left_img = cv2.cvtColor(left_img, cv2.COLOR_BGR2RGB)
-
         right_img = cv2.resize(right_img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_LINEAR)
-        right_img = cv2.cvtColor(right_img, cv2.COLOR_BGR2RGB)
 
-        # Stack left and right (6 channels: left_R, left_G, left_B, right_R, right_G, right_B)
+        # Stack left and right (6 channels: left_B, left_G, left_R, right_B, right_G, right_R)
         stereo_img = np.concatenate([left_img, right_img], axis=2)
         images_memmap[i] = stereo_img
 

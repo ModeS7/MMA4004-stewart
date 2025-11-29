@@ -18,25 +18,40 @@ from torch.distributions import Normal
 
 class Actor(nn.Module):
     """
-    Feedforward actor that takes observation history.
+    1D CNN actor that processes frame history temporally.
 
     Outputs:
         - Action (2D): platform tilt targets
         - Physics estimate (3D): [friction, servo_tau, mass_factor]
     """
 
-    def __init__(self, input_dim, action_dim, hidden_dim=256, physics_dim=3):
+    def __init__(self, input_dim, action_dim, hidden_dim=256, physics_dim=3,
+                 num_frames=12, obs_per_frame=7):
         super(Actor, self).__init__()
 
         self.input_dim = input_dim
         self.physics_dim = physics_dim
+        self.num_frames = num_frames
+        self.obs_per_frame = obs_per_frame
 
-        # Shared backbone
-        self.backbone = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        # 1D CNN backbone: (batch, 7, 12) -> (batch, features)
+        # Kernel spans all features, slides across time
+        self.conv = nn.Sequential(
+            nn.Conv1d(obs_per_frame, 32, kernel_size=3, padding=1),  # (batch, 32, 12)
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),             # (batch, 64, 12)
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, stride=2),              # (batch, 64, 5)
+            nn.ReLU(),
+        )
+
+        # Calculate CNN output size: 64 channels × 5 time steps = 320
+        cnn_out_dim = 64 * 5
+
+        # MLP after CNN
+        self.fc = nn.Sequential(
+            nn.Linear(cnn_out_dim, hidden_dim),
+            nn.ReLU(),
         )
 
         # Action head (Gaussian policy)
@@ -56,12 +71,24 @@ class Actor(nn.Module):
         Forward pass.
 
         Args:
-            obs: (batch, input_dim) observation history
+            obs: (batch, input_dim) observation history (84 = 12 frames × 7 features)
 
         Returns:
             action_mean, action_log_std, physics_estimate
         """
-        features = self.backbone(obs)
+        batch_size = obs.shape[0]
+
+        # Reshape: (batch, 84) -> (batch, 12, 7) -> (batch, 7, 12)
+        # Conv1d expects (batch, channels, length)
+        x = obs.view(batch_size, self.num_frames, self.obs_per_frame)
+        x = x.permute(0, 2, 1)  # (batch, 7, 12)
+
+        # CNN feature extraction
+        x = self.conv(x)
+        x = x.flatten(1)  # (batch, 320)
+
+        # MLP
+        features = self.fc(x)
 
         # Action output
         action_mean = torch.tanh(self.action_mean(features))
@@ -102,24 +129,41 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
     """
-    Twin Q-networks for observations.
+    Twin Q-networks with 1D CNN for temporal observation processing.
     """
 
-    def __init__(self, input_dim, action_dim, hidden_dim=256):
+    def __init__(self, input_dim, action_dim, hidden_dim=256,
+                 num_frames=12, obs_per_frame=7):
         super(Critic, self).__init__()
 
-        # Q1 network
+        self.num_frames = num_frames
+        self.obs_per_frame = obs_per_frame
+
+        # Shared CNN for observation encoding
+        self.conv = nn.Sequential(
+            nn.Conv1d(obs_per_frame, 32, kernel_size=3, padding=1),  # (batch, 32, 12)
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),             # (batch, 64, 12)
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, stride=2),              # (batch, 64, 5)
+            nn.ReLU(),
+        )
+
+        # CNN output: 64 × 5 = 320, plus action_dim
+        cnn_out_dim = 64 * 5
+
+        # Q1 network (takes CNN features + action)
         self.q1 = nn.Sequential(
-            nn.Linear(input_dim + action_dim, hidden_dim),
+            nn.Linear(cnn_out_dim + action_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
-        # Q2 network
+        # Q2 network (takes CNN features + action)
         self.q2 = nn.Sequential(
-            nn.Linear(input_dim + action_dim, hidden_dim),
+            nn.Linear(cnn_out_dim + action_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -128,7 +172,19 @@ class Critic(nn.Module):
 
     def forward(self, obs, action):
         """Forward pass through both Q networks."""
-        x = torch.cat([obs, action], dim=-1)
+        batch_size = obs.shape[0]
+
+        # Reshape: (batch, 84) -> (batch, 7, 12)
+        x = obs.view(batch_size, self.num_frames, self.obs_per_frame)
+        x = x.permute(0, 2, 1)  # (batch, 7, 12)
+
+        # CNN feature extraction
+        x = self.conv(x)
+        x = x.flatten(1)  # (batch, 320)
+
+        # Concatenate with action
+        x = torch.cat([x, action], dim=-1)
+
         return self.q1(x), self.q2(x)
 
 
@@ -328,16 +384,18 @@ class SACAgent:
 
     def __init__(
             self,
-            obs_dim,          # Total observation dim (e.g., 12 * 5 = 60)
+            obs_dim,          # Total observation dim (e.g., 12 * 7 = 84)
             action_dim=2,
             hidden_dim=256,
             physics_dim=3,    # [friction, servo_tau, mass_factor]
+            num_frames=12,    # Number of frames in history
+            obs_per_frame=7,  # Features per frame
             lr=3e-4,
             gamma=0.99,
             tau=0.005,
             alpha=0.2,
             alpha_lr=1e-4,    # Slower learning rate for alpha (prevents collapse)
-            alpha_min=0.05,   # Minimum alpha floor (prevents deterministic policy)
+            alpha_min=0.15,   # Minimum alpha floor (keeps exploration active)
             physics_loss_weight=0.1,  # Weight for auxiliary physics loss
             automatic_entropy_tuning=True,
             device="cpu",
@@ -360,10 +418,13 @@ class SACAgent:
         # AMP dtype (bfloat16 is more stable than float16 for RL)
         self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-        # Networks
-        self.actor = Actor(obs_dim, action_dim, hidden_dim, physics_dim).to(self.device)
-        self.critic = Critic(obs_dim, action_dim, hidden_dim).to(self.device)
-        self.critic_target = Critic(obs_dim, action_dim, hidden_dim).to(self.device)
+        # Networks (1D CNN for temporal processing)
+        self.actor = Actor(obs_dim, action_dim, hidden_dim, physics_dim,
+                          num_frames, obs_per_frame).to(self.device)
+        self.critic = Critic(obs_dim, action_dim, hidden_dim,
+                            num_frames, obs_per_frame).to(self.device)
+        self.critic_target = Critic(obs_dim, action_dim, hidden_dim,
+                                   num_frames, obs_per_frame).to(self.device)
 
         # Optional: compile networks for speedup (PyTorch 2.0+)
         if compile_model and hasattr(torch, 'compile'):

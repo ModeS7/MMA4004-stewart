@@ -561,10 +561,10 @@ class StewartEnvGPU:
         # Simple: -distance (normalized) + alive bonus
         max_dist = self.cfg.platform_radius_mm  # 150mm
         reward = -dist_mm / max_dist  # Range: ~[-1.4, 0]
-        reward += 0.1  # Alive bonus
+        reward += 0.5  # Alive bonus (must be large enough to make survival valuable)
 
-        # Termination penalty
-        reward = torch.where(fell_off, torch.full_like(reward, -10.0), reward)
+        # Termination penalty (must be large enough to make falling worse than surviving)
+        reward = torch.where(fell_off, torch.full_like(reward, -100.0), reward)
 
         return reward
 

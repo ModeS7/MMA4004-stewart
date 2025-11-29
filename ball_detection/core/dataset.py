@@ -226,7 +226,8 @@ class BallDetectionDataset(Dataset):
         if self.disable_normalize:
             transforms_list.append(A.ToFloat(max_value=255.0))
         else:
-            transforms_list.append(A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+            # BGR order (model trained on BGR for faster inference)
+            transforms_list.append(A.Normalize(mean=[0.406, 0.456, 0.485], std=[0.225, 0.224, 0.229]))
         transforms_list.append(ToTensorV2())
         return A.Compose(transforms_list)
 
@@ -345,7 +346,8 @@ class BallDetectionDataset(Dataset):
             transforms_list.append(A.ToFloat(max_value=255.0))
         else:
             # Standard ImageNet normalization
-            transforms_list.append(A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+            # BGR order (model trained on BGR for faster inference)
+            transforms_list.append(A.Normalize(mean=[0.406, 0.456, 0.485], std=[0.225, 0.224, 0.229]))
 
         transforms_list.append(ToTensorV2())
 
@@ -372,11 +374,10 @@ class BallDetectionDataset(Dataset):
         # Check if sample is marked as difficult (skip appearance augmentations)
         is_difficult = label.get('difficult', False)
 
-        # Load image
+        # Load image (keep BGR - model trained on BGR for faster inference)
         image = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Failed to load image: {img_path}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         height, width = image.shape[:2]
 
         # Original ball coordinates
@@ -590,9 +591,9 @@ class FullFrameDataset(Dataset):
                 A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
             ])
 
-        # Normalize and convert to tensor
+        # Normalize and convert to tensor (BGR order - model trained on BGR)
         transforms_list.extend([
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            A.Normalize(mean=[0.406, 0.456, 0.485], std=[0.225, 0.224, 0.229]),
             ToTensorV2()
         ])
 
@@ -604,9 +605,8 @@ class FullFrameDataset(Dataset):
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
 
-        # Load image
+        # Load image (keep BGR - model trained on BGR for faster inference)
         image = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = image.shape[:2]
 
         # Get ball coordinates (at original resolution)
@@ -648,9 +648,9 @@ class FullFrameMemmapDataset(Dataset):
         data_dir/labels.npy  - (N, 3) float32 [x_norm, y_norm, valid]
     """
 
-    # ImageNet normalization
-    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # BGR order normalization (model trained on BGR for faster inference)
+    MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
+    STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
     def __init__(self, data_dir, use_augmentation=True, indices=None):
         self.data_dir = Path(data_dir)
@@ -691,7 +691,7 @@ class FullFrameMemmapDataset(Dataset):
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
 
-        # Load from memmap (already RGB, already resized)
+        # Load from memmap (already BGR, already resized)
         image = np.array(self.images[real_idx])  # Copy from memmap
         label = self.labels[real_idx]
 
@@ -728,8 +728,9 @@ class CachedFullFrameMemmapDataset(Dataset):
     Maximizes GPU utilization by eliminating CPU augmentation bottleneck.
     """
 
-    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # BGR order normalization (model trained on BGR for faster inference)
+    MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
+    STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
     def __init__(self, data_dir, indices=None, cache_multiplier=3, max_reuse=2):
         """
@@ -901,17 +902,17 @@ class StereoMemmapDataset(Dataset):
     Stereo dataset using pre-processed memmap files for fast loading.
 
     Expects:
-        data_dir/images.npy  - (N, H, W, 6) uint8 [left_RGB + right_RGB]
+        data_dir/images.npy  - (N, H, W, 6) uint8 [left_BGR + right_BGR]
         data_dir/labels.npy  - (N, 5) float32 [x_left, y_left, x_right, y_right, confidence]
 
     Applies same augmentations as FullFrameMemmapDataset but to 6-channel input.
     Spatial augmentations are applied identically to both views.
-    Color augmentations are applied separately to each 3-channel RGB triplet.
+    Color augmentations are applied separately to each 3-channel BGR triplet.
     """
 
-    # ImageNet normalization (applied to each RGB triplet)
-    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # BGR order normalization (applied to each BGR triplet)
+    MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
+    STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
     def __init__(self, data_dir, use_augmentation=True, indices=None):
         self.data_dir = Path(data_dir)
@@ -986,24 +987,24 @@ class StereoMemmapDataset(Dataset):
                 left_x_px, left_y_px = transformed['keypoints'][0]
                 right_x_px, right_y_px = transformed['keypoints'][1]
 
-            # 2. Apply color augmentations separately to each RGB triplet
+            # 2. Apply color augmentations separately to each BGR triplet
             # Use same random params for both views to keep them consistent
-            left_rgb = image[:, :, :3]
-            right_rgb = image[:, :, 3:]
+            left_bgr = image[:, :, :3]
+            right_bgr = image[:, :, 3:]
 
             # Apply same color transform to both
             replay = A.ReplayCompose([
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
                 A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
             ])
-            left_result = replay(image=left_rgb)
-            right_result = A.ReplayCompose.replay(left_result['replay'], image=right_rgb)
+            left_result = replay(image=left_bgr)
+            right_result = A.ReplayCompose.replay(left_result['replay'], image=right_bgr)
 
-            left_rgb = left_result['image']
-            right_rgb = right_result['image']
+            left_bgr = left_result['image']
+            right_bgr = right_result['image']
 
             # Recombine
-            image = np.concatenate([left_rgb, right_rgb], axis=2)
+            image = np.concatenate([left_bgr, right_bgr], axis=2)
 
         # Back to normalized
         x_left = np.clip(left_x_px / self.width, 0.0, 1.0)
@@ -1014,14 +1015,14 @@ class StereoMemmapDataset(Dataset):
         # Convert to tensor: (H, W, 6) -> (6, H, W)
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
 
-        # Normalize each RGB triplet separately
-        left_rgb = image_tensor[:3]  # First 3 channels
-        right_rgb = image_tensor[3:]  # Last 3 channels
+        # Normalize each BGR triplet separately
+        left_bgr = image_tensor[:3]  # First 3 channels
+        right_bgr = image_tensor[3:]  # Last 3 channels
 
-        left_rgb = (left_rgb - self.MEAN) / self.STD
-        right_rgb = (right_rgb - self.MEAN) / self.STD
+        left_bgr = (left_bgr - self.MEAN) / self.STD
+        right_bgr = (right_bgr - self.MEAN) / self.STD
 
-        image_tensor = torch.cat([left_rgb, right_rgb], dim=0)
+        image_tensor = torch.cat([left_bgr, right_bgr], dim=0)
 
         target = torch.tensor([x_left, y_left, x_right, y_right, confidence], dtype=torch.float32)
         return image_tensor, target
@@ -1239,9 +1240,9 @@ class CropMemmapDataset(Dataset):
     All samples are positive (ball visible). No confidence output.
     """
 
-    # ImageNet normalization
-    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # BGR order normalization (model trained on BGR for faster inference)
+    MEAN = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
+    STD = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
     def __init__(self, data_dir, crop_size=128, use_augmentation=True, indices=None):
         self.data_dir = Path(data_dir)

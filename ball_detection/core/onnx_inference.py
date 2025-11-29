@@ -70,30 +70,30 @@ class ONNXBallDetector:
         print(f"  Output: {self.output_name}")
         print(f"  Expected input shape: (batch, 3, {image_size}, {image_size})")
 
-        # Normalization parameters (ImageNet stats)
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # Normalization parameters (BGR order - model trained on BGR)
+        self.mean = np.array([0.406, 0.456, 0.485], dtype=np.float32)
+        self.std = np.array([0.225, 0.224, 0.229], dtype=np.float32)
 
         # Statistics
         self.inference_count = 0
         self.total_inference_time = 0.0
 
-    def preprocess(self, image_rgb):
+    def preprocess(self, image_bgr):
         """
         Preprocess image for model input.
 
         Args:
-            image_rgb: RGB image (H, W, 3), uint8, range [0, 255]
+            image_bgr: BGR image (H, W, 3), uint8, range [0, 255]
 
         Returns:
             Preprocessed tensor (1, 3, H, W), float32
         """
         # Resize if needed
-        if image_rgb.shape[:2] != (self.image_size, self.image_size):
-            image_rgb = cv2.resize(image_rgb, (self.image_size, self.image_size))
+        if image_bgr.shape[:2] != (self.image_size, self.image_size):
+            image_bgr = cv2.resize(image_bgr, (self.image_size, self.image_size))
 
         # Convert to float [0, 1]
-        image_float = image_rgb.astype(np.float32) / 255.0
+        image_float = image_bgr.astype(np.float32) / 255.0
 
         # Normalize
         image_float = (image_float - self.mean) / self.std
@@ -104,12 +104,12 @@ class ONNXBallDetector:
 
         return image_tensor
 
-    def detect(self, image_rgb) -> Tuple[float, float, float]:
+    def detect(self, image_bgr) -> Tuple[float, float, float]:
         """
         Detect ball center in image.
 
         Args:
-            image_rgb: RGB image crop (H, W, 3), uint8
+            image_bgr: BGR image crop (H, W, 3), uint8
 
         Returns:
             x_normalized: X coordinate normalized to [0, 1]
@@ -252,7 +252,7 @@ class ONNXStereoDetector:
 
     def __init__(self, stereo_model_path, crop_model_path=None, use_gpu=True,
                  stereo_size=(320, 180), crop_size=128, frame_size=(1280, 720),
-                 confidence_threshold=0.5, use_refinement=True):
+                 confidence_threshold=0.5, use_refinement=True, convert_to_rgb=False):
         """
         Initialize stereo detector.
 
@@ -265,12 +265,14 @@ class ONNXStereoDetector:
             frame_size: Original frame size (width, height)
             confidence_threshold: Minimum confidence for detection
             use_refinement: Enable stage 2 crop refinement
+            convert_to_rgb: Convert BGR frames to RGB before stereo model
         """
         self.stereo_size = stereo_size  # (320, 180)
         self.crop_size = crop_size
         self.frame_size = frame_size  # (1280, 720)
         self.confidence_threshold = confidence_threshold
         self.use_refinement = use_refinement and crop_model_path is not None
+        self.convert_to_rgb = convert_to_rgb
 
         # Setup providers
         if use_gpu:
@@ -319,7 +321,7 @@ class ONNXStereoDetector:
         self.mean_bgr = np.array([0.406, 0.456, 0.485], dtype=np.float32)
         self.std_bgr = np.array([0.225, 0.224, 0.229], dtype=np.float32)
 
-        # Normalization - RGB order for crop model (trained on RGB like ROI_NN)
+        # Normalization - RGB order (only used if convert_to_rgb=True)
         self.mean_rgb = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std_rgb = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -328,19 +330,25 @@ class ONNXStereoDetector:
         self.total_time = 0.0
 
     def _preprocess_stereo(self, left_bgr, right_bgr):
-        """Preprocess stereo pair for tiny_stereo model.
-
-        Takes BGR frames directly (no color conversion - using BGR mean/std).
-        """
+        """Preprocess stereo pair for tiny_stereo model."""
         # Resize to stereo input size
         left_small = cv2.resize(left_bgr, self.stereo_size)
         right_small = cv2.resize(right_bgr, self.stereo_size)
 
-        # Normalize (using BGR mean/std, no conversion needed)
-        left_norm = (left_small.astype(np.float32) / 255.0 - self.mean_bgr) / self.std_bgr
-        right_norm = (right_small.astype(np.float32) / 255.0 - self.mean_bgr) / self.std_bgr
+        if self.convert_to_rgb:
+            # Convert BGR->RGB (for RGB-trained models)
+            left_small = cv2.cvtColor(left_small, cv2.COLOR_BGR2RGB)
+            right_small = cv2.cvtColor(right_small, cv2.COLOR_BGR2RGB)
+            mean, std = self.mean_rgb, self.std_rgb
+        else:
+            # Keep BGR (for BGR-trained models)
+            mean, std = self.mean_bgr, self.std_bgr
 
-        # Stack as 6-channel (left BGR + right BGR)
+        # Normalize
+        left_norm = (left_small.astype(np.float32) / 255.0 - mean) / std
+        right_norm = (right_small.astype(np.float32) / 255.0 - mean) / std
+
+        # Stack as 6-channel
         # Shape: (H, W, 6) -> (6, H, W) -> (1, 6, H, W)
         stereo = np.concatenate([left_norm, right_norm], axis=2)  # (H, W, 6)
         stereo = np.transpose(stereo, (2, 0, 1))  # (6, H, W)
@@ -349,19 +357,12 @@ class ONNXStereoDetector:
         return stereo.astype(np.float32)
 
     def _preprocess_crop(self, crop_bgr):
-        """Preprocess single crop for refinement model.
-
-        Converts small 128x128 BGR crop to RGB (same as ROI_NN pipeline).
-        The crop model was trained on RGB input.
-        """
+        """Preprocess single crop for refinement model (BGR, no conversion)."""
         if crop_bgr.shape[:2] != (self.crop_size, self.crop_size):
             crop_bgr = cv2.resize(crop_bgr, (self.crop_size, self.crop_size))
 
-        # Convert small crop to RGB (fast on 128x128)
-        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-
-        # Normalize with RGB mean/std (same as ROI_NN)
-        crop_norm = (crop_rgb.astype(np.float32) / 255.0 - self.mean_rgb) / self.std_rgb
+        # Normalize with BGR mean/std (same as stereo model)
+        crop_norm = (crop_bgr.astype(np.float32) / 255.0 - self.mean_bgr) / self.std_bgr
         crop_tensor = np.transpose(crop_norm, (2, 0, 1))
         crop_tensor = np.expand_dims(crop_tensor, axis=0)
 
@@ -417,7 +418,7 @@ class ONNXStereoDetector:
         frame_h, frame_w = left_frame.shape[:2]
 
         # Stage 1: Coarse detection with tiny_stereo
-        # Preprocessing includes resize + BGR->RGB on small frames
+        # Preprocessing includes resize (+ BGR->RGB only if convert_to_rgb=True)
         stereo_input = self._preprocess_stereo(left_frame, right_frame)
         t_stereo_prep = time.perf_counter()
 
@@ -450,7 +451,7 @@ class ONNXStereoDetector:
         refine_R_ms = 0
 
         if self.use_refinement and self.crop_session is not None:
-            # Refine left - extract crop from BGR frame, preprocess converts to RGB
+            # Refine left - extract crop from BGR frame
             t_refine_L_start = time.perf_counter()
             left_crop, left_offset = self._extract_crop(left_frame, x_l_norm, y_l_norm)
             left_input = self._preprocess_crop(left_crop)
@@ -465,7 +466,7 @@ class ONNXStereoDetector:
             x_l_px = left_offset[0] + x_l_crop * self.crop_size
             y_l_px = left_offset[1] + y_l_crop * self.crop_size
 
-            # Refine right - extract crop from BGR frame, preprocess converts to RGB
+            # Refine right - extract crop from BGR frame
             t_refine_R_start = time.perf_counter()
             right_crop, right_offset = self._extract_crop(right_frame, x_r_norm, y_r_norm)
             right_input = self._preprocess_crop(right_crop)

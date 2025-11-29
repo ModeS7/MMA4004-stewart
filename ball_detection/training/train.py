@@ -5,9 +5,12 @@ Two modes:
 - CROP: 128x128 crops, outputs (x, y) normalized coordinates
 - FULLFRAME: 1280x720 or 320x180 input, outputs (x, y, confidence)
 
-Edit settings below and run: python -m ball_detection.training.train
+Usage:
+    python -m ball_detection.training.train --mode fullframe
+    python -m ball_detection.training.train --mode crop
 """
 
+import argparse
 import time
 from pathlib import Path
 import numpy as np
@@ -44,23 +47,20 @@ from ..core.dataset import (
 # SETTINGS
 # ============================================================
 
-# Mode: "crop" or "fullframe"
-MODE = "fullframe"
-
-# Model selection (depends on mode):
+# Model selection:
 #
 # CROP MODE (128x128 input → x, y output):
 #   "cnn"        - Custom CNN with residual blocks
 #   "mobilenet"  - MobileNetV3-Small backbone
 #   "shufflenet" - ShuffleNetV2 x0.5 backbone
-#
+MODEL_CROP = "shufflenet"
+
 # FULLFRAME MODE (1280x720 or 320x180 input → x, y, confidence output):
 #   "tiny"      - Custom lightweight backbone (~150K params)
 #   "ultra"     - PixelUnshuffle + custom backbone (~138K params)
 #   "shufflenet"- ShuffleNetV2 x0.5 (~355K params)
 #   "mobilenet" - PixelUnshuffle + MobileNetV3-Small (~1M params)
-#
-MODEL = "tiny"
+MODEL_FULLFRAME = "tiny"
 
 # Resolution for fullframe mode (width, height)
 RESOLUTION = (320, 180)
@@ -401,8 +401,9 @@ def visualize_predictions(images, targets, preds, img_size, stereo=False):
     """Create visualization grid with GT (green) and predictions (red)."""
     import cv2
 
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # BGR order for denormalization (model trained on BGR)
+    mean_bgr = torch.tensor([0.406, 0.456, 0.485]).view(3, 1, 1)
+    std_bgr = torch.tensor([0.225, 0.224, 0.229]).view(3, 1, 1)
 
     vis_images = []
     for i in range(min(8, len(images))):
@@ -413,8 +414,8 @@ def visualize_predictions(images, targets, preds, img_size, stereo=False):
             left_img = img[:3]
             right_img = img[3:]
 
-            left_img = left_img * std + mean
-            right_img = right_img * std + mean
+            left_img = left_img * std_bgr + mean_bgr
+            right_img = right_img * std_bgr + mean_bgr
 
             left_img = torch.clamp(left_img, 0, 1).numpy().transpose(1, 2, 0)
             right_img = torch.clamp(right_img, 0, 1).numpy().transpose(1, 2, 0)
@@ -424,26 +425,28 @@ def visualize_predictions(images, targets, preds, img_size, stereo=False):
 
             h, w = left_img.shape[:2]
 
-            # Left image: left GT and pred
+            # Left image: left GT and pred (BGR colors for cv2)
             gt_x_l, gt_y_l = int(targets[i, 0] * w), int(targets[i, 1] * h)
             pred_x_l, pred_y_l = int(preds[i, 0] * w), int(preds[i, 1] * h)
             cv2.circle(left_img, (gt_x_l, gt_y_l), 3, (0, 255, 0), -1)
-            cv2.circle(left_img, (pred_x_l, pred_y_l), 3, (255, 0, 0), -1)
-            cv2.line(left_img, (gt_x_l, gt_y_l), (pred_x_l, pred_y_l), (255, 255, 0), 1)
+            cv2.circle(left_img, (pred_x_l, pred_y_l), 3, (0, 0, 255), -1)  # Red in BGR
+            cv2.line(left_img, (gt_x_l, gt_y_l), (pred_x_l, pred_y_l), (0, 255, 255), 1)  # Yellow in BGR
 
-            # Right image: right GT and pred
+            # Right image: right GT and pred (BGR colors for cv2)
             gt_x_r, gt_y_r = int(targets[i, 2] * w), int(targets[i, 3] * h)
             pred_x_r, pred_y_r = int(preds[i, 2] * w), int(preds[i, 3] * h)
             cv2.circle(right_img, (gt_x_r, gt_y_r), 3, (0, 255, 0), -1)
-            cv2.circle(right_img, (pred_x_r, pred_y_r), 3, (255, 0, 0), -1)
-            cv2.line(right_img, (gt_x_r, gt_y_r), (pred_x_r, pred_y_r), (255, 255, 0), 1)
+            cv2.circle(right_img, (pred_x_r, pred_y_r), 3, (0, 0, 255), -1)  # Red in BGR
+            cv2.line(right_img, (gt_x_r, gt_y_r), (pred_x_r, pred_y_r), (0, 255, 255), 1)  # Yellow in BGR
 
-            # Stack left and right horizontally
+            # Convert BGR->RGB for display and stack
+            left_img = cv2.cvtColor(left_img, cv2.COLOR_BGR2RGB)
+            right_img = cv2.cvtColor(right_img, cv2.COLOR_BGR2RGB)
             combined = np.concatenate([left_img, right_img], axis=1)
             vis_images.append(torch.from_numpy(combined).permute(2, 0, 1).float() / 255.0)
         else:
             # Non-stereo: 3-channel image
-            img = img * std + mean
+            img = img * std_bgr + mean_bgr
             img = torch.clamp(img, 0, 1)
             img = img.numpy().transpose(1, 2, 0)
             img = (img * 255).astype(np.uint8).copy()
@@ -452,10 +455,13 @@ def visualize_predictions(images, targets, preds, img_size, stereo=False):
             gt_x, gt_y = int(targets[i, 0] * w), int(targets[i, 1] * h)
             pred_x, pred_y = int(preds[i, 0] * w), int(preds[i, 1] * h)
 
+            # BGR colors for cv2
             cv2.circle(img, (gt_x, gt_y), 3, (0, 255, 0), -1)
-            cv2.circle(img, (pred_x, pred_y), 3, (255, 0, 0), -1)
-            cv2.line(img, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
+            cv2.circle(img, (pred_x, pred_y), 3, (0, 0, 255), -1)  # Red in BGR
+            cv2.line(img, (gt_x, gt_y), (pred_x, pred_y), (0, 255, 255), 1)  # Yellow in BGR
 
+            # Convert BGR->RGB for display
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             vis_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
 
     return vutils.make_grid(vis_images, nrow=4 if not stereo else 2, padding=2)
@@ -583,7 +589,10 @@ def validate(model, dataloader, criterion, device, pixel_size, stereo=False):
 # MAIN
 # ============================================================
 
-def main():
+def main(MODE):
+    # Select model based on mode
+    MODEL = MODEL_FULLFRAME if MODE == "fullframe" else MODEL_CROP
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if device.type == 'cuda':
@@ -903,4 +912,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Train ball detection model')
+    parser.add_argument('--mode', type=str, choices=['crop', 'fullframe'],
+                        default='fullframe', help='Training mode (default: fullframe)')
+    args = parser.parse_args()
+
+    main(args.mode)

@@ -103,13 +103,12 @@ def main():
     half_crop = CROP_SIZE // 2
 
     for i, (img_name, img_path, label) in enumerate(tqdm(samples, desc="Processing")):
-        # Load image
+        # Load image (keep BGR - model trained on BGR)
         img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img is None:
             print(f"Warning: Could not load {img_path}")
             continue
 
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
 
         # Ball position in original image

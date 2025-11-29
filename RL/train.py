@@ -136,12 +136,14 @@ def train():
         )
         print(f"\nCPU Environment created with {NUM_ENVS} parallel envs")
 
-    # Create agent
+    # Create agent (1D CNN for temporal processing)
     agent = SACAgent(
         obs_dim=env_cfg.obs_dim,
         action_dim=env_cfg.action_dim,
         hidden_dim=sac_cfg.hidden_dim,
         physics_dim=env_cfg.physics_dim,
+        num_frames=env_cfg.num_frames,
+        obs_per_frame=env_cfg.obs_per_frame,
         lr=sac_cfg.lr,
         gamma=sac_cfg.gamma,
         tau=sac_cfg.tau,

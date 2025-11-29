@@ -101,8 +101,9 @@ class SACConfig:
     alpha = 0.2  # Initial entropy coefficient
     automatic_entropy_tuning = True
 
-    # Replay buffer
-    buffer_size = 100_000
+    # Replay buffer (must be large enough to hold multiple episodes worth of data)
+    # With 1000 envs × 800 steps = 800k transitions/episode
+    buffer_size = 1_000_000
     batch_size = 1024  # Larger batch = more GPU utilization
 
     # Training

@@ -119,10 +119,8 @@ class RedBallROIExtractor:
         if crop is None:
             return None, None, None
 
-        # Convert to RGB (CNN expects RGB)
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-
-        return crop_rgb, (cx, cy), crop_offset
+        # Return BGR crop (CNN trained on BGR)
+        return crop, (cx, cy), crop_offset
 
     def _extract_crop(self, frame, center) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]]]:
         """
