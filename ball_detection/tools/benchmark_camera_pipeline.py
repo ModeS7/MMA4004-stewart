@@ -50,7 +50,9 @@ DEFAULT_DATASET_PATH = "ball_detection/data/full_dataset/training_data_full"
 DEFAULT_MODELS = {
     'stereo': 'ball_detection/models/Tiny_stereo/Tiny_stereo.onnx',
     #'crop': 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned.onnx',
-    'crop': 'ball_detection/models/shufflenet128x128/shufflenet128x128.onnx',
+    #'crop': 'ball_detection/models/shufflenet128x128/shufflenet128x128.onnx',
+    #'crop': 'ball_detection/models/mobileLiteV3/mobileLiteV3.onnx',
+    'crop': 'ball_detection/models/CustomCNN/CustomCNN.onnx',
 }
 
 

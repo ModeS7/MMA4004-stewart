@@ -325,9 +325,27 @@ class ONNXStereoDetector:
         self.mean_rgb = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std_rgb = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+        # Pre-computed 6-channel versions for stereo preprocessing
+        self.mean6_bgr = np.concatenate([self.mean_bgr, self.mean_bgr])
+        self.mean6_rgb = np.concatenate([self.mean_rgb, self.mean_rgb])
+        # Pre-compute reciprocal (multiply is faster than divide)
+        self.inv_std6_bgr = 1.0 / np.concatenate([self.std_bgr, self.std_bgr])
+        self.inv_std6_rgb = 1.0 / np.concatenate([self.std_rgb, self.std_rgb])
+
+        # Pre-compute alpha and beta for single-step normalization
+        # (pixel / 255 - mean) * inv_std = pixel * alpha + beta
+        self.alpha_bgr = (self.inv_std6_bgr / 255.0).astype(np.float32)
+        self.beta_bgr = (-self.mean6_bgr * self.inv_std6_bgr).astype(np.float32)
+        self.alpha_rgb = (self.inv_std6_rgb / 255.0).astype(np.float32)
+        self.beta_rgb = (-self.mean6_rgb * self.inv_std6_rgb).astype(np.float32)
+
         # Statistics
         self.inference_count = 0
         self.total_time = 0.0
+
+        # Pre-allocate stereo buffer (reused every frame)
+        h, w = self.stereo_size[1], self.stereo_size[0]
+        self._stereo_buffer = np.empty((1, 6, h, w), dtype=np.float32)
 
     def _preprocess_stereo(self, left_bgr, right_bgr):
         """Preprocess stereo pair for tiny_stereo model.
@@ -337,30 +355,31 @@ class ONNXStereoDetector:
         """
         t0 = time.perf_counter()
 
-        # Resize to stereo input size
-        left_small = cv2.resize(left_bgr, self.stereo_size)
-        right_small = cv2.resize(right_bgr, self.stereo_size)
+        # Resize to stereo input size (INTER_NEAREST is fastest)
+        left_small = cv2.resize(left_bgr, self.stereo_size, interpolation=cv2.INTER_NEAREST)
+        right_small = cv2.resize(right_bgr, self.stereo_size, interpolation=cv2.INTER_NEAREST)
         t_resize = time.perf_counter()
 
         if self.convert_to_rgb:
             # Convert BGR->RGB (for RGB-trained models)
             left_small = cv2.cvtColor(left_small, cv2.COLOR_BGR2RGB)
             right_small = cv2.cvtColor(right_small, cv2.COLOR_BGR2RGB)
-            mean, std = self.mean_rgb, self.std_rgb
-        else:
-            # Keep BGR (for BGR-trained models)
-            mean, std = self.mean_bgr, self.std_bgr
         t_convert = time.perf_counter()
 
-        # Normalize
-        left_norm = (left_small.astype(np.float32) / 255.0 - mean) / std
-        right_norm = (right_small.astype(np.float32) / 255.0 - mean) / std
+        # Use pre-computed alpha/beta for single-step normalization
+        if self.convert_to_rgb:
+            alpha, beta = self.alpha_rgb, self.beta_rgb
+        else:
+            alpha, beta = self.alpha_bgr, self.beta_bgr
 
-        # Stack as 6-channel
-        # Shape: (H, W, 6) -> (6, H, W) -> (1, 6, H, W)
-        stereo = np.concatenate([left_norm, right_norm], axis=2)  # (H, W, 6)
-        stereo = np.transpose(stereo, (2, 0, 1))  # (6, H, W)
-        stereo = np.expand_dims(stereo, axis=0)  # (1, 6, H, W)
+        # Reuse pre-allocated buffer (no allocation per frame)
+        stereo = self._stereo_buffer
+
+        # Normalize each channel: pixel * alpha + beta
+        for c in range(3):
+            stereo[0, c] = left_small[:, :, c].astype(np.float32) * alpha[c] + beta[c]
+            stereo[0, c + 3] = right_small[:, :, c].astype(np.float32) * alpha[c + 3] + beta[c + 3]
+
         t_norm = time.perf_counter()
 
         prep_timing = {
@@ -369,7 +388,7 @@ class ONNXStereoDetector:
             'normalize_ms': (t_norm - t_convert) * 1000,
         }
 
-        return stereo.astype(np.float32), prep_timing
+        return stereo, prep_timing  # Already float32
 
     def _preprocess_crop(self, crop_bgr):
         """Preprocess single crop for refinement model (BGR, no conversion)."""
