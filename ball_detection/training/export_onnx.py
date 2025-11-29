@@ -15,7 +15,12 @@ import onnxruntime as ort
 import numpy as np
 from pathlib import Path
 
-from ..core.model import BallDetectorCNN, BallDetectorMobileNetV3, BallDetectorShuffleNetV2
+from ..core.model import (
+    BallDetectorCNN,
+    BallDetectorMobileNetV3,
+    BallDetectorShuffleNetV2,
+    BallDetectorFullFrameTinyStereo,
+)
 
 
 def count_onnx_nodes(model_path):
@@ -342,14 +347,25 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, model_type='m
     print(f"Loading PyTorch model from: {pytorch_model_path}")
 
     if model_type == 'shufflenet':
-        print("Architecture: ShuffleNetV2 x0.5")
+        print("Architecture: ShuffleNetV2 x0.5 (128x128, 2 outputs)")
         model = BallDetectorShuffleNetV2(pretrained=False)
+        input_channels = 3
+        input_height, input_width = crop_size, crop_size
     elif model_type == 'mobilenet':
         print("Architecture: MobileNetV3-Small")
         model = BallDetectorMobileNetV3(pretrained=False)
+        input_channels = 3
+        input_height, input_width = crop_size, crop_size
+    elif model_type == 'tiny_stereo':
+        print("Architecture: TinyStereo (320x180, 6ch, 5 outputs)")
+        model = BallDetectorFullFrameTinyStereo()
+        input_channels = 6
+        input_height, input_width = 180, 320
     else:
         print("Architecture: BallDetectorCNN")
         model = BallDetectorCNN()
+        input_channels = 3
+        input_height, input_width = crop_size, crop_size
 
     checkpoint = torch.load(pytorch_model_path, map_location=device)
 
@@ -420,8 +436,9 @@ def export_to_onnx(pytorch_model_path, output_path, crop_size=128, model_type='m
     print(f"  Parameters: {param_count:,} ({param_count * 4 / 1024:.1f} KB)")
     print()
 
-    # Create dummy input (128x128 RGB crop)
-    dummy_input = torch.randn(1, 3, crop_size, crop_size, device=device)
+    # Create dummy input
+    dummy_input = torch.randn(1, input_channels, input_height, input_width, device=device)
+    print(f"  Input shape: (1, {input_channels}, {input_height}, {input_width})")
 
     # Export to ONNX
     print(f"\nExporting to ONNX (opset {opset_version})...")
@@ -488,9 +505,12 @@ def test_onnx_inference(onnx_path, use_directml=True):
     for out in session.get_outputs():
         print(f"  {out.name}: shape={out.shape}, type={out.type}")
 
-    # Test inference
+    # Test inference - get shape from model
     print(f"\nRunning test inference...")
-    dummy_input = np.random.randn(1, 3, 128, 128).astype(np.float32)
+    input_info = session.get_inputs()[0]
+    input_shape = [d if isinstance(d, int) else 1 for d in input_info.shape]
+    dummy_input = np.random.randn(*input_shape).astype(np.float32)
+    print(f"  Input shape: {input_shape}")
 
     import time
     start = time.time()
@@ -501,10 +521,18 @@ def test_onnx_inference(onnx_path, use_directml=True):
     print(f"Output shape: {outputs[0].shape}")
     print(f"Output values: {outputs[0]}")
 
-    x, y = outputs[0][0]
+    out = outputs[0][0]
     print(f"\nParsed output:")
-    print(f"  x (normalized): {x:.4f}")
-    print(f"  y (normalized): {y:.4f}")
+    if len(out) == 2:
+        print(f"  x (normalized): {out[0]:.4f}")
+        print(f"  y (normalized): {out[1]:.4f}")
+    elif len(out) == 5:
+        print(f"  x_left:  {out[0]:.4f}, y_left:  {out[1]:.4f}")
+        print(f"  x_right: {out[2]:.4f}, y_right: {out[3]:.4f}")
+        print(f"  confidence: {out[4]:.4f}")
+    else:
+        for i, v in enumerate(out):
+            print(f"  [{i}]: {v:.4f}")
 
     # Benchmark with multiple runs
     print(f"\nBenchmarking (100 runs)...")
@@ -538,7 +566,7 @@ def main():
     parser.add_argument('--crop-size', type=int, default=128,
                         help='Input crop size (default: 128)')
     parser.add_argument('--model-type', type=str, default='mobilenet',
-                        choices=['mobilenet', 'shufflenet', 'custom'],
+                        choices=['mobilenet', 'shufflenet', 'custom', 'tiny_stereo'],
                         help='Model architecture (default: mobilenet)')
     parser.add_argument('--opset', type=int, default=14,
                         help='ONNX opset version')

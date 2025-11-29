@@ -554,41 +554,17 @@ class StewartEnvGPU:
         )
 
     def _compute_reward(self, actions, fell_off):
-        """Compute reward (vectorized)."""
-        cfg = self.reward_cfg
+        """Compute reward - simplified: -distance + alive bonus."""
+        # Distance from center in mm
+        dist_mm = torch.sqrt((self.ball_x * 1000.0)**2 + (self.ball_y * 1000.0)**2)
 
-        pos_x_mm = self.ball_x * 1000.0
-        pos_y_mm = self.ball_y * 1000.0
-        pos_error_sq = pos_x_mm**2 + pos_y_mm**2
+        # Simple: -distance (normalized) + alive bonus
+        max_dist = self.cfg.platform_radius_mm  # 150mm
+        reward = -dist_mm / max_dist  # Range: ~[-1.4, 0]
+        reward += 0.1  # Alive bonus
 
-        vel_x_mm_s = self.ball_vx * 1000.0
-        vel_y_mm_s = self.ball_vy * 1000.0
-        vel_sq = vel_x_mm_s**2 + vel_y_mm_s**2
-        speed_mm_s = torch.sqrt(vel_sq)
-
-        rx_deg = torch.rad2deg(self.platform_rx)
-        ry_deg = torch.rad2deg(self.platform_ry)
-        tilt_sq = rx_deg**2 + ry_deg**2
-
-        action_sq = actions[:, 0]**2 + actions[:, 1]**2
-        action_delta = actions - self.prev_actions
-        action_rate_sq = action_delta[:, 0]**2 + action_delta[:, 1]**2
-
-        reward = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        reward -= cfg.k_position * pos_error_sq
-        reward -= cfg.k_velocity * vel_sq
-        reward -= cfg.k_tilt * tilt_sq
-        reward -= cfg.k_action * action_sq
-        reward -= cfg.k_action_rate * action_rate_sq
-
-        dist_mm = torch.sqrt(pos_error_sq)
-        center_bonus = cfg.k_center_bonus * torch.exp(-dist_mm / cfg.center_threshold_mm)
-        reward += center_bonus
-
-        stability_mask = (dist_mm < cfg.center_threshold_mm) & (speed_mm_s < cfg.stability_vel_threshold)
-        reward += cfg.k_stability_bonus * stability_mask.float()
-
-        reward = torch.where(fell_off, torch.full_like(reward, cfg.out_of_bounds_penalty), reward)
+        # Termination penalty
+        reward = torch.where(fell_off, torch.full_like(reward, -10.0), reward)
 
         return reward
 
