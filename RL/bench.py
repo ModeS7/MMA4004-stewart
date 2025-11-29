@@ -17,10 +17,10 @@ from sac_lstm_agent import LSTMSACAgent
 # BENCHMARK CONFIG
 # ============================================================================
 
-NUM_ITERATIONS = 1000   # Number of inference calls to average
+NUM_ITERATIONS = 1000    # Number of inference calls to average
 WARMUP_ITERATIONS = 100  # Warmup iterations (not counted)
 BATCH_SIZE = 1          # Batch size for inference (1 = single env)
-DEVICE = "cuda"         # "cuda" or "cpu"
+DEVICE = "cpu"          # "cpu" for laptop, "cuda" for desktop GPU
 
 # ============================================================================
 
