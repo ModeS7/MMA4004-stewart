@@ -48,8 +48,9 @@ DEFAULT_DATASET_PATH = "ball_detection/data/full_dataset/training_data_full"
 
 # Model paths (can be overridden via command line)
 DEFAULT_MODELS = {
-    'stereo': 'ball_detection/models/run_20251129_052450_tiny_320x180_stereo/best_model.onnx',
-    'crop': 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned.onnx',
+    'stereo': 'ball_detection/models/Tiny_stereo/Tiny_stereo.onnx',
+    #'crop': 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned.onnx',
+    'crop': 'ball_detection/models/shufflenet128x128/shufflenet128x128.onnx',
 }
 
 
