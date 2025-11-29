@@ -1049,6 +1049,183 @@ def create_dataloaders(data_dir, batch_size=32, crop_size=128,
     return train_loader, val_loader
 
 
+class CropMemmapDataset(Dataset):
+    """
+    Crop dataset using pre-processed memmap files for fast loading.
+
+    Expects:
+        data_dir/images.npy  - (N, 256, 256, 3) uint8, ball-centered crops
+        data_dir/labels.npy  - (N, 2) float32 [x_norm, y_norm]
+
+    All samples are positive (ball visible). No confidence output.
+    """
+
+    # ImageNet normalization
+    MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    def __init__(self, data_dir, crop_size=128, use_augmentation=True, indices=None):
+        self.data_dir = Path(data_dir)
+        self.crop_size = crop_size
+        self.use_augmentation = use_augmentation
+
+        # Load memmap arrays
+        self.images = np.load(self.data_dir / "images.npy", mmap_mode='r')
+        self.labels = np.load(self.data_dir / "labels.npy", mmap_mode='r')
+
+        self.n_samples, self.memmap_size, _, _ = self.images.shape
+
+        # Use subset if indices provided
+        self.indices = indices if indices is not None else list(range(self.n_samples))
+
+        print(f"CropMemmapDataset: {len(self.indices)} samples, memmap {self.memmap_size}x{self.memmap_size}, crop {crop_size}x{crop_size}")
+
+        # Augmentation (applied to crop)
+        self.transform = self._get_transforms()
+
+    def _get_transforms(self):
+        transforms_list = []
+
+        if self.use_augmentation:
+            transforms_list.extend([
+                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=180,
+                                   border_mode=cv2.BORDER_CONSTANT, p=0.7),
+                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
+                A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=25, p=0.5),
+                A.OneOf([
+                    A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                    A.MotionBlur(blur_limit=5, p=1.0),
+                ], p=0.3),
+                A.GaussNoise(std_range=(0.01, 0.05), p=0.3),
+            ])
+
+        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+
+        # Load from memmap
+        image = np.array(self.images[real_idx])  # Copy from memmap
+        label = self.labels[real_idx]
+
+        x_norm, y_norm = label[0], label[1]
+
+        # Ball position in memmap image
+        ball_x = x_norm * self.memmap_size
+        ball_y = y_norm * self.memmap_size
+
+        # Random offset for crop (ball not always at center)
+        half_crop = self.crop_size // 2
+        max_offset = (self.memmap_size - self.crop_size) // 2
+
+        if self.use_augmentation:
+            offset_x = np.random.randint(-max_offset, max_offset + 1)
+            offset_y = np.random.randint(-max_offset, max_offset + 1)
+        else:
+            offset_x, offset_y = 0, 0
+
+        # Crop centered on ball with offset
+        center_x = int(ball_x)
+        center_y = int(ball_y)
+
+        x1 = center_x - half_crop + offset_x
+        y1 = center_y - half_crop + offset_y
+
+        # Clamp to valid range
+        x1 = np.clip(x1, 0, self.memmap_size - self.crop_size)
+        y1 = np.clip(y1, 0, self.memmap_size - self.crop_size)
+
+        x2 = x1 + self.crop_size
+        y2 = y1 + self.crop_size
+
+        crop = image[y1:y2, x1:x2]
+
+        # Ball position in crop
+        ball_x_in_crop = ball_x - x1
+        ball_y_in_crop = ball_y - y1
+
+        # Apply augmentations
+        if self.use_augmentation:
+            transformed = self.transform(image=crop, keypoints=[(ball_x_in_crop, ball_y_in_crop)])
+            crop = transformed['image']
+            if len(transformed['keypoints']) > 0:
+                ball_x_in_crop, ball_y_in_crop = transformed['keypoints'][0]
+
+        # Normalize to [0, 1]
+        x_out = np.clip(ball_x_in_crop / self.crop_size, 0.0, 1.0)
+        y_out = np.clip(ball_y_in_crop / self.crop_size, 0.0, 1.0)
+
+        # Convert to tensor and normalize
+        image_tensor = torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
+        image_tensor = (image_tensor - self.MEAN) / self.STD
+
+        target = torch.tensor([x_out, y_out], dtype=torch.float32)
+        return image_tensor, target
+
+
+def create_crop_memmap_dataloaders(data_dir, batch_size=32, crop_size=128,
+                                    train_split=0.8, num_workers=4):
+    """
+    Create train and validation dataloaders from crop memmap.
+
+    Args:
+        data_dir: Directory containing images.npy and labels.npy
+        batch_size: Batch size
+        crop_size: Final crop size for training (memmap is larger)
+        train_split: Fraction for training
+        num_workers: Data loading workers
+
+    Returns:
+        train_loader, val_loader
+    """
+    # Load metadata to get sample count
+    images = np.load(Path(data_dir) / "images.npy", mmap_mode='r')
+    n_samples = images.shape[0]
+
+    # Split indices
+    train_size = int(train_split * n_samples)
+    train_indices = list(range(train_size))
+    val_indices = list(range(train_size, n_samples))
+
+    train_dataset = CropMemmapDataset(
+        data_dir, crop_size=crop_size,
+        use_augmentation=True, indices=train_indices
+    )
+
+    val_dataset = CropMemmapDataset(
+        data_dir, crop_size=crop_size,
+        use_augmentation=False, indices=val_indices
+    )
+
+    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=8 if num_workers > 0 else None,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers // 2 if num_workers > 0 else 0,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 1 else False,
+        drop_last=False,
+    )
+
+    return train_loader, val_loader
+
+
 if __name__ == "__main__":
     # Test dataset loading
     import sys

@@ -10,12 +10,16 @@ Edit settings below and run: python -m ball_detection.training.train
 
 import time
 from pathlib import Path
-import json
+import numpy as np
+from collections import deque
+import json  # For config.json only
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.utils.prune as prune
 from torch.utils.tensorboard import SummaryWriter
+import torchvision.utils as vutils
 from tqdm import tqdm
 
 from ..core.model import (
@@ -27,7 +31,12 @@ from ..core.model import (
     BallDetectorFullFrameMobileNet,
     BallDetectorFullFrameShuffleNet,
 )
-from ..core.dataset import create_dataloaders, create_fullframe_dataloaders, create_fullframe_memmap_dataloaders
+from ..core.dataset import (
+    create_dataloaders,
+    create_fullframe_dataloaders,
+    create_fullframe_memmap_dataloaders,
+    create_crop_memmap_dataloaders,
+)
 
 # ============================================================
 # SETTINGS
@@ -45,22 +54,17 @@ MODE = "fullframe"
 #
 # FULLFRAME MODE (1280x720 or 320x180 input → x, y, confidence output):
 #   "tiny"      - Custom lightweight backbone (~150K params)
-#                 Aggressive downsampling, depthwise separable convs
 #   "ultra"     - PixelUnshuffle + custom backbone (~138K params)
-#                 Zero-compute 8x spatial reduction, very fast on GPU
-#   "shufflenet"- PixelUnshuffle + ShuffleNetV2 x0.5 (~400K params)
-#                 ImageNet pretrained, fast inference
+#   "shufflenet"- ShuffleNetV2 x0.5 (~355K params)
 #   "mobilenet" - PixelUnshuffle + MobileNetV3-Small (~1M params)
-#                 ImageNet pretrained, best fullframe accuracy
 #
-MODEL = "shufflenet"
+MODEL = "tiny"
 
 # Resolution for fullframe mode (width, height)
-# Common: (320, 180) for speed, (1280, 720) for accuracy
 RESOLUTION = (320, 180)
 
 # Training parameters
-EPOCHS = 2000
+EPOCHS = 500
 BATCH_SIZE = 128
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-4
@@ -72,15 +76,12 @@ TRAIN_SPLIT = 0.8
 DATA_DIR = "./ball_detection/data/full_dataset/training_data_full"
 OUTPUT_DIR = "./ball_detection/models"
 
-# Memmap (fullframe mode only - faster loading)
+# Memmap - faster loading from preprocessed data
 USE_MEMMAP = True
-MEMMAP_DIR = "./ball_detection/data/fullframe_memmap"
+MEMMAP_DIR = "./ball_detection/data/fullframe_memmap"  # Fullframe mode
+CROP_MEMMAP_DIR = "./ball_detection/data/crop_memmap"  # Crop mode
 
-# Caching (fullframe + memmap only - pre-augmented images in RAM)
-USE_CACHE = True
-CACHE_MULTIPLIER = 3  # Cache size = dataset_size * multiplier
-
-# Augmentation (crop mode only)
+# Augmentation
 USE_SPATIAL_AUG = True
 USE_APPEARANCE_AUG = True
 USE_COLOR_INVARIANCE_AUG = True
@@ -88,25 +89,36 @@ USE_TEARING_AUG = True
 TEARING_PROBABILITY = 0.01
 
 # Checkpoints
-SAVE_INTERVAL = 100
+SAVE_INTERVAL = 50
 VALIDATION_INTERVAL = 2
+
+# ============================================================
+# PRUNING SETTINGS
+# ============================================================
+ENABLE_PRUNING = False
+PRUNING_START_EPOCH = 150
+PRUNING_CHECK_INTERVAL = 10
+INITIAL_TARGET_SPARSITY = 0.90
+SPARSITY_INCREMENT = 0.05
+PRUNE_AMOUNT_PER_STEP = 0.1
+VALIDATION_PIXEL_THRESHOLD = 1.0
+PRUNING_PATIENCE = 10
+PRUNING_LR = 2e-4
+
+# ============================================================
+# TENSORBOARD SETTINGS
+# ============================================================
+ENABLE_TENSORBOARD = True
+TENSORBOARD_LOG_INTERVAL = 1
+TENSORBOARD_IMAGE_INTERVAL = 50
+TENSORBOARD_HISTOGRAM_INTERVAL = 100
 
 # ============================================================
 # MODEL FACTORY
 # ============================================================
 
 def create_model(mode: str, model_name: str, pretrained: bool = True):
-    """
-    Create model based on mode and name.
-
-    Args:
-        mode: "crop" or "fullframe"
-        model_name: Model architecture name
-        pretrained: Use pretrained backbone (where applicable)
-
-    Returns:
-        PyTorch model
-    """
+    """Create model based on mode and name."""
     if mode == "crop":
         if model_name == "cnn":
             return BallDetectorCNN()
@@ -115,7 +127,7 @@ def create_model(mode: str, model_name: str, pretrained: bool = True):
         elif model_name == "shufflenet":
             return BallDetectorShuffleNetV2(pretrained=pretrained)
         else:
-            raise ValueError(f"Unknown crop model: {model_name}. Use 'cnn', 'mobilenet', or 'shufflenet'")
+            raise ValueError(f"Unknown crop model: {model_name}")
 
     elif mode == "fullframe":
         if model_name == "tiny":
@@ -127,10 +139,9 @@ def create_model(mode: str, model_name: str, pretrained: bool = True):
         elif model_name == "mobilenet":
             return BallDetectorFullFrameMobileNet(pretrained=pretrained)
         else:
-            raise ValueError(f"Unknown fullframe model: {model_name}. Use 'tiny', 'ultra', 'shufflenet', or 'mobilenet'")
-
+            raise ValueError(f"Unknown fullframe model: {model_name}")
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use 'crop' or 'fullframe'")
+        raise ValueError(f"Unknown mode: {mode}")
 
 
 # ============================================================
@@ -144,24 +155,72 @@ class CropLoss(nn.Module):
         self.mse = nn.MSELoss()
 
     def forward(self, pred, target):
-        # pred: (batch, 2), target: (batch, 3) -> use only x, y
         return self.mse(pred, target[:, :2])
 
 
 class FullframeLoss(nn.Module):
-    """Combined MSE + BCE loss for (x, y, confidence)."""
-    def __init__(self, coord_weight=1.0, conf_weight=0.1):
+    """
+    Fullframe loss prioritizing:
+    1. Confidence (ball detection) - most important
+    2. Location with 30px tolerance - small errors OK
+    3. Heavy outlier penalty - big mistakes punished hard
+    """
+    def __init__(self, resolution=(320, 180), tolerance_px=30, conf_weight=2.0, coord_weight=1.0, outlier_weight=5.0):
         super().__init__()
-        self.mse = nn.MSELoss()
         self.bce = nn.BCELoss()
-        self.coord_weight = coord_weight
         self.conf_weight = conf_weight
+        self.coord_weight = coord_weight
+        self.outlier_weight = outlier_weight
+
+        # Normalize tolerance to [0,1] range
+        # Use average of width/height for threshold
+        avg_size = (resolution[0] + resolution[1]) / 2
+        self.tolerance = tolerance_px / avg_size  # ~0.12 for 30px on 320x180
+
+        # Store for logging
+        self.last_coord_loss = 0
+        self.last_conf_loss = 0
+        self.last_outlier_loss = 0
 
     def forward(self, pred, target):
-        # pred: (batch, 3), target: (batch, 3)
-        coord_loss = self.mse(pred[:, :2], target[:, :2])
-        conf_loss = self.bce(torch.sigmoid(pred[:, 2]), target[:, 2])
-        return self.coord_weight * coord_loss + self.conf_weight * conf_loss
+        # Confidence loss (most important)
+        conf_loss = self.bce(pred[:, 2], target[:, 2])
+
+        # Only compute coord loss for positive samples (ball visible)
+        positive_mask = target[:, 2] > 0.5
+
+        if positive_mask.any():
+            pred_coords = pred[positive_mask, :2]
+            target_coords = target[positive_mask, :2]
+
+            # Per-sample errors
+            diff = pred_coords - target_coords
+            distances = torch.sqrt((diff ** 2).sum(dim=1) + 1e-8)
+
+            # Base coord loss (MSE-like but per sample)
+            coord_loss = (diff ** 2).mean()
+
+            # Outlier penalty: extra loss for samples > tolerance
+            outlier_mask = distances > self.tolerance
+            if outlier_mask.any():
+                # Quadratic penalty for how much they exceed tolerance
+                excess = distances[outlier_mask] - self.tolerance
+                outlier_loss = (excess ** 2).mean()
+            else:
+                outlier_loss = torch.tensor(0.0, device=pred.device)
+        else:
+            coord_loss = torch.tensor(0.0, device=pred.device)
+            outlier_loss = torch.tensor(0.0, device=pred.device)
+
+        self.last_conf_loss = conf_loss.item()
+        self.last_coord_loss = coord_loss.item() if torch.is_tensor(coord_loss) else coord_loss
+        self.last_outlier_loss = outlier_loss.item() if torch.is_tensor(outlier_loss) else outlier_loss
+
+        total = (self.conf_weight * conf_loss +
+                 self.coord_weight * coord_loss +
+                 self.outlier_weight * outlier_loss)
+
+        return total
 
 
 # ============================================================
@@ -169,13 +228,109 @@ class FullframeLoss(nn.Module):
 # ============================================================
 
 def calculate_pixel_error(pred, target, size):
-    """Calculate average pixel error."""
-    # pred, target: (batch, 2+) normalized coordinates
-    pred_pixels = pred[:, :2] * size
-    target_pixels = target[:, :2] * size
+    """Calculate average pixel error.
+
+    Args:
+        size: Either int (for square) or tuple (width, height)
+    """
+    if isinstance(size, (tuple, list)):
+        width, height = size
+        scale = torch.tensor([width, height], device=pred.device)
+    else:
+        scale = size
+
+    pred_pixels = pred[:, :2] * scale
+    target_pixels = target[:, :2] * scale
     diff = pred_pixels - target_pixels
     distances = torch.sqrt((diff ** 2).sum(dim=1))
     return distances.mean().item()
+
+
+# ============================================================
+# PRUNING FUNCTIONS
+# ============================================================
+
+def apply_structured_pruning(model, amount, input_size):
+    """Apply structured pruning using torch_pruning library."""
+    import torch_pruning as tp
+
+    imp = tp.importance.MagnitudeImportance(p=1)
+
+    ignored_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and module.out_features in [2, 3]:
+            ignored_layers.append(module)
+
+    pruner = tp.pruner.MagnitudePruner(
+        model,
+        example_inputs=torch.randn(1, 3, input_size[1], input_size[0]).to(next(model.parameters()).device),
+        importance=imp,
+        iterative_steps=1,
+        pruning_ratio=amount,
+        ignored_layers=ignored_layers,
+    )
+
+    pruner.step()
+
+    # Reset BatchNorm statistics
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            module.reset_running_stats()
+
+    return model
+
+
+def get_model_sparsity(model, original_params):
+    """Calculate percentage parameter reduction."""
+    current_params = count_model_parameters(model)
+    if original_params is not None:
+        reduction = 1.0 - (current_params / original_params)
+        return reduction * 100
+    return 0.0
+
+
+def count_model_parameters(model):
+    """Count total parameters."""
+    return sum(p.numel() for p in model.parameters())
+
+
+def check_pruning_readiness(history, threshold):
+    """Check if all values in deque are below threshold."""
+    if len(history) < history.maxlen:
+        return False
+    return all(err < threshold for err in history)
+
+
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+def visualize_predictions(images, targets, preds, img_size):
+    """Create visualization grid with GT (green) and predictions (red)."""
+    import cv2
+
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    vis_images = []
+    for i in range(min(8, len(images))):
+        img = images[i].cpu()
+        img = img * std + mean
+        img = torch.clamp(img, 0, 1)
+        img = img.numpy().transpose(1, 2, 0)
+        img = (img * 255).astype(np.uint8).copy()
+
+        h, w = img.shape[:2]
+        gt_x, gt_y = int(targets[i, 0] * w), int(targets[i, 1] * h)
+        pred_x, pred_y = int(preds[i, 0] * w), int(preds[i, 1] * h)
+
+        cv2.circle(img, (gt_x, gt_y), 3, (0, 255, 0), -1)
+        cv2.circle(img, (pred_x, pred_y), 3, (255, 0, 0), -1)
+        cv2.line(img, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
+
+        vis_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+
+    return vutils.make_grid(vis_images, nrow=4, padding=2)
 
 
 # ============================================================
@@ -195,22 +350,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, pixel_si
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        # Forward pass with AMP
         if use_amp:
             with torch.amp.autocast(device.type, dtype=torch.bfloat16):
                 outputs = model(images)
         else:
             outputs = model(images)
 
-        # Loss in fp32
         loss = criterion(outputs.float(), targets)
 
-        # Backward
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Metrics
         pixel_error = calculate_pixel_error(outputs.float(), targets, pixel_size)
         total_loss += loss.detach()
         total_pixel_error += pixel_error
@@ -223,11 +374,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, pixel_si
 
 
 def validate(model, dataloader, criterion, device, pixel_size):
-    """Validate model."""
+    """Validate model. Returns avg_loss, avg_pixel_error, worst_pixel_error, p98_pixel_error."""
     model.eval()
     total_loss = 0
-    total_pixel_error = 0
+    worst_pixel_error = 0
+    all_errors_list = []
     num_batches = len(dataloader)
+
+    # Handle tuple or scalar pixel_size
+    if isinstance(pixel_size, (tuple, list)):
+        scale = torch.tensor([pixel_size[0], pixel_size[1]], device=device)
+    else:
+        scale = pixel_size
 
     with torch.no_grad():
         for images, targets in tqdm(dataloader, desc='Validation'):
@@ -236,12 +394,40 @@ def validate(model, dataloader, criterion, device, pixel_size):
 
             outputs = model(images)
             loss = criterion(outputs, targets)
-            pixel_error = calculate_pixel_error(outputs, targets, pixel_size)
+
+            # Calculate per-sample pixel errors
+            pred_pixels = outputs[:, :2] * scale
+            target_pixels = targets[:, :2] * scale
+            diff = pred_pixels - target_pixels
+            distances = torch.sqrt((diff ** 2).sum(dim=1))
+
+            # Fullframe mode: only count positive samples (confidence > 0.5)
+            # Crop mode: all samples are positive (ball always visible in crop)
+            if targets.shape[1] > 2:
+                positive_mask = targets[:, 2] > 0.5
+                if positive_mask.any():
+                    valid_errors = distances[positive_mask]
+                else:
+                    valid_errors = None
+            else:
+                valid_errors = distances
+
+            if valid_errors is not None and len(valid_errors) > 0:
+                max_error = valid_errors.max().item()
+                worst_pixel_error = max(worst_pixel_error, max_error)
+                all_errors_list.append(valid_errors.cpu())
 
             total_loss += loss.item()
-            total_pixel_error += pixel_error
 
-    return total_loss / num_batches, total_pixel_error / num_batches
+    # Calculate avg and p98
+    avg_pixel_error = 0
+    p98_pixel_error = 0
+    if all_errors_list:
+        all_errors = torch.cat(all_errors_list)
+        avg_pixel_error = all_errors.mean().item()
+        p98_pixel_error = torch.quantile(all_errors, 0.98).item()
+
+    return total_loss / num_batches, avg_pixel_error, worst_pixel_error, p98_pixel_error
 
 
 # ============================================================
@@ -249,7 +435,6 @@ def validate(model, dataloader, criterion, device, pixel_size):
 # ============================================================
 
 def main():
-    # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if device.type == 'cuda':
@@ -267,6 +452,7 @@ def main():
     print(f"Device: {device}")
     print(f"Epochs: {EPOCHS}")
     print(f"Batch size: {BATCH_SIZE}")
+    print(f"Pruning: {'Enabled' if ENABLE_PRUNING else 'Disabled'}")
     print("=" * 60)
 
     # Create output directory
@@ -275,6 +461,8 @@ def main():
     run_name = f"run_{timestamp}_{MODEL}"
     if MODE == "fullframe":
         run_name += f"_{RESOLUTION[0]}x{RESOLUTION[1]}"
+    if ENABLE_PRUNING:
+        run_name += "_pruning"
 
     output_dir = Path(OUTPUT_DIR) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -289,42 +477,58 @@ def main():
         'batch_size': BATCH_SIZE,
         'learning_rate': LEARNING_RATE,
         'weight_decay': WEIGHT_DECAY,
+        'enable_pruning': ENABLE_PRUNING,
     }
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
-    # TensorBoard
-    writer = SummaryWriter(log_dir=output_dir / 'tensorboard')
+    # TensorBoard - centralized location
+    writer = None
+    if ENABLE_TENSORBOARD:
+        tensorboard_base = Path(OUTPUT_DIR) / 'tensorboard_logs'
+        tensorboard_dir = tensorboard_base / run_name
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tensorboard_dir), max_queue=10000, flush_secs=300)
+        print(f"TensorBoard: {tensorboard_dir}")
+        print(f"  Command: tensorboard --logdir={tensorboard_base}\n")
 
     # Create dataloaders
     if MODE == "crop":
-        print(f"Loading data from: {DATA_DIR}")
-        train_loader, val_loader = create_dataloaders(
-            data_dir=DATA_DIR,
-            batch_size=BATCH_SIZE,
-            crop_size=128,
-            train_split=TRAIN_SPLIT,
-            num_workers=NUM_WORKERS,
-            use_spatial_augmentation=USE_SPATIAL_AUG,
-            use_appearance_augmentation=USE_APPEARANCE_AUG,
-            use_color_invariance_augmentation=USE_COLOR_INVARIANCE_AUG,
-            use_tearing_augmentation=USE_TEARING_AUG,
-            tearing_probability=TEARING_PROBABILITY,
-        )
+        # Crop mode: only positive samples (ball always visible)
+        if USE_MEMMAP:
+            print(f"Loading crop memmap from: {CROP_MEMMAP_DIR}")
+            train_loader, val_loader = create_crop_memmap_dataloaders(
+                data_dir=CROP_MEMMAP_DIR,
+                batch_size=BATCH_SIZE,
+                crop_size=128,
+                train_split=TRAIN_SPLIT,
+                num_workers=NUM_WORKERS,
+            )
+        else:
+            print(f"Loading data from: {DATA_DIR}")
+            train_loader, val_loader = create_dataloaders(
+                data_dir=DATA_DIR,
+                batch_size=BATCH_SIZE,
+                crop_size=128,
+                train_split=TRAIN_SPLIT,
+                num_workers=NUM_WORKERS,
+                use_spatial_augmentation=USE_SPATIAL_AUG,
+                use_appearance_augmentation=USE_APPEARANCE_AUG,
+                use_color_invariance_augmentation=USE_COLOR_INVARIANCE_AUG,
+                use_tearing_augmentation=False,
+                tearing_probability=0,
+            )
         pixel_size = 128
+        input_size = (128, 128)
         criterion = CropLoss()
-    else:  # fullframe
+    else:
         if USE_MEMMAP:
             print(f"Loading memmap data from: {MEMMAP_DIR}")
-            if USE_CACHE:
-                print(f"Using cached augmentation (multiplier={CACHE_MULTIPLIER})")
             train_loader, val_loader = create_fullframe_memmap_dataloaders(
                 data_dir=MEMMAP_DIR,
                 batch_size=BATCH_SIZE,
                 train_split=TRAIN_SPLIT,
                 num_workers=NUM_WORKERS,
-                use_cache=USE_CACHE,
-                cache_multiplier=CACHE_MULTIPLIER,
             )
         else:
             print(f"Loading data from: {DATA_DIR}")
@@ -335,31 +539,42 @@ def main():
                 train_split=TRAIN_SPLIT,
                 num_workers=NUM_WORKERS,
             )
-        # Use diagonal for pixel error (accounts for both dimensions)
-        pixel_size = (RESOLUTION[0]**2 + RESOLUTION[1]**2) ** 0.5
-        criterion = FullframeLoss()
+        pixel_size = RESOLUTION  # (width, height) tuple
+        input_size = RESOLUTION
+        criterion = FullframeLoss(resolution=RESOLUTION, tolerance_px=5)
 
     # Create model
     print(f"\nCreating model: {MODEL}")
     model = create_model(MODE, MODEL, pretrained=True)
     model = model.to(device)
 
-    param_count = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {param_count:,}")
+    original_param_count = count_model_parameters(model)
+    print(f"Parameters: {original_param_count:,}")
+
+    # Compile model for faster training (PyTorch 2.0+)
+    if device.type == 'cuda':
+        model = torch.compile(model, mode='reduce-overhead')
+        print("Model compiled with torch.compile()")
 
     # Optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Warmup + cosine annealing
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=WARMUP_EPOCHS
     )
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6
+        optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-5
     )
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[WARMUP_EPOCHS]
     )
+
+    # Pruning state
+    pruning_active = ENABLE_PRUNING
+    pruning_limit_reached = False
+    pixel_error_history = deque(maxlen=PRUNING_PATIENCE)
+    current_sparsity_target = INITIAL_TARGET_SPARSITY
+    last_pruning_epoch = 0
 
     # Training loop
     print(f"\nStarting training for {EPOCHS} epochs...")
@@ -367,7 +582,7 @@ def main():
 
     best_val_loss = float('inf')
     best_pixel_error = float('inf')
-    training_history = []
+    val_loss, val_pixel_err, val_worst_px_err, val_p98_px_err = 0, 0, 0, 0
 
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.time()
@@ -377,9 +592,9 @@ def main():
             model, train_loader, criterion, optimizer, device, epoch, pixel_size
         )
 
-        # Validate (every N epochs)
+        # Validate
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
-            val_loss, val_px_err = validate(model, val_loader, criterion, device, pixel_size)
+            val_loss, val_pixel_err, val_worst_px_err, val_p98_px_err = validate(model, val_loader, criterion, device, pixel_size)
 
         scheduler.step()
         epoch_time = time.time() - epoch_start
@@ -389,42 +604,111 @@ def main():
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
             print(f"\nEpoch {epoch}/{EPOCHS}:")
             print(f"  Train: loss={train_loss:.4f}, px_err={train_px_err:.3f}")
-            print(f"  Val:   loss={val_loss:.4f}, px_err={val_px_err:.3f}")
+            print(f"  Val:   loss={val_loss:.4f}, px_err={val_pixel_err:.3f}, p98={val_p98_px_err:.3f}, worst={val_worst_px_err:.3f}")
             print(f"  LR: {current_lr:.6f}, Time: {epoch_time:.1f}s")
+            if ENABLE_PRUNING:
+                sparsity = get_model_sparsity(model, original_param_count)
+                print(f"  Sparsity: {sparsity:.1f}%")
         else:
-            print(f"\nEpoch {epoch}: train_loss={train_loss:.4f}, px_err={train_px_err:.3f}, time={epoch_time:.1f}s")
-
-        # Save history
-        training_history.append({
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'train_pixel_error': train_px_err,
-            'val_loss': val_loss if epoch % VALIDATION_INTERVAL == 0 else None,
-            'val_pixel_error': val_px_err if epoch % VALIDATION_INTERVAL == 0 else None,
-            'lr': current_lr,
-        })
+            print(f"\nEpoch {epoch}: loss={train_loss:.4f}, px_err={train_px_err:.3f}, time={epoch_time:.1f}s")
 
         # TensorBoard logging
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('PixelError/train', train_px_err, epoch)
-        writer.add_scalar('LearningRate', current_lr, epoch)
-        if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
-            writer.add_scalar('Loss/val', val_loss, epoch)
-            writer.add_scalar('PixelError/val', val_px_err, epoch)
+        if writer is not None:
+            if epoch % TENSORBOARD_LOG_INTERVAL == 0:
+                writer.add_scalar('Loss/train', train_loss, epoch)
+                writer.add_scalar('PixelError/train', train_px_err, epoch)
+                writer.add_scalar('LearningRate/lr', current_lr, epoch)
+                writer.add_scalar('Performance/epoch_time', epoch_time, epoch)
 
-        # Save best models (only on validation epochs)
+                # Fullframe mode: log coord, conf, and outlier losses separately
+                if MODE == "fullframe" and hasattr(criterion, 'last_coord_loss'):
+                    writer.add_scalar('Loss/coord', criterion.last_coord_loss, epoch)
+                    writer.add_scalar('Loss/conf', criterion.last_conf_loss, epoch)
+                    writer.add_scalar('Loss/outlier', criterion.last_outlier_loss, epoch)
+
+                if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+                    writer.add_scalar('Loss/val', val_loss, epoch)
+                    writer.add_scalar('PixelError/val', val_pixel_err, epoch)
+                    writer.add_scalar('PixelError/val_p98', val_p98_px_err, epoch)
+                    writer.add_scalar('PixelError/val_worst', val_worst_px_err, epoch)
+
+                if ENABLE_PRUNING:
+                    sparsity = get_model_sparsity(model, original_param_count)
+                    writer.add_scalar('Sparsity/global', sparsity, epoch)
+
+            # Images
+            if epoch % TENSORBOARD_IMAGE_INTERVAL == 0:
+                sample_images, sample_targets = next(iter(val_loader))
+                sample_images = sample_images[:8].to(device)
+                sample_targets = sample_targets[:8].to(device)
+                with torch.no_grad():
+                    sample_preds = model(sample_images)
+                vis_grid = visualize_predictions(sample_images, sample_targets, sample_preds, pixel_size)
+                writer.add_image('Predictions/validation', vis_grid, epoch)
+
+            # Histograms
+            if epoch % TENSORBOARD_HISTOGRAM_INTERVAL == 0:
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        writer.add_histogram(f'Weights/{name}', param, epoch)
+                        if param.grad is not None:
+                            writer.add_histogram(f'Gradients/{name}', param.grad, epoch)
+
+            if epoch % 50 == 0:
+                writer.flush()
+
+        # Pruning logic
+        if ENABLE_PRUNING and pruning_active and not pruning_limit_reached:
+            if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
+                pixel_error_history.append(val_pixel_err)
+
+            if (epoch >= PRUNING_START_EPOCH and
+                epoch % PRUNING_CHECK_INTERVAL == 0 and
+                (epoch % VALIDATION_INTERVAL == 0 or epoch == 1)):
+
+                if check_pruning_readiness(pixel_error_history, VALIDATION_PIXEL_THRESHOLD):
+                    current_sparsity = get_model_sparsity(model, original_param_count)
+
+                    if current_sparsity < current_sparsity_target * 100:
+                        print(f"\n{'='*60}")
+                        print(f"APPLYING STRUCTURED PRUNING at Epoch {epoch}")
+                        print(f"  Current: {current_sparsity:.1f}%, Target: {current_sparsity_target*100:.0f}%")
+
+                        params_before = count_model_parameters(model)
+                        model = apply_structured_pruning(model, PRUNE_AMOUNT_PER_STEP, input_size)
+                        params_after = count_model_parameters(model)
+
+                        new_sparsity = get_model_sparsity(model, original_param_count)
+                        print(f"  New: {new_sparsity:.1f}%, Params: {params_after:,}")
+
+                        if params_before - params_after < 10:
+                            print(f"  PRUNING LIMIT REACHED!")
+                            pruning_limit_reached = True
+                            pruning_active = False
+                        else:
+                            for pg in optimizer.param_groups:
+                                pg['lr'] = PRUNING_LR * 0.5
+                            pixel_error_history.clear()
+                            last_pruning_epoch = epoch
+
+                        print(f"{'='*60}\n")
+
+                    elif current_sparsity >= current_sparsity_target * 100:
+                        current_sparsity_target += SPARSITY_INCREMENT
+
+        # Save best models
         if epoch % VALIDATION_INTERVAL == 0 or epoch == 1:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), output_dir / 'best_model.pth')
                 print(f"  * New best loss!")
 
-            if val_px_err < best_pixel_error:
-                best_pixel_error = val_px_err
+            if val_pixel_err < best_pixel_error:
+                best_pixel_error = val_pixel_err
                 torch.save(model.state_dict(), output_dir / 'best_pixel_error.pth')
                 print(f"  * New best pixel error!")
 
-        # Periodic checkpoints
+        # Checkpoints
         if epoch % SAVE_INTERVAL == 0:
             torch.save({
                 'epoch': epoch,
@@ -434,53 +718,9 @@ def main():
             }, output_dir / f'checkpoint_epoch_{epoch}.pth')
             print(f"  Checkpoint saved")
 
-    # Save training history
-    with open(output_dir / 'training_history.json', 'w') as f:
-        json.dump(training_history, f, indent=2)
-
-    # Export ONNX
-    print("\n" + "=" * 60)
-    print("EXPORTING TO ONNX")
-    print("=" * 60)
-
-    try:
-        onnx_path = output_dir / f"{run_name}.onnx"
-
-        if MODE == "crop":
-            dummy_input = torch.randn(1, 3, 128, 128).to(device)
-        else:
-            dummy_input = torch.randn(1, 3, RESOLUTION[1], RESOLUTION[0]).to(device)
-
-        # Load best model for export
-        model.load_state_dict(torch.load(output_dir / 'best_pixel_error.pth'))
-        model.eval()
-
-        torch.onnx.export(
-            model,
-            dummy_input,
-            onnx_path,
-            export_params=True,
-            opset_version=14,
-            do_constant_folding=True,
-            input_names=['input'],
-            output_names=['output'],
-            dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
-        )
-
-        # Verify
-        import onnx
-        onnx_model = onnx.load(str(onnx_path))
-        onnx.checker.check_model(onnx_model)
-
-        model_size = onnx_path.stat().st_size / (1024 * 1024)
-        print(f"Exported: {onnx_path}")
-        print(f"Size: {model_size:.2f} MB")
-
-    except Exception as e:
-        print(f"ONNX export failed: {e}")
-
     # Close TensorBoard
-    writer.close()
+    if writer is not None:
+        writer.close()
 
     # Summary
     print("\n" + "=" * 60)
@@ -489,7 +729,11 @@ def main():
     print(f"Run: {run_name}")
     print(f"Best loss: {best_val_loss:.4f}")
     print(f"Best pixel error: {best_pixel_error:.3f}px")
-    print(f"\nOutput directory: {output_dir}")
+    if ENABLE_PRUNING:
+        print(f"Final params: {count_model_parameters(model):,} ({get_model_sparsity(model, original_param_count):.1f}% reduction)")
+    print(f"\nOutput: {output_dir}")
+    if ENABLE_TENSORBOARD:
+        print(f"TensorBoard: tensorboard --logdir={Path(OUTPUT_DIR) / 'tensorboard_logs'}")
     print("=" * 60)
 
 
