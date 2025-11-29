@@ -43,10 +43,10 @@ class EnvConfig:
     init_pos_range_mm = 50.0  # Ball starts within [-50, 50] mm
     init_vel_range_mm_s = 30.0  # Initial velocity range
 
-    # Camera noise (ZED camera model x10 for robustness)
-    # ZED typical noise: ~1-2mm at close range, we use 10x
+    # Camera noise (ZED camera model)
+    # ZED typical noise: ~1-2mm at close range
     use_camera_noise = True
-    position_noise_std_mm = 15.0  # ~1.5mm base * 10x = 15mm std
+    position_noise_std_mm = 3.0  # 3mm std noise
     # Noise can also scale with distance from camera (depth-dependent)
     noise_depth_scale = 0.1  # Additional noise = distance * scale * 10x
 
