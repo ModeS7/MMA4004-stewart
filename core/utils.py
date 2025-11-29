@@ -611,8 +611,8 @@ class StereoDetectionConfig:
     """
 
     # Model paths
-    STEREO_MODEL_PATH = 'ball_detection/models/tiny_stereo.onnx'
-    CROP_MODEL_PATH = 'ball_detection/models/shufflenet_128.onnx'
+    STEREO_MODEL_PATH = 'ball_detection/models/tiny_stereo/tiny_stereo.onnx'
+    CROP_MODEL_PATH = 'ball_detection/models/shufflenet128x128/shufflenet128x128.onnx'
 
     # Input sizes
     STEREO_WIDTH = 320
