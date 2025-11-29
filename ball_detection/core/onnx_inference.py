@@ -315,25 +315,32 @@ class ONNXStereoDetector:
                 print(f"Failed to load crop model: {e}")
                 self.use_refinement = False
 
-        # Normalization (ImageNet stats)
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # Normalization - BGR order for stereo model (no conversion needed)
+        self.mean_bgr = np.array([0.406, 0.456, 0.485], dtype=np.float32)
+        self.std_bgr = np.array([0.225, 0.224, 0.229], dtype=np.float32)
+
+        # Normalization - RGB order for crop model (trained on RGB like ROI_NN)
+        self.mean_rgb = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std_rgb = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
         # Statistics
         self.inference_count = 0
         self.total_time = 0.0
 
-    def _preprocess_stereo(self, left_rgb, right_rgb):
-        """Preprocess stereo pair for tiny_stereo model."""
+    def _preprocess_stereo(self, left_bgr, right_bgr):
+        """Preprocess stereo pair for tiny_stereo model.
+
+        Takes BGR frames directly (no color conversion - using BGR mean/std).
+        """
         # Resize to stereo input size
-        left_small = cv2.resize(left_rgb, self.stereo_size)
-        right_small = cv2.resize(right_rgb, self.stereo_size)
+        left_small = cv2.resize(left_bgr, self.stereo_size)
+        right_small = cv2.resize(right_bgr, self.stereo_size)
 
-        # Normalize
-        left_norm = (left_small.astype(np.float32) / 255.0 - self.mean) / self.std
-        right_norm = (right_small.astype(np.float32) / 255.0 - self.mean) / self.std
+        # Normalize (using BGR mean/std, no conversion needed)
+        left_norm = (left_small.astype(np.float32) / 255.0 - self.mean_bgr) / self.std_bgr
+        right_norm = (right_small.astype(np.float32) / 255.0 - self.mean_bgr) / self.std_bgr
 
-        # Stack as 6-channel (left RGB + right RGB)
+        # Stack as 6-channel (left BGR + right BGR)
         # Shape: (H, W, 6) -> (6, H, W) -> (1, 6, H, W)
         stereo = np.concatenate([left_norm, right_norm], axis=2)  # (H, W, 6)
         stereo = np.transpose(stereo, (2, 0, 1))  # (6, H, W)
@@ -341,20 +348,31 @@ class ONNXStereoDetector:
 
         return stereo.astype(np.float32)
 
-    def _preprocess_crop(self, crop_rgb):
-        """Preprocess single crop for refinement model."""
-        if crop_rgb.shape[:2] != (self.crop_size, self.crop_size):
-            crop_rgb = cv2.resize(crop_rgb, (self.crop_size, self.crop_size))
+    def _preprocess_crop(self, crop_bgr):
+        """Preprocess single crop for refinement model.
 
-        crop_norm = (crop_rgb.astype(np.float32) / 255.0 - self.mean) / self.std
+        Converts small 128x128 BGR crop to RGB (same as ROI_NN pipeline).
+        The crop model was trained on RGB input.
+        """
+        if crop_bgr.shape[:2] != (self.crop_size, self.crop_size):
+            crop_bgr = cv2.resize(crop_bgr, (self.crop_size, self.crop_size))
+
+        # Convert small crop to RGB (fast on 128x128)
+        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+
+        # Normalize with RGB mean/std (same as ROI_NN)
+        crop_norm = (crop_rgb.astype(np.float32) / 255.0 - self.mean_rgb) / self.std_rgb
         crop_tensor = np.transpose(crop_norm, (2, 0, 1))
         crop_tensor = np.expand_dims(crop_tensor, axis=0)
 
         return crop_tensor.astype(np.float32)
 
-    def _extract_crop(self, frame_rgb, x_norm, y_norm):
-        """Extract crop centered at normalized coordinates."""
-        h, w = frame_rgb.shape[:2]
+    def _extract_crop(self, frame, x_norm, y_norm):
+        """Extract crop centered at normalized coordinates.
+
+        Works with any color format (BGR or RGB).
+        """
+        h, w = frame.shape[:2]
         cx = int(x_norm * w)
         cy = int(y_norm * h)
 
@@ -365,7 +383,7 @@ class ONNXStereoDetector:
         y2 = min(h, cy + half)
 
         # Extract crop
-        crop = frame_rgb[y1:y2, x1:x2].copy()
+        crop = frame[y1:y2, x1:x2].copy()
 
         # Pad if needed (edge cases)
         if crop.shape[0] != self.crop_size or crop.shape[1] != self.crop_size:
@@ -382,8 +400,8 @@ class ONNXStereoDetector:
         Detect ball in stereo pair.
 
         Args:
-            left_frame: Left camera frame (H, W, 3) BGR or RGB
-            right_frame: Right camera frame (H, W, 3) BGR or RGB
+            left_frame: Left camera frame (H, W, 3) BGR from OpenCV
+            right_frame: Right camera frame (H, W, 3) BGR from OpenCV
 
         Returns:
             dict with:
@@ -395,20 +413,13 @@ class ONNXStereoDetector:
         """
         t_start = time.perf_counter()
 
-        # Convert BGR to RGB if needed (assume BGR input from OpenCV)
-        if left_frame.shape[2] == 3:
-            left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB)
-            right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB)
-        else:
-            left_rgb = left_frame
-            right_rgb = right_frame
-
-        frame_h, frame_w = left_rgb.shape[:2]
+        # Work directly with BGR frames (no early conversion)
+        frame_h, frame_w = left_frame.shape[:2]
 
         # Stage 1: Coarse detection with tiny_stereo
-        t_prep = time.perf_counter()
-        stereo_input = self._preprocess_stereo(left_rgb, right_rgb)
-        t_stereo_start = time.perf_counter()
+        # Preprocessing includes resize + BGR->RGB on small frames
+        stereo_input = self._preprocess_stereo(left_frame, right_frame)
+        t_stereo_prep = time.perf_counter()
 
         stereo_output = self.stereo_session.run(
             [self.stereo_output_name], {self.stereo_input_name: stereo_input}
@@ -420,16 +431,17 @@ class ONNXStereoDetector:
 
         # Check confidence threshold
         if confidence < self.confidence_threshold:
+            t_end = time.perf_counter()
             return {
                 'x_left': 0, 'y_left': 0,
                 'x_right': 0, 'y_right': 0,
                 'confidence': float(confidence),
                 'detected': False,
                 'timing': {
-                    'prep_ms': (t_stereo_start - t_prep) * 1000,
-                    'stereo_ms': (t_stereo_end - t_stereo_start) * 1000,
+                    'prep_ms': (t_stereo_prep - t_start) * 1000,
+                    'stereo_ms': (t_stereo_end - t_stereo_prep) * 1000,
                     'refine_L_ms': 0, 'refine_R_ms': 0,
-                    'total_ms': (t_stereo_end - t_start) * 1000
+                    'total_ms': (t_end - t_start) * 1000
                 }
             }
 
@@ -438,9 +450,9 @@ class ONNXStereoDetector:
         refine_R_ms = 0
 
         if self.use_refinement and self.crop_session is not None:
-            # Refine left
+            # Refine left - extract crop from BGR frame, preprocess converts to RGB
             t_refine_L_start = time.perf_counter()
-            left_crop, left_offset = self._extract_crop(left_rgb, x_l_norm, y_l_norm)
+            left_crop, left_offset = self._extract_crop(left_frame, x_l_norm, y_l_norm)
             left_input = self._preprocess_crop(left_crop)
             left_output = self.crop_session.run(
                 [self.crop_output_name], {self.crop_input_name: left_input}
@@ -453,9 +465,9 @@ class ONNXStereoDetector:
             x_l_px = left_offset[0] + x_l_crop * self.crop_size
             y_l_px = left_offset[1] + y_l_crop * self.crop_size
 
-            # Refine right
+            # Refine right - extract crop from BGR frame, preprocess converts to RGB
             t_refine_R_start = time.perf_counter()
-            right_crop, right_offset = self._extract_crop(right_rgb, x_r_norm, y_r_norm)
+            right_crop, right_offset = self._extract_crop(right_frame, x_r_norm, y_r_norm)
             right_input = self._preprocess_crop(right_crop)
             right_output = self.crop_session.run(
                 [self.crop_output_name], {self.crop_input_name: right_input}
@@ -488,8 +500,8 @@ class ONNXStereoDetector:
             'confidence': float(confidence),
             'detected': True,
             'timing': {
-                'prep_ms': (t_stereo_start - t_prep) * 1000,
-                'stereo_ms': (t_stereo_end - t_stereo_start) * 1000,
+                'prep_ms': (t_stereo_prep - t_start) * 1000,
+                'stereo_ms': (t_stereo_end - t_stereo_prep) * 1000,
                 'refine_L_ms': refine_L_ms,
                 'refine_R_ms': refine_R_ms,
                 'total_ms': (t_end - t_start) * 1000

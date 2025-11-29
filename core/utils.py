@@ -35,7 +35,7 @@ DETECTION_MODE = 'STEREO_NN'
 # ============================================================================
 # DEBUG OPTIONS
 # ============================================================================
-DEBUG_DETECTION_TIMING = False   # Print detection timing breakdown (ROI, prep, CNN)
+DEBUG_DETECTION_TIMING = True   # Print detection timing breakdown (ROI, prep, CNN)
 DEBUG_TIMING_INTERVAL = 100     # Print timing every N frames
 
 # ============================================================================
@@ -619,7 +619,7 @@ class StereoDetectionConfig:
 
     # Model paths
     STEREO_MODEL_PATH = 'ball_detection/models/tiny_stereo/tiny_stereo.onnx'
-    CROP_MODEL_PATH = 'ball_detection/models/shufflenet128x128/shufflenet128x128.onnx'
+    CROP_MODEL_PATH = 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned.onnx'
 
     # Input sizes
     STEREO_WIDTH = 320
@@ -635,7 +635,7 @@ class StereoDetectionConfig:
     USE_REFINEMENT = True  # Enable stage 2 crop refinement
 
     # GPU settings
-    USE_GPU = True  # Use DirectML GPU acceleration
+    USE_GPU = False  # Use DirectML GPU acceleration
 
 
 # ============================================================================
