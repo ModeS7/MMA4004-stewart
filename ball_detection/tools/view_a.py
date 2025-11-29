@@ -213,6 +213,8 @@ class FullFrameDataset:
 # ============================================================
 DATA_DIR = "./ball_detection/data/full_dataset/training_data_full"
 FULLFRAME_MODE = True  # True for 1280x720 full frames, False for 128x128 crops
+STEREO_MODE = True  # True to view stereo augmentations side by side
+STEREO_MEMMAP_DIR = "./ball_detection/data/stereo_memmap"
 CROP_SIZE = 128
 FULLFRAME_WIDTH = 1280
 FULLFRAME_HEIGHT = 720
@@ -242,6 +244,24 @@ def denormalize(img):
     return img
 
 
+def denormalize_stereo(img_tensor):
+    """Denormalize 6-channel stereo image to two RGB images."""
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+
+    # Split into left and right (first 3 channels, last 3 channels)
+    left = img_tensor[:3].numpy().transpose(1, 2, 0)  # CHW -> HWC
+    right = img_tensor[3:].numpy().transpose(1, 2, 0)
+
+    left = (left * std + mean) * 255
+    right = (right * std + mean) * 255
+
+    left = np.clip(left, 0, 255).astype(np.uint8)
+    right = np.clip(right, 0, 255).astype(np.uint8)
+
+    return left, right
+
+
 def draw_keypoint(img, x, y, color=(0, 255, 0), fullframe=False):
     """Draw keypoint on image."""
     img = img.copy()
@@ -263,8 +283,123 @@ def draw_keypoint(img, x, y, color=(0, 255, 0), fullframe=False):
     return img
 
 
+def visualize_stereo():
+    """Visualize stereo augmentations - shows left and right side by side."""
+    from ball_detection.core.dataset import StereoMemmapDataset
+
+    print("=" * 60)
+    print("STEREO AUGMENTATION VISUALIZATION")
+    print("=" * 60)
+    print(f"Data: {STEREO_MEMMAP_DIR}")
+    print(f"Mode: {MODE.upper()}")
+    print("=" * 60)
+    print()
+
+    # Load stereo dataset
+    images = np.load(Path(STEREO_MEMMAP_DIR) / "images.npy", mmap_mode='r')
+    n_samples = len(images)
+    del images
+
+    # Create indices for train/val split
+    train_size = int(0.8 * n_samples)
+    all_indices = list(range(n_samples))
+    np.random.seed(42)
+    np.random.shuffle(all_indices)
+
+    if MODE == "train":
+        indices = all_indices[:train_size]
+        use_aug = True
+    else:
+        indices = all_indices[train_size:]
+        use_aug = False
+
+    # Create two datasets - one without augmentation for "original", one with
+    dataset_no_aug = StereoMemmapDataset(STEREO_MEMMAP_DIR, use_augmentation=False, indices=indices)
+    dataset_with_aug = StereoMemmapDataset(STEREO_MEMMAP_DIR, use_augmentation=use_aug, indices=indices)
+    print(f"Dataset loaded: {len(dataset_no_aug)} samples")
+    print()
+
+    # Select random samples
+    np.random.seed(None)  # Use random seed for visualization
+    sample_indices = np.random.choice(len(dataset_no_aug), NUM_SAMPLES, replace=False)
+
+    # Create figure: each row shows original pair + augmented pairs
+    # Columns: [Original Left | Original Right] + [Aug1 Left | Aug1 Right] + ...
+    n_cols = 2 * (NUM_AUGMENTATIONS + 1)  # 2 images per augmentation (left + right)
+    fig, axes = plt.subplots(NUM_SAMPLES, n_cols, figsize=(n_cols * 3, NUM_SAMPLES * 3))
+    title = f'STEREO {MODE.upper()} Augmentation (Green=ball, verify left/right match)'
+    fig.suptitle(title, fontsize=14, y=0.995)
+
+    for row, idx in enumerate(sample_indices):
+        # Get multiple augmentations of the same sample
+        for aug_idx in range(NUM_AUGMENTATIONS + 1):
+            # First column: no augmentation, rest: with augmentation
+            if aug_idx == 0:
+                img_tensor, target = dataset_no_aug[idx]
+            else:
+                img_tensor, target = dataset_with_aug[idx]
+
+            # Denormalize to get left and right images
+            left_img, right_img = denormalize_stereo(img_tensor)
+
+            # Get coordinates
+            x_left, y_left, x_right, y_right, confidence = target.numpy()
+
+            # Draw keypoints
+            if confidence > 0.5:
+                left_img = draw_keypoint(left_img, x_left, y_left, fullframe=True)
+                right_img = draw_keypoint(right_img, x_right, y_right, fullframe=True)
+
+            # Calculate column indices
+            col_left = aug_idx * 2
+            col_right = aug_idx * 2 + 1
+
+            # Display
+            if NUM_SAMPLES == 1:
+                ax_left = axes[col_left]
+                ax_right = axes[col_right]
+            else:
+                ax_left = axes[row, col_left]
+                ax_right = axes[row, col_right]
+
+            ax_left.imshow(left_img)
+            ax_right.imshow(right_img)
+
+            if aug_idx == 0:
+                ax_left.set_title('Original L', fontsize=9)
+                ax_right.set_title('Original R', fontsize=9)
+            else:
+                ax_left.set_title(f'Aug{aug_idx} L', fontsize=9)
+                ax_right.set_title(f'Aug{aug_idx} R', fontsize=9)
+
+            ax_left.axis('off')
+            ax_right.axis('off')
+
+        print(f"Processed sample {row + 1}/{NUM_SAMPLES}")
+
+    plt.tight_layout()
+
+    # Save or show
+    output_path = "./ball_detection/augmentation_examples_stereo.png"
+    if SAVE_OUTPUT:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print()
+        print(f"Saved visualization to: {output_path}")
+    else:
+        print()
+        print("Displaying visualization...")
+        plt.show()
+
+    print("=" * 60)
+
+
 def main():
     """Visualize augmentations."""
+    # Use stereo visualization if enabled
+    if STEREO_MODE:
+        visualize_stereo()
+        return
+
     print("=" * 60)
     print("AUGMENTATION VISUALIZATION")
     print("=" * 60)

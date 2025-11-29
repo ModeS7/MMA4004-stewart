@@ -17,7 +17,7 @@ class EnvConfig:
 
     # Physics
     dt = 0.01  # Time step (10ms, 100Hz control)
-    max_steps = 1000  # Steps per episode (10 seconds) - longer for stability learning
+    max_steps = 1000  # Steps per episode - longer for stability learning
 
     # Platform limits (from core/utils.py)
     platform_radius_mm = 150.0  # Platform radius in mm
@@ -103,12 +103,12 @@ class SACConfig:
 
     # Replay buffer
     buffer_size = 100_000
-    batch_size = 256  # Reduced for sequence data
+    batch_size = 1024  # Larger batch = more GPU utilization
 
     # Training
     warmup_steps = 1000  # Random actions before training
-    updates_per_step = 1  # Gradient updates per update call
-    update_every = 10  # Update every N environment steps (set higher for faster training)
+    updates_per_step = 4  # Gradient updates per update call (more GPU work per call)
+    update_every = 10  # Update every N environment steps
 
 
 # ============================================================================

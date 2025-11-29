@@ -462,23 +462,28 @@ class BallDetectorFullFrameTiny(nn.Module):
 
 class BallDetectorFullFrameTinyStereo(nn.Module):
     """
-    Stereo version of BallDetectorFullFrameTiny.
+    Dual-encoder stereo detector with shared stem and late fusion.
 
-    Takes 6-channel input (left RGB + right RGB) and outputs 5 values:
-    (x_left, y_left, x_right, y_right, confidence)
+    Architecture:
+    - Shared stem processes left and right images separately (weight sharing)
+    - Features concatenated after stem (32+32=64 channels)
+    - Wider fusion backbone for stereo correspondence learning
+    - Outputs: (x_left, y_left, x_right, y_right, confidence)
 
     Input: (batch, 6, H, W) - left RGB concatenated with right RGB
     Output: (batch, 5) - normalized coordinates for both views + confidence
+
+    Parameters: ~200K (vs ~150K for original tiny)
     """
 
     def __init__(self):
         super().__init__()
 
-        # Very aggressive stem: 1280x720 -> 80x45 (16x reduction)
-        # Modified to accept 6 channels instead of 3
+        # Shared stem for left and right (3→16→32)
+        # Same weights process both views - learns view-invariant features
         self.stem = nn.Sequential(
             # 1280x720 -> 320x180
-            nn.Conv2d(6, 16, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3, bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             # 320x180 -> 80x45
@@ -487,19 +492,20 @@ class BallDetectorFullFrameTinyStereo(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Tiny backbone (same as non-stereo)
+        # Fusion backbone (64 channels after concat)
+        # Wider than original to learn stereo relationships
         self.backbone = nn.Sequential(
             # 80x45 -> 40x23
-            self._make_block(32, 64, stride=2),
-            # 40x23 -> 20x12
             self._make_block(64, 128, stride=2),
-            # 20x12 -> 10x6
+            # 40x23 -> 20x12
             self._make_block(128, 256, stride=2),
+            # 20x12 -> 10x6
+            self._make_block(256, 256, stride=2),
             # Refine
             self._make_block(256, 256, stride=1),
         )
 
-        # Regression head - 5 outputs instead of 3
+        # Regression head
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.head = nn.Sequential(
             nn.Linear(256, 64),
@@ -522,8 +528,19 @@ class BallDetectorFullFrameTinyStereo(nn.Module):
         )
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.backbone(x)
+        # Split left and right images
+        left = x[:, :3]   # (B, 3, H, W)
+        right = x[:, 3:]  # (B, 3, H, W)
+
+        # Process through shared stem (same weights for both)
+        left_feat = self.stem(left)   # (B, 32, H/16, W/16)
+        right_feat = self.stem(right)  # (B, 32, H/16, W/16)
+
+        # Concatenate features (late fusion)
+        fused = torch.cat([left_feat, right_feat], dim=1)  # (B, 64, H/16, W/16)
+
+        # Backbone and head
+        x = self.backbone(fused)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.head(x)

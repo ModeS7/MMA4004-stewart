@@ -66,12 +66,12 @@ MODEL = "tiny"
 RESOLUTION = (320, 180)
 
 # Stereo mode (uses left+right pairs, 6-channel input)
-USE_STEREO = False
+USE_STEREO = True
 STEREO_MEMMAP_DIR = "./ball_detection/data/stereo_memmap"
 
 # Training parameters
 EPOCHS = 500
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 10
@@ -397,7 +397,7 @@ def check_pruning_readiness(history, threshold):
 # VISUALIZATION
 # ============================================================
 
-def visualize_predictions(images, targets, preds, img_size):
+def visualize_predictions(images, targets, preds, img_size, stereo=False):
     """Create visualization grid with GT (green) and predictions (red)."""
     import cv2
 
@@ -407,22 +407,58 @@ def visualize_predictions(images, targets, preds, img_size):
     vis_images = []
     for i in range(min(8, len(images))):
         img = images[i].cpu()
-        img = img * std + mean
-        img = torch.clamp(img, 0, 1)
-        img = img.numpy().transpose(1, 2, 0)
-        img = (img * 255).astype(np.uint8).copy()
 
-        h, w = img.shape[:2]
-        gt_x, gt_y = int(targets[i, 0] * w), int(targets[i, 1] * h)
-        pred_x, pred_y = int(preds[i, 0] * w), int(preds[i, 1] * h)
+        if stereo:
+            # Stereo: 6-channel image, show left (first 3 channels) and right (last 3)
+            left_img = img[:3]
+            right_img = img[3:]
 
-        cv2.circle(img, (gt_x, gt_y), 3, (0, 255, 0), -1)
-        cv2.circle(img, (pred_x, pred_y), 3, (255, 0, 0), -1)
-        cv2.line(img, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
+            left_img = left_img * std + mean
+            right_img = right_img * std + mean
 
-        vis_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+            left_img = torch.clamp(left_img, 0, 1).numpy().transpose(1, 2, 0)
+            right_img = torch.clamp(right_img, 0, 1).numpy().transpose(1, 2, 0)
 
-    return vutils.make_grid(vis_images, nrow=4, padding=2)
+            left_img = (left_img * 255).astype(np.uint8).copy()
+            right_img = (right_img * 255).astype(np.uint8).copy()
+
+            h, w = left_img.shape[:2]
+
+            # Left image: left GT and pred
+            gt_x_l, gt_y_l = int(targets[i, 0] * w), int(targets[i, 1] * h)
+            pred_x_l, pred_y_l = int(preds[i, 0] * w), int(preds[i, 1] * h)
+            cv2.circle(left_img, (gt_x_l, gt_y_l), 3, (0, 255, 0), -1)
+            cv2.circle(left_img, (pred_x_l, pred_y_l), 3, (255, 0, 0), -1)
+            cv2.line(left_img, (gt_x_l, gt_y_l), (pred_x_l, pred_y_l), (255, 255, 0), 1)
+
+            # Right image: right GT and pred
+            gt_x_r, gt_y_r = int(targets[i, 2] * w), int(targets[i, 3] * h)
+            pred_x_r, pred_y_r = int(preds[i, 2] * w), int(preds[i, 3] * h)
+            cv2.circle(right_img, (gt_x_r, gt_y_r), 3, (0, 255, 0), -1)
+            cv2.circle(right_img, (pred_x_r, pred_y_r), 3, (255, 0, 0), -1)
+            cv2.line(right_img, (gt_x_r, gt_y_r), (pred_x_r, pred_y_r), (255, 255, 0), 1)
+
+            # Stack left and right horizontally
+            combined = np.concatenate([left_img, right_img], axis=1)
+            vis_images.append(torch.from_numpy(combined).permute(2, 0, 1).float() / 255.0)
+        else:
+            # Non-stereo: 3-channel image
+            img = img * std + mean
+            img = torch.clamp(img, 0, 1)
+            img = img.numpy().transpose(1, 2, 0)
+            img = (img * 255).astype(np.uint8).copy()
+
+            h, w = img.shape[:2]
+            gt_x, gt_y = int(targets[i, 0] * w), int(targets[i, 1] * h)
+            pred_x, pred_y = int(preds[i, 0] * w), int(preds[i, 1] * h)
+
+            cv2.circle(img, (gt_x, gt_y), 3, (0, 255, 0), -1)
+            cv2.circle(img, (pred_x, pred_y), 3, (255, 0, 0), -1)
+            cv2.line(img, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
+
+            vis_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+
+    return vutils.make_grid(vis_images, nrow=4 if not stereo else 2, padding=2)
 
 
 # ============================================================
@@ -772,7 +808,7 @@ def main():
                 sample_targets = sample_targets[:8].to(device)
                 with torch.no_grad():
                     sample_preds = model(sample_images)
-                vis_grid = visualize_predictions(sample_images, sample_targets, sample_preds, pixel_size)
+                vis_grid = visualize_predictions(sample_images, sample_targets, sample_preds, pixel_size, stereo=USE_STEREO and MODE == "fullframe")
                 writer.add_image('Predictions/validation', vis_grid, epoch)
 
             # Histograms

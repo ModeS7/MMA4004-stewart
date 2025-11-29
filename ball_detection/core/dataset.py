@@ -905,6 +905,8 @@ class StereoMemmapDataset(Dataset):
         data_dir/labels.npy  - (N, 5) float32 [x_left, y_left, x_right, y_right, confidence]
 
     Applies same augmentations as FullFrameMemmapDataset but to 6-channel input.
+    Spatial augmentations are applied identically to both views.
+    Color augmentations are applied separately to each 3-channel RGB triplet.
     """
 
     # ImageNet normalization (applied to each RGB triplet)
@@ -926,24 +928,34 @@ class StereoMemmapDataset(Dataset):
 
         print(f"StereoMemmapDataset: {len(self.indices)} samples, {self.width}x{self.height}, 6 channels")
 
-        # Augmentation - same as FullFrameMemmapDataset
-        self.transform = self._get_transforms()
+        # Augmentation pipelines
+        self.spatial_transform, self.color_transform = self._get_transforms()
 
     def _get_transforms(self):
-        transforms_list = []
+        """Create separate spatial and color transform pipelines."""
+        spatial_transforms = []
+        color_transforms = []
 
         if self.use_augmentation:
-            transforms_list.extend([
+            # Spatial transforms - applied to full 6-channel image
+            spatial_transforms.extend([
                 A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
                                    border_mode=cv2.BORDER_CONSTANT, p=0.5),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
                 A.GaussianBlur(blur_limit=(3, 5), p=0.2),
                 A.GaussNoise(std_range=(0.02, 0.05), p=0.2),
             ])
 
-        # Keypoints for both left and right coordinates
-        return A.Compose(transforms_list, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+            # Color transforms - applied separately to each 3-channel image
+            color_transforms.extend([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+            ])
+
+        spatial_pipeline = A.Compose(spatial_transforms,
+                                     keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+        color_pipeline = A.Compose(color_transforms)
+
+        return spatial_pipeline, color_pipeline
 
     def __len__(self):
         return len(self.indices)
@@ -963,10 +975,9 @@ class StereoMemmapDataset(Dataset):
         right_x_px = x_right * self.width
         right_y_px = y_right * self.height
 
-        # Apply augmentations to 6-channel image
-        # Albumentations handles multi-channel images automatically
         if self.use_augmentation:
-            transformed = self.transform(
+            # 1. Apply spatial augmentations to full 6-channel image
+            transformed = self.spatial_transform(
                 image=image,
                 keypoints=[(left_x_px, left_y_px), (right_x_px, right_y_px)]
             )
@@ -974,6 +985,25 @@ class StereoMemmapDataset(Dataset):
             if len(transformed['keypoints']) >= 2:
                 left_x_px, left_y_px = transformed['keypoints'][0]
                 right_x_px, right_y_px = transformed['keypoints'][1]
+
+            # 2. Apply color augmentations separately to each RGB triplet
+            # Use same random params for both views to keep them consistent
+            left_rgb = image[:, :, :3]
+            right_rgb = image[:, :, 3:]
+
+            # Apply same color transform to both
+            replay = A.ReplayCompose([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+            ])
+            left_result = replay(image=left_rgb)
+            right_result = A.ReplayCompose.replay(left_result['replay'], image=right_rgb)
+
+            left_rgb = left_result['image']
+            right_rgb = right_result['image']
+
+            # Recombine
+            image = np.concatenate([left_rgb, right_rgb], axis=2)
 
         # Back to normalized
         x_left = np.clip(left_x_px / self.width, 0.0, 1.0)

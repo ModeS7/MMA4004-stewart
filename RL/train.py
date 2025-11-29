@@ -26,7 +26,7 @@ from agent import SACAgent, ReplayBuffer
 # TRAINING CONFIGURATION - MODIFY THESE
 # ============================================================================
 
-NUM_ENVS = 10           # Number of parallel environments
+NUM_ENVS = 1000         # Number of parallel environments
 MAX_EPISODES = 1500     # Total training episodes
 DEVICE = "cuda"         # "cuda" or "cpu"
 USE_GPU_ENV = True      # Use GPU-accelerated environment (faster physics)
@@ -202,6 +202,7 @@ def train():
         episode_reward = np.zeros(NUM_ENVS)
         episode_length = np.zeros(NUM_ENVS)
         done_mask = np.zeros(NUM_ENVS, dtype=bool)
+        step_in_episode = 0  # Track actual steps for update_every
 
         episode_start_time = time.time()
 
@@ -224,14 +225,15 @@ def train():
 
             # Update agent (every N steps to speed up training)
             update_every = getattr(sac_cfg, 'update_every', 1)
+            step_in_episode += 1
             if (total_steps >= sac_cfg.warmup_steps and
                 len(buffer) >= sac_cfg.batch_size and
-                total_steps % update_every == 0):
+                step_in_episode % update_every == 0):
                 for _ in range(sac_cfg.updates_per_step):
                     update_info = agent.update(buffer, sac_cfg.batch_size)
 
                 # Track losses (periodically)
-                if total_steps % 100 == 0:
+                if step_in_episode % 100 == 0:
                     losses['critic'].append(update_info['critic_loss'])
                     losses['actor'].append(update_info['actor_loss'])
                     losses['physics'].append(update_info['physics_loss'])
