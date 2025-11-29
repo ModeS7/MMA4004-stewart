@@ -459,9 +459,10 @@ class StereoCameraController:
                         total_ms = (t_end - loop_start) * 1000
                         rectify_ms = (t_rectify - t_detect) * 1000
                         rest_ms = (t_end - t_rectify) * 1000
+                        prep_total = timing['resize_ms'] + timing['convert_ms'] + timing['normalize_ms']
                         print(f"[Frame {self.frame_count}] Total: {total_ms:.1f}ms | "
-                              f"prep: {timing['prep_ms']:.1f} | stereo: {timing['stereo_ms']:.1f} | "
-                              f"refine_L: {timing['refine_L_ms']:.1f} | refine_R: {timing['refine_R_ms']:.1f} | "
+                              f"prep: {prep_total:.1f} (resize:{timing['resize_ms']:.1f} cvt:{timing['convert_ms']:.1f} norm:{timing['normalize_ms']:.1f}) | "
+                              f"stereo: {timing['stereo_ms']:.1f} | refine_L: {timing['refine_L_ms']:.1f} | refine_R: {timing['refine_R_ms']:.1f} | "
                               f"tri: {rectify_ms + rest_ms:.1f} | grabber: {self.grabber_fps:.1f}fps")
                         if detection_result['detected']:
                             print(f"  conf={detection_result['confidence']:.2f} | "

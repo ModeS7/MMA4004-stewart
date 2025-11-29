@@ -117,7 +117,7 @@ class ONNXBallDetector:
             confidence: Detection confidence [0, 1]
         """
         # Preprocess
-        input_tensor = self.preprocess(image_rgb)
+        input_tensor = self.preprocess(image_bgr)
 
         # Inference
         start_time = time.time()
@@ -141,7 +141,7 @@ class ONNXBallDetector:
 
         return float(x_norm), float(y_norm), float(confidence)
 
-    def detect_with_timing(self, image_rgb) -> Tuple[Tuple[float, float, float], dict]:
+    def detect_with_timing(self, image_bgr) -> Tuple[Tuple[float, float, float], dict]:
         """
         Detect ball center with detailed timing breakdown.
 
@@ -151,7 +151,7 @@ class ONNXBallDetector:
         """
         # Preprocess with timing
         t0 = time.perf_counter()
-        input_tensor = self.preprocess(image_rgb)
+        input_tensor = self.preprocess(image_bgr)
         t1 = time.perf_counter()
 
         # Inference with timing
@@ -178,19 +178,19 @@ class ONNXBallDetector:
 
         return (float(x_norm), float(y_norm), float(confidence)), timing
 
-    def detect_batch(self, images_rgb) -> np.ndarray:
+    def detect_batch(self, images_bgr) -> np.ndarray:
         """
         Detect ball centers in batch of images.
 
         Args:
-            images_rgb: List or array of RGB images
+            images_bgr: List or array of BGR images
 
         Returns:
             Array of shape (N, 3) containing (x, y, confidence) for each image
         """
         # Preprocess all images
         batch = []
-        for img in images_rgb:
+        for img in images_bgr:
             tensor = self.preprocess(img)
             batch.append(tensor)
 
@@ -202,7 +202,7 @@ class ONNXBallDetector:
         inference_time = time.time() - start_time
 
         # Update statistics
-        self.inference_count += len(images_rgb)
+        self.inference_count += len(images_bgr)
         self.total_inference_time += inference_time
 
         # Handle both 2-output and 3-output models
@@ -330,10 +330,17 @@ class ONNXStereoDetector:
         self.total_time = 0.0
 
     def _preprocess_stereo(self, left_bgr, right_bgr):
-        """Preprocess stereo pair for tiny_stereo model."""
+        """Preprocess stereo pair for tiny_stereo model.
+
+        Returns:
+            tuple: (stereo_tensor, timing_dict)
+        """
+        t0 = time.perf_counter()
+
         # Resize to stereo input size
         left_small = cv2.resize(left_bgr, self.stereo_size)
         right_small = cv2.resize(right_bgr, self.stereo_size)
+        t_resize = time.perf_counter()
 
         if self.convert_to_rgb:
             # Convert BGR->RGB (for RGB-trained models)
@@ -343,6 +350,7 @@ class ONNXStereoDetector:
         else:
             # Keep BGR (for BGR-trained models)
             mean, std = self.mean_bgr, self.std_bgr
+        t_convert = time.perf_counter()
 
         # Normalize
         left_norm = (left_small.astype(np.float32) / 255.0 - mean) / std
@@ -353,8 +361,15 @@ class ONNXStereoDetector:
         stereo = np.concatenate([left_norm, right_norm], axis=2)  # (H, W, 6)
         stereo = np.transpose(stereo, (2, 0, 1))  # (6, H, W)
         stereo = np.expand_dims(stereo, axis=0)  # (1, 6, H, W)
+        t_norm = time.perf_counter()
 
-        return stereo.astype(np.float32)
+        prep_timing = {
+            'resize_ms': (t_resize - t0) * 1000,
+            'convert_ms': (t_convert - t_resize) * 1000,
+            'normalize_ms': (t_norm - t_convert) * 1000,
+        }
+
+        return stereo.astype(np.float32), prep_timing
 
     def _preprocess_crop(self, crop_bgr):
         """Preprocess single crop for refinement model (BGR, no conversion)."""
@@ -419,7 +434,7 @@ class ONNXStereoDetector:
 
         # Stage 1: Coarse detection with tiny_stereo
         # Preprocessing includes resize (+ BGR->RGB only if convert_to_rgb=True)
-        stereo_input = self._preprocess_stereo(left_frame, right_frame)
+        stereo_input, prep_timing = self._preprocess_stereo(left_frame, right_frame)
         t_stereo_prep = time.perf_counter()
 
         stereo_output = self.stereo_session.run(
@@ -439,7 +454,9 @@ class ONNXStereoDetector:
                 'confidence': float(confidence),
                 'detected': False,
                 'timing': {
-                    'prep_ms': (t_stereo_prep - t_start) * 1000,
+                    'resize_ms': prep_timing['resize_ms'],
+                    'convert_ms': prep_timing['convert_ms'],
+                    'normalize_ms': prep_timing['normalize_ms'],
                     'stereo_ms': (t_stereo_end - t_stereo_prep) * 1000,
                     'refine_L_ms': 0, 'refine_R_ms': 0,
                     'total_ms': (t_end - t_start) * 1000
@@ -501,7 +518,9 @@ class ONNXStereoDetector:
             'confidence': float(confidence),
             'detected': True,
             'timing': {
-                'prep_ms': (t_stereo_prep - t_start) * 1000,
+                'resize_ms': prep_timing['resize_ms'],
+                'convert_ms': prep_timing['convert_ms'],
+                'normalize_ms': prep_timing['normalize_ms'],
                 'stereo_ms': (t_stereo_end - t_stereo_prep) * 1000,
                 'refine_L_ms': refine_L_ms,
                 'refine_R_ms': refine_R_ms,
@@ -659,9 +678,8 @@ if __name__ == "__main__":
                 cv2.putText(frame, f"Confidence: {conf:.3f}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                # Show crop in corner
-                crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-                crop_large = cv2.resize(crop_bgr, (128, 128))
+                # Show crop in corner (crop is already BGR)
+                crop_large = cv2.resize(crop, (128, 128))
                 frame[:128, :128] = crop_large
 
             cv2.imshow('ONNX Detector Test', frame)

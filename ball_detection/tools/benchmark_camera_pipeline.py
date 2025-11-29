@@ -135,6 +135,9 @@ class StereoFrameLoader:
                         'right_label': right_label,
                     })
 
+        # Sort by frame_id for sequential playback
+        pairs.sort(key=lambda x: x['frame_id'])
+
         return pairs
 
     def get_next_frame(self):
@@ -350,7 +353,9 @@ class StereoPipelineBenchmark:
 
         # Accumulate timing
         self.timing['total'].append((t_end - t_start) * 1000)
-        self.timing['prep'].append(result['timing']['prep_ms'])
+        self.timing['resize'].append(result['timing']['resize_ms'])
+        self.timing['convert'].append(result['timing']['convert_ms'])
+        self.timing['normalize'].append(result['timing']['normalize_ms'])
         self.timing['stereo_nn'].append(result['timing']['stereo_ms'])
         if self.use_refinement:
             self.timing['refine_L'].append(result['timing']['refine_L_ms'])
@@ -421,10 +426,12 @@ def visualize_detection(left_frame, right_frame, result, frame_id, fps):
     combined = cv2.resize(combined, (display_width, int(h * scale)))
 
     # Add info overlay
+    timing = result['timing']
+    convert_ms = timing.get('convert_ms', 0)
     info_lines = [
         f"Frame: {frame_id}",
         f"FPS: {fps:.1f}",
-        f"Time: {result['timing'].get('total_ms', 0):.1f}ms",
+        f"Time: {timing.get('total_ms', 0):.1f}ms (cvt:{convert_ms:.1f})",
         f"Conf: {result['left']['confidence']:.2f}",
     ]
 
@@ -581,8 +588,8 @@ def print_results(pipeline, frame_times, args):
     print(f"{'Stage':<20} {'Mean':>8} {'Std':>8} {'P95':>8} {'P99':>8}")
     print("-" * 50)
 
-    for key in ['total', 'rgb_convert', 'prep', 'stereo_nn', 'roi_L', 'roi_R',
-                'cnn_L', 'cnn_R', 'refine_L', 'refine_R']:
+    for key in ['total', 'resize', 'convert', 'normalize', 'stereo_nn',
+                'roi_L', 'roi_R', 'cnn_L', 'cnn_R', 'refine_L', 'refine_R']:
         if key in stats:
             s = stats[key]
             print(f"{key:<20} {s['mean']:>7.2f}ms {s['std']:>7.2f}ms "

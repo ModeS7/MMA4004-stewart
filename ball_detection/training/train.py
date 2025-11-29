@@ -53,7 +53,7 @@ from ..core.dataset import (
 #   "cnn"        - Custom CNN with residual blocks
 #   "mobilenet"  - MobileNetV3-Small backbone
 #   "shufflenet" - ShuffleNetV2 x0.5 backbone
-MODEL_CROP = "shufflenet"
+MODEL_CROP = "cnn"
 
 # FULLFRAME MODE (1280x720 or 320x180 input → x, y, confidence output):
 #   "tiny"      - Custom lightweight backbone (~150K params)
