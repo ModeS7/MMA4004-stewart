@@ -248,23 +248,16 @@ class ReplayBuffer:
         self.position = end_pos % self.capacity
         self.size = min(self.size + n, self.capacity)
 
-    def push_batch_tensor(self, states, actions, rewards, next_states, dones, physics_gt, mask):
-        """Add multiple transitions from GPU tensors (no CPU transfer)."""
-        # Filter by mask (all on GPU)
-        indices = torch.where(mask)[0]
-        if len(indices) == 0:
-            return
+    def push_batch_tensor(self, states, actions, rewards, next_states, dones, physics_gt, mask=None):
+        """Add all transitions from GPU tensors (no CPU transfer, no filtering).
 
-        states = states[indices]
-        actions = actions[indices]
-        rewards = rewards[indices].unsqueeze(-1)
-        next_states = next_states[indices]
-        dones = dones[indices].float().unsqueeze(-1)
-        physics_gt = physics_gt[indices]
+        Note: mask is ignored to avoid CUDA syncs. All transitions are stored.
+        """
+        n = states.shape[0]  # Known at compile time, no sync
+        rewards = rewards.unsqueeze(-1)
+        dones = dones.float().unsqueeze(-1)
 
-        n = len(states)
-
-        # Handle wrap-around
+        # Handle wrap-around (n is fixed NUM_ENVS, so end_pos is predictable)
         end_pos = self.position + n
         if end_pos <= self.capacity:
             # No wrap
