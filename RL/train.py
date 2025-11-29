@@ -216,11 +216,12 @@ def train():
             episode_reward = torch.zeros(NUM_ENVS, device=DEVICE)
             episode_length = torch.zeros(NUM_ENVS, device=DEVICE)
             done_mask = torch.zeros(NUM_ENVS, device=DEVICE, dtype=torch.bool)
-            step_in_episode = 0
 
             episode_start_time = time.time()
+            update_every = getattr(sac_cfg, 'update_every', 1)
 
-            while not done_mask.all():
+            # Fixed-step loop to avoid CUDA sync from done_mask.all()
+            for step_in_episode in range(1, env_cfg.max_steps + 1):
                 # Select action (all on GPU)
                 if total_steps < sac_cfg.warmup_steps:
                     # Random actions during warmup
@@ -231,15 +232,24 @@ def train():
                 # Step environment (all on GPU)
                 next_obs, rewards, dones, next_physics_gt = env.step_tensor(actions)
 
-                # Store transitions (all on GPU)
+                # Store transitions (all on GPU, no mask to avoid sync)
                 buffer.push_batch_tensor(
-                    obs, actions, rewards, next_obs, dones,
-                    physics_gt, mask=~done_mask
+                    obs, actions, rewards, next_obs, dones, physics_gt
                 )
 
-                # Update agent
-                update_every = getattr(sac_cfg, 'update_every', 1)
-                step_in_episode += 1
+                # Accumulate rewards before updating done_mask (GPU, no sync)
+                episode_reward += rewards * (~done_mask)
+                episode_length += (~done_mask).float()
+
+                # Update done mask
+                done_mask = done_mask | dones
+
+                # Update state
+                obs = next_obs
+                physics_gt = next_physics_gt
+                total_steps += NUM_ENVS
+
+                # Update agent (less frequently)
                 if (total_steps >= sac_cfg.warmup_steps and
                     len(buffer) >= sac_cfg.batch_size and
                     step_in_episode % update_every == 0):
@@ -259,16 +269,6 @@ def train():
                         writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
                         writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
                         writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
-
-                # Accumulate rewards (GPU)
-                episode_reward += rewards * (~done_mask)
-                episode_length += (~done_mask).float()
-
-                # Update state
-                obs = next_obs
-                physics_gt = next_physics_gt
-                done_mask = done_mask | dones
-                total_steps += NUM_ENVS
 
             # Convert to numpy only for logging
             episode_reward = episode_reward.cpu().numpy()
