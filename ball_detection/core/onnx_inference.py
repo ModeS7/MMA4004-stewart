@@ -241,6 +241,279 @@ class ONNXBallDetector:
         self.total_inference_time = 0.0
 
 
+class ONNXStereoDetector:
+    """
+    Two-stage stereo detector: tiny_stereo + crop refinement.
+
+    Pipeline:
+        Stage 1: tiny_stereo (320x180, 6ch) → coarse detection [x_l, y_l, x_r, y_r, conf]
+        Stage 2: crop model (128x128) → per-image refinement [x, y] within crop
+    """
+
+    def __init__(self, stereo_model_path, crop_model_path=None, use_gpu=True,
+                 stereo_size=(320, 180), crop_size=128, frame_size=(1280, 720),
+                 confidence_threshold=0.5, use_refinement=True):
+        """
+        Initialize stereo detector.
+
+        Args:
+            stereo_model_path: Path to tiny_stereo ONNX model (6ch input)
+            crop_model_path: Path to crop refinement model (3ch, 128x128)
+            use_gpu: Use DirectML GPU acceleration
+            stereo_size: (width, height) for stereo model input
+            crop_size: Crop size for refinement model
+            frame_size: Original frame size (width, height)
+            confidence_threshold: Minimum confidence for detection
+            use_refinement: Enable stage 2 crop refinement
+        """
+        self.stereo_size = stereo_size  # (320, 180)
+        self.crop_size = crop_size
+        self.frame_size = frame_size  # (1280, 720)
+        self.confidence_threshold = confidence_threshold
+        self.use_refinement = use_refinement and crop_model_path is not None
+
+        # Setup providers
+        if use_gpu:
+            providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
+        else:
+            providers = ['CPUExecutionProvider']
+
+        session_options = ort.SessionOptions()
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        # Load stereo model (6-channel input)
+        print(f"Loading stereo model: {stereo_model_path}")
+        try:
+            self.stereo_session = ort.InferenceSession(
+                str(stereo_model_path), sess_options=session_options, providers=providers
+            )
+        except Exception as e:
+            print(f"DirectML failed, falling back to CPU: {e}")
+            self.stereo_session = ort.InferenceSession(
+                str(stereo_model_path), sess_options=session_options,
+                providers=['CPUExecutionProvider']
+            )
+
+        self.stereo_input_name = self.stereo_session.get_inputs()[0].name
+        self.stereo_output_name = self.stereo_session.get_outputs()[0].name
+        print(f"  Stereo model loaded: input={self.stereo_input_name}, "
+              f"shape=(1, 6, {stereo_size[1]}, {stereo_size[0]})")
+
+        # Load crop model (3-channel input) if provided
+        self.crop_session = None
+        if crop_model_path:
+            print(f"Loading crop model: {crop_model_path}")
+            try:
+                self.crop_session = ort.InferenceSession(
+                    str(crop_model_path), sess_options=session_options, providers=providers
+                )
+                self.crop_input_name = self.crop_session.get_inputs()[0].name
+                self.crop_output_name = self.crop_session.get_outputs()[0].name
+                print(f"  Crop model loaded: input={self.crop_input_name}, "
+                      f"shape=(1, 3, {crop_size}, {crop_size})")
+            except Exception as e:
+                print(f"Failed to load crop model: {e}")
+                self.use_refinement = False
+
+        # Normalization (ImageNet stats)
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        # Statistics
+        self.inference_count = 0
+        self.total_time = 0.0
+
+    def _preprocess_stereo(self, left_rgb, right_rgb):
+        """Preprocess stereo pair for tiny_stereo model."""
+        # Resize to stereo input size
+        left_small = cv2.resize(left_rgb, self.stereo_size)
+        right_small = cv2.resize(right_rgb, self.stereo_size)
+
+        # Normalize
+        left_norm = (left_small.astype(np.float32) / 255.0 - self.mean) / self.std
+        right_norm = (right_small.astype(np.float32) / 255.0 - self.mean) / self.std
+
+        # Stack as 6-channel (left RGB + right RGB)
+        # Shape: (H, W, 6) -> (6, H, W) -> (1, 6, H, W)
+        stereo = np.concatenate([left_norm, right_norm], axis=2)  # (H, W, 6)
+        stereo = np.transpose(stereo, (2, 0, 1))  # (6, H, W)
+        stereo = np.expand_dims(stereo, axis=0)  # (1, 6, H, W)
+
+        return stereo.astype(np.float32)
+
+    def _preprocess_crop(self, crop_rgb):
+        """Preprocess single crop for refinement model."""
+        if crop_rgb.shape[:2] != (self.crop_size, self.crop_size):
+            crop_rgb = cv2.resize(crop_rgb, (self.crop_size, self.crop_size))
+
+        crop_norm = (crop_rgb.astype(np.float32) / 255.0 - self.mean) / self.std
+        crop_tensor = np.transpose(crop_norm, (2, 0, 1))
+        crop_tensor = np.expand_dims(crop_tensor, axis=0)
+
+        return crop_tensor.astype(np.float32)
+
+    def _extract_crop(self, frame_rgb, x_norm, y_norm):
+        """Extract crop centered at normalized coordinates."""
+        h, w = frame_rgb.shape[:2]
+        cx = int(x_norm * w)
+        cy = int(y_norm * h)
+
+        half = self.crop_size // 2
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(w, cx + half)
+        y2 = min(h, cy + half)
+
+        # Extract crop
+        crop = frame_rgb[y1:y2, x1:x2].copy()
+
+        # Pad if needed (edge cases)
+        if crop.shape[0] != self.crop_size or crop.shape[1] != self.crop_size:
+            padded = np.zeros((self.crop_size, self.crop_size, 3), dtype=crop.dtype)
+            ph, pw = crop.shape[:2]
+            padded[:ph, :pw] = crop
+            crop = padded
+
+        # Return crop and offset for coordinate conversion
+        return crop, (x1, y1)
+
+    def detect(self, left_frame, right_frame):
+        """
+        Detect ball in stereo pair.
+
+        Args:
+            left_frame: Left camera frame (H, W, 3) BGR or RGB
+            right_frame: Right camera frame (H, W, 3) BGR or RGB
+
+        Returns:
+            dict with:
+                x_left, y_left: Left camera coordinates (pixels)
+                x_right, y_right: Right camera coordinates (pixels)
+                confidence: Detection confidence [0, 1]
+                detected: Whether ball was detected
+                timing: dict with stage timings (ms)
+        """
+        t_start = time.perf_counter()
+
+        # Convert BGR to RGB if needed (assume BGR input from OpenCV)
+        if left_frame.shape[2] == 3:
+            left_rgb = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB)
+            right_rgb = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB)
+        else:
+            left_rgb = left_frame
+            right_rgb = right_frame
+
+        frame_h, frame_w = left_rgb.shape[:2]
+
+        # Stage 1: Coarse detection with tiny_stereo
+        t_prep = time.perf_counter()
+        stereo_input = self._preprocess_stereo(left_rgb, right_rgb)
+        t_stereo_start = time.perf_counter()
+
+        stereo_output = self.stereo_session.run(
+            [self.stereo_output_name], {self.stereo_input_name: stereo_input}
+        )[0][0]
+        t_stereo_end = time.perf_counter()
+
+        # Parse stereo output: [x_l, y_l, x_r, y_r, conf]
+        x_l_norm, y_l_norm, x_r_norm, y_r_norm, confidence = stereo_output
+
+        # Check confidence threshold
+        if confidence < self.confidence_threshold:
+            return {
+                'x_left': 0, 'y_left': 0,
+                'x_right': 0, 'y_right': 0,
+                'confidence': float(confidence),
+                'detected': False,
+                'timing': {
+                    'prep_ms': (t_stereo_start - t_prep) * 1000,
+                    'stereo_ms': (t_stereo_end - t_stereo_start) * 1000,
+                    'refine_L_ms': 0, 'refine_R_ms': 0,
+                    'total_ms': (t_stereo_end - t_start) * 1000
+                }
+            }
+
+        # Stage 2: Refinement (if enabled)
+        refine_L_ms = 0
+        refine_R_ms = 0
+
+        if self.use_refinement and self.crop_session is not None:
+            # Refine left
+            t_refine_L_start = time.perf_counter()
+            left_crop, left_offset = self._extract_crop(left_rgb, x_l_norm, y_l_norm)
+            left_input = self._preprocess_crop(left_crop)
+            left_output = self.crop_session.run(
+                [self.crop_output_name], {self.crop_input_name: left_input}
+            )[0][0]
+            t_refine_L_end = time.perf_counter()
+            refine_L_ms = (t_refine_L_end - t_refine_L_start) * 1000
+
+            # Convert crop coords to frame coords
+            x_l_crop, y_l_crop = left_output[0], left_output[1]
+            x_l_px = left_offset[0] + x_l_crop * self.crop_size
+            y_l_px = left_offset[1] + y_l_crop * self.crop_size
+
+            # Refine right
+            t_refine_R_start = time.perf_counter()
+            right_crop, right_offset = self._extract_crop(right_rgb, x_r_norm, y_r_norm)
+            right_input = self._preprocess_crop(right_crop)
+            right_output = self.crop_session.run(
+                [self.crop_output_name], {self.crop_input_name: right_input}
+            )[0][0]
+            t_refine_R_end = time.perf_counter()
+            refine_R_ms = (t_refine_R_end - t_refine_R_start) * 1000
+
+            # Convert crop coords to frame coords
+            x_r_crop, y_r_crop = right_output[0], right_output[1]
+            x_r_px = right_offset[0] + x_r_crop * self.crop_size
+            y_r_px = right_offset[1] + y_r_crop * self.crop_size
+        else:
+            # Use coarse detection directly
+            x_l_px = x_l_norm * frame_w
+            y_l_px = y_l_norm * frame_h
+            x_r_px = x_r_norm * frame_w
+            y_r_px = y_r_norm * frame_h
+
+        t_end = time.perf_counter()
+
+        # Update statistics
+        self.inference_count += 1
+        self.total_time += (t_end - t_start)
+
+        return {
+            'x_left': float(x_l_px),
+            'y_left': float(y_l_px),
+            'x_right': float(x_r_px),
+            'y_right': float(y_r_px),
+            'confidence': float(confidence),
+            'detected': True,
+            'timing': {
+                'prep_ms': (t_stereo_start - t_prep) * 1000,
+                'stereo_ms': (t_stereo_end - t_stereo_start) * 1000,
+                'refine_L_ms': refine_L_ms,
+                'refine_R_ms': refine_R_ms,
+                'total_ms': (t_end - t_start) * 1000
+            }
+        }
+
+    def get_statistics(self):
+        """Get inference statistics."""
+        if self.inference_count == 0:
+            return {'count': 0, 'avg_time_ms': 0.0, 'fps': 0.0}
+
+        avg_time = self.total_time / self.inference_count
+        return {
+            'count': self.inference_count,
+            'avg_time_ms': avg_time * 1000,
+            'fps': 1.0 / avg_time if avg_time > 0 else 0.0
+        }
+
+    def reset_statistics(self):
+        """Reset statistics."""
+        self.inference_count = 0
+        self.total_time = 0.0
+
+
 def benchmark_onnx_model(model_path, num_iterations=100, batch_sizes=[1, 2, 4], use_gpu=True):
     """
     Benchmark ONNX model performance.

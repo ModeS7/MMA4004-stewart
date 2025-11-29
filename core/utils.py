@@ -599,6 +599,39 @@ class StereoCameraConfig:
     SAMPLE_RATE_RANGE = (0.0, 100.0)  # Hz
 
 # ============================================================================
+# STEREO DETECTION CONFIGURATION (Neural Network Pipeline)
+# ============================================================================
+
+class StereoDetectionConfig:
+    """Configuration for two-stage neural network stereo detection.
+
+    Pipeline:
+        Stage 1: tiny_stereo (320x180, 6ch) → coarse stereo detection
+        Stage 2: crop model (128x128) → per-image refinement
+    """
+
+    # Model paths
+    STEREO_MODEL_PATH = 'ball_detection/models/tiny_stereo.onnx'
+    CROP_MODEL_PATH = 'ball_detection/models/shufflenet_128.onnx'
+
+    # Input sizes
+    STEREO_WIDTH = 320
+    STEREO_HEIGHT = 180
+    CROP_SIZE = 128
+
+    # Original frame size (for coordinate conversion)
+    FRAME_WIDTH = 1280
+    FRAME_HEIGHT = 720
+
+    # Detection settings
+    CONFIDENCE_THRESHOLD = 0.5
+    USE_REFINEMENT = True  # Enable stage 2 crop refinement
+
+    # GPU settings
+    USE_GPU = True  # Use DirectML GPU acceleration
+
+
+# ============================================================================
 # BALL PHYSICS CONFIGURATION
 # ============================================================================
 

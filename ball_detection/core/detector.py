@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 from pathlib import Path
 
 from .roi_extractor import RedBallROIExtractor
-from .onnx_inference import ONNXBallDetector
+from .onnx_inference import ONNXBallDetector, ONNXStereoDetector
 
 
 class BallDetector:
@@ -222,6 +222,93 @@ class BallDetector:
     def set_hsv_ranges(self, lower1, upper1, lower2, upper2):
         """Set HSV color ranges for ROI extraction (for tuning)."""
         self.roi_extractor.set_hsv_ranges(lower1, upper1, lower2, upper2)
+
+
+class StereoBallDetector:
+    """
+    Stereo ball detector using two-stage neural network pipeline.
+
+    Pipeline:
+        Stage 1: tiny_stereo (320x180, 6ch) → coarse stereo detection
+        Stage 2: crop model (128x128) → per-image refinement (optional)
+
+    Replaces ROI + CNN pipeline with end-to-end neural network detection.
+    """
+
+    def __init__(self, stereo_model_path, crop_model_path=None, use_gpu=True,
+                 confidence_threshold=0.5, use_refinement=True):
+        """
+        Initialize stereo detector.
+
+        Args:
+            stereo_model_path: Path to tiny_stereo ONNX model
+            crop_model_path: Path to 128x128 crop model (optional)
+            use_gpu: Use DirectML GPU acceleration
+            confidence_threshold: Minimum confidence for detection
+            use_refinement: Enable stage 2 crop refinement
+        """
+        print("Initializing Stereo Ball Detector...")
+        self.stereo_detector = ONNXStereoDetector(
+            stereo_model_path=stereo_model_path,
+            crop_model_path=crop_model_path,
+            use_gpu=use_gpu,
+            confidence_threshold=confidence_threshold,
+            use_refinement=use_refinement
+        )
+        print("Stereo detector ready!\n")
+
+    def detect_stereo(self, left_frame, right_frame):
+        """
+        Detect ball in stereo pair.
+
+        Args:
+            left_frame: Left camera frame (BGR)
+            right_frame: Right camera frame (BGR)
+
+        Returns:
+            dict with:
+                x_left, y_left: Left camera coords (pixels) or None
+                x_right, y_right: Right camera coords (pixels) or None
+                confidence: Detection confidence
+                detected: Whether ball was detected
+                timing: Timing breakdown (ms)
+        """
+        return self.stereo_detector.detect(left_frame, right_frame)
+
+    def visualize(self, left_frame, right_frame, result):
+        """
+        Create visualization of stereo detection.
+
+        Args:
+            left_frame, right_frame: Input frames
+            result: Output from detect_stereo()
+
+        Returns:
+            Tuple of (vis_left, vis_right) visualization frames
+        """
+        vis_left = left_frame.copy()
+        vis_right = right_frame.copy()
+
+        if result['detected']:
+            # Draw on left frame
+            x, y = int(result['x_left']), int(result['y_left'])
+            cv2.circle(vis_left, (x, y), 8, (0, 255, 0), 2)
+            cv2.circle(vis_left, (x, y), 2, (0, 255, 0), -1)
+            cv2.line(vis_left, (x - 20, y), (x + 20, y), (0, 255, 0), 1)
+            cv2.line(vis_left, (x, y - 20), (x, y + 20), (0, 255, 0), 1)
+
+            # Draw on right frame
+            x, y = int(result['x_right']), int(result['y_right'])
+            cv2.circle(vis_right, (x, y), 8, (0, 255, 0), 2)
+            cv2.circle(vis_right, (x, y), 2, (0, 255, 0), -1)
+            cv2.line(vis_right, (x - 20, y), (x + 20, y), (0, 255, 0), 1)
+            cv2.line(vis_right, (x, y - 20), (x, y + 20), (0, 255, 0), 1)
+
+        return vis_left, vis_right
+
+    def get_statistics(self):
+        """Get detection statistics."""
+        return self.stereo_detector.get_statistics()
 
 
 def test_detector_webcam(model_path, camera_id=0, use_gpu=True):
