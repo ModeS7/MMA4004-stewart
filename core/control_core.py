@@ -286,10 +286,11 @@ class LQRController:
 
 class RLController:
     """
-    Reinforcement Learning Controller using trained SAC policy.
+    Reinforcement Learning Controller using trained SAC or PPO policy.
 
     Uses frame stacking (12 frames × 7 values = 84 inputs) with physics estimation.
-    Matches the architecture trained in RL/train.py.
+    Matches the architecture trained in RL/train.py or RL/train_ppo.py.
+    Auto-detects checkpoint format (SAC vs PPO).
     """
 
     def __init__(self,
@@ -298,7 +299,7 @@ class RLController:
                  device: str = "cpu") -> None:
         """
         Args:
-            model_path: Path to trained SAC model checkpoint
+            model_path: Path to trained SAC or PPO model checkpoint
             output_limit: Maximum tilt angle (degrees)
             device: "cpu" or "cuda" for inference
         """
@@ -320,8 +321,12 @@ class RLController:
         # Frame history buffer
         self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
 
+        # Model type will be detected during load
+        self.model_type = None  # 'sac' or 'ppo'
+
         # Build actor network (1D CNN - same architecture as RL/agent.py)
         class Actor(nn.Module):
+            """SAC-style actor network."""
             def __init__(self, input_dim=84, action_dim=2, hidden_dim=256, physics_dim=3,
                          num_frames=12, obs_per_frame=7):
                 super().__init__()
@@ -376,10 +381,70 @@ class RLController:
                 action_mean = torch.tanh(self.action_mean(features))
                 return action_mean
 
-        self.actor = Actor(input_dim=self.obs_dim).to(self.device)
-        self.actor.eval()
+        # Build PPO actor-critic network
+        class ActorCritic(nn.Module):
+            """PPO-style actor-critic network."""
+            def __init__(self, obs_dim=84, action_dim=2, hidden_dim=256,
+                         num_frames=12, obs_per_frame=7):
+                super().__init__()
+                self.num_frames = num_frames
+                self.obs_per_frame = obs_per_frame
 
-        # Load trained weights
+                # Shared 1D CNN backbone
+                self.conv = nn.Sequential(
+                    nn.Conv1d(obs_per_frame, 32, kernel_size=3, padding=1),
+                    nn.ReLU(),
+                    nn.Conv1d(32, 64, kernel_size=3, padding=1),
+                    nn.ReLU(),
+                    nn.Conv1d(64, 64, kernel_size=3, stride=2),
+                    nn.ReLU(),
+                )
+
+                # CNN output: 64 × 5 = 320
+                cnn_out_dim = 64 * 5
+
+                # Shared MLP
+                self.shared_fc = nn.Sequential(
+                    nn.Linear(cnn_out_dim, hidden_dim),
+                    nn.ReLU(),
+                )
+
+                # Actor head
+                self.actor_mean = nn.Linear(hidden_dim, action_dim)
+                self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
+
+                # Critic head (not used for inference, but needed for loading)
+                self.critic = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 1)
+                )
+
+            def forward(self, obs):
+                batch_size = obs.shape[0]
+                # Reshape: (batch, 84) -> (batch, 12, 7) -> (batch, 7, 12)
+                x = obs.view(batch_size, self.num_frames, self.obs_per_frame)
+                x = x.permute(0, 2, 1)
+
+                # CNN
+                x = self.conv(x)
+                x = x.flatten(1)
+
+                # Shared MLP
+                features = self.shared_fc(x)
+
+                # Action output (deterministic for inference)
+                action_mean = torch.tanh(self.actor_mean(features))
+                return action_mean
+
+        # Store both network classes for later instantiation
+        self._Actor = Actor
+        self._ActorCritic = ActorCritic
+
+        # Will be set during model load
+        self.actor = None
+
+        # Load trained weights (this also creates the appropriate network)
         self._load_model(model_path)
 
         # Track current platform tilt
@@ -390,35 +455,66 @@ class RLController:
         self.last_time = None
 
     def _load_model(self, model_path: str) -> None:
-        """Load trained actor weights."""
+        """Load trained actor weights. Auto-detects SAC vs PPO format."""
         import torch
         import glob
         import os
 
         # If path doesn't exist, try to find latest checkpoint
         if not os.path.exists(model_path):
-            # Try timestamped folders
-            checkpoints = glob.glob('RL/checkpoints/*/sac_*.pt')
-            if checkpoints:
-                model_path = max(checkpoints, key=os.path.getmtime)
-                print(f"[RLController] Auto-selected latest checkpoint: {model_path}")
+            # Priority 1: checkpoints/final folder (production models)
+            final_checkpoints = glob.glob('RL/checkpoints/final/*.pt')
+            if final_checkpoints:
+                model_path = max(final_checkpoints, key=os.path.getmtime)
+                print(f"[RLController] Auto-selected from final/: {model_path}")
             else:
-                # Try root folder
-                root_checkpoints = glob.glob('RL/checkpoints/sac_*.pt')
-                if root_checkpoints:
-                    model_path = max(root_checkpoints, key=os.path.getmtime)
-                    print(f"[RLController] Auto-selected checkpoint: {model_path}")
+                # Priority 2: timestamped folders (training runs)
+                checkpoints = glob.glob('RL/checkpoints/*/sac_*.pt')
+                checkpoints += glob.glob('RL/checkpoints/*/ppo_*.pt')
+                if checkpoints:
+                    model_path = max(checkpoints, key=os.path.getmtime)
+                    print(f"[RLController] Auto-selected latest checkpoint: {model_path}")
+                else:
+                    # Priority 3: root folder
+                    root_checkpoints = glob.glob('RL/checkpoints/sac_*.pt')
+                    root_checkpoints += glob.glob('RL/checkpoints/ppo_*.pt')
+                    if root_checkpoints:
+                        model_path = max(root_checkpoints, key=os.path.getmtime)
+                        print(f"[RLController] Auto-selected checkpoint: {model_path}")
 
         try:
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            if 'actor' in checkpoint:
+
+            # Auto-detect checkpoint format
+            if 'network' in checkpoint:
+                # PPO format: {'network': state_dict, 'optimizer': ...}
+                self.model_type = 'ppo'
+                self.actor = self._ActorCritic(obs_dim=self.obs_dim).to(self.device)
+                self.actor.load_state_dict(checkpoint['network'], strict=False)
+                print(f"[RLController] Loaded PPO model from {model_path}")
+
+            elif 'actor' in checkpoint:
+                # SAC format: {'actor': state_dict, 'critic1': ..., ...}
+                self.model_type = 'sac'
+                self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
                 self.actor.load_state_dict(checkpoint['actor'], strict=False)
+                print(f"[RLController] Loaded SAC model from {model_path}")
+
             else:
+                # Raw state_dict (assume SAC actor)
+                self.model_type = 'sac'
+                self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
                 self.actor.load_state_dict(checkpoint, strict=False)
-            print(f"[RLController] Loaded model from {model_path}")
+                print(f"[RLController] Loaded model (raw state_dict) from {model_path}")
+
+            self.actor.eval()
+
         except Exception as e:
             print(f"[RLController] Warning: Could not load model: {e}")
-            print("[RLController] Using random initialization")
+            print("[RLController] Using random SAC initialization")
+            self.model_type = 'sac'
+            self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
+            self.actor.eval()
 
     def _get_frame(self, ball_pos_mm: Tuple[float, float],
                    platform_tilt_deg: Tuple[float, float],

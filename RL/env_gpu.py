@@ -70,6 +70,11 @@ class StewartEnvGPU:
         self.platform_offset_rx = torch.zeros(num_envs, device=self.device, dtype=torch.float32)
         self.platform_offset_ry = torch.zeros(num_envs, device=self.device, dtype=torch.float32)
 
+        # Interactive reward settings (can be modified during training via dashboard)
+        self.interactive_dist_scale = self.reward_cfg.dist_scale
+        self.interactive_speed_scale = self.reward_cfg.speed_scale
+        self.interactive_fall_penalty = self.reward_cfg.fall_penalty
+
         # State tensors
         self.ball_x = torch.zeros(num_envs, device=self.device, dtype=torch.float32)
         self.ball_y = torch.zeros(num_envs, device=self.device, dtype=torch.float32)
@@ -175,7 +180,9 @@ class StewartEnvGPU:
 
     def _randomize_platform_offset(self, mask):
         """Randomize platform placement offset for environments where mask is True."""
-        if not self.cfg.use_domain_randomization:
+        # Check for separate platform offset flag, fallback to domain_randomization
+        use_offset = getattr(self.cfg, 'use_platform_offset', self.cfg.use_domain_randomization)
+        if not use_offset:
             self.platform_offset_rx[mask] = 0.0
             self.platform_offset_ry[mask] = 0.0
             return
@@ -184,7 +191,7 @@ class StewartEnvGPU:
         if n == 0:
             return
 
-        # Random magnitude 0 to max_deg
+        # Random magnitude 0 to max_deg (simulates unlevel platform / gravity offset)
         magnitude = torch.rand(n, device=self.device) * self.platform_offset_max_deg
         # Random direction
         direction = torch.rand(n, device=self.device) * 2 * np.pi
@@ -260,16 +267,20 @@ class StewartEnvGPU:
         self._randomize_physics(mask)
         self._randomize_platform_offset(mask)
 
-        # Random initial position
+        # Random initial position (uniform in circle)
         init_pos_m = self.cfg.init_pos_range_mm / 1000.0
         n = mask.sum().item()
-        self.ball_x[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_pos_m
-        self.ball_y[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_pos_m
+        radius = torch.sqrt(torch.rand(n, device=self.device)) * init_pos_m
+        angle = torch.rand(n, device=self.device) * 2 * np.pi
+        self.ball_x[mask] = radius * torch.cos(angle)
+        self.ball_y[mask] = radius * torch.sin(angle)
 
-        # Random initial velocity
+        # Random initial velocity (uniform in circle)
         init_vel_m_s = self.cfg.init_vel_range_mm_s / 1000.0
-        self.ball_vx[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_vel_m_s
-        self.ball_vy[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_vel_m_s
+        vel_radius = torch.sqrt(torch.rand(n, device=self.device)) * init_vel_m_s
+        vel_angle = torch.rand(n, device=self.device) * 2 * np.pi
+        self.ball_vx[mask] = vel_radius * torch.cos(vel_angle)
+        self.ball_vy[mask] = vel_radius * torch.sin(vel_angle)
 
         # Platform starts level
         self.platform_rx[mask] = 0.0
@@ -307,16 +318,20 @@ class StewartEnvGPU:
         self._randomize_physics(mask)
         self._randomize_platform_offset(mask)
 
-        # Random initial position
+        # Random initial position (uniform in circle)
         init_pos_m = self.cfg.init_pos_range_mm / 1000.0
         n = mask.sum().item()
-        self.ball_x[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_pos_m
-        self.ball_y[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_pos_m
+        radius = torch.sqrt(torch.rand(n, device=self.device)) * init_pos_m
+        angle = torch.rand(n, device=self.device) * 2 * np.pi
+        self.ball_x[mask] = radius * torch.cos(angle)
+        self.ball_y[mask] = radius * torch.sin(angle)
 
-        # Random initial velocity
+        # Random initial velocity (uniform in circle)
         init_vel_m_s = self.cfg.init_vel_range_mm_s / 1000.0
-        self.ball_vx[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_vel_m_s
-        self.ball_vy[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_vel_m_s
+        vel_radius = torch.sqrt(torch.rand(n, device=self.device)) * init_vel_m_s
+        vel_angle = torch.rand(n, device=self.device) * 2 * np.pi
+        self.ball_vx[mask] = vel_radius * torch.cos(vel_angle)
+        self.ball_vy[mask] = vel_radius * torch.sin(vel_angle)
 
         # Platform starts level
         self.platform_rx[mask] = 0.0
@@ -571,17 +586,14 @@ class StewartEnvGPU:
         speed_mm_s = torch.sqrt((self.ball_vx * 1000.0)**2 + (self.ball_vy * 1000.0)**2)
 
         # Multiplicative reward (bounded 0-1)
-        # Scale factors tuned for platform size (150mm) and typical speeds
-        dist_scale = 30.0   # ~30mm from center gives 0.5 distance factor
-        speed_scale = 50.0  # ~50mm/s gives 0.5 speed factor
-
-        dist_factor = 1.0 / (1.0 + dist_mm / dist_scale)
-        speed_factor = 1.0 / (1.0 + speed_mm_s / speed_scale)
+        # Scale factors use interactive settings (can be modified via dashboard)
+        dist_factor = 1.0 / (1.0 + dist_mm / self.interactive_dist_scale)
+        speed_factor = 1.0 / (1.0 + speed_mm_s / self.interactive_speed_scale)
 
         reward = dist_factor * speed_factor  # Range: [0, 1]
 
-        # Termination penalty
-        reward = torch.where(fell_off, torch.full_like(reward, -10.0), reward)
+        # Termination penalty (uses interactive fall penalty)
+        reward = torch.where(fell_off, torch.full_like(reward, self.interactive_fall_penalty), reward)
 
         return reward
 

@@ -40,19 +40,20 @@ class EnvConfig:
     physics_dim = 3  # [friction, servo_tau, mass_factor]
 
     # Initial state randomization
-    init_pos_range_mm = 50.0  # Ball starts within [-50, 50] mm
-    init_vel_range_mm_s = 30.0  # Initial velocity range
+    init_pos_range_mm = 100.0  # Ball starts within [-100, 100] mm (harder)
+    init_vel_range_mm_s = 50.0  # Initial velocity range
 
     # Camera noise (ZED camera model)
-    # ZED typical noise: ~1-2mm at close range
-    use_camera_noise = True
-    position_noise_std_mm = 3.0  # 3mm std noise
+    use_camera_noise = False
+    position_noise_std_mm = 2.0  # 2mm std noise
     # Noise can also scale with distance from camera (depth-dependent)
-    noise_depth_scale = 0.1  # Additional noise = distance * scale
+    noise_depth_scale = 0.0
 
     # Domain randomization (for sim-to-real transfer)
-    use_domain_randomization = True
-    # Physics parameter ranges for randomization
+    # Only platform tilt offset enabled (simulates gravity vector)
+    use_domain_randomization = False  # Physics params fixed
+    use_platform_offset = True        # Random tilt offset enabled
+    # Physics parameter ranges for randomization (used when enabled)
     friction_range = (0.01, 0.05)       # Rolling friction coefficient
     servo_tau_range = (0.03, 0.08)      # Servo time constant (30-80ms)
     mass_factor_range = (1.4, 2.0)      # Ball inertia factor (1.67 nominal)
@@ -81,6 +82,11 @@ class RewardConfig:
     # Termination
     out_of_bounds_penalty = -100.0  # Ball fell off
 
+    # Multiplicative reward scales (used by GPU env)
+    dist_scale = 30.0   # ~30mm from center gives 0.5 distance factor
+    speed_scale = 50.0  # ~50mm/s gives 0.5 speed factor
+    fall_penalty = -10.0  # Penalty when ball falls off
+
 
 # ============================================================================
 # SAC CONFIGURATION
@@ -95,23 +101,52 @@ class SACConfig:
 
     # Learning rates (separate for actor/critic per CleanRL/research)
     actor_lr = 3e-4  # Policy learning rate
-    critic_lr = 1e-3  # Q-network learning rate (higher for faster value learning)
+    critic_lr = 3e-4  # Q-network learning rate (same as actor for stability)
 
-    # SAC parameters (tuned for parallel training)
-    gamma = 0.98  # Discount factor (lower for parallel - shorter horizon)
-    tau = 0.02  # Soft update coefficient (higher for faster target updates)
-    alpha = 0.2  # Initial entropy coefficient
+    # SAC parameters (tuned for parallel training with TD3-style stability)
+    gamma = 0.99  # Discount factor
+    tau = 0.005  # Soft update coefficient (slower for stability)
+    alpha = 0.01  # Initial entropy coefficient (lower for parallel - research shows 0.001-0.02)
     automatic_entropy_tuning = True
+    policy_delay = 8  # Update actor every N critic updates (TD3-style, prevents following unstable Q)
 
     # Replay buffer (must be large enough to hold multiple episodes worth of data)
     # With 1000 envs × 800 steps = 800k transitions/episode
     buffer_size = 2_000_000  # 2M for better experience diversity
     batch_size = 1024  # Larger batch = more GPU utilization
 
-    # Training (tuned for parallel - more gradient steps)
+    # Training (reduced gradient steps to prevent overfitting)
     warmup_steps = 1000  # Random actions before training
-    updates_per_step = 32  # Gradient updates per update call (increased for parallel)
+    updates_per_step = 8  # Gradient updates per update call (reduced from 32)
     update_every = 10  # Update every N environment steps
+
+
+# ============================================================================
+# PPO CONFIGURATION
+# ============================================================================
+
+class PPOConfig:
+    """PPO hyperparameters - tuned for parallel GPU training (1000+ envs)."""
+
+    # Network architecture (same as SAC for consistency)
+    hidden_dim = 256
+
+    # PPO parameters
+    learning_rate = 3e-4
+    gamma = 0.99              # Discount factor
+    gae_lambda = 0.95         # GAE lambda
+    clip_range = 0.2          # PPO clipping parameter
+    clip_range_vf = None      # Value function clipping (None = disabled)
+
+    # Loss coefficients
+    ent_coef = 0.01           # Entropy bonus coefficient
+    vf_coef = 0.5             # Value function loss coefficient
+    max_grad_norm = 0.5       # Gradient clipping
+
+    # Rollout settings (for 1000 parallel envs)
+    n_steps = 32              # Steps per env before update (32 * 1000 = 32k samples)
+    n_epochs = 4              # Epochs per update
+    batch_size = 1024         # Minibatch size
 
 
 # ============================================================================
@@ -147,6 +182,7 @@ def get_configs():
         'env': EnvConfig(),
         'reward': RewardConfig(),
         'sac': SACConfig(),
+        'ppo': PPOConfig(),
         'training': TrainingConfig()
     }
 

@@ -410,12 +410,13 @@ class SACAgent:
             num_frames=12,    # Number of frames in history
             obs_per_frame=7,  # Features per frame
             actor_lr=3e-4,    # Policy learning rate
-            critic_lr=1e-3,   # Q-network learning rate (higher per research)
-            gamma=0.98,       # Discount factor (lower for parallel training)
-            tau=0.02,         # Soft update coefficient (higher for parallel)
-            alpha=0.2,
+            critic_lr=3e-4,   # Q-network learning rate
+            gamma=0.99,       # Discount factor
+            tau=0.005,        # Soft update coefficient (slower for stability)
+            alpha=0.01,       # Initial entropy coefficient (lower for parallel)
             alpha_lr=1e-4,    # Slower learning rate for alpha (prevents collapse)
-            alpha_min=0.15,   # Minimum alpha floor (keeps exploration active)
+            alpha_min=0.005,  # Minimum alpha floor
+            policy_delay=8,   # Update actor every N critic updates (TD3-style stability)
             physics_loss_weight=0.1,  # Weight for auxiliary physics loss
             automatic_entropy_tuning=True,
             use_layer_norm=True,  # LayerNorm on critic for stability
@@ -427,6 +428,8 @@ class SACAgent:
         self.tau = tau
         self.alpha = alpha
         self.alpha_min = alpha_min
+        self.policy_delay = policy_delay
+        self.update_counter = 0  # Track critic updates for policy delay
         self.physics_loss_weight = physics_loss_weight
         self.automatic_entropy_tuning = automatic_entropy_tuning
         self.obs_dim = obs_dim
@@ -465,7 +468,8 @@ class SACAgent:
         # Automatic entropy tuning with slower learning rate
         if automatic_entropy_tuning:
             self.target_entropy = -action_dim
-            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            # Initialize log_alpha from configured alpha (not zeros which gives alpha=1.0)
+            self.log_alpha = torch.tensor([np.log(alpha)], requires_grad=True, device=self.device)
             self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=alpha_lr)  # Slower LR
             self.alpha = self.log_alpha.exp().item()
 
@@ -533,11 +537,17 @@ class SACAgent:
 
     def update(self, replay_buffer, batch_size=256):
         """
-        Update actor and critic networks.
+        Update actor and critic networks with TD3-style policy delay.
+
+        Critic is updated every call, but actor only every policy_delay calls.
+        This prevents the actor from following unstable Q-value estimates.
 
         Returns:
             dict with losses and metrics
         """
+        # Increment update counter
+        self.update_counter += 1
+
         # Sample batch
         states, actions, rewards, next_states, dones, physics_gt = replay_buffer.sample(batch_size)
 
@@ -550,7 +560,7 @@ class SACAgent:
             dones = torch.FloatTensor(dones).to(self.device)
             physics_gt = torch.FloatTensor(physics_gt).to(self.device)
 
-        # ===== Update Critic =====
+        # ===== Update Critic (every step) =====
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                 next_actions, next_log_probs, _ = self.actor.sample(next_states)
@@ -573,46 +583,56 @@ class SACAgent:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # ===== Update Actor =====
-        with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-            new_actions, log_probs, physics_est = self.actor.sample(states)
-            q1, q2 = self.critic(states, new_actions)
-        min_q = torch.min(q1, q2)
+        # Initialize return values (in case actor not updated this step)
+        actor_loss_val = 0.0
+        policy_loss_val = 0.0
+        physics_loss_val = 0.0
 
-        if self.automatic_entropy_tuning:
-            alpha = self.log_alpha.exp()
-        else:
-            alpha = self.alpha
+        # ===== Update Actor (every policy_delay steps) =====
+        if self.update_counter % self.policy_delay == 0:
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                new_actions, log_probs, physics_est = self.actor.sample(states)
+                q1, q2 = self.critic(states, new_actions)
+            min_q = torch.min(q1, q2)
 
-        # Actor loss = policy loss + physics auxiliary loss (in float32 for stability)
-        policy_loss = (alpha * log_probs.float() - min_q.float()).mean()
-        physics_loss = nn.MSELoss()(physics_est.float(), physics_gt)
-        actor_loss = policy_loss + self.physics_loss_weight * physics_loss
+            if self.automatic_entropy_tuning:
+                alpha = self.log_alpha.exp()
+            else:
+                alpha = self.alpha
 
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+            # Actor loss = policy loss + physics auxiliary loss (in float32 for stability)
+            policy_loss = (alpha * log_probs.float() - min_q.float()).mean()
+            physics_loss = nn.MSELoss()(physics_est.float(), physics_gt)
+            actor_loss = policy_loss + self.physics_loss_weight * physics_loss
 
-        # ===== Update Alpha =====
-        if self.automatic_entropy_tuning:
-            alpha_loss = -(self.log_alpha * (log_probs.float() + self.target_entropy).detach()).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
 
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
+            actor_loss_val = actor_loss.item()
+            policy_loss_val = policy_loss.item()
+            physics_loss_val = physics_loss.item()
 
-            # Apply minimum alpha floor to prevent entropy collapse
-            self.alpha = max(self.log_alpha.exp().item(), self.alpha_min)
+            # ===== Update Alpha (only when actor updates) =====
+            if self.automatic_entropy_tuning:
+                alpha_loss = -(self.log_alpha * (log_probs.float() + self.target_entropy).detach()).mean()
 
-        # ===== Soft Update Target =====
-        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+
+                # Apply minimum alpha floor to prevent entropy collapse
+                self.alpha = max(self.log_alpha.exp().item(), self.alpha_min)
+
+            # ===== Soft Update Target (only when actor updates) =====
+            for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
         return {
             'critic_loss': critic_loss.item(),
-            'actor_loss': actor_loss.item(),
-            'policy_loss': policy_loss.item(),
-            'physics_loss': physics_loss.item(),
+            'actor_loss': actor_loss_val,
+            'policy_loss': policy_loss_val,
+            'physics_loss': physics_loss_val,
             'alpha': self.alpha
         }
 

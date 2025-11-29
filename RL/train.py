@@ -24,6 +24,14 @@ from env import StewartEnv
 from env_gpu import StewartEnvGPU
 from agent import SACAgent, ReplayBuffer
 
+# Dashboard (optional - set USE_DASHBOARD=True to enable)
+try:
+    from dashboard_state import get_state, reset_state
+    from dashboard import launch_dashboard
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+
 
 # ============================================================================
 # TRAINING CONFIGURATION - MODIFY THESE
@@ -36,6 +44,7 @@ USE_GPU_ENV = True      # Use GPU-accelerated environment (faster physics)
 USE_COMPILE = True      # Use torch.compile for faster networks (PyTorch 2.0+)
 USE_AMP = True          # Use automatic mixed precision (bfloat16)
 CHECKPOINT = None       # Path to checkpoint to resume from, or None
+USE_DASHBOARD = True    # Enable interactive Gradio dashboard
 
 # Logging
 LOG_INTERVAL = 1        # Print stats every N episodes
@@ -149,6 +158,7 @@ def train():
         gamma=sac_cfg.gamma,
         tau=sac_cfg.tau,
         alpha=sac_cfg.alpha,
+        policy_delay=sac_cfg.policy_delay,
         physics_loss_weight=0.1,
         automatic_entropy_tuning=sac_cfg.automatic_entropy_tuning,
         use_layer_norm=sac_cfg.use_layer_norm,
@@ -198,6 +208,22 @@ def train():
     # Create TensorBoard writer
     writer = SummaryWriter(run_dir)
     print(f"Run directory: {run_dir}")
+
+    # Launch dashboard if enabled
+    dashboard_state = None
+    if USE_DASHBOARD and DASHBOARD_AVAILABLE:
+        dashboard_state = reset_state()
+        # Initialize dashboard state from config
+        dashboard_state.use_domain_randomization = env_cfg.use_domain_randomization
+        dashboard_state.use_platform_offset = env_cfg.use_platform_offset
+        dashboard_state.use_camera_noise = env_cfg.use_camera_noise
+        dashboard_state.platform_offset_max_deg = env_cfg.platform_offset_max_deg
+        dashboard_state.dist_scale = reward_cfg.dist_scale
+        dashboard_state.speed_scale = reward_cfg.speed_scale
+        dashboard_state.fall_penalty = reward_cfg.fall_penalty
+        launch_dashboard(dashboard_state, port=7860)
+    elif USE_DASHBOARD and not DASHBOARD_AVAILABLE:
+        print("Warning: Dashboard requested but gradio not available. Install with: pip install gradio")
 
     # Log hyperparameters
     writer.add_text("config/env", f"num_frames={env_cfg.num_frames}, obs_per_frame={env_cfg.obs_per_frame}")
@@ -339,6 +365,49 @@ def train():
 
         episode_time = time.time() - episode_start_time
 
+        # ===== Dashboard synchronization =====
+        if dashboard_state is not None:
+            # Update metrics for live plots
+            dashboard_state.add_episode(mean_reward, mean_length)
+            if losses['critic']:
+                dashboard_state.update_losses(
+                    critic=losses['critic'][-1],
+                    actor=losses['actor'][-1],
+                    alpha=agent.alpha
+                )
+
+            # Handle pause
+            while dashboard_state.paused:
+                time.sleep(0.1)
+
+            # Handle stop request
+            if dashboard_state.stop_requested:
+                print("\n[DASHBOARD] Stop requested - finishing training...")
+                break
+
+            # Handle save request
+            if dashboard_state.save_requested:
+                checkpoint_path = os.path.join(run_dir, f"sac_ep{episode + 1}_manual.pt")
+                agent.save(checkpoint_path)
+                print(f"  [DASHBOARD] Manual checkpoint saved: {checkpoint_path}")
+                dashboard_state.clear_save_request()
+
+            # Apply dynamic settings from dashboard to environment
+            env_settings = dashboard_state.get_env_settings()
+            reward_settings = dashboard_state.get_reward_settings()
+
+            # Update environment settings
+            env.cfg.use_domain_randomization = env_settings['use_domain_randomization']
+            env.cfg.use_platform_offset = env_settings['use_platform_offset']
+            env.cfg.use_camera_noise = env_settings['use_camera_noise']
+            env.cfg.platform_offset_max_deg = env_settings['platform_offset_max_deg']
+
+            # Update reward settings (for GPU env)
+            if USE_GPU_ENV:
+                env.interactive_dist_scale = reward_settings['dist_scale']
+                env.interactive_speed_scale = reward_settings['speed_scale']
+                env.interactive_fall_penalty = reward_settings['fall_penalty']
+
         # TensorBoard episode logging
         writer.add_scalar("episode/reward", mean_reward, episode)
         writer.add_scalar("episode/length", mean_length, episode)
@@ -359,6 +428,10 @@ def train():
         if (episode + 1) % train_cfg.eval_interval == 0:
             eval_info = evaluate(agent, env_cfg, reward_cfg)
             eval_rewards.append(eval_info['mean_reward'])
+
+            # Update dashboard with eval metrics
+            if dashboard_state is not None:
+                dashboard_state.add_eval(eval_info['mean_reward'])
 
             # TensorBoard eval logging
             writer.add_scalar("eval/reward_mean", eval_info['mean_reward'], episode)
