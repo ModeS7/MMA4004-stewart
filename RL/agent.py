@@ -143,18 +143,29 @@ class ReplayBuffer:
     Stores physics ground truth for auxiliary loss.
     """
 
-    def __init__(self, capacity, obs_dim, action_dim, physics_dim=3):
+    def __init__(self, capacity, obs_dim, action_dim, physics_dim=3, device="cpu"):
         self.capacity = capacity
         self.position = 0
         self.size = 0
+        self.device = torch.device(device)
+        self.on_gpu = device != "cpu"
 
-        # Pre-allocate arrays
-        self.states = np.zeros((capacity, obs_dim), dtype=np.float32)
-        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
-        self.next_states = np.zeros((capacity, obs_dim), dtype=np.float32)
-        self.dones = np.zeros((capacity, 1), dtype=np.float32)
-        self.physics_gt = np.zeros((capacity, physics_dim), dtype=np.float32)
+        if self.on_gpu:
+            # GPU tensors
+            self.states = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
+            self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=self.device)
+            self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
+            self.next_states = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
+            self.dones = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
+            self.physics_gt = torch.zeros((capacity, physics_dim), dtype=torch.float32, device=self.device)
+        else:
+            # CPU numpy arrays
+            self.states = np.zeros((capacity, obs_dim), dtype=np.float32)
+            self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+            self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+            self.next_states = np.zeros((capacity, obs_dim), dtype=np.float32)
+            self.dones = np.zeros((capacity, 1), dtype=np.float32)
+            self.physics_gt = np.zeros((capacity, physics_dim), dtype=np.float32)
 
     def push(self, state, action, reward, next_state, done, physics_gt=None):
         """Add a single transition."""
@@ -186,15 +197,28 @@ class ReplayBuffer:
         if n == 0:
             return
 
+        # Convert to tensors if on GPU
+        if self.on_gpu:
+            states = torch.from_numpy(states).to(self.device)
+            actions = torch.from_numpy(actions).to(self.device)
+            rewards = torch.from_numpy(rewards).to(self.device).reshape(-1, 1)
+            next_states = torch.from_numpy(next_states).to(self.device)
+            dones = torch.from_numpy(dones).to(self.device).reshape(-1, 1)
+            if physics_gt is not None:
+                physics_gt = torch.from_numpy(physics_gt).to(self.device)
+        else:
+            rewards = rewards.reshape(-1, 1)
+            dones = dones.reshape(-1, 1)
+
         # Handle wrap-around
         end_pos = self.position + n
         if end_pos <= self.capacity:
             # No wrap
             self.states[self.position:end_pos] = states
             self.actions[self.position:end_pos] = actions
-            self.rewards[self.position:end_pos] = rewards.reshape(-1, 1)
+            self.rewards[self.position:end_pos] = rewards
             self.next_states[self.position:end_pos] = next_states
-            self.dones[self.position:end_pos] = dones.reshape(-1, 1)
+            self.dones[self.position:end_pos] = dones
             if physics_gt is not None:
                 self.physics_gt[self.position:end_pos] = physics_gt
         else:
@@ -208,14 +232,14 @@ class ReplayBuffer:
             self.actions[self.position:] = actions[:first_part]
             self.actions[:second_part] = actions[first_part:]
 
-            self.rewards[self.position:] = rewards[:first_part].reshape(-1, 1)
-            self.rewards[:second_part] = rewards[first_part:].reshape(-1, 1)
+            self.rewards[self.position:] = rewards[:first_part]
+            self.rewards[:second_part] = rewards[first_part:]
 
             self.next_states[self.position:] = next_states[:first_part]
             self.next_states[:second_part] = next_states[first_part:]
 
-            self.dones[self.position:] = dones[:first_part].reshape(-1, 1)
-            self.dones[:second_part] = dones[first_part:].reshape(-1, 1)
+            self.dones[self.position:] = dones[:first_part]
+            self.dones[:second_part] = dones[first_part:]
 
             if physics_gt is not None:
                 self.physics_gt[self.position:] = physics_gt[:first_part]
@@ -224,9 +248,62 @@ class ReplayBuffer:
         self.position = end_pos % self.capacity
         self.size = min(self.size + n, self.capacity)
 
+    def push_batch_tensor(self, states, actions, rewards, next_states, dones, physics_gt, mask):
+        """Add multiple transitions from GPU tensors (no CPU transfer)."""
+        # Filter by mask (all on GPU)
+        indices = torch.where(mask)[0]
+        if len(indices) == 0:
+            return
+
+        states = states[indices]
+        actions = actions[indices]
+        rewards = rewards[indices].unsqueeze(-1)
+        next_states = next_states[indices]
+        dones = dones[indices].float().unsqueeze(-1)
+        physics_gt = physics_gt[indices]
+
+        n = len(states)
+
+        # Handle wrap-around
+        end_pos = self.position + n
+        if end_pos <= self.capacity:
+            # No wrap
+            self.states[self.position:end_pos] = states
+            self.actions[self.position:end_pos] = actions
+            self.rewards[self.position:end_pos] = rewards
+            self.next_states[self.position:end_pos] = next_states
+            self.dones[self.position:end_pos] = dones
+            self.physics_gt[self.position:end_pos] = physics_gt
+        else:
+            # Wrap around
+            first_part = self.capacity - self.position
+            second_part = n - first_part
+
+            self.states[self.position:] = states[:first_part]
+            self.states[:second_part] = states[first_part:]
+
+            self.actions[self.position:] = actions[:first_part]
+            self.actions[:second_part] = actions[first_part:]
+
+            self.rewards[self.position:] = rewards[:first_part]
+            self.rewards[:second_part] = rewards[first_part:]
+
+            self.next_states[self.position:] = next_states[:first_part]
+            self.next_states[:second_part] = next_states[first_part:]
+
+            self.dones[self.position:] = dones[:first_part]
+            self.dones[:second_part] = dones[first_part:]
+
+            self.physics_gt[self.position:] = physics_gt[:first_part]
+            self.physics_gt[:second_part] = physics_gt[first_part:]
+
+        self.position = end_pos % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
     def sample(self, batch_size):
-        """Sample a batch of transitions."""
-        indices = np.random.randint(0, self.size, size=batch_size)
+        """Sample a batch of transitions. Returns tensors if on GPU, numpy if on CPU."""
+        indices = torch.randint(0, self.size, (batch_size,), device=self.device) if self.on_gpu else \
+                  np.random.randint(0, self.size, size=batch_size)
 
         return (
             self.states[indices],
@@ -266,25 +343,41 @@ class SACAgent:
             gamma=0.99,
             tau=0.005,
             alpha=0.2,
+            alpha_lr=1e-4,    # Slower learning rate for alpha (prevents collapse)
+            alpha_min=0.05,   # Minimum alpha floor (prevents deterministic policy)
             physics_loss_weight=0.1,  # Weight for auxiliary physics loss
             automatic_entropy_tuning=True,
-            device="cpu"
+            device="cpu",
+            compile_model=False,  # Use torch.compile for speedup (PyTorch 2.0+)
+            use_amp=False  # Use automatic mixed precision (bfloat16)
     ):
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
+        self.alpha_min = alpha_min
         self.physics_loss_weight = physics_loss_weight
         self.automatic_entropy_tuning = automatic_entropy_tuning
         self.obs_dim = obs_dim
         self.physics_dim = physics_dim
+        self.use_amp = use_amp and device != "cpu"
 
         # Device
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+        # AMP dtype (bfloat16 is more stable than float16 for RL)
+        self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
         # Networks
         self.actor = Actor(obs_dim, action_dim, hidden_dim, physics_dim).to(self.device)
         self.critic = Critic(obs_dim, action_dim, hidden_dim).to(self.device)
         self.critic_target = Critic(obs_dim, action_dim, hidden_dim).to(self.device)
+
+        # Optional: compile networks for speedup (PyTorch 2.0+)
+        if compile_model and hasattr(torch, 'compile'):
+            # Use 'default' mode - 'reduce-overhead' uses CUDA graphs which conflict with SAC
+            self.actor = torch.compile(self.actor)
+            self.critic = torch.compile(self.critic)
+            self.critic_target = torch.compile(self.critic_target)
 
         # Copy parameters to target
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
@@ -294,11 +387,11 @@ class SACAgent:
         self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=lr)
         self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=lr)
 
-        # Automatic entropy tuning
+        # Automatic entropy tuning with slower learning rate
         if automatic_entropy_tuning:
             self.target_entropy = -action_dim
             self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-            self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=lr)
+            self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=alpha_lr)  # Slower LR
             self.alpha = self.log_alpha.exp().item()
 
     def select_action(self, obs, evaluate=False):
@@ -345,6 +438,24 @@ class SACAgent:
 
         return actions.cpu().numpy(), physics_est.cpu().numpy()
 
+    def select_action_batch_tensor(self, obs_tensor, evaluate=False):
+        """
+        Select actions for a batch of observations (GPU tensor version).
+
+        Args:
+            obs_tensor: (batch, obs_dim) GPU tensor
+            evaluate: If True, use deterministic action
+
+        Returns:
+            actions: (batch, action_dim) GPU tensor
+        """
+        with torch.no_grad():
+            if evaluate:
+                actions, _ = self.actor.get_action_deterministic(obs_tensor)
+            else:
+                actions, _, _ = self.actor.sample(obs_tensor)
+        return actions
+
     def update(self, replay_buffer, batch_size=256):
         """
         Update actor and critic networks.
@@ -355,18 +466,20 @@ class SACAgent:
         # Sample batch
         states, actions, rewards, next_states, dones, physics_gt = replay_buffer.sample(batch_size)
 
-        # Convert to tensors
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.FloatTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
-        physics_gt = torch.FloatTensor(physics_gt).to(self.device)
+        # Convert to tensors (skip if already tensors from GPU buffer)
+        if not isinstance(states, torch.Tensor):
+            states = torch.FloatTensor(states).to(self.device)
+            actions = torch.FloatTensor(actions).to(self.device)
+            rewards = torch.FloatTensor(rewards).to(self.device)
+            next_states = torch.FloatTensor(next_states).to(self.device)
+            dones = torch.FloatTensor(dones).to(self.device)
+            physics_gt = torch.FloatTensor(physics_gt).to(self.device)
 
         # ===== Update Critic =====
         with torch.no_grad():
-            next_actions, next_log_probs, _ = self.actor.sample(next_states)
-            target_q1, target_q2 = self.critic_target(next_states, next_actions)
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                next_actions, next_log_probs, _ = self.actor.sample(next_states)
+                target_q1, target_q2 = self.critic_target(next_states, next_actions)
             target_q = torch.min(target_q1, target_q2)
 
             if self.automatic_entropy_tuning:
@@ -377,16 +490,18 @@ class SACAgent:
             target_q = target_q - alpha * next_log_probs
             target_q = rewards + (1 - dones) * self.gamma * target_q
 
-        current_q1, current_q2 = self.critic(states, actions)
-        critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
+        with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+            current_q1, current_q2 = self.critic(states, actions)
+        critic_loss = nn.MSELoss()(current_q1.float(), target_q.float()) + nn.MSELoss()(current_q2.float(), target_q.float())
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
         # ===== Update Actor =====
-        new_actions, log_probs, physics_est = self.actor.sample(states)
-        q1, q2 = self.critic(states, new_actions)
+        with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+            new_actions, log_probs, physics_est = self.actor.sample(states)
+            q1, q2 = self.critic(states, new_actions)
         min_q = torch.min(q1, q2)
 
         if self.automatic_entropy_tuning:
@@ -394,9 +509,9 @@ class SACAgent:
         else:
             alpha = self.alpha
 
-        # Actor loss = policy loss + physics auxiliary loss
-        policy_loss = (alpha * log_probs - min_q).mean()
-        physics_loss = nn.MSELoss()(physics_est, physics_gt)
+        # Actor loss = policy loss + physics auxiliary loss (in float32 for stability)
+        policy_loss = (alpha * log_probs.float() - min_q.float()).mean()
+        physics_loss = nn.MSELoss()(physics_est.float(), physics_gt)
         actor_loss = policy_loss + self.physics_loss_weight * physics_loss
 
         self.actor_optimizer.zero_grad()
@@ -405,13 +520,14 @@ class SACAgent:
 
         # ===== Update Alpha =====
         if self.automatic_entropy_tuning:
-            alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.log_alpha * (log_probs.float() + self.target_entropy).detach()).mean()
 
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
 
-            self.alpha = self.log_alpha.exp().item()
+            # Apply minimum alpha floor to prevent entropy collapse
+            self.alpha = max(self.log_alpha.exp().item(), self.alpha_min)
 
         # ===== Soft Update Target =====
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):

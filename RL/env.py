@@ -364,9 +364,9 @@ class StewartEnv:
         # actual_dt varies per environment and per step
         obs[:, 4] = self.actual_dt / 0.01  # Normalized so 10ms = 1.0
 
-        # Target position (normalized, currently always 0,0)
-        obs[:, 5] = self.target_x
-        obs[:, 6] = self.target_y
+        # Target position (normalized)
+        obs[:, 5] = self.target_x / self.cfg.platform_radius_mm
+        obs[:, 6] = self.target_y / self.cfg.platform_radius_mm
 
         return obs
 

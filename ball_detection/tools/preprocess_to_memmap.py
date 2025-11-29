@@ -250,8 +250,9 @@ def process_stereo_mode(input_path, output_path, labels, image_dir):
         else:
             x_right, y_right = 0.5, 0.5
 
-        # Confidence: 1.0 if either left or right is valid
-        confidence = 1.0 if (left_valid or right_valid) else 0.0
+        # Confidence: 1.0 only if BOTH left and right are valid
+        # (stereo triangulation requires ball visible in both views)
+        confidence = 1.0 if (left_valid and right_valid) else 0.0
 
         if left_valid and right_valid:
             valid_both_count += 1
@@ -285,10 +286,10 @@ def process_stereo_mode(input_path, output_path, labels, image_dir):
     print()
     print("=" * 50)
     print(f"Done! {n_samples} stereo pairs")
-    print(f"  Valid left: {valid_left_count}")
-    print(f"  Valid right: {valid_right_count}")
-    print(f"  Valid both: {valid_both_count}")
-    print(f"  Valid either (confidence=1): {valid_either_count}")
+    print(f"  Valid left only: {valid_left_count - valid_both_count}")
+    print(f"  Valid right only: {valid_right_count - valid_both_count}")
+    print(f"  Valid BOTH (confidence=1): {valid_both_count}")
+    print(f"  Invalid both: {n_samples - valid_either_count}")
     print(f"Images: {images_path}")
     print(f"Labels: {labels_path}")
     print("=" * 50)

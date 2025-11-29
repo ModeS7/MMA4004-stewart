@@ -66,7 +66,7 @@ class RewardConfig:
     """Reward function weights."""
 
     # Penalties (negative)
-    k_position = 0.002  # Position error: -k * (x^2 + y^2) in mm^2 [increased]
+    k_position = 0.01  # Position error: -k * (x^2 + y^2) in mm^2 [5x increase to punish off-center]
     k_velocity = 0.005  # Velocity penalty: -k * (vx^2 + vy^2) [increased 50x from original]
     k_tilt = 0.01  # Tilt penalty: -k * (rx^2 + ry^2)
     k_action = 0.001  # Action magnitude: -k * (a^2)

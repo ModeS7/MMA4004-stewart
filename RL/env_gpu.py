@@ -295,6 +295,49 @@ class StewartEnvGPU:
         }
         return self._get_observation().cpu().numpy(), info
 
+    def reset_tensor(self, indices=None):
+        """Reset environments. Returns GPU tensors (no CPU transfer)."""
+        if indices is None:
+            mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        else:
+            mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+            mask[indices] = True
+
+        # Randomize physics and platform offset
+        self._randomize_physics(mask)
+        self._randomize_platform_offset(mask)
+
+        # Random initial position
+        init_pos_m = self.cfg.init_pos_range_mm / 1000.0
+        n = mask.sum().item()
+        self.ball_x[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_pos_m
+        self.ball_y[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_pos_m
+
+        # Random initial velocity
+        init_vel_m_s = self.cfg.init_vel_range_mm_s / 1000.0
+        self.ball_vx[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_vel_m_s
+        self.ball_vy[mask] = (torch.rand(n, device=self.device) * 2 - 1) * init_vel_m_s
+
+        # Platform starts level
+        self.platform_rx[mask] = 0.0
+        self.platform_ry[mask] = 0.0
+
+        # Reset counters
+        self.step_count[mask] = 0
+        self.episode_reward[mask] = 0.0
+        self.prev_actions[mask] = 0.0
+
+        # Initialize actual_dt
+        self.actual_dt[mask] = self.base_dt[mask]
+
+        # Initialize frame history
+        initial_obs = self._get_single_frame()
+        for i in range(self.cfg.num_frames):
+            self.frame_history[mask, i, :] = initial_obs[mask]
+
+        # Return tensors (no CPU transfer)
+        return self._get_observation(), self.get_physics_normalized()
+
     def _get_single_frame(self):
         """Get single frame observation for all environments."""
         obs = torch.zeros((self.num_envs, self.cfg.obs_per_frame),
@@ -325,9 +368,9 @@ class StewartEnvGPU:
         # dt normalized
         obs[:, 4] = self.actual_dt / 0.01
 
-        # Target position
-        obs[:, 5] = self.target_x
-        obs[:, 6] = self.target_y
+        # Target position (normalized)
+        obs[:, 5] = self.target_x / self.cfg.platform_radius_mm
+        obs[:, 6] = self.target_y / self.cfg.platform_radius_mm
 
         return obs
 
@@ -426,6 +469,88 @@ class StewartEnvGPU:
             dones.cpu().numpy(),
             truncated.cpu().numpy(),
             info
+        )
+
+    def step_tensor(self, actions):
+        """
+        Step all environments (GPU tensor version - no CPU transfer).
+
+        Args:
+            actions: GPU tensor (num_envs, 2) in [-1, 1]
+
+        Returns:
+            obs: GPU tensor (num_envs, obs_dim)
+            rewards: GPU tensor (num_envs,)
+            dones: GPU tensor (num_envs,) bool
+            physics_gt: GPU tensor (num_envs, 3)
+        """
+        # Sample dt
+        self._sample_dt()
+
+        # Scale actions
+        action_rx = actions[:, 0] * self.max_tilt_rad
+        action_ry = actions[:, 1] * self.max_tilt_rad
+
+        # Servo dynamics (vectorized)
+        decay = torch.exp(-self.actual_dt / self.servo_tau)
+        new_rx = action_rx + (self.platform_rx - action_rx) * decay
+        new_ry = action_ry + (self.platform_ry - action_ry) * decay
+
+        # Clamp
+        new_rx = torch.clamp(new_rx, -self.max_tilt_rad, self.max_tilt_rad)
+        new_ry = torch.clamp(new_ry, -self.max_tilt_rad, self.max_tilt_rad)
+
+        self.platform_rx = new_rx
+        self.platform_ry = new_ry
+
+        # Effective tilt (with platform offset)
+        effective_rx = new_rx + self.platform_offset_rx
+        effective_ry = new_ry + self.platform_offset_ry
+
+        # Ball physics (fully vectorized RK4)
+        new_x, new_y, new_vx, new_vy = self._rk4_step(
+            self.ball_x, self.ball_y, self.ball_vx, self.ball_vy,
+            effective_rx, effective_ry, self.actual_dt,
+            self.mass_factor, self.mu_roll
+        )
+
+        # Check bounds
+        dist = torch.sqrt(new_x**2 + new_y**2)
+        fell_off = dist > self.platform_radius_m
+
+        # Reset fallen balls to center (they'll get terminal reward)
+        new_x = torch.where(fell_off, torch.zeros_like(new_x), new_x)
+        new_y = torch.where(fell_off, torch.zeros_like(new_y), new_y)
+        new_vx = torch.where(fell_off, torch.zeros_like(new_vx), new_vx)
+        new_vy = torch.where(fell_off, torch.zeros_like(new_vy), new_vy)
+
+        self.ball_x = new_x
+        self.ball_y = new_y
+        self.ball_vx = new_vx
+        self.ball_vy = new_vy
+
+        # Compute rewards
+        rewards = self._compute_reward(actions, fell_off)
+
+        # Update tracking
+        self.prev_actions = actions.clone()
+        self.step_count += 1
+        self.episode_reward += rewards
+
+        # Update frame history
+        new_frame = self._get_single_frame()
+        self.frame_history[:, :-1, :] = self.frame_history[:, 1:, :].clone()
+        self.frame_history[:, -1, :] = new_frame
+
+        # Check done
+        dones = fell_off | (self.step_count >= self.cfg.max_steps)
+
+        # Return tensors (no CPU transfer)
+        return (
+            self._get_observation(),
+            rewards,
+            dones,
+            self.get_physics_normalized()
         )
 
     def _compute_reward(self, actions, fell_off):

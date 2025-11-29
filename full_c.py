@@ -159,7 +159,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             platform_tilt = (self.prev_effective_angles['rx'], self.prev_effective_angles['ry'])
             rx, ry = self.controller.update(
                 ball_pos_filtered, ball_vel_filtered, target_pos_mm,
-                platform_tilt_deg=platform_tilt
+                platform_tilt_deg=platform_tilt,
+                dt=dt
             )
         else:
             return None

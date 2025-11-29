@@ -13,6 +13,9 @@ import torch
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 
+# Enable TensorFloat32 for faster matmul on Ampere+ GPUs
+torch.set_float32_matmul_precision('high')
+
 # Add RL directory to path for standalone execution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,10 +33,12 @@ NUM_ENVS = 1000         # Number of parallel environments
 MAX_EPISODES = 1500     # Total training episodes
 DEVICE = "cuda"         # "cuda" or "cpu"
 USE_GPU_ENV = True      # Use GPU-accelerated environment (faster physics)
+USE_COMPILE = True      # Use torch.compile for faster networks (PyTorch 2.0+)
+USE_AMP = True          # Use automatic mixed precision (bfloat16)
 CHECKPOINT = None       # Path to checkpoint to resume from, or None
 
 # Logging
-LOG_INTERVAL = 10       # Print stats every N episodes
+LOG_INTERVAL = 1        # Print stats every N episodes
 EVAL_INTERVAL = 50      # Evaluate every N episodes
 SAVE_INTERVAL = 100     # Save checkpoint every N episodes
 
@@ -143,9 +148,15 @@ def train():
         alpha=sac_cfg.alpha,
         physics_loss_weight=0.1,
         automatic_entropy_tuning=sac_cfg.automatic_entropy_tuning,
-        device=train_cfg.device
+        device=train_cfg.device,
+        compile_model=USE_COMPILE,
+        use_amp=USE_AMP
     )
-    print(f"Agent created on device: {agent.device}")
+    opts = []
+    if USE_COMPILE: opts.append("compiled")
+    if USE_AMP: opts.append("bfloat16")
+    opts_str = f" ({', '.join(opts)})" if opts else ""
+    print(f"Agent created on device: {agent.device}{opts_str}")
 
     # Load checkpoint if specified
     start_episode = 0
@@ -158,14 +169,16 @@ def train():
             pass
         print(f"Loaded checkpoint: {CHECKPOINT}")
 
-    # Create replay buffer
+    # Create replay buffer (on GPU if using GPU env for faster sampling)
+    buffer_device = DEVICE if USE_GPU_ENV else "cpu"
     buffer = ReplayBuffer(
         capacity=sac_cfg.buffer_size,
         obs_dim=env_cfg.obs_dim,
         action_dim=env_cfg.action_dim,
-        physics_dim=env_cfg.physics_dim
+        physics_dim=env_cfg.physics_dim,
+        device=buffer_device
     )
-    print(f"Replay buffer created with capacity {sac_cfg.buffer_size}")
+    print(f"Replay buffer created with capacity {sac_cfg.buffer_size} on {buffer_device}")
 
     # Training metrics
     episode_rewards = []
@@ -196,65 +209,123 @@ def train():
     train_start_time = time.time()
 
     for episode in range(start_episode, train_cfg.max_episodes):
-        obs, reset_info = env.reset()
-        physics_gt = reset_info['physics_gt']  # Ground truth physics for auxiliary loss
+        # GPU-resident training loop (no CPU transfers during episode)
+        if USE_GPU_ENV:
+            obs, physics_gt = env.reset_tensor()  # Returns GPU tensors
 
-        episode_reward = np.zeros(NUM_ENVS)
-        episode_length = np.zeros(NUM_ENVS)
-        done_mask = np.zeros(NUM_ENVS, dtype=bool)
-        step_in_episode = 0  # Track actual steps for update_every
+            episode_reward = torch.zeros(NUM_ENVS, device=DEVICE)
+            episode_length = torch.zeros(NUM_ENVS, device=DEVICE)
+            done_mask = torch.zeros(NUM_ENVS, device=DEVICE, dtype=torch.bool)
+            step_in_episode = 0
 
-        episode_start_time = time.time()
+            episode_start_time = time.time()
 
-        while not done_mask.all():
-            # Select action
-            if total_steps < sac_cfg.warmup_steps:
-                # Random actions during warmup
-                actions = np.random.uniform(-1, 1, (NUM_ENVS, env_cfg.action_dim)).astype(np.float32)
-            else:
-                actions, _ = agent.select_action_batch(obs, evaluate=False)
+            while not done_mask.all():
+                # Select action (all on GPU)
+                if total_steps < sac_cfg.warmup_steps:
+                    # Random actions during warmup
+                    actions = torch.rand(NUM_ENVS, env_cfg.action_dim, device=DEVICE) * 2 - 1
+                else:
+                    actions = agent.select_action_batch_tensor(obs, evaluate=False)
 
-            # Step environment
-            next_obs, rewards, dones, truncated, step_info = env.step(actions)
+                # Step environment (all on GPU)
+                next_obs, rewards, dones, next_physics_gt = env.step_tensor(actions)
 
-            # Store transitions (vectorized, only for non-done envs)
-            buffer.push_batch(
-                obs, actions, rewards, next_obs, dones.astype(np.float32),
-                physics_gt, mask=~done_mask
-            )
+                # Store transitions (all on GPU)
+                buffer.push_batch_tensor(
+                    obs, actions, rewards, next_obs, dones,
+                    physics_gt, mask=~done_mask
+                )
 
-            # Update agent (every N steps to speed up training)
-            update_every = getattr(sac_cfg, 'update_every', 1)
-            step_in_episode += 1
-            if (total_steps >= sac_cfg.warmup_steps and
-                len(buffer) >= sac_cfg.batch_size and
-                step_in_episode % update_every == 0):
-                for _ in range(sac_cfg.updates_per_step):
-                    update_info = agent.update(buffer, sac_cfg.batch_size)
+                # Update agent
+                update_every = getattr(sac_cfg, 'update_every', 1)
+                step_in_episode += 1
+                if (total_steps >= sac_cfg.warmup_steps and
+                    len(buffer) >= sac_cfg.batch_size and
+                    step_in_episode % update_every == 0):
+                    for _ in range(sac_cfg.updates_per_step):
+                        update_info = agent.update(buffer, sac_cfg.batch_size)
 
-                # Track losses (periodically)
-                if step_in_episode % 100 == 0:
-                    losses['critic'].append(update_info['critic_loss'])
-                    losses['actor'].append(update_info['actor_loss'])
-                    losses['physics'].append(update_info['physics_loss'])
-                    losses['alpha'].append(update_info['alpha'])
+                    # Track losses (periodically)
+                    if step_in_episode % 100 == 0:
+                        losses['critic'].append(update_info['critic_loss'])
+                        losses['actor'].append(update_info['actor_loss'])
+                        losses['physics'].append(update_info['physics_loss'])
+                        losses['alpha'].append(update_info['alpha'])
 
-                    # TensorBoard logging
-                    writer.add_scalar("loss/critic", update_info['critic_loss'], total_steps)
-                    writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
-                    writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
-                    writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
-                    writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
+                        # TensorBoard logging
+                        writer.add_scalar("loss/critic", update_info['critic_loss'], total_steps)
+                        writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
+                        writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
+                        writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
+                        writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
 
-            # Accumulate rewards
-            episode_reward += rewards * (~done_mask)
-            episode_length += (~done_mask)
+                # Accumulate rewards (GPU)
+                episode_reward += rewards * (~done_mask)
+                episode_length += (~done_mask).float()
 
-            # Update state
-            obs = next_obs
-            physics_gt = step_info['physics_gt']
-            done_mask |= (dones | truncated)
-            total_steps += NUM_ENVS
+                # Update state
+                obs = next_obs
+                physics_gt = next_physics_gt
+                done_mask = done_mask | dones
+                total_steps += NUM_ENVS
+
+            # Convert to numpy only for logging
+            episode_reward = episode_reward.cpu().numpy()
+            episode_length = episode_length.cpu().numpy()
+
+        else:
+            # CPU fallback (original loop)
+            obs, reset_info = env.reset()
+            physics_gt = reset_info['physics_gt']
+
+            episode_reward = np.zeros(NUM_ENVS)
+            episode_length = np.zeros(NUM_ENVS)
+            done_mask = np.zeros(NUM_ENVS, dtype=bool)
+            step_in_episode = 0
+
+            episode_start_time = time.time()
+
+            while not done_mask.all():
+                if total_steps < sac_cfg.warmup_steps:
+                    actions = np.random.uniform(-1, 1, (NUM_ENVS, env_cfg.action_dim)).astype(np.float32)
+                else:
+                    actions, _ = agent.select_action_batch(obs, evaluate=False)
+
+                next_obs, rewards, dones, truncated, step_info = env.step(actions)
+
+                buffer.push_batch(
+                    obs, actions, rewards, next_obs, dones.astype(np.float32),
+                    physics_gt, mask=~done_mask
+                )
+
+                update_every = getattr(sac_cfg, 'update_every', 1)
+                step_in_episode += 1
+                if (total_steps >= sac_cfg.warmup_steps and
+                    len(buffer) >= sac_cfg.batch_size and
+                    step_in_episode % update_every == 0):
+                    for _ in range(sac_cfg.updates_per_step):
+                        update_info = agent.update(buffer, sac_cfg.batch_size)
+
+                    if step_in_episode % 100 == 0:
+                        losses['critic'].append(update_info['critic_loss'])
+                        losses['actor'].append(update_info['actor_loss'])
+                        losses['physics'].append(update_info['physics_loss'])
+                        losses['alpha'].append(update_info['alpha'])
+
+                        writer.add_scalar("loss/critic", update_info['critic_loss'], total_steps)
+                        writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
+                        writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
+                        writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
+                        writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
+
+                episode_reward += rewards * (~done_mask)
+                episode_length += (~done_mask)
+
+                obs = next_obs
+                physics_gt = step_info['physics_gt']
+                done_mask |= (dones | truncated)
+                total_steps += NUM_ENVS
 
         # Episode complete
         mean_reward = np.mean(episode_reward)

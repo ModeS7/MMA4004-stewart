@@ -288,8 +288,8 @@ class RLController:
     """
     Reinforcement Learning Controller using trained SAC policy.
 
-    Uses a neural network policy trained in simulation to control
-    platform tilt for ball balancing.
+    Uses frame stacking (12 frames × 7 values = 84 inputs) with physics estimation.
+    Matches the architecture trained in RL/train.py.
     """
 
     def __init__(self,
@@ -308,43 +308,80 @@ class RLController:
         self.output_limit = output_limit
         self.device = torch.device(device)
 
+        # Frame stacking config (must match training)
+        self.num_frames = 12
+        self.obs_per_frame = 7  # [ball_x, ball_y, platform_rx, platform_ry, dt, target_x, target_y]
+        self.obs_dim = self.num_frames * self.obs_per_frame  # 84
+
         # Normalization constants (must match training)
         self.platform_radius_mm = 150.0
-        self.max_vel_mm_s = 500.0
         self.max_tilt_deg = 10.0
+
+        # Frame history buffer
+        self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
 
         # Build actor network (same architecture as training)
         class Actor(nn.Module):
-            def __init__(self, state_dim=6, action_dim=2, hidden_dim=256):
+            def __init__(self, input_dim=84, action_dim=2, hidden_dim=256, physics_dim=3):
                 super().__init__()
-                self.network = nn.Sequential(
-                    nn.Linear(state_dim, hidden_dim),
+                # Shared backbone
+                self.backbone = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
                     nn.ReLU(),
                     nn.Linear(hidden_dim, hidden_dim),
                     nn.ReLU()
                 )
-                self.mean = nn.Linear(hidden_dim, action_dim)
+                # Action head
+                self.action_mean = nn.Linear(hidden_dim, action_dim)
+                self.action_log_std = nn.Linear(hidden_dim, action_dim)
+                # Physics head (not used for inference, but needed for loading weights)
+                self.physics_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim // 2),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim // 2, physics_dim),
+                    nn.Sigmoid()
+                )
 
-            def forward(self, state):
-                features = self.network(state)
-                return torch.tanh(self.mean(features))
+            def forward(self, obs):
+                features = self.backbone(obs)
+                action_mean = torch.tanh(self.action_mean(features))
+                return action_mean
 
-        self.actor = Actor().to(self.device)
+        self.actor = Actor(input_dim=self.obs_dim).to(self.device)
         self.actor.eval()
 
         # Load trained weights
         self._load_model(model_path)
 
-        # Track current platform tilt (updated externally or from last action)
+        # Track current platform tilt
         self.current_rx = 0.0
         self.current_ry = 0.0
+
+        # Track dt for observation
+        self.last_time = None
 
     def _load_model(self, model_path: str) -> None:
         """Load trained actor weights."""
         import torch
+        import glob
+        import os
+
+        # If path doesn't exist, try to find latest checkpoint
+        if not os.path.exists(model_path):
+            # Try timestamped folders
+            checkpoints = glob.glob('RL/checkpoints/*/sac_*.pt')
+            if checkpoints:
+                model_path = max(checkpoints, key=os.path.getmtime)
+                print(f"[RLController] Auto-selected latest checkpoint: {model_path}")
+            else:
+                # Try root folder
+                root_checkpoints = glob.glob('RL/checkpoints/sac_*.pt')
+                if root_checkpoints:
+                    model_path = max(root_checkpoints, key=os.path.getmtime)
+                    print(f"[RLController] Auto-selected checkpoint: {model_path}")
 
         try:
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             if 'actor' in checkpoint:
                 self.actor.load_state_dict(checkpoint['actor'], strict=False)
             else:
@@ -354,22 +391,41 @@ class RLController:
             print(f"[RLController] Warning: Could not load model: {e}")
             print("[RLController] Using random initialization")
 
+    def _get_frame(self, ball_pos_mm: Tuple[float, float],
+                   platform_tilt_deg: Tuple[float, float],
+                   dt: float,
+                   target_pos_mm: Tuple[float, float]) -> np.ndarray:
+        """Build single frame observation (normalized)."""
+        frame = np.array([
+            ball_pos_mm[0] / self.platform_radius_mm,  # ball_x normalized
+            ball_pos_mm[1] / self.platform_radius_mm,  # ball_y normalized
+            platform_tilt_deg[0] / self.max_tilt_deg,  # platform_rx normalized
+            platform_tilt_deg[1] / self.max_tilt_deg,  # platform_ry normalized
+            dt / 0.01,  # dt normalized (10ms = 1.0)
+            target_pos_mm[0] / self.platform_radius_mm,  # target_x normalized
+            target_pos_mm[1] / self.platform_radius_mm,  # target_y normalized
+        ], dtype=np.float32)
+        return frame
+
     def update(self, ball_pos_mm: Tuple[float, float], ball_vel_mm_s: Tuple[float, float],
                target_pos_mm: Tuple[float, float] = (0.0, 0.0),
-               platform_tilt_deg: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
+               platform_tilt_deg: Optional[Tuple[float, float]] = None,
+               dt: Optional[float] = None) -> Tuple[float, float]:
         """
         Compute RL control output.
 
         Args:
             ball_pos_mm: (x, y) current position in mm
-            ball_vel_mm_s: (vx, vy) current velocity in mm/s
-            target_pos_mm: (x, y) target position in mm (used to compute error)
-            platform_tilt_deg: (rx, ry) current platform tilt in degrees (optional)
+            ball_vel_mm_s: (vx, vy) current velocity in mm/s (not directly used, implicit in frame history)
+            target_pos_mm: (x, y) target position in mm
+            platform_tilt_deg: (rx, ry) current platform tilt in degrees
+            dt: Time step in seconds (optional, estimated if not provided)
 
         Returns:
             (rx, ry): platform tilt angles in degrees
         """
         import torch
+        import time
 
         # Use provided platform tilt or tracked values
         if platform_tilt_deg is not None:
@@ -377,23 +433,25 @@ class RLController:
         else:
             rx_current, ry_current = self.current_rx, self.current_ry
 
-        # Compute error relative to target
-        error_x = ball_pos_mm[0] - target_pos_mm[0]
-        error_y = ball_pos_mm[1] - target_pos_mm[1]
+        # Estimate dt if not provided
+        if dt is None:
+            current_time = time.time()
+            if self.last_time is not None:
+                dt = current_time - self.last_time
+            else:
+                dt = 0.01  # Default 10ms
+            self.last_time = current_time
+        dt = np.clip(dt, 0.001, 0.1)  # Clamp to reasonable range
 
-        # Build normalized observation (must match training)
-        # [ball_x, ball_y, ball_vx, ball_vy, platform_rx, platform_ry]
-        obs = np.array([
-            error_x / self.platform_radius_mm,  # Normalized position
-            error_y / self.platform_radius_mm,
-            ball_vel_mm_s[0] / self.max_vel_mm_s,  # Normalized velocity
-            ball_vel_mm_s[1] / self.max_vel_mm_s,
-            rx_current / self.max_tilt_deg,  # Normalized tilt
-            ry_current / self.max_tilt_deg
-        ], dtype=np.float32)
+        # Build new frame
+        new_frame = self._get_frame(ball_pos_mm, (rx_current, ry_current), dt, target_pos_mm)
 
-        # Clip to prevent extreme inputs
-        obs = np.clip(obs, -2.0, 2.0)
+        # Shift history and add new frame
+        self.frame_history[:-1] = self.frame_history[1:]
+        self.frame_history[-1] = new_frame
+
+        # Flatten for network input
+        obs = self.frame_history.flatten()
 
         # Run inference
         with torch.no_grad():
@@ -417,6 +475,8 @@ class RLController:
         """Reset controller state."""
         self.current_rx = 0.0
         self.current_ry = 0.0
+        self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
+        self.last_time = None
 
     def set_platform_tilt(self, rx: float, ry: float) -> None:
         """Update tracked platform tilt (call with IMU/FK feedback)."""
