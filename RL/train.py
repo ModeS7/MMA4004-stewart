@@ -1,274 +1,357 @@
 """
-Training Script for Stewart Platform RL
+Training script for Feedforward SAC with Physics Estimation.
 
-Train SAC agent to balance ball on Stewart platform.
+Uses frame stacking (12 frames) and domain randomization for sim-to-real.
 """
 
 import os
 import sys
-import argparse
-from time import time
-
+import time
+from datetime import datetime
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
-from rl_config import EnvConfig, RewardConfig, SACConfig, TrainingConfig
-from stewart_env import StewartBallEnv
-from sac_agent import SACAgent, ReplayBuffer
+# Add RL directory to path for standalone execution
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from rl_config import EnvConfig, SACConfig, RewardConfig, TrainingConfig
+from env import StewartEnv
+from agent import SACAgent, ReplayBuffer
 
 
-def train(args):
-    """Main training function."""
+# ============================================================================
+# TRAINING CONFIGURATION - MODIFY THESE
+# ============================================================================
 
+NUM_ENVS = 10           # Number of parallel environments
+MAX_EPISODES = 1000     # Total training episodes
+DEVICE = "cuda"         # "cuda" or "cpu"
+CHECKPOINT = None       # Path to checkpoint to resume from, or None
+
+# Logging
+LOG_INTERVAL = 10       # Print stats every N episodes
+EVAL_INTERVAL = 50      # Evaluate every N episodes
+SAVE_INTERVAL = 100     # Save checkpoint every N episodes
+
+# ============================================================================
+
+
+def evaluate(agent, env_config, reward_config, num_episodes=10):
+    """Evaluate agent on fresh environments."""
+    eval_env = StewartEnv(
+        num_envs=num_episodes,
+        config=env_config,
+        reward_config=reward_config,
+        use_domain_randomization=False  # Fixed physics for evaluation
+    )
+
+    obs, _ = eval_env.reset()
+    episode_rewards = np.zeros(num_episodes)
+    episode_lengths = np.zeros(num_episodes)
+    done_mask = np.zeros(num_episodes, dtype=bool)
+
+    while not done_mask.all():
+        actions, _ = agent.select_action_batch(obs, evaluate=True)
+        obs, rewards, dones, truncated, info = eval_env.step(actions)
+
+        # Accumulate rewards for non-done episodes
+        episode_rewards += rewards * (~done_mask)
+        episode_lengths += (~done_mask)
+
+        done_mask |= (dones | truncated)
+
+    return {
+        'mean_reward': np.mean(episode_rewards),
+        'std_reward': np.std(episode_rewards),
+        'mean_length': np.mean(episode_lengths),
+        'success_rate': np.mean(episode_lengths >= env_config.max_steps)
+    }
+
+
+def train():
+    """Main training loop."""
     print("=" * 60)
-    print("Stewart Platform Ball Balancing - SAC Training")
+    print("SAC Training with Physics Estimation")
     print("=" * 60)
 
     # Load configs
     env_cfg = EnvConfig()
-    reward_cfg = RewardConfig()
     sac_cfg = SACConfig()
+    reward_cfg = RewardConfig()
     train_cfg = TrainingConfig()
 
-    # Override with command line args
-    num_envs = args.num_envs
-    max_episodes = args.max_episodes or train_cfg.max_episodes
-    device = args.device or train_cfg.device
+    # Override with script settings
+    train_cfg.max_episodes = MAX_EPISODES
+    train_cfg.device = DEVICE
+    train_cfg.log_interval = LOG_INTERVAL
+    train_cfg.eval_interval = EVAL_INTERVAL
+    train_cfg.save_interval = SAVE_INTERVAL
 
     print(f"\nConfiguration:")
-    print(f"  Parallel environments: {num_envs}")
-    print(f"  Max episodes: {max_episodes}")
-    print(f"  Device: {device}")
-    print(f"  State dim: {env_cfg.state_dim}")
-    print(f"  Action dim: {env_cfg.action_dim}")
-
-    # Set seed
-    np.random.seed(train_cfg.seed)
-    torch.manual_seed(train_cfg.seed)
+    print(f"  Device: {train_cfg.device}")
+    print(f"  Num envs: {NUM_ENVS}")
+    print(f"  Max episodes: {train_cfg.max_episodes}")
+    print(f"  Max steps per episode: {env_cfg.max_steps}")
+    print(f"  Num frames: {env_cfg.num_frames}")
+    print(f"  Obs per frame: {env_cfg.obs_per_frame}")
+    print(f"  obs dim: {env_cfg.obs_dim}")
+    print(f"  Physics dim: {env_cfg.physics_dim}")
+    print(f"  Domain randomization: {env_cfg.use_domain_randomization}")
+    print(f"  Camera noise: {env_cfg.use_camera_noise} (std={env_cfg.position_noise_std_mm}mm)")
 
     # Create environment
-    env = StewartBallEnv(num_envs=num_envs, config=env_cfg, reward_config=reward_cfg)
-    print(f"\nEnvironment created with {num_envs} parallel envs")
+    env = StewartEnv(
+        num_envs=NUM_ENVS,
+        config=env_cfg,
+        reward_config=reward_cfg,
+        use_domain_randomization=env_cfg.use_domain_randomization
+    )
+    print(f"\nEnvironment created with {NUM_ENVS} parallel envs")
 
     # Create agent
     agent = SACAgent(
-        state_dim=env_cfg.state_dim,
+        obs_dim=env_cfg.obs_dim,
         action_dim=env_cfg.action_dim,
         hidden_dim=sac_cfg.hidden_dim,
+        physics_dim=env_cfg.physics_dim,
         lr=sac_cfg.lr,
         gamma=sac_cfg.gamma,
         tau=sac_cfg.tau,
         alpha=sac_cfg.alpha,
+        physics_loss_weight=0.1,
         automatic_entropy_tuning=sac_cfg.automatic_entropy_tuning,
-        device=device
+        device=train_cfg.device
     )
-    print(f"SAC agent created on {agent.device}")
+    print(f"Agent created on device: {agent.device}")
+
+    # Load checkpoint if specified
+    start_episode = 0
+    if CHECKPOINT is not None:
+        agent.load(CHECKPOINT)
+        # Extract episode number from checkpoint name if possible
+        try:
+            start_episode = int(CHECKPOINT.split('_ep')[-1].split('.')[0])
+        except:
+            pass
+        print(f"Loaded checkpoint: {CHECKPOINT}")
 
     # Create replay buffer
     buffer = ReplayBuffer(
         capacity=sac_cfg.buffer_size,
-        state_dim=env_cfg.state_dim,
-        action_dim=env_cfg.action_dim
+        obs_dim=env_cfg.obs_dim,
+        action_dim=env_cfg.action_dim,
+        physics_dim=env_cfg.physics_dim
     )
-
-    # Load checkpoint if provided
-    if args.checkpoint:
-        agent.load(args.checkpoint)
-        print(f"Loaded checkpoint: {args.checkpoint}")
+    print(f"Replay buffer created with capacity {sac_cfg.buffer_size}")
 
     # Training metrics
     episode_rewards = []
     episode_lengths = []
-    critic_losses = []
-    actor_losses = []
-    alpha_values = []
+    eval_rewards = []
+    losses = {'critic': [], 'actor': [], 'physics': [], 'alpha': []}
+
+    # Create run directory with timestamp
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(train_cfg.save_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Create TensorBoard writer
+    writer = SummaryWriter(run_dir)
+    print(f"Run directory: {run_dir}")
+
+    # Log hyperparameters
+    writer.add_text("config/env", f"num_frames={env_cfg.num_frames}, obs_per_frame={env_cfg.obs_per_frame}")
+    writer.add_text("config/sac", f"hidden_dim={sac_cfg.hidden_dim}, lr={sac_cfg.lr}, gamma={sac_cfg.gamma}")
+    writer.add_text("config/training", f"num_envs={NUM_ENVS}, max_episodes={MAX_EPISODES}")
 
     # Training loop
-    print(f"\nStarting training...")
-    print("-" * 60)
+    print("\n" + "=" * 60)
+    print("Starting training...")
+    print("=" * 60)
 
     total_steps = 0
-    start_time = time()
+    train_start_time = time.time()
 
-    for episode in range(max_episodes):
-        # Reset all environments
-        obs = env.reset()
-        episode_reward = np.zeros(num_envs)
-        episode_length = 0
+    for episode in range(start_episode, train_cfg.max_episodes):
+        obs, reset_info = env.reset()
+        physics_gt = reset_info['physics_gt']  # Ground truth physics for auxiliary loss
 
-        done_mask = np.zeros(num_envs, dtype=bool)
+        episode_reward = np.zeros(NUM_ENVS)
+        episode_length = np.zeros(NUM_ENVS)
+        done_mask = np.zeros(NUM_ENVS, dtype=bool)
 
-        # Episode loop
+        episode_start_time = time.time()
+
         while not done_mask.all():
-            # Select actions
+            # Select action
             if total_steps < sac_cfg.warmup_steps:
-                # Random exploration
-                actions = np.random.uniform(-1, 1, (num_envs, env_cfg.action_dim)).astype(np.float32)
+                # Random actions during warmup
+                actions = np.random.uniform(-1, 1, (NUM_ENVS, env_cfg.action_dim)).astype(np.float32)
             else:
-                actions = agent.select_action_batch(obs)
+                actions, _ = agent.select_action_batch(obs, evaluate=False)
 
             # Step environment
-            next_obs, rewards, dones, infos = env.step(actions)
+            next_obs, rewards, dones, truncated, step_info = env.step(actions)
 
-            # Store transitions (only for envs that weren't already done)
-            for i in range(num_envs):
+            # Store transitions (only for non-done envs)
+            for i in range(NUM_ENVS):
                 if not done_mask[i]:
-                    buffer.push(obs[i], actions[i], rewards[i], next_obs[i], float(dones[i]))
-                    episode_reward[i] += rewards[i]
+                    buffer.push(
+                        obs[i],
+                        actions[i],
+                        rewards[i],
+                        next_obs[i],
+                        float(dones[i]),
+                        physics_gt[i]  # Physics ground truth for auxiliary loss
+                    )
 
-            # Update done mask
-            done_mask = done_mask | dones
-            episode_length += 1
-            total_steps += num_envs
-
-            # Update networks
-            if len(buffer) > sac_cfg.batch_size and total_steps >= sac_cfg.warmup_steps:
+            # Update agent
+            if total_steps >= sac_cfg.warmup_steps and len(buffer) >= sac_cfg.batch_size:
                 for _ in range(sac_cfg.updates_per_step):
-                    info = agent.update(buffer, sac_cfg.batch_size)
-                    critic_losses.append(info['critic_loss'])
-                    actor_losses.append(info['actor_loss'])
-                    alpha_values.append(info['alpha'])
+                    update_info = agent.update(buffer, sac_cfg.batch_size)
 
+                    # Track losses (periodically)
+                    if total_steps % 100 == 0:
+                        losses['critic'].append(update_info['critic_loss'])
+                        losses['actor'].append(update_info['actor_loss'])
+                        losses['physics'].append(update_info['physics_loss'])
+                        losses['alpha'].append(update_info['alpha'])
+
+                        # TensorBoard logging
+                        writer.add_scalar("loss/critic", update_info['critic_loss'], total_steps)
+                        writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
+                        writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
+                        writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
+                        writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
+
+            # Accumulate rewards
+            episode_reward += rewards * (~done_mask)
+            episode_length += (~done_mask)
+
+            # Update state
             obs = next_obs
-
-            # Safety break
-            if episode_length >= env_cfg.max_steps:
-                break
+            physics_gt = step_info['physics_gt']
+            done_mask |= (dones | truncated)
+            total_steps += NUM_ENVS
 
         # Episode complete
-        mean_reward = episode_reward.mean()
+        mean_reward = np.mean(episode_reward)
+        mean_length = np.mean(episode_length)
         episode_rewards.append(mean_reward)
-        episode_lengths.append(episode_length)
+        episode_lengths.append(mean_length)
+
+        episode_time = time.time() - episode_start_time
+
+        # TensorBoard episode logging
+        writer.add_scalar("episode/reward", mean_reward, episode)
+        writer.add_scalar("episode/length", mean_length, episode)
+        writer.add_scalar("episode/time", episode_time, episode)
+        writer.add_scalar("buffer/size", len(buffer), episode)
 
         # Logging
         if (episode + 1) % train_cfg.log_interval == 0:
-            elapsed = time() - start_time
-            avg_reward = np.mean(episode_rewards[-train_cfg.log_interval:])
-            avg_length = np.mean(episode_lengths[-train_cfg.log_interval:])
+            recent_rewards = episode_rewards[-train_cfg.log_interval:]
+            print(f"Episode {episode + 1:4d} | "
+                  f"Reward: {mean_reward:7.1f} (avg: {np.mean(recent_rewards):7.1f}) | "
+                  f"Length: {mean_length:4.0f} | "
+                  f"Alpha: {agent.alpha:.3f} | "
+                  f"Buffer: {len(buffer):6d} | "
+                  f"Time: {episode_time:.1f}s")
 
-            # Get recent losses
-            if critic_losses:
-                recent_critic = np.mean(critic_losses[-100:])
-                recent_actor = np.mean(actor_losses[-100:])
-                recent_alpha = np.mean(alpha_values[-100:])
-            else:
-                recent_critic = recent_actor = recent_alpha = 0
+        # Evaluation
+        if (episode + 1) % train_cfg.eval_interval == 0:
+            eval_info = evaluate(agent, env_cfg, reward_cfg)
+            eval_rewards.append(eval_info['mean_reward'])
 
-            steps_per_sec = total_steps / elapsed
+            # TensorBoard eval logging
+            writer.add_scalar("eval/reward_mean", eval_info['mean_reward'], episode)
+            writer.add_scalar("eval/reward_std", eval_info['std_reward'], episode)
+            writer.add_scalar("eval/length", eval_info['mean_length'], episode)
+            writer.add_scalar("eval/success_rate", eval_info['success_rate'], episode)
 
-            print(f"Ep {episode+1:4d}/{max_episodes} | "
-                  f"R: {mean_reward:7.2f} | "
-                  f"AvgR: {avg_reward:7.2f} | "
-                  f"Len: {avg_length:5.0f} | "
-                  f"C: {recent_critic:.3f} | "
-                  f"A: {recent_actor:.3f} | "
-                  f"a: {recent_alpha:.3f} | "
-                  f"{steps_per_sec:.0f} sps")
+            print(f"\n  [EVAL] Mean reward: {eval_info['mean_reward']:.1f} ± {eval_info['std_reward']:.1f} | "
+                  f"Success rate: {eval_info['success_rate']*100:.0f}% | "
+                  f"Mean length: {eval_info['mean_length']:.0f}\n")
 
         # Save checkpoint
         if (episode + 1) % train_cfg.save_interval == 0:
-            os.makedirs(train_cfg.save_dir, exist_ok=True)
-            save_path = os.path.join(train_cfg.save_dir, f"sac_ep{episode+1}.pt")
-            agent.save(save_path)
-            print(f"  Saved: {save_path}")
+            checkpoint_path = os.path.join(run_dir, f"sac_ep{episode + 1}.pt")
+            agent.save(checkpoint_path)
+            print(f"  [SAVE] Checkpoint saved: {checkpoint_path}")
 
     # Training complete
-    elapsed = time() - start_time
-    print("-" * 60)
-    print(f"Training completed in {elapsed:.1f}s")
+    total_time = time.time() - train_start_time
+    print("\n" + "=" * 60)
+    print("Training Complete!")
+    print("=" * 60)
+    print(f"Total time: {total_time / 60:.1f} minutes")
     print(f"Total steps: {total_steps:,}")
-    print(f"Average speed: {total_steps/elapsed:.0f} steps/sec")
+    print(f"Final mean reward: {np.mean(episode_rewards[-10:]):.1f}")
 
     # Save final model
-    os.makedirs(train_cfg.save_dir, exist_ok=True)
-    final_path = os.path.join(train_cfg.save_dir, "sac_final.pt")
+    final_path = os.path.join(run_dir, "sac_final.pt")
     agent.save(final_path)
     print(f"Final model saved: {final_path}")
 
-    # Plot training progress
-    plot_training(episode_rewards, critic_losses, actor_losses, alpha_values, train_cfg.save_dir)
-
-    return agent
-
-
-def plot_training(rewards, critic_losses, actor_losses, alpha_values, save_dir):
-    """Plot and save training curves."""
-
+    # Plot training curves
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
     # Episode rewards
-    ax = axes[0, 0]
-    ax.plot(rewards, alpha=0.3, label='Episode')
-    if len(rewards) >= 10:
-        window = min(50, len(rewards) // 5)
-        smoothed = np.convolve(rewards, np.ones(window)/window, mode='valid')
-        ax.plot(np.arange(window-1, len(rewards)), smoothed, label=f'MA-{window}')
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Reward')
-    ax.set_title('Episode Rewards')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    axes[0, 0].plot(episode_rewards, alpha=0.3)
+    if len(episode_rewards) >= 10:
+        smoothed = np.convolve(episode_rewards, np.ones(10)/10, mode='valid')
+        axes[0, 0].plot(range(9, len(episode_rewards)), smoothed, 'r-', linewidth=2)
+    axes[0, 0].set_xlabel('Episode')
+    axes[0, 0].set_ylabel('Reward')
+    axes[0, 0].set_title('Episode Rewards')
+    axes[0, 0].grid(True)
 
-    # Critic loss
-    ax = axes[0, 1]
-    if critic_losses:
-        ax.plot(critic_losses, alpha=0.3)
-        if len(critic_losses) >= 100:
-            window = 100
-            smoothed = np.convolve(critic_losses, np.ones(window)/window, mode='valid')
-            ax.plot(np.arange(window-1, len(critic_losses)), smoothed)
-    ax.set_xlabel('Update Step')
-    ax.set_ylabel('Loss')
-    ax.set_title('Critic Loss')
-    ax.grid(True, alpha=0.3)
+    # Episode lengths
+    axes[0, 1].plot(episode_lengths)
+    axes[0, 1].axhline(y=env_cfg.max_steps, color='g', linestyle='--', label='Max steps')
+    axes[0, 1].set_xlabel('Episode')
+    axes[0, 1].set_ylabel('Length')
+    axes[0, 1].set_title('Episode Lengths')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
 
-    # Actor loss
-    ax = axes[1, 0]
-    if actor_losses:
-        ax.plot(actor_losses, alpha=0.3)
-        if len(actor_losses) >= 100:
-            window = 100
-            smoothed = np.convolve(actor_losses, np.ones(window)/window, mode='valid')
-            ax.plot(np.arange(window-1, len(actor_losses)), smoothed)
-    ax.set_xlabel('Update Step')
-    ax.set_ylabel('Loss')
-    ax.set_title('Actor Loss')
-    ax.grid(True, alpha=0.3)
+    # Losses
+    if losses['critic']:
+        axes[1, 0].plot(losses['critic'], label='Critic', alpha=0.7)
+        axes[1, 0].plot(losses['actor'], label='Actor', alpha=0.7)
+        axes[1, 0].set_xlabel('Update (x100)')
+        axes[1, 0].set_ylabel('Loss')
+        axes[1, 0].set_title('Losses')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True)
 
-    # Alpha
-    ax = axes[1, 1]
-    if alpha_values:
-        ax.plot(alpha_values)
-    ax.set_xlabel('Update Step')
-    ax.set_ylabel('Alpha')
-    ax.set_title('Entropy Coefficient')
-    ax.grid(True, alpha=0.3)
+    # Physics loss and alpha
+    if losses['physics']:
+        ax2 = axes[1, 1]
+        ax2.plot(losses['physics'], 'b-', label='Physics Loss')
+        ax2.set_xlabel('Update (x100)')
+        ax2.set_ylabel('Physics Loss', color='b')
+        ax2.tick_params(axis='y', labelcolor='b')
+
+        ax3 = ax2.twinx()
+        ax3.plot(losses['alpha'], 'r-', label='Alpha')
+        ax3.set_ylabel('Alpha', color='r')
+        ax3.tick_params(axis='y', labelcolor='r')
+        ax2.set_title('Physics Loss & Entropy Coefficient')
+        ax2.grid(True)
 
     plt.tight_layout()
-
-    save_path = os.path.join(save_dir, "training_progress.png")
-    plt.savefig(save_path, dpi=150)
+    plot_path = os.path.join(run_dir, "training.png")
+    plt.savefig(plot_path, dpi=150)
+    print(f"Training plot saved: {plot_path}")
     plt.close()
-    print(f"Training plot saved: {save_path}")
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Train SAC for Stewart Platform")
-
-    parser.add_argument('--num-envs', type=int, default=10,
-                        help='Number of parallel environments (default: 10)')
-    parser.add_argument('--max-episodes', type=int, default=None,
-                        help='Maximum training episodes')
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device: cuda or cpu')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to checkpoint to resume from')
-
-    args = parser.parse_args()
-
-    train(args)
+    # Close TensorBoard writer
+    writer.close()
+    print(f"\nTo view TensorBoard: tensorboard --logdir {train_cfg.save_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    train()

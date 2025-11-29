@@ -27,17 +27,17 @@ class EnvConfig:
     ball_radius_m = 0.02  # 20mm radius
     ball_mass_kg = 0.0027  # 2.7g
 
-    # LSTM sequence settings
-    seq_length = 10  # Number of timesteps in history for LSTM
-
-    # State space per timestep: [ball_x, ball_y, platform_rx, platform_ry]
-    # No velocity - LSTM will infer from position history
-    obs_per_step = 4  # Observation dimension per timestep
-    state_dim = obs_per_step  # For compatibility (actual input is seq_length x obs_per_step)
+    # Frame history settings
+    num_frames = 12  # Number of frames in history
+    obs_per_frame = 5  # [ball_x, ball_y, platform_rx, platform_ry, dt]
+    obs_dim = num_frames * obs_per_frame  # 12 * 5 = 60
 
     # Action space: [rx_target, ry_target] normalized to [-1, 1]
     action_dim = 2
     action_scale = max_tilt_deg  # Maps [-1, 1] to [-max_tilt, max_tilt]
+
+    # Physics estimation output
+    physics_dim = 3  # [friction, servo_tau, mass_factor]
 
     # Initial state randomization
     init_pos_range_mm = 50.0  # Ball starts within [-50, 50] mm
@@ -48,11 +48,14 @@ class EnvConfig:
     use_camera_noise = True
     position_noise_std_mm = 3.0  # 3mm std noise
     # Noise can also scale with distance from camera (depth-dependent)
-    noise_depth_scale = 0.1  # Additional noise = distance * scale * 10x
+    noise_depth_scale = 0.1  # Additional noise = distance * scale
 
     # Domain randomization (for sim-to-real transfer)
-    use_domain_randomization = False
-    randomization_pct = 0.1  # +/- 10% parameter variation
+    use_domain_randomization = True
+    # Physics parameter ranges for randomization
+    friction_range = (0.01, 0.05)       # Rolling friction coefficient
+    servo_tau_range = (0.03, 0.08)      # Servo time constant (30-80ms)
+    mass_factor_range = (1.4, 2.0)      # Ball inertia factor (1.67 nominal)
 
 
 # ============================================================================
@@ -84,12 +87,10 @@ class RewardConfig:
 # ============================================================================
 
 class SACConfig:
-    """SAC hyperparameters (from successful Pendulum project)."""
+    """SAC hyperparameters."""
 
     # Network architecture
     hidden_dim = 256  # Hidden layer size
-    lstm_hidden_dim = 128  # LSTM hidden state size
-    lstm_layers = 1  # Number of LSTM layers
 
     # Learning rates
     lr = 3e-4  # Learning rate for all networks
@@ -156,7 +157,7 @@ if __name__ == "__main__":
     train = TrainingConfig()
 
     print(f"\nEnvironment:")
-    print(f"  State dim: {env.state_dim}")
+    print(f"  Obs dim: {env.obs_dim} ({env.num_frames} frames × {env.obs_per_frame})")
     print(f"  Action dim: {env.action_dim}")
     print(f"  Max steps: {env.max_steps} ({env.max_steps * env.dt}s)")
     print(f"  Platform radius: {env.platform_radius_mm}mm")
