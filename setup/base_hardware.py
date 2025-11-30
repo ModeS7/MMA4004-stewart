@@ -807,6 +807,7 @@ class HardwareControllerBase(BaseStewartSimulator):
         self.last_ball_update: float = 0.0
         self.ball_pos_mm: np.ndarray = np.array([0.0, 0.0])
         self.ball_detected: bool = False
+        self.ball_in_control_zone: bool = False  # True when ball is within 200mm radius
 
         # Performance tracking
         self.performance_data: Dict[str, List[float]] = {
@@ -1185,12 +1186,13 @@ class HardwareControllerBase(BaseStewartSimulator):
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
+                self.ball_in_control_zone = ball_data.get('in_control_zone', True)  # Default True for backwards compatibility
 
                 # Update ball_pos tensor for plotting (convert mm to m)
                 self.ball_pos[0, 0] = ball_x_mm / 1000.0
                 self.ball_pos[0, 1] = ball_y_mm / 1000.0
 
-                # Track ball history for trail (only if detected)
+                # Track ball history for trail (only if detected - even outside control zone)
                 if self.ball_detected:
                     self.ball_history_x.append(ball_x_mm)
                     self.ball_history_y.append(ball_y_mm)
@@ -1205,8 +1207,8 @@ class HardwareControllerBase(BaseStewartSimulator):
                 ry_deg = self.prev_platform_angles.get('ry', 0.0)
                 self.kalman_filter.predict([rx_deg, ry_deg])
 
-                # Update step (only if we have a recent ball measurement)
-                if ball_data is not None and self.ball_detected:
+                # Update step (only if ball is detected AND within control zone)
+                if ball_data is not None and self.ball_detected and self.ball_in_control_zone:
                     # Convert mm to meters for Kalman filter
                     ball_pos_m = [self.ball_pos_mm[0] / 1000.0, self.ball_pos_mm[1] / 1000.0]
                     self.kalman_filter.update(ball_pos_m, self.simulation_time)
@@ -1220,20 +1222,27 @@ class HardwareControllerBase(BaseStewartSimulator):
 
             # Controller update (if enabled)
             if self.controller_enabled and self.controller is not None:
-                target_pos_mm = np.array([self.target_x * 1000.0, self.target_y * 1000.0])
+                # Only run controller if ball is in control zone
+                if self.ball_in_control_zone:
+                    target_pos_mm = np.array([self.target_x * 1000.0, self.target_y * 1000.0])
 
-                ik_start = time.perf_counter()
-                rx_ctrl, ry_ctrl = self._update_controller(
-                    ball_pos_filtered,
-                    ball_vel_filtered,
-                    target_pos_mm,
-                    self.control_interval
-                )
-                ik_time = time.perf_counter() - ik_start
+                    ik_start = time.perf_counter()
+                    rx_ctrl, ry_ctrl = self._update_controller(
+                        ball_pos_filtered,
+                        ball_vel_filtered,
+                        target_pos_mm,
+                        self.control_interval
+                    )
+                    ik_time = time.perf_counter() - ik_start
 
-                # Use controller output directly (no IMU in base class)
-                rx = rx_ctrl
-                ry = ry_ctrl
+                    # Use controller output directly (no IMU in base class)
+                    rx = rx_ctrl
+                    ry = ry_ctrl
+                else:
+                    # Ball outside control zone - hold platform level
+                    rx = 0.0
+                    ry = 0.0
+                    ik_time = 0.0
 
                 # Update dof_values so GUI reflects current state
                 self.dof_values['rx'] = rx

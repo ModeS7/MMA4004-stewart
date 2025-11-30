@@ -339,6 +339,13 @@ class ONNXStereoDetector:
         self.alpha_rgb = (self.inv_std6_rgb / 255.0).astype(np.float32)
         self.beta_rgb = (-self.mean6_rgb * self.inv_std6_rgb).astype(np.float32)
 
+        # Per-channel scalars for cv2.multiply/add (releases GIL!)
+        # cv2 works with scalar values per channel
+        self.alpha_ch_bgr = [float(self.alpha_bgr[i]) for i in range(3)]
+        self.beta_ch_bgr = [float(self.beta_bgr[i]) for i in range(3)]
+        self.alpha_ch_rgb = [float(self.alpha_rgb[i]) for i in range(3)]
+        self.beta_ch_rgb = [float(self.beta_rgb[i]) for i in range(3)]
+
         # Statistics
         self.inference_count = 0
         self.total_time = 0.0
@@ -353,35 +360,45 @@ class ONNXStereoDetector:
     def _preprocess_stereo(self, left_bgr, right_bgr):
         """Preprocess stereo pair for tiny_stereo model.
 
+        Uses cv2.split/merge with scalar operations to release GIL.
+
         Returns:
             tuple: (stereo_tensor, timing_dict)
         """
         t0 = time.perf_counter()
 
-        # Resize to stereo input size (INTER_NEAREST is fastest)
+        # Resize to stereo input size (releases GIL)
         left_small = cv2.resize(left_bgr, self.stereo_size, interpolation=cv2.INTER_NEAREST)
         right_small = cv2.resize(right_bgr, self.stereo_size, interpolation=cv2.INTER_NEAREST)
         t_resize = time.perf_counter()
 
         if self.convert_to_rgb:
-            # Convert BGR->RGB (for RGB-trained models)
+            # Convert BGR->RGB (releases GIL)
             left_small = cv2.cvtColor(left_small, cv2.COLOR_BGR2RGB)
             right_small = cv2.cvtColor(right_small, cv2.COLOR_BGR2RGB)
+            alpha = self.alpha_ch_rgb
+            beta = self.beta_ch_rgb
+        else:
+            alpha = self.alpha_ch_bgr
+            beta = self.beta_ch_bgr
         t_convert = time.perf_counter()
 
-        # Use pre-computed alpha/beta for single-step normalization
-        if self.convert_to_rgb:
-            alpha, beta = self.alpha_rgb, self.beta_rgb
-        else:
-            alpha, beta = self.alpha_bgr, self.beta_bgr
+        # Split channels (uint8) - releases GIL
+        l_ch = list(cv2.split(left_small))
+        r_ch = list(cv2.split(right_small))
 
-        # Reuse pre-allocated buffer (no allocation per frame)
-        stereo = self._stereo_buffer
+        # Convert to float32 AND multiply by alpha in one step, then add beta
+        # All cv2 operations release GIL
+        for i in range(3):
+            l_ch[i] = cv2.multiply(l_ch[i], alpha[i], dtype=cv2.CV_32F)
+            cv2.add(l_ch[i], beta[i], dst=l_ch[i])
+            r_ch[i] = cv2.multiply(r_ch[i], alpha[i], dtype=cv2.CV_32F)
+            cv2.add(r_ch[i], beta[i], dst=r_ch[i])
 
-        # Normalize each channel: pixel * alpha + beta
-        for c in range(3):
-            stereo[0, c] = left_small[:, :, c].astype(np.float32) * alpha[c] + beta[c]
-            stereo[0, c + 3] = right_small[:, :, c].astype(np.float32) * alpha[c + 3] + beta[c + 3]
+        # Copy channels directly to buffer in CHW format
+        for i in range(3):
+            self._stereo_buffer[0, i] = l_ch[i]
+            self._stereo_buffer[0, i + 3] = r_ch[i]
 
         t_norm = time.perf_counter()
 
@@ -391,21 +408,29 @@ class ONNXStereoDetector:
             'normalize_ms': (t_norm - t_convert) * 1000,
         }
 
-        return stereo, prep_timing  # Already float32
+        return self._stereo_buffer, prep_timing
 
     def _preprocess_crop(self, crop_bgr):
-        """Preprocess single crop for refinement model (BGR, no conversion)."""
+        """Preprocess single crop for refinement model (BGR, no conversion).
+
+        Uses cv2.split with scalar operations to release GIL.
+        """
         if crop_bgr.shape[:2] != (self.crop_size, self.crop_size):
             crop_bgr = cv2.resize(crop_bgr, (self.crop_size, self.crop_size), interpolation=cv2.INTER_NEAREST)
 
-        # Reuse pre-allocated crop buffer
-        crop_out = self._crop_buffer
+        # Split channels (uint8) - releases GIL
+        channels = list(cv2.split(crop_bgr))
 
-        # Fast normalization: pixel * alpha + beta (pre-computed in __init__)
-        for c in range(3):
-            crop_out[0, c] = crop_bgr[:, :, c].astype(np.float32) * self.alpha_bgr[c] + self.beta_bgr[c]
+        # Convert to float32 AND multiply by alpha in one step, then add beta
+        for i in range(3):
+            channels[i] = cv2.multiply(channels[i], self.alpha_ch_bgr[i], dtype=cv2.CV_32F)
+            cv2.add(channels[i], self.beta_ch_bgr[i], dst=channels[i])
 
-        return crop_out
+        # Copy channels directly to buffer in CHW format
+        for i in range(3):
+            self._crop_buffer[0, i] = channels[i]
+
+        return self._crop_buffer
 
     def _extract_crop(self, frame, x_norm, y_norm):
         """Extract crop centered at normalized coordinates.

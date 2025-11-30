@@ -9,14 +9,19 @@ Compatible interface with Pixy2 serial controller.
 import cv2
 import numpy as np
 import time
+import os
 import threading
+from multiprocessing import Process, Value
+from multiprocessing.shared_memory import SharedMemory
 from queue import Queue, Empty
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 
 import sys
-parent_dir = Path(__file__).parent.parent
-sys.path.insert(0, str(parent_dir))
+# Add project root to path for core.utils import
+# NOTE: Only add project root, NOT ball_detection_dir (it has its own core/ that shadows core.utils)
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 from core.utils import (
     StereoCameraConfig, StereoDetectionConfig,
@@ -25,6 +30,161 @@ from core.utils import (
 from ball_detection.utils.camera import create_camera_capture, load_camera_config, apply_camera_settings
 from ball_detection.utils.calibration import load_stereo_calibration
 from ball_detection.utils.coordinate_transform import load_platform_transform, apply_platform_transform
+from ball_detection.core.inference_pool import InferencePool
+
+
+# Frame dimensions for shared memory
+FRAME_WIDTH = 2560
+FRAME_HEIGHT = 720
+FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * 3  # BGR uint8
+
+
+class SharedFrameBuffer:
+    """Zero-copy frame buffer using shared memory."""
+
+    def __init__(self, name: str, create: bool = False):
+        if create:
+            self.shm = SharedMemory(name=name, create=True, size=FRAME_SIZE)
+        else:
+            self.shm = SharedMemory(name=name, create=False)
+        self.frame = np.ndarray(
+            (FRAME_HEIGHT, FRAME_WIDTH, 3),
+            dtype=np.uint8,
+            buffer=self.shm.buf
+        )
+
+    def write(self, frame: np.ndarray):
+        """Write frame to shared memory (grabber process)."""
+        np.copyto(self.frame, frame)
+
+    def read(self) -> np.ndarray:
+        """Read frame from shared memory (main process)."""
+        return self.frame.copy()  # Copy to avoid race condition
+
+    def close(self):
+        self.shm.close()
+
+    def unlink(self):
+        self.shm.unlink()
+
+
+def _frame_grabber_process(camera_id: int, shm_name: str, frame_ready, frame_consumed,
+                           running_flag, grabber_fps_value, config: dict):
+    """Frame grabber running in separate process with independent GIL.
+
+    Runs at full camera speed (~60fps), continuously overwriting shared memory.
+    Detection loop reads latest frame when ready (no synchronization wait).
+
+    Args:
+        camera_id: OpenCV camera device ID
+        shm_name: Name of shared memory segment
+        frame_ready: Value flag indicating frame is ready
+        frame_consumed: Not used (kept for API compatibility)
+        running_flag: Value flag to stop the process
+        grabber_fps_value: Value to store current grabber FPS
+        config: Camera configuration dict
+    """
+    import cv2
+    import time
+    import sys
+
+    def log(msg):
+        print(msg, flush=True)
+
+    log("[GrabberProcess] Starting...")
+
+    # Attach to shared memory (don't create, main process creates)
+    try:
+        buffer = SharedFrameBuffer(name=shm_name, create=False)
+        log("[GrabberProcess] Attached to shared memory")
+    except Exception as e:
+        log(f"[GrabberProcess] Failed to attach to shared memory: {e}")
+        return
+
+    # Try backends in order - prioritize MSMF which worked in main process
+    cap = None
+    backend_names = {cv2.CAP_MSMF: 'MSMF', cv2.CAP_DSHOW: 'DirectShow', cv2.CAP_ANY: 'Any'}
+    for backend in [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]:
+        log(f"[GrabberProcess] Trying {backend_names.get(backend, backend)}...")
+        cap = cv2.VideoCapture(camera_id + backend)
+        if cap.isOpened():
+            log(f"[GrabberProcess] Opened with {backend_names.get(backend, backend)}")
+            break
+        else:
+            log(f"[GrabberProcess] Failed to open with {backend_names.get(backend, backend)}")
+
+    if not cap or not cap.isOpened():
+        log(f"[GrabberProcess] FAILED to open camera {camera_id} with any backend!")
+        buffer.close()
+        return
+
+    # Configure camera - set FOURCC before resolution (some cameras require this order)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.get('width', 2560))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.get('height', 720))
+    cap.set(cv2.CAP_PROP_FPS, config.get('fps', 60))
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # Apply camera settings if provided
+    if 'settings' in config:
+        for prop, val in config['settings'].items():
+            cap.set(prop, val)
+
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    actual_bufsize = cap.get(cv2.CAP_PROP_BUFFERSIZE)
+    log(f"[GrabberProcess] Camera: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {actual_fps}fps, bufsize={actual_bufsize}")
+
+    # Warm up - discard first few frames which may be stale
+    for _ in range(3):
+        cap.read()
+
+    # FPS tracking
+    fps_window_start = time.perf_counter()
+    fps_window_count = 0
+
+    # Timing for debugging
+    read_times = []
+    copy_times = []
+
+    while running_flag.value:
+        t0 = time.perf_counter()
+        ret, frame = cap.read()
+        t1 = time.perf_counter()
+
+        if not ret or frame is None:
+            time.sleep(0.001)
+            continue
+
+        # Write to shared memory (continuous, no waiting for consumer)
+        buffer.write(frame)
+        t2 = time.perf_counter()
+
+        # Signal frame ready
+        frame_ready.value = 1
+
+        # Track timing
+        read_times.append((t1 - t0) * 1000)
+        copy_times.append((t2 - t1) * 1000)
+
+        # Update FPS every 100 frames
+        fps_window_count += 1
+        if fps_window_count >= 100:
+            elapsed = time.perf_counter() - fps_window_start
+            current_fps = fps_window_count / elapsed if elapsed > 0 else 0
+            grabber_fps_value.value = current_fps
+            avg_read = sum(read_times) / len(read_times) if read_times else 0
+            avg_copy = sum(copy_times) / len(copy_times) if copy_times else 0
+            log(f"[GrabberProcess] {current_fps:.1f}fps | read: {avg_read:.1f}ms | copy: {avg_copy:.1f}ms")
+            fps_window_start = time.perf_counter()
+            fps_window_count = 0
+            read_times = []
+            copy_times = []
+
+        # No waiting - run at full camera speed
+
+    cap.release()
+    buffer.close()
+    log("[GrabberProcess] Stopped")
 
 
 class StereoCameraController:
@@ -71,12 +231,26 @@ class StereoCameraController:
         self.running = False
         self.thread = None
 
-        # Frame grabber thread (decouples camera latency from detection)
+        # Frame grabber thread (for ROI_CNN mode - threading works fine)
         self.grabber_thread = None
         self.frame_lock = threading.Lock()
         self.latest_frame = None
-        self.frame_ready = threading.Event()
+        self.frame_ready_event = threading.Event()
         self.grabber_fps = 0.0
+
+        # Inference pool (for STEREO_NN mode - moves inference to separate process)
+        self.inference_pool = None
+
+        # Legacy: Frame grabber process (not used - kept for reference)
+        self.grabber_process = None
+        self.shm = None
+        self.shared_buffer = None
+        self.shm_name = None
+        # Multiprocessing sync flags (ctypes Value)
+        self.mp_running_flag = None
+        self.mp_frame_ready = None
+        self.mp_frame_consumed = None
+        self.mp_grabber_fps = None
 
         # Ball data queue (same interface as SerialController)
         self.ball_data_queue = Queue(maxsize=10)
@@ -143,27 +317,42 @@ class StereoCameraController:
             self.cap = None
             used_backend = "Unknown"
 
-            for backend, name in backends:
-                print(f"Trying {name} backend...")
-                cap = cv2.VideoCapture(self.camera_id + backend)
-                if cap.isOpened():
-                    # Test if we can get stereo resolution
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, StereoCameraConfig.STEREO_FRAME_WIDTH)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, StereoCameraConfig.STEREO_FRAME_HEIGHT)
-                    cap.set(cv2.CAP_PROP_FPS, StereoCameraConfig.TARGET_FPS)
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            # Use MJPG codec (compressed, reliable)
+            # YUYV (raw) caused access violations on some cameras
+            codecs = [
+                ('MJPG', 'MJPG'),
+            ]
 
-                    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    if actual_width >= StereoCameraConfig.STEREO_FRAME_WIDTH * 0.9:
-                        self.cap = cap
-                        used_backend = name
-                        print(f"Using {name} backend")
-                        break
+            for backend, backend_name in backends:
+                print(f"Trying {backend_name} backend...")
+                for fourcc, codec_name in codecs:
+                    cap = cv2.VideoCapture(self.camera_id + backend)
+                    if cap.isOpened():
+                        # Set FOURCC first (some cameras need codec before resolution)
+                        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+                        # Then set resolution and FPS
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, StereoCameraConfig.STEREO_FRAME_WIDTH)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, StereoCameraConfig.STEREO_FRAME_HEIGHT)
+                        cap.set(cv2.CAP_PROP_FPS, StereoCameraConfig.TARGET_FPS)
+
+                        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                        actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+                        actual_fourcc_str = ''.join([chr((actual_fourcc >> 8 * i) & 0xFF) for i in range(4)])
+
+                        if actual_width >= StereoCameraConfig.STEREO_FRAME_WIDTH * 0.9:
+                            self.cap = cap
+                            used_backend = backend_name
+                            print(f"Using {backend_name} + {codec_name} (actual={actual_fourcc_str}, fps={actual_fps})")
+                            break
+                        else:
+                            print(f"{backend_name} + {codec_name}: Got {actual_width}px width, need {StereoCameraConfig.STEREO_FRAME_WIDTH}")
+                            cap.release()
                     else:
-                        print(f"{name}: Got {actual_width}px width, need {StereoCameraConfig.STEREO_FRAME_WIDTH}")
-                        cap.release()
-                else:
-                    print(f"{name}: Failed to open")
+                        print(f"{backend_name}: Failed to open")
+                        break  # Don't try other codecs if backend failed
+                if self.cap is not None:
+                    break
 
             if self.cap is None:
                 return False, f"Could not open camera {self.camera_id} with any backend"
@@ -188,15 +377,29 @@ class StereoCameraController:
             self.frame_width = width
             self.frame_height = height
 
-            # Initialize ball detector based on DETECTION_MODE
+            # Initialize detection mode
             self.detection_mode = DETECTION_MODE
             print(f"Detection mode: {self.detection_mode}")
 
+            # Start frame grabber FIRST (before initializing detectors)
+            # This keeps camera alive during potentially slow GPU initialization
+            self.running = True
+            self.grabber_thread = threading.Thread(target=self._frame_grabber_loop, daemon=True)
+            self.grabber_thread.start()
+
+            # Wait for first frame
+            if not self.frame_ready_event.wait(timeout=2.0):
+                self.running = False
+                self.cap.release()
+                return False, "Timeout waiting for first frame from camera"
+
+            print("Grabber thread started, initializing detector...")
+
+            # Now initialize detector (grabber keeps camera alive during GPU init)
             if self.detection_mode == 'STEREO_NN':
-                # New pipeline: tiny_stereo + optional refinement
-                print(f"Initializing stereo neural network detector...")
-                from ball_detection.core.detector import StereoBallDetector
-                self.detector = StereoBallDetector(
+                # New pipeline: inference pool (runs in separate process to avoid GIL)
+                print(f"Initializing inference pool for stereo detection...")
+                self.inference_pool = InferencePool(
                     stereo_model_path=StereoDetectionConfig.STEREO_MODEL_PATH,
                     crop_model_path=StereoDetectionConfig.CROP_MODEL_PATH if StereoDetectionConfig.USE_REFINEMENT else None,
                     use_gpu=StereoDetectionConfig.USE_GPU,
@@ -204,6 +407,11 @@ class StereoCameraController:
                     use_refinement=StereoDetectionConfig.USE_REFINEMENT,
                     convert_to_rgb=StereoDetectionConfig.CONVERT_TO_RGB
                 )
+                if not self.inference_pool.start():
+                    self.running = False
+                    self.cap.release()
+                    return False, "Failed to start inference pool"
+                self.detector = None  # Using inference_pool instead
             else:  # ROI_CNN
                 # Old pipeline: ROI extraction + CNN
                 print(f"Initializing ROI + CNN detector...")
@@ -214,17 +422,6 @@ class StereoCameraController:
                     crop_size=StereoCameraConfig.CROP_SIZE,
                     confidence_threshold=StereoCameraConfig.CONFIDENCE_THRESHOLD
                 )
-
-            # Start frame grabber thread (continuously reads frames)
-            self.running = True
-            self.grabber_thread = threading.Thread(target=self._frame_grabber_loop, daemon=True)
-            self.grabber_thread.start()
-
-            # Wait for first frame
-            if not self.frame_ready.wait(timeout=2.0):
-                self.running = False
-                self.cap.release()
-                return False, "Timeout waiting for first frame from camera"
 
             # Start detection thread
             self.thread = threading.Thread(target=self._detection_loop, daemon=True)
@@ -244,6 +441,23 @@ class StereoCameraController:
         camera_config = load_camera_config()
         apply_camera_settings(self.cap, camera_config)
 
+    def _cleanup_shared_memory(self) -> None:
+        """Clean up shared memory resources."""
+        if self.shared_buffer:
+            try:
+                self.shared_buffer.close()
+            except Exception:
+                pass
+            self.shared_buffer = None
+
+        if self.shm:
+            try:
+                self.shm.close()
+                self.shm.unlink()
+            except Exception:
+                pass
+            self.shm = None
+
     def disconnect(self) -> None:
         """Disconnect from camera and stop detection thread."""
         self.running = False
@@ -252,14 +466,24 @@ class StereoCameraController:
         if self.recording:
             self.stop_recording()
 
+        # Stop detection thread
         if self.thread:
             self.thread.join(timeout=1.0)
 
+        # Stop inference pool (STEREO_NN mode)
+        if self.inference_pool:
+            self.inference_pool.stop()
+            self.inference_pool = None
+
+        # Stop grabber thread
         if self.grabber_thread:
             self.grabber_thread.join(timeout=1.0)
+            self.grabber_thread = None
 
+        # Release camera
         if self.cap:
             self.cap.release()
+            self.cap = None
 
         print("Stereo camera disconnected")
 
@@ -353,7 +577,8 @@ class StereoCameraController:
         The detection loop always gets the latest frame instantly.
         """
         grab_count = 0
-        grab_start = time.perf_counter()
+        fps_window_start = time.perf_counter()
+        fps_window_count = 0
 
         while self.running and self.cap and self.cap.isOpened():
             try:
@@ -362,17 +587,20 @@ class StereoCameraController:
                 if ret and frame is not None:
                     with self.frame_lock:
                         self.latest_frame = frame
-                    self.frame_ready.set()
+                    self.frame_ready_event.set()
                     grab_count += 1
+                    fps_window_count += 1
 
                     # Write frame to video if recording
                     if self.recording and self.video_writer:
                         self.video_writer.write(frame)
 
-                    # Calculate grabber FPS every 100 frames
-                    if grab_count % 100 == 0:
-                        elapsed = time.perf_counter() - grab_start
-                        self.grabber_fps = grab_count / elapsed if elapsed > 0 else 0
+                    # Calculate grabber FPS every 100 frames (sliding window)
+                    if fps_window_count >= 100:
+                        elapsed = time.perf_counter() - fps_window_start
+                        self.grabber_fps = fps_window_count / elapsed if elapsed > 0 else 0
+                        fps_window_start = time.perf_counter()
+                        fps_window_count = 0
 
             except Exception as e:
                 print(f"Error in frame grabber: {e}")
@@ -388,14 +616,15 @@ class StereoCameraController:
             try:
                 loop_start = time.perf_counter()
 
-                # Get latest frame from grabber (non-blocking)
+                # Get frame from threaded grabber (both modes now use this)
                 with self.frame_lock:
                     frame = self.latest_frame
-                t_get_frame = time.perf_counter()
 
                 if frame is None:
                     time.sleep(0.001)
                     continue
+
+                t_get_frame = time.perf_counter()
 
                 self.frame_count += 1
 
@@ -412,6 +641,7 @@ class StereoCameraController:
                     'y': 0.0,
                     'z': 0.0,
                     'detected': False,
+                    'in_control_zone': False,  # True = within 200mm radius, safe for control
                     'error_x': 0.0,
                     'error_y': 0.0,
                     'confidence': 0.0
@@ -419,9 +649,19 @@ class StereoCameraController:
 
                 # Run detection based on mode
                 if self.detection_mode == 'STEREO_NN':
-                    # New pipeline: stereo neural network
-                    detection_result = self.detector.detect_stereo(left_frame, right_frame)
+                    # New pipeline: inference pool (separate process)
+                    # Submit frame to pool
+                    if not self.inference_pool.submit_frame(frame):
+                        continue  # Pool busy, skip this frame
+
+                    # Get result (blocking with timeout)
+                    detection_result = self.inference_pool.get_result(timeout=0.05)
                     t_detect = time.perf_counter()
+
+                    if detection_result is None:
+                        # No result yet
+                        continue
+
                     timing = detection_result['timing']
                     t_rectify = t_detect
 
@@ -442,12 +682,19 @@ class StereoCameraController:
                             if self.platform_transform is not None:
                                 R, T = self.platform_transform
                                 point_3d = apply_platform_transform(point_3d, R, T)
+
+                            # Check if detection is within control zone
+                            MAX_RADIUS = 200.0  # mm - circular boundary
+                            dist_sq = point_3d[0]**2 + point_3d[1]**2
+                            in_control_zone = dist_sq <= MAX_RADIUS**2
+
                             ball_data = {
                                 'timestamp': time.time(),
                                 'x': float(point_3d[0]),
                                 'y': float(point_3d[1]),
                                 'z': float(point_3d[2]),
                                 'detected': True,
+                                'in_control_zone': in_control_zone,  # False = outside 200mm, don't use for control
                                 'error_x': 0.0,
                                 'error_y': 0.0,
                                 'confidence': confidence
@@ -467,8 +714,8 @@ class StereoCameraController:
                               f"get: {get_frame_ms:.1f} | split: {split_ms:.1f} | "
                               f"detect: {detect_ms:.1f} | pt_rect: {rectify_ms:.1f} | rest: {rest_ms:.1f} | "
                               f"grabber: {self.grabber_fps:.1f}fps")
-                        print(f"  resize: {timing['resize_ms']:.2f} | cvt: {timing['convert_ms']:.2f} | "
-                              f"norm: {timing['normalize_ms']:.2f} | stereo_nn: {timing['stereo_ms']:.2f} | "
+                        print(f"  copy: {timing['copy_ms']:.2f} | prep: {timing['preprocess_ms']:.2f} | "
+                              f"stereo_nn: {timing['stereo_ms']:.2f} | "
                               f"refine_L: {timing['refine_L_ms']:.2f} | refine_R: {timing['refine_R_ms']:.2f}")
                         if detection_result['detected']:
                             print(f"  conf={detection_result['confidence']:.2f} | "
@@ -500,12 +747,19 @@ class StereoCameraController:
                             if self.platform_transform is not None:
                                 R, T = self.platform_transform
                                 point_3d = apply_platform_transform(point_3d, R, T)
+
+                            # Check if detection is within control zone
+                            MAX_RADIUS = 200.0  # mm - circular boundary
+                            dist_sq = point_3d[0]**2 + point_3d[1]**2
+                            in_control_zone = dist_sq <= MAX_RADIUS**2
+
                             ball_data = {
                                 'timestamp': time.time(),
                                 'x': float(point_3d[0]),
                                 'y': float(point_3d[1]),
                                 'z': float(point_3d[2]),
                                 'detected': True,
+                                'in_control_zone': in_control_zone,  # False = outside 200mm, don't use for control
                                 'error_x': 0.0,
                                 'error_y': 0.0,
                                 'confidence': min(conf_left, conf_right)

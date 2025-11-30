@@ -35,7 +35,7 @@ DETECTION_MODE = 'ROI_CNN'
 # ============================================================================
 # DEBUG OPTIONS
 # ============================================================================
-DEBUG_DETECTION_TIMING = True   # Print detection timing breakdown (ROI, prep, CNN)
+DEBUG_DETECTION_TIMING = False   # Print detection timing breakdown (ROI, prep, CNN)
 DEBUG_TIMING_INTERVAL = 100     # Print timing every N frames
 
 # ============================================================================
@@ -252,17 +252,17 @@ class PIDConfig:
     """Default PID controller parameters."""
 
     # Simulation defaults (aggressive tuning for ideal conditions)
-    SIM_DEFAULT_GAINS = {
-        'kp': 3.0,
-        'ki': 0.0,
-        'kd': 3.0
-    }
-
-    # Hardware defaults (conservative tuning for real system)
     HW_DEFAULT_GAINS = {
         'kp': 1.0,
         'ki': 0.0,
         'kd': 4.0
+    }
+
+    # Hardware defaults (tuned for mm coordinates from stereo camera)
+    HW_DEFAULT_GAINS = {
+        'kp': 5.0,
+        'ki': 0.0,
+        'kd': 3.0
     }
 
     # Scalar multiplier values for GUI sliders
@@ -279,9 +279,9 @@ class PIDConfig:
     }
 
     HW_SCALAR_INDICES = {
-        'kp': 6,  # 0.1
+        'kp': 5,  # 0.01 → kp = 5.0 × 0.01 = 0.05
         'ki': 6,  # 0.1
-        'kd': 5  # 0.01
+        'kd': 5   # 0.01 → kd = 3.0 × 0.01 = 0.03
     }
 
     # Controller limits
@@ -577,7 +577,7 @@ class StereoCameraConfig:
     #   2 = mobileLiteV3         (1M params, full MobileNetV3-Small)
     #   3 = CustomCNN            (custom architecture)
     #   4 = shufflenetV2         (ShuffleNetV2 x0.5)
-    MODEL_SELECT = 5  # <-- Change this to switch models
+    MODEL_SELECT = 7  # <-- Change this to switch models
     USE_INT8 = False  # <-- Set True to use INT8 quantized version
 
     # Model paths (auto-selected based on MODEL_SELECT and USE_INT8)
@@ -586,7 +586,9 @@ class StereoCameraConfig:
         2: 'ball_detection/models/mobileLiteV3/mobileLiteV3',
         3: 'ball_detection/models/CustomCNN/CustomCNN',
         4: 'ball_detection/models/shufflenetV2/shufflenetV2',
-        5: 'ball_detection/models/new/mobilenet/mobilenet'
+        5: 'ball_detection/models/new/mobilenet/mobilenet',
+        6: 'ball_detection/models/new/shufflenet/shufflenet',
+        7: 'ball_detection/models/new/cnn/cnn',
     }
     MODEL_PATH = _MODEL_PATHS[MODEL_SELECT] + ('_int8.onnx' if USE_INT8 else '.onnx')
     # =========================================================================

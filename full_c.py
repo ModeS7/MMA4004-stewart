@@ -954,6 +954,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
                 self.ball_pos_mm = np.array([ball_x_mm, ball_y_mm])
                 self.ball_detected = ball_data.get('detected', False)
+                self.ball_in_control_zone = ball_data.get('in_control_zone', True)
 
                 # Update ball_pos tensor for plotting (convert mm to m)
                 self.ball_pos[0, 0] = ball_x_mm / 1000.0
@@ -979,8 +980,8 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 ry_deg = self.prev_effective_angles.get('ry', 0.0)
                 self.kalman_filter.predict([rx_deg, ry_deg])
 
-                # Update step (only when ball is detected)
-                if ball_data is not None and self.ball_detected:
+                # Update step (only when ball is detected AND within control zone)
+                if ball_data is not None and self.ball_detected and self.ball_in_control_zone:
                     # Convert mm to meters for Kalman filter
                     ball_pos_m = [self.ball_pos_mm[0] / 1000.0, self.ball_pos_mm[1] / 1000.0]
                     self.kalman_filter.update(ball_pos_m, self.simulation_time)
@@ -1006,81 +1007,102 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
             # Update controller if enabled and ball is detected
             if self.controller_enabled and self.controller is not None and self.ball_detected:
-                control_output = self._update_controller(
-                    ball_pos_mm, ball_vel_mm_s, target_pos_mm, self.control_interval
-                )
+                if self.ball_in_control_zone:
+                    # Ball within control zone - run controller
+                    control_output = self._update_controller(
+                        ball_pos_mm, ball_vel_mm_s, target_pos_mm, self.control_interval
+                    )
 
-                if control_output is not None:
-                    rx_ctrl, ry_ctrl = control_output
-                    rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, MAX_CONTROLLER_OUTPUT_DEG)
+                    if control_output is not None:
+                        rx_ctrl, ry_ctrl = control_output
+                        rx_ctrl, ry_ctrl, _ = clip_tilt_vector(rx_ctrl, ry_ctrl, MAX_CONTROLLER_OUTPUT_DEG)
 
-                    # Store controller output (gravity-relative) for Kalman physics prediction
-                    self.prev_effective_angles['rx'] = rx_ctrl
-                    self.prev_effective_angles['ry'] = ry_ctrl
+                        # Store controller output (gravity-relative) for Kalman physics prediction
+                        self.prev_effective_angles['rx'] = rx_ctrl
+                        self.prev_effective_angles['ry'] = ry_ctrl
 
-                    # Apply IMU compensation to achieve desired effective tilt
-                    rx, ry = self._apply_imu_tilt_correction(rx_ctrl, ry_ctrl)
+                        # Apply IMU compensation to achieve desired effective tilt
+                        rx, ry = self._apply_imu_tilt_correction(rx_ctrl, ry_ctrl)
 
-                    # Update dof_values so GUI reflects final combined state
-                    self.dof_values['rx'] = rx
-                    self.dof_values['ry'] = ry
+                        # Update dof_values so GUI reflects final combined state
+                        self.dof_values['rx'] = rx
+                        self.dof_values['ry'] = ry
 
-                    # Determine yaw angle (from IMU if 6-DOF enabled, otherwise manual)
-                    if self.orientation_kalman.enable_yaw_tracking and self.imu_tilt_correction_enabled:
-                        rz = np.clip(self.current_yaw_imu, -MAX_YAW_ANGLE_DEG, MAX_YAW_ANGLE_DEG)
-                    else:
-                        rz = self.dof_values['rz']
-
-                    # Calculate servo angles
-                    translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
-                    rotation = np.array([rx, ry, rz])
-
-                    # Apply Z optimization if enabled
-                    if self.z_optimization_enabled:
-                        optimized_translation, angles, success = self.ik.optimize_z_offset(
-                            translation, rotation,
-                            use_top_surface_offset=self.use_top_surface_offset,
-                            z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
-                            max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
-                            tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
-                            ik_cache=self.ik_cache if hasattr(self, 'ik_cache') else None
-                        )
-
-                        if success and angles is not None:
-                            self.z_offset = optimized_translation[2] - translation[2]
-                            max_angle = np.max(angles)
-                            min_angle = np.min(angles)
-                            self.servo_balance = (max_angle, min_angle)
+                        # Determine yaw angle (from IMU if 6-DOF enabled, otherwise manual)
+                        if self.orientation_kalman.enable_yaw_tracking and self.imu_tilt_correction_enabled:
+                            rz = np.clip(self.current_yaw_imu, -MAX_YAW_ANGLE_DEG, MAX_YAW_ANGLE_DEG)
                         else:
-                            # Fallback to standard IK
-                            angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                            rz = self.dof_values['rz']
+
+                        # Calculate servo angles
+                        translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
+                        rotation = np.array([rx, ry, rz])
+
+                        # Apply Z optimization if enabled
+                        if self.z_optimization_enabled:
+                            optimized_translation, angles, success = self.ik.optimize_z_offset(
+                                translation, rotation,
+                                use_top_surface_offset=self.use_top_surface_offset,
+                                z_search_range=IKZOptimizationConfig.Z_SEARCH_RANGE_MM,
+                                max_iterations=IKZOptimizationConfig.MAX_ITERATIONS,
+                                tolerance=IKZOptimizationConfig.TOLERANCE_DEG,
+                                ik_cache=self.ik_cache if hasattr(self, 'ik_cache') else None
+                            )
+
+                            if success and angles is not None:
+                                self.z_offset = optimized_translation[2] - translation[2]
+                                max_angle = np.max(angles)
+                                min_angle = np.min(angles)
+                                self.servo_balance = (max_angle, min_angle)
+                            else:
+                                # Fallback to standard IK
+                                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                                if angles is not None:
+                                    max_angle = np.max(angles)
+                                    min_angle = np.min(angles)
+                                    self.servo_balance = (max_angle, min_angle)
+                                    self.z_offset = 0.0
+                        else:
+                            # Standard IK (with cache if available)
+                            if self.ik_cache:
+                                angles = self.ik_cache.get(translation, rotation)
+                                if angles is None:
+                                    angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+                                    if angles is not None:
+                                        self.ik_cache.put(translation, rotation, angles)
+                            else:
+                                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
+
+                            # Update servo balance for display
                             if angles is not None:
                                 max_angle = np.max(angles)
                                 min_angle = np.min(angles)
                                 self.servo_balance = (max_angle, min_angle)
                                 self.z_offset = 0.0
-                    else:
-                        # Standard IK (with cache if available)
-                        if self.ik_cache:
-                            angles = self.ik_cache.get(translation, rotation)
-                            if angles is None:
-                                angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
-                                if angles is not None:
-                                    self.ik_cache.put(translation, rotation, angles)
-                        else:
-                            angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
 
-                        # Update servo balance for display
                         if angles is not None:
-                            max_angle = np.max(angles)
-                            min_angle = np.min(angles)
-                            self.servo_balance = (max_angle, min_angle)
-                            self.z_offset = 0.0
+                            self.serial_controller.send_servo_angles(angles)
+                            self.last_cmd_angles = angles
 
+                            self.prev_platform_angles['rx'] = rx
+                            self.prev_platform_angles['ry'] = ry
+                else:
+                    # Ball outside control zone - hold platform level
+                    rx_ctrl, ry_ctrl = 0.0, 0.0
+                    self.prev_effective_angles['rx'] = 0.0
+                    self.prev_effective_angles['ry'] = 0.0
+
+                    rx, ry = self._apply_imu_tilt_correction(0.0, 0.0)
+                    self.dof_values['rx'] = rx
+                    self.dof_values['ry'] = ry
+
+                    rz = self.dof_values['rz']
+                    translation = np.array([0.0, 0.0, self.ik.home_height_top_surface])
+                    rotation = np.array([rx, ry, rz])
+                    angles = self.ik.calculate_servo_angles(translation, rotation, self.use_top_surface_offset)
                     if angles is not None:
                         self.serial_controller.send_servo_angles(angles)
                         self.last_cmd_angles = angles
-
                         self.prev_platform_angles['rx'] = rx
                         self.prev_platform_angles['ry'] = ry
 
