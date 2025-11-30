@@ -21,7 +21,7 @@ torch.set_float32_matmul_precision('high')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rl_config import EnvConfig, PPOConfig, RewardConfig, TrainingConfig
-from env_gpu import StewartEnvGPU
+from env import StewartEnvVec
 from ppo_agent import PPOAgent, RolloutBuffer
 
 
@@ -45,15 +45,15 @@ SAVE_INTERVAL = 50      # Save checkpoint every N updates
 
 def evaluate(agent, env_config, reward_config, num_episodes=10, device="cuda"):
     """Evaluate agent on fresh environments."""
-    eval_env = StewartEnvGPU(
+    eval_env = StewartEnvVec(
         num_envs=num_episodes,
         config=env_config,
         reward_config=reward_config,
-        device=device,
-        use_domain_randomization=False  # Fixed physics for evaluation
+        device=device
     )
 
-    obs, _ = eval_env.reset_tensor()
+    obs, _ = eval_env.reset()
+    obs = torch.from_numpy(obs).to(device)
     episode_rewards = torch.zeros(num_episodes, device=device)
     episode_lengths = torch.zeros(num_episodes, device=device)
     done_mask = torch.zeros(num_episodes, device=device, dtype=torch.bool)
@@ -97,15 +97,14 @@ def train():
     print(f"  N epochs: {ppo_cfg.n_epochs}")
     print(f"  Samples per update: {NUM_ENVS * ppo_cfg.n_steps:,}")
 
-    # Create environment
-    env = StewartEnvGPU(
+    # Create simulation environment
+    env = StewartEnvVec(
         num_envs=NUM_ENVS,
         config=env_cfg,
         reward_config=reward_cfg,
-        device=DEVICE,
-        use_domain_randomization=env_cfg.use_domain_randomization
+        device=DEVICE
     )
-    print(f"\nGPU Environment created with {NUM_ENVS} parallel envs on {DEVICE}")
+    print(f"\nSimulation environment created with {NUM_ENVS} parallel envs")
 
     # Create agent
     agent = PPOAgent(

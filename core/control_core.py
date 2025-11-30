@@ -625,12 +625,30 @@ class RLController:
 
         return rx, ry
 
-    def reset(self) -> None:
-        """Reset controller state."""
-        self.current_rx = 0.0
-        self.current_ry = 0.0
-        self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
+    def reset(self, ball_pos_mm: Tuple[float, float] = (0.0, 0.0),
+              platform_tilt_deg: Tuple[float, float] = (0.0, 0.0),
+              target_pos_mm: Tuple[float, float] = (0.0, 0.0)) -> None:
+        """
+        Reset controller state and initialize frame history.
+
+        IMPORTANT: Must pass actual ball position to properly initialize frame history!
+        In training, all 12 frames are initialized with the actual observation.
+        If reset() is called with zeros when ball is elsewhere, model will be confused.
+
+        Args:
+            ball_pos_mm: Current ball position in mm (default: center)
+            platform_tilt_deg: Current platform tilt in degrees (default: level)
+            target_pos_mm: Target position in mm (default: center)
+        """
+        self.current_rx = platform_tilt_deg[0]
+        self.current_ry = platform_tilt_deg[1]
         self.last_time = None
+
+        # Build initial frame with actual position (matches training env_gpu.py reset)
+        initial_frame = self._get_frame(ball_pos_mm, platform_tilt_deg, 0.01, target_pos_mm)
+
+        # Initialize ALL frames with the same observation (matches training)
+        self.frame_history = np.tile(initial_frame, (self.num_frames, 1))
 
     def set_platform_tilt(self, rx: float, ry: float) -> None:
         """Update tracked platform tilt (call with IMU/FK feedback)."""

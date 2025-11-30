@@ -1,552 +1,448 @@
 """
-Stewart Platform Environment for Feedforward Agent
-
-Features:
-- 12 frames of history with dt timing
-- Domain randomization for sim-to-real transfer
-- Returns observations and physics ground truth
+Stewart Platform RL Environment
 """
 
 import numpy as np
-import numba as nb
+import torch
+from typing import Tuple, Dict, Any, Optional
 
-try:
-    from .rl_config import EnvConfig, RewardConfig
-except ImportError:
-    from rl_config import EnvConfig, RewardConfig
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.core import SimpleBallPhysics2D, FirstOrderServo, StewartPlatformIK
+from core.utils import (
+    SimulationConfig, StewartPlatformConfig, BallPhysicsConfig,
+    PLATFORM_RADIUS_MM, MAX_CONTROLLER_OUTPUT_DEG
+)
+from RL.rl_config import EnvConfig, RewardConfig
 
-# ============================================================================
-# NUMBA-OPTIMIZED PHYSICS (same as original)
-# ============================================================================
-
-@nb.njit(fastmath=True, cache=True)
-def clip_value(value, min_val, max_val):
-    if value < min_val:
-        return min_val
-    elif value > max_val:
-        return max_val
-    return value
-
-
-@nb.njit(fastmath=True, cache=True)
-def compute_ball_acceleration(ball_x, ball_y, ball_vx, ball_vy,
-                               platform_rx, platform_ry,
-                               g, mass_factor, mu_roll):
-    sin_rx = np.sin(platform_rx)
-    sin_ry = np.sin(platform_ry)
-    cos_rx = np.cos(platform_rx)
-    cos_ry = np.cos(platform_ry)
-
-    ax = g * sin_ry * cos_rx / mass_factor
-    ay = -g * sin_rx * cos_ry / mass_factor
-
-    speed = np.sqrt(ball_vx * ball_vx + ball_vy * ball_vy)
-    if speed > 1e-6:
-        friction_ax = -mu_roll * g * ball_vx / speed
-        friction_ay = -mu_roll * g * ball_vy / speed
-        ax += friction_ax
-        ay += friction_ay
-
-    return ax, ay
-
-
-@nb.njit(fastmath=True, cache=True)
-def rk4_step(x, y, vx, vy, rx, ry, dt, g, mass_factor, mu_roll):
-    ax1, ay1 = compute_ball_acceleration(x, y, vx, vy, rx, ry, g, mass_factor, mu_roll)
-    k1_x, k1_y = vx, vy
-    k1_vx, k1_vy = ax1, ay1
-
-    x2 = x + 0.5 * dt * k1_x
-    y2 = y + 0.5 * dt * k1_y
-    vx2 = vx + 0.5 * dt * k1_vx
-    vy2 = vy + 0.5 * dt * k1_vy
-    ax2, ay2 = compute_ball_acceleration(x2, y2, vx2, vy2, rx, ry, g, mass_factor, mu_roll)
-    k2_x, k2_y = vx2, vy2
-    k2_vx, k2_vy = ax2, ay2
-
-    x3 = x + 0.5 * dt * k2_x
-    y3 = y + 0.5 * dt * k2_y
-    vx3 = vx + 0.5 * dt * k2_vx
-    vy3 = vy + 0.5 * dt * k2_vy
-    ax3, ay3 = compute_ball_acceleration(x3, y3, vx3, vy3, rx, ry, g, mass_factor, mu_roll)
-    k3_x, k3_y = vx3, vy3
-    k3_vx, k3_vy = ax3, ay3
-
-    x4 = x + dt * k3_x
-    y4 = y + dt * k3_y
-    vx4 = vx + dt * k3_vx
-    vy4 = vy + dt * k3_vy
-    ax4, ay4 = compute_ball_acceleration(x4, y4, vx4, vy4, rx, ry, g, mass_factor, mu_roll)
-    k4_x, k4_y = vx4, vy4
-    k4_vx, k4_vy = ax4, ay4
-
-    new_x = x + (dt / 6.0) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
-    new_y = y + (dt / 6.0) * (k1_y + 2.0 * k2_y + 2.0 * k3_y + k4_y)
-    new_vx = vx + (dt / 6.0) * (k1_vx + 2.0 * k2_vx + 2.0 * k3_vx + k4_vx)
-    new_vy = vy + (dt / 6.0) * (k1_vy + 2.0 * k2_vy + 2.0 * k3_vy + k4_vy)
-
-    return new_x, new_y, new_vx, new_vy
-
-
-# ============================================================================
-# ENVIRONMENT CLASS
-# ============================================================================
 
 class StewartEnv:
     """
-    Stewart Platform Environment with frame history.
-
-    Observation: [x, y, rx, ry, dt] × num_frames
-    Returns physics ground truth for auxiliary loss.
-    Supports domain randomization.
+    Stewart platform environment for RL training.
+    Single environment only (no vectorization).
     """
 
-    def __init__(self, num_envs=1, config=None, reward_config=None, use_domain_randomization=None):
-        self.num_envs = num_envs
+    def __init__(
+        self,
+        config: Optional[EnvConfig] = None,
+        reward_config: Optional[RewardConfig] = None,
+        device: str = "cuda"
+    ):
         self.cfg = config or EnvConfig()
         self.reward_cfg = reward_config or RewardConfig()
+        self.device = torch.device(device)
 
-        # Override domain randomization if specified
-        if use_domain_randomization is not None:
-            self.cfg.use_domain_randomization = use_domain_randomization
+        # Platform parameters
+        self.platform_radius_mm = PLATFORM_RADIUS_MM
+        self.platform_radius_m = PLATFORM_RADIUS_MM / 1000.0
+        self.max_tilt_deg = MAX_CONTROLLER_OUTPUT_DEG
 
-        # Convert to SI units
-        self.platform_radius_m = self.cfg.platform_radius_mm / 1000.0
-        self.max_tilt_rad = np.radians(self.cfg.max_tilt_deg)
+        # Initialize Stewart Platform IK
+        platform_params = StewartPlatformConfig.as_dict()
+        self.ik = StewartPlatformIK(**platform_params)
 
-        # Default physics (will be randomized per env)
-        self.g = 9.81
-        self.default_mass_factor = 5.0 / 3.0
-        self.default_mu_roll = 0.02
-        self.default_servo_tau = 0.05
+        # Initialize 6 servos
+        self.servos = [
+            FirstOrderServo(
+                K=1.0,
+                tau=SimulationConfig.DEFAULT_SERVO_TAU,
+                delay=SimulationConfig.DEFAULT_SERVO_DELAY,
+                max_velocity=SimulationConfig.DEFAULT_SERVO_MAX_VELOCITY
+            )
+            for _ in range(6)
+        ]
 
-        # Per-environment physics parameters (for domain randomization)
-        self.mass_factor = np.full(num_envs, self.default_mass_factor, dtype=np.float32)
-        self.mu_roll = np.full(num_envs, self.default_mu_roll, dtype=np.float32)
-        self.servo_tau = np.full(num_envs, self.default_servo_tau, dtype=np.float32)
+        # Initialize ball physics
+        self.ball_physics = SimpleBallPhysics2D(**BallPhysicsConfig.for_physics_sim())
 
-        # Per-environment timing parameters
-        # base_dt: each env has different base timestep (5-20ms)
-        # actual_dt: the dt used for current step (with variance and jitter)
-        self.base_dt = np.full(num_envs, self.cfg.dt, dtype=np.float32)
-        self.actual_dt = np.full(num_envs, self.cfg.dt, dtype=np.float32)
+        # State variables
+        self.ball_pos = np.zeros((1, 3), dtype=np.float32)  # [x, y, z] in meters
+        self.ball_vel = np.zeros((1, 3), dtype=np.float32)
+        self.ball_omega = np.zeros((1, 3), dtype=np.float32)
 
-        # Timing randomization settings
-        self.dt_range = (0.005, 0.020)  # 5-20ms base dt range
-        self.dt_variance = 0.20          # 20% variance per step
-        self.jitter_prob = 0.002         # 0.2% chance of jitter
-        self.jitter_dt = 0.050           # 50ms jitter when it occurs
+        # Platform state
+        self.platform_rx = 0.0  # degrees
+        self.platform_ry = 0.0  # degrees
+        self.home_z = self.ik.home_height_top_surface
 
-        # Platform placement offset (simulates non-level surface)
-        # Random 0-2 degree tilt in random direction, set once per env
-        self.platform_offset_max_deg = 2.0
-        self.platform_offset_rx = np.zeros(num_envs, dtype=np.float32)
-        self.platform_offset_ry = np.zeros(num_envs, dtype=np.float32)
+        # For FK warm-start
+        self.last_fk_translation = None
+        self.last_fk_rotation = None
 
-        # State arrays
-        self.ball_x = np.zeros(num_envs, dtype=np.float32)
-        self.ball_y = np.zeros(num_envs, dtype=np.float32)
-        self.ball_vx = np.zeros(num_envs, dtype=np.float32)
-        self.ball_vy = np.zeros(num_envs, dtype=np.float32)
-        self.platform_rx = np.zeros(num_envs, dtype=np.float32)
-        self.platform_ry = np.zeros(num_envs, dtype=np.float32)
+        # Platform angular acceleration (for advanced physics)
+        self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
+        self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
+        self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
 
-        # Target position (where ball should go, normalized)
-        # For now always 0,0 (center), later can be trajectories
-        self.target_x = np.zeros(num_envs, dtype=np.float32)
-        self.target_y = np.zeros(num_envs, dtype=np.float32)
+        # Simulation time
+        self.sim_time = 0.0
+        self.dt = self.cfg.dt
+        self.step_count = 0
 
-        # Episode tracking
-        self.step_count = np.zeros(num_envs, dtype=np.int32)
-        self.episode_reward = np.zeros(num_envs, dtype=np.float32)
-        self.prev_actions = np.zeros((num_envs, 2), dtype=np.float32)
+        # Frame history for observations
+        self.num_frames = self.cfg.num_frames
+        self.obs_per_frame = self.cfg.obs_per_frame
+        self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
 
-        # Frame history buffer: (num_envs, num_frames, obs_per_frame)
-        # obs_per_frame = [ball_x, ball_y, platform_rx, platform_ry, dt]
-        self.frame_history = np.zeros(
-            (num_envs, self.cfg.num_frames, self.cfg.obs_per_frame),
-            dtype=np.float32
-        )
+        # Target position (always center for now)
+        self.target_x = 0.0
+        self.target_y = 0.0
 
-        # Last step time for dt calculation (simulated)
-        self.last_step_time = np.zeros(num_envs, dtype=np.float32)
+        # Reward scales (from interactive dashboard values)
+        self.dist_scale = self.reward_cfg.dist_scale
+        self.speed_scale = self.reward_cfg.speed_scale
+        self.fall_penalty = self.reward_cfg.fall_penalty
+        self.approach_scale = self.reward_cfg.approach_scale
 
-        # Warmup numba
-        self._warmup_numba()
+        # Physics ground truth for auxiliary loss
+        self.physics_gt = np.array([
+            self.ball_physics.mu_roll,
+            SimulationConfig.DEFAULT_SERVO_TAU,
+            self.ball_physics.mass_factor
+        ], dtype=np.float32)
 
-    def _warmup_numba(self):
-        """Pre-compile Numba functions."""
-        _ = rk4_step(0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                     self.cfg.dt, self.g, self.default_mass_factor, self.default_mu_roll)
+    def reset(self) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Reset environment to random initial state."""
+        # Reset simulation time
+        self.sim_time = 0.0
+        self.step_count = 0
 
-    def _randomize_platform_offset(self, indices):
-        """Randomize platform placement offset (non-level surface simulation)."""
-        n = len(indices)
+        # Reset servos
+        for servo in self.servos:
+            servo.reset()
 
-        if self.cfg.use_domain_randomization:
-            # Random magnitude 0 to max_deg
-            magnitude = np.random.uniform(0, self.platform_offset_max_deg, n)
-            # Random direction (angle in radians)
-            direction = np.random.uniform(0, 2 * np.pi, n)
+        # Reset platform state
+        self.platform_rx = 0.0
+        self.platform_ry = 0.0
+        self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
+        self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
+        self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
 
-            # Convert to rx, ry offsets
-            self.platform_offset_rx[indices] = np.radians(magnitude * np.sin(direction)).astype(np.float32)
-            self.platform_offset_ry[indices] = np.radians(magnitude * np.cos(direction)).astype(np.float32)
-        else:
-            self.platform_offset_rx[indices] = 0.0
-            self.platform_offset_ry[indices] = 0.0
-
-    def _randomize_physics(self, indices):
-        """Randomize physics parameters for specified environments."""
-        n = len(indices)
-
-        if self.cfg.use_domain_randomization:
-            # Randomize friction
-            self.mu_roll[indices] = np.random.uniform(
-                self.cfg.friction_range[0],
-                self.cfg.friction_range[1],
-                n
-            ).astype(np.float32)
-
-            # Randomize servo time constant
-            self.servo_tau[indices] = np.random.uniform(
-                self.cfg.servo_tau_range[0],
-                self.cfg.servo_tau_range[1],
-                n
-            ).astype(np.float32)
-
-            # Randomize mass factor
-            self.mass_factor[indices] = np.random.uniform(
-                self.cfg.mass_factor_range[0],
-                self.cfg.mass_factor_range[1],
-                n
-            ).astype(np.float32)
-
-            # Randomize base dt (5-20ms per environment)
-            self.base_dt[indices] = np.random.uniform(
-                self.dt_range[0],
-                self.dt_range[1],
-                n
-            ).astype(np.float32)
-        else:
-            # Use default values
-            self.mu_roll[indices] = self.default_mu_roll
-            self.servo_tau[indices] = self.default_servo_tau
-            self.mass_factor[indices] = self.default_mass_factor
-            self.base_dt[indices] = self.cfg.dt
-
-    def _sample_dt(self):
-        """
-        Sample actual dt for this step with variance and jitter.
-
-        Each environment has:
-        - base_dt: 5-20ms (set at reset)
-        - variance: ±20% of base_dt
-        - jitter: 0.2% chance of 50ms spike
-        """
-        # Start with base dt + 20% variance
-        variance = 1.0 + np.random.uniform(-self.dt_variance, self.dt_variance, self.num_envs)
-        self.actual_dt = (self.base_dt * variance).astype(np.float32)
-
-        # Apply jitter (0.2% chance of 50ms)
-        jitter_mask = np.random.random(self.num_envs) < self.jitter_prob
-        self.actual_dt[jitter_mask] = self.jitter_dt
-
-        # Clamp to reasonable range (1ms - 60ms)
-        self.actual_dt = np.clip(self.actual_dt, 0.001, 0.060)
-
-        return self.actual_dt
-
-    def get_physics_normalized(self):
-        """
-        Get normalized physics parameters for all environments.
-
-        Returns: (num_envs, 3) array of [friction, servo_tau, mass_factor] in [0, 1]
-        """
-        physics = np.zeros((self.num_envs, 3), dtype=np.float32)
-
-        # Normalize to [0, 1] based on ranges
-        fr = self.cfg.friction_range
-        sr = self.cfg.servo_tau_range
-        mr = self.cfg.mass_factor_range
-
-        physics[:, 0] = (self.mu_roll - fr[0]) / (fr[1] - fr[0])
-        physics[:, 1] = (self.servo_tau - sr[0]) / (sr[1] - sr[0])
-        physics[:, 2] = (self.mass_factor - mr[0]) / (mr[1] - mr[0])
-
-        return np.clip(physics, 0, 1)
-
-    def reset(self, indices=None):
-        """
-        Reset environments.
-
-        Returns:
-            obs: (num_envs, obs_dim) observations
-            physics_gt: (num_envs, physics_dim) normalized physics ground truth
-        """
-        if indices is None:
-            indices = np.arange(self.num_envs)
-
-        n = len(indices)
-
-        # Randomize physics and platform offset for these environments
-        self._randomize_physics(indices)
-        self._randomize_platform_offset(indices)
-
-        # Random initial position
-        init_pos_m = self.cfg.init_pos_range_mm / 1000.0
-        self.ball_x[indices] = np.random.uniform(-init_pos_m, init_pos_m, n).astype(np.float32)
-        self.ball_y[indices] = np.random.uniform(-init_pos_m, init_pos_m, n).astype(np.float32)
+        # Random initial ball position (uniform in circle)
+        init_radius_m = self.cfg.init_pos_range_mm / 1000.0
+        r = np.sqrt(np.random.random()) * init_radius_m
+        theta = np.random.random() * 2 * np.pi
+        init_x = r * np.cos(theta)
+        init_y = r * np.sin(theta)
 
         # Random initial velocity
         init_vel_m_s = self.cfg.init_vel_range_mm_s / 1000.0
-        self.ball_vx[indices] = np.random.uniform(-init_vel_m_s, init_vel_m_s, n).astype(np.float32)
-        self.ball_vy[indices] = np.random.uniform(-init_vel_m_s, init_vel_m_s, n).astype(np.float32)
+        init_vx = np.random.uniform(-init_vel_m_s, init_vel_m_s)
+        init_vy = np.random.uniform(-init_vel_m_s, init_vel_m_s)
 
-        # Platform starts level
-        self.platform_rx[indices] = 0.0
-        self.platform_ry[indices] = 0.0
+        # Set ball state
+        ball_z = (self.home_z / 1000.0) + self.ball_physics.radius
+        self.ball_pos = np.array([[init_x, init_y, ball_z]], dtype=np.float32)
+        self.ball_vel = np.array([[init_vx, init_vy, 0.0]], dtype=np.float32)
+        self.ball_omega = np.zeros((1, 3), dtype=np.float32)
 
-        # Reset counters
-        self.step_count[indices] = 0
-        self.episode_reward[indices] = 0.0
-        self.prev_actions[indices] = 0.0
-        self.last_step_time[indices] = 0.0
+        # Reset FK warm-start
+        self.last_fk_translation = np.array([0.0, 0.0, self.home_z])
+        self.last_fk_rotation = np.array([0.0, 0.0, 0.0])
 
-        # Initialize actual_dt for first frame
-        self.actual_dt[indices] = self.base_dt[indices]
+        # Build initial observation frame
+        initial_frame = self._get_single_frame()
 
-        # Initialize frame history with current observation (all frames same)
-        initial_obs = self._get_single_frame()
-        for i in indices:
-            for f in range(self.cfg.num_frames):
-                self.frame_history[i, f, :] = initial_obs[i]
+        # Fill ALL frames with initial observation (same as env_gpu.py)
+        for i in range(self.num_frames):
+            self.frame_history[i] = initial_frame
+
+        obs = self.frame_history.flatten()
 
         info = {
-            'physics_gt': self.get_physics_normalized(),
-            'base_dt': self.base_dt.copy(),
+            'physics_gt': self.physics_gt.copy()
         }
 
-        return self._get_observation(), info
+        return obs, info
 
-    def _get_single_frame(self):
+    def _get_single_frame(self) -> np.ndarray:
+        """Get single observation frame (7 values)."""
+        ball_x_mm = self.ball_pos[0, 0] * 1000.0
+        ball_y_mm = self.ball_pos[0, 1] * 1000.0
+
+        frame = np.array([
+            ball_x_mm / self.platform_radius_mm,           # ball_x normalized
+            ball_y_mm / self.platform_radius_mm,           # ball_y normalized
+            self.platform_rx / self.max_tilt_deg,          # platform_rx normalized
+            self.platform_ry / self.max_tilt_deg,          # platform_ry normalized
+            self.dt / 0.01,                                # dt normalized
+            self.target_x / self.platform_radius_mm,       # target_x normalized
+            self.target_y / self.platform_radius_mm,       # target_y normalized
+        ], dtype=np.float32)
+
+        return frame
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
-        Get single frame observation for all environments.
-
-        Returns: (num_envs, obs_per_frame) array [x, y, rx, ry, dt, target_x, target_y]
-        """
-        obs = np.zeros((self.num_envs, self.cfg.obs_per_frame), dtype=np.float32)
-
-        # Ball position with noise
-        ball_x_mm = self.ball_x * 1000.0
-        ball_y_mm = self.ball_y * 1000.0
-
-        if self.cfg.use_camera_noise:
-            noise_x = np.random.normal(0, self.cfg.position_noise_std_mm, self.num_envs)
-            noise_y = np.random.normal(0, self.cfg.position_noise_std_mm, self.num_envs)
-            dist = np.sqrt(ball_x_mm**2 + ball_y_mm**2)
-            depth_scale = 1.0 + dist * self.cfg.noise_depth_scale
-            noise_x *= depth_scale
-            noise_y *= depth_scale
-            ball_x_mm = ball_x_mm + noise_x.astype(np.float32)
-            ball_y_mm = ball_y_mm + noise_y.astype(np.float32)
-
-        # Normalize position
-        obs[:, 0] = ball_x_mm / self.cfg.platform_radius_mm
-        obs[:, 1] = ball_y_mm / self.cfg.platform_radius_mm
-
-        # Normalize platform angles
-        obs[:, 2] = np.degrees(self.platform_rx) / self.cfg.max_tilt_deg
-        obs[:, 3] = np.degrees(self.platform_ry) / self.cfg.max_tilt_deg
-
-        # dt normalized (nominal dt = 0.01s = 10ms)
-        # actual_dt varies per environment and per step
-        obs[:, 4] = self.actual_dt / 0.01  # Normalized so 10ms = 1.0
-
-        # Target position (normalized)
-        obs[:, 5] = self.target_x / self.cfg.platform_radius_mm
-        obs[:, 6] = self.target_y / self.cfg.platform_radius_mm
-
-        return obs
-
-    def _get_observation(self):
-        """
-        Get observation for all environments.
-
-        Returns: (num_envs, obs_dim) array
-        """
-        return self.frame_history.reshape(self.num_envs, -1)
-
-    def step(self, actions):
-        """
-        Step all environments.
+        Step the simulation.
 
         Args:
-            actions: (num_envs, 2) array [rx_target, ry_target] in [-1, 1]
+            action: [rx_target, ry_target] normalized to [-1, 1]
 
         Returns:
-            obs: (num_envs, obs_dim)
-            rewards: (num_envs,)
-            dones: (num_envs,)
-            infos: dict with physics_gt and other info
+            obs, reward, done, truncated, info
         """
-        # Sample dt for this step (with variance and jitter)
-        self._sample_dt()
+        # Scale action to degrees
+        rx_target = float(action[0]) * self.max_tilt_deg
+        ry_target = float(action[1]) * self.max_tilt_deg
 
-        # Scale actions
-        action_rx = actions[:, 0].astype(np.float32) * self.max_tilt_rad
-        action_ry = actions[:, 1].astype(np.float32) * self.max_tilt_rad
+        # Compute IK to get servo angles
+        translation = np.array([0.0, 0.0, self.home_z])
+        rotation = np.array([rx_target, ry_target, 0.0])
 
-        # Step physics for each environment (with per-env parameters and dt)
-        fell_off = np.zeros(self.num_envs, dtype=bool)
+        servo_angles = self.ik.calculate_servo_angles(
+            translation, rotation, use_top_surface_offset=True
+        )
 
-        for i in range(self.num_envs):
-            dt_i = self.actual_dt[i]
+        if servo_angles is not None:
+            # Send commands to all 6 servos
+            for i, servo in enumerate(self.servos):
+                servo.send_command(servo_angles[i], self.sim_time)
 
-            # Servo dynamics (using per-env dt)
-            if self.servo_tau[i] > 1e-6:
-                decay = np.exp(-dt_i / self.servo_tau[i])
-                new_rx = action_rx[i] + (self.platform_rx[i] - action_rx[i]) * decay
-                new_ry = action_ry[i] + (self.platform_ry[i] - action_ry[i]) * decay
-            else:
-                new_rx = action_rx[i]
-                new_ry = action_ry[i]
+        # Update servo dynamics
+        for servo in self.servos:
+            servo.update(self.dt, self.sim_time)
 
-            new_rx = clip_value(new_rx, -self.max_tilt_rad, self.max_tilt_rad)
-            new_ry = clip_value(new_ry, -self.max_tilt_rad, self.max_tilt_rad)
+        # Get actual servo angles
+        actual_angles = np.array([servo.get_angle() for servo in self.servos])
 
-            self.platform_rx[i] = new_rx
-            self.platform_ry[i] = new_ry
+        # Compute forward kinematics to get actual platform pose
+        initial_guess = None
+        if self.last_fk_translation is not None:
+            initial_guess = (self.last_fk_translation, self.last_fk_rotation)
 
-            # Ball physics (using per-env dt)
-            # Add platform offset to simulate non-level surface
-            effective_rx = new_rx + self.platform_offset_rx[i]
-            effective_ry = new_ry + self.platform_offset_ry[i]
+        fk_translation, fk_rotation, success, _ = self.ik.calculate_forward_kinematics(
+            actual_angles,
+            initial_guess=initial_guess,
+            use_top_surface_offset=True
+        )
 
-            bx, by, bvx, bvy = rk4_step(
-                self.ball_x[i], self.ball_y[i],
-                self.ball_vx[i], self.ball_vy[i],
-                effective_rx, effective_ry, dt_i,
-                self.g, self.mass_factor[i], self.mu_roll[i]
-            )
+        if success:
+            self.last_fk_translation = fk_translation
+            self.last_fk_rotation = fk_rotation
+            actual_rx = fk_rotation[0]
+            actual_ry = fk_rotation[1]
+        else:
+            # Fallback to target if FK fails
+            actual_rx = rx_target
+            actual_ry = ry_target
 
-            # Check bounds
-            dist = np.sqrt(bx * bx + by * by)
-            if dist > self.platform_radius_m:
-                fell_off[i] = True
-                bx, by, bvx, bvy = 0.0, 0.0, 0.0, 0.0
+        # Compute platform angular acceleration
+        omega_rx = (actual_rx - self.prev_platform_angles['rx']) / self.dt
+        omega_ry = (actual_ry - self.prev_platform_angles['ry']) / self.dt
+        alpha_rx = (omega_rx - self.platform_angular_vel['rx']) / self.dt
+        alpha_ry = (omega_ry - self.platform_angular_vel['ry']) / self.dt
 
-            self.ball_x[i] = bx
-            self.ball_y[i] = by
-            self.ball_vx[i] = bvx
-            self.ball_vy[i] = bvy
+        self.platform_angular_vel['rx'] = omega_rx
+        self.platform_angular_vel['ry'] = omega_ry
+        self.platform_angular_accel['rx'] = alpha_rx
+        self.platform_angular_accel['ry'] = alpha_ry
+        self.prev_platform_angles['rx'] = actual_rx
+        self.prev_platform_angles['ry'] = actual_ry
 
-        # Compute rewards
-        rewards = self._compute_reward(actions, fell_off)
+        # Update platform state
+        self.platform_rx = actual_rx
+        self.platform_ry = actual_ry
 
-        # Update tracking
-        self.prev_actions = actions.astype(np.float32).copy()
-        self.step_count += 1
-        self.episode_reward += rewards
+        # Build platform pose for ball physics
+        # SimpleBallPhysics2D expects [x, y, z, rx, ry, rz] with x,y,z in mm and angles in degrees
+        platform_pose = np.array([[
+            0.0,  # x in mm (platform centered)
+            0.0,  # y in mm
+            self.home_z,  # z in mm
+            actual_rx,  # rx in degrees
+            actual_ry,  # ry in degrees
+            0.0   # rz in degrees
+        ]], dtype=np.float32)
 
-        # Update frame history (shift and add new frame)
+        # Step ball physics
+        self.ball_pos, self.ball_vel, self.ball_omega, contact_info = self.ball_physics.step(
+            self.ball_pos,
+            self.ball_vel,
+            self.ball_omega,
+            platform_pose,
+            self.dt,
+            platform_angular_accel=self.platform_angular_accel
+        )
+
+        # Check if ball fell off
+        done = contact_info.get('fell_off', False)
+
+        # Compute reward
+        reward = self._compute_reward(done)
+
+        # Update frame history
         new_frame = self._get_single_frame()
-        self.frame_history[:, :-1, :] = self.frame_history[:, 1:, :]
-        self.frame_history[:, -1, :] = new_frame
+        self.frame_history[:-1] = self.frame_history[1:]  # Shift left
+        self.frame_history[-1] = new_frame
 
-        # Check done
-        dones = (self.step_count >= self.cfg.max_steps) | fell_off
+        # Update time
+        self.sim_time += self.dt
+        self.step_count += 1
+
+        # Check truncation
         truncated = self.step_count >= self.cfg.max_steps
 
-        infos = {
-            'fell_off': fell_off,
-            'episode_reward': self.episode_reward.copy(),
-            'step_count': self.step_count.copy(),
-            'physics_gt': self.get_physics_normalized(),
-            'actual_dt': self.actual_dt.copy(),
-            'base_dt': self.base_dt.copy(),
+        obs = self.frame_history.flatten()
+
+        info = {
+            'physics_gt': self.physics_gt.copy(),
+            'ball_pos_mm': (self.ball_pos[0, 0] * 1000, self.ball_pos[0, 1] * 1000),
+            'platform_angles': (actual_rx, actual_ry),
+            'fell_off': done
         }
 
-        return self._get_observation(), rewards, dones, truncated, infos
+        return obs, reward, done, truncated, info
 
-    def _compute_reward(self, actions, fell_off):
-        """Compute reward (same as original)."""
-        cfg = self.reward_cfg
+    def _compute_reward(self, fell_off: bool) -> float:
+        """Compute reward (same formula as env_gpu.py)."""
+        if fell_off:
+            return float(self.fall_penalty)
 
-        pos_x_mm = self.ball_x * 1000.0
-        pos_y_mm = self.ball_y * 1000.0
-        pos_error_sq = pos_x_mm ** 2 + pos_y_mm ** 2
+        # Ball position relative to target (in mm)
+        ball_x_mm = (self.ball_pos[0, 0] - self.target_x / 1000.0) * 1000.0
+        ball_y_mm = (self.ball_pos[0, 1] - self.target_y / 1000.0) * 1000.0
+        dist_mm = np.sqrt(ball_x_mm**2 + ball_y_mm**2)
 
-        vel_x_mm_s = self.ball_vx * 1000.0
-        vel_y_mm_s = self.ball_vy * 1000.0
-        vel_sq = vel_x_mm_s ** 2 + vel_y_mm_s ** 2
-        speed_mm_s = np.sqrt(vel_sq)
+        # Ball velocity (in mm/s)
+        vx_mm_s = self.ball_vel[0, 0] * 1000.0
+        vy_mm_s = self.ball_vel[0, 1] * 1000.0
+        speed_mm_s = np.sqrt(vx_mm_s**2 + vy_mm_s**2)
 
-        rx_deg = np.degrees(self.platform_rx)
-        ry_deg = np.degrees(self.platform_ry)
-        tilt_sq = rx_deg ** 2 + ry_deg ** 2
+        # Base multiplicative reward (bounded 0-1)
+        dist_factor = 1.0 / (1.0 + dist_mm / self.dist_scale)
+        speed_factor = 1.0 / (1.0 + speed_mm_s / self.speed_scale)
+        base_reward = dist_factor * speed_factor
 
-        action_sq = actions[:, 0] ** 2 + actions[:, 1] ** 2
-        action_delta = actions - self.prev_actions
-        action_rate_sq = action_delta[:, 0] ** 2 + action_delta[:, 1] ** 2
+        # Approach velocity bonus
+        eps = 1e-6
+        if dist_mm > eps:
+            vel_towards_target = -(vx_mm_s * ball_x_mm + vy_mm_s * ball_y_mm) / (dist_mm + eps)
+            approach_reward = (dist_mm / self.dist_scale) * \
+                              (vel_towards_target / self.speed_scale) * \
+                              self.approach_scale
+            approach_reward = np.clip(approach_reward, -1.0, 1.0)
+        else:
+            approach_reward = 0.0
 
-        reward = np.zeros(self.num_envs, dtype=np.float32)
-        reward -= cfg.k_position * pos_error_sq
-        reward -= cfg.k_velocity * vel_sq
-        reward -= cfg.k_tilt * tilt_sq
-        reward -= cfg.k_action * action_sq
-        reward -= cfg.k_action_rate * action_rate_sq
-
-        dist_mm = np.sqrt(pos_error_sq)
-        center_bonus = cfg.k_center_bonus * np.exp(-dist_mm / cfg.center_threshold_mm)
-        reward += center_bonus
-
-        stability_mask = (dist_mm < cfg.center_threshold_mm) & (speed_mm_s < cfg.stability_vel_threshold)
-        reward += cfg.k_stability_bonus * stability_mask.astype(np.float32)
-
-        reward[fell_off] = cfg.out_of_bounds_penalty
-
-        return reward
+        return float(base_reward + approach_reward)
 
 
-# ============================================================================
-# TEST
-# ============================================================================
+class StewartEnvVec:
+    """
+    Vectorized wrapper for StewartEnv.
+
+    Creates multiple independent simulation environments.
+    """
+
+    def __init__(
+        self,
+        num_envs: int = 1,
+        config: Optional[EnvConfig] = None,
+        reward_config: Optional[RewardConfig] = None,
+        device: str = "cuda"
+    ):
+        self.num_envs = num_envs
+        self.device = torch.device(device)
+        self.cfg = config or EnvConfig()
+
+        # Create individual environments
+        self.envs = [
+            StewartEnv(config=config, reward_config=reward_config, device=device)
+            for _ in range(num_envs)
+        ]
+
+        # Observation and action dimensions
+        self.obs_dim = self.cfg.num_frames * self.cfg.obs_per_frame
+        self.action_dim = self.cfg.action_dim
+
+    def reset(self) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Reset all environments."""
+        obs_list = []
+        physics_gt_list = []
+
+        for env in self.envs:
+            obs, info = env.reset()
+            obs_list.append(obs)
+            physics_gt_list.append(info['physics_gt'])
+
+        obs = np.stack(obs_list, axis=0)
+        physics_gt = np.stack(physics_gt_list, axis=0)
+
+        return obs, {'physics_gt': physics_gt}
+
+    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """Step all environments."""
+        obs_list = []
+        reward_list = []
+        done_list = []
+        truncated_list = []
+        physics_gt_list = []
+
+        for i, env in enumerate(self.envs):
+            obs, reward, done, truncated, info = env.step(actions[i])
+            obs_list.append(obs)
+            reward_list.append(reward)
+            done_list.append(done)
+            truncated_list.append(truncated)
+            physics_gt_list.append(info['physics_gt'])
+
+            # Auto-reset if done or truncated
+            if done or truncated:
+                obs, reset_info = env.reset()
+                obs_list[-1] = obs
+                physics_gt_list[-1] = reset_info['physics_gt']
+
+        obs = np.stack(obs_list, axis=0)
+        rewards = np.array(reward_list, dtype=np.float32)
+        dones = np.array(done_list, dtype=bool)
+        truncateds = np.array(truncated_list, dtype=bool)
+        physics_gt = np.stack(physics_gt_list, axis=0)
+
+        return obs, rewards, dones, truncateds, {'physics_gt': physics_gt}
+
 
 if __name__ == "__main__":
-    print("Testing StewartEnv...")
+    print("Testing Stewart Platform Environment...")
+    print("=" * 60)
 
-    env = StewartEnv(num_envs=4)
-    print(f"Created env with {env.num_envs} parallel envs")
-    print(f"  Num frames: {env.cfg.num_frames}")
-    print(f"  Obs per frame: {env.cfg.obs_per_frame}")
-    print(f"  obs dim: {env.cfg.obs_dim}")
-    print(f"  Domain randomization: {env.cfg.use_domain_randomization}")
+    env = StewartEnv()
 
-    # Reset
     obs, info = env.reset()
-    print(f"\nAfter reset:")
-    print(f"  obs shape: {obs.shape}")
-    print(f"  physics_gt shape: {info['physics_gt'].shape}")
-    print(f"  physics_gt (env 0): {info['physics_gt'][0]}")
-    print(f"  base_dt per env (ms): {info['base_dt'] * 1000}")
+    print(f"Observation shape: {obs.shape}")
+    print(f"Physics GT: {info['physics_gt']}")
 
-    # Step and collect dt statistics
-    dt_samples = []
-    jitter_count = 0
-    for step in range(1000):
-        actions = np.random.uniform(-1, 1, (4, 2)).astype(np.float32)
-        obs, rewards, dones, truncated, infos = env.step(actions)
-        dt_samples.extend(infos['actual_dt'].tolist())
-        jitter_count += np.sum(infos['actual_dt'] > 0.040)
+    # Run a few steps
+    total_reward = 0
+    for step in range(100):
+        action = np.random.uniform(-1, 1, 2).astype(np.float32)
+        obs, reward, done, truncated, info = env.step(action)
+        total_reward += reward
 
-    dt_samples = np.array(dt_samples)
-    print(f"\ndt statistics over 1000 steps × 4 envs:")
-    print(f"  Mean dt: {dt_samples.mean()*1000:.2f} ms")
-    print(f"  Std dt:  {dt_samples.std()*1000:.2f} ms")
-    print(f"  Min dt:  {dt_samples.min()*1000:.2f} ms")
-    print(f"  Max dt:  {dt_samples.max()*1000:.2f} ms")
-    print(f"  Jitter frames (>40ms): {jitter_count} ({100*jitter_count/len(dt_samples):.2f}%)")
+        if step % 20 == 0:
+            print(f"Step {step}: reward={reward:.3f}, ball_pos={info['ball_pos_mm']}, "
+                  f"platform={info['platform_angles']}")
 
-    print("\n[OK] StewartEnv test passed!")
+        if done:
+            print(f"Ball fell off at step {step}")
+            break
+
+    print(f"\nTotal reward: {total_reward:.1f}")
+    print("\n[OK] Environment working!")
+
+    # Test vectorized version
+    print("\n" + "=" * 60)
+    print("Testing Vectorized Environment...")
+
+    vec_env = StewartEnvVec(num_envs=2)
+    obs, info = vec_env.reset()
+    print(f"Vectorized obs shape: {obs.shape}")
+
+    for step in range(10):
+        actions = np.random.uniform(-1, 1, (2, 2)).astype(np.float32)
+        obs, rewards, dones, truncateds, info = vec_env.step(actions)
+        print(f"Step {step}: rewards={rewards}")
+
+    print("\n[OK] Vectorized environment working!")

@@ -55,7 +55,8 @@ class EnvConfig:
     use_platform_offset = True        # Random tilt offset enabled
     platform_offset_max_deg = 2.0     # Max platform tilt offset (degrees)
     # Physics parameter ranges for randomization (used when enabled)
-    friction_range = (0.01, 0.05)       # Rolling friction coefficient
+    # Default rolling_friction = 0.0225 in SimpleBallPhysics2D
+    friction_range = (0.015, 0.035)     # Rolling friction coefficient (centered on 0.0225)
     servo_tau_range = (0.03, 0.08)      # Servo time constant (30-80ms)
     mass_factor_range = (1.4, 2.0)      # Ball inertia factor (1.67 nominal)
 
