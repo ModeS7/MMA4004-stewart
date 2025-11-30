@@ -46,12 +46,180 @@ USE_AMP = True          # Use automatic mixed precision (bfloat16)
 CHECKPOINT = None       # Path to checkpoint to resume from, or None
 USE_DASHBOARD = True    # Enable interactive Gradio dashboard
 
+# Demonstration learning (imitation from PID/LQR)
+USE_DEMONSTRATIONS = True   # Pre-fill buffer with expert demonstrations
+DEMO_CONTROLLER = 'PID'     # 'PID' or 'LQR'
+DEMO_EPISODES = 100         # Number of demonstration episodes to collect (10M transitions)
+DEMO_BC_WEIGHT = 0.5        # Behavioral cloning loss weight (0 = off, 0.1-1.0 typical)
+DEMO_BC_DECAY_STEPS = 2_000_000  # Steps to anneal BC weight to 0 (~250 episodes, 17% of training)
+
 # Logging
 LOG_INTERVAL = 1        # Print stats every N episodes
 EVAL_INTERVAL = 5      # Evaluate every N episodes
 SAVE_INTERVAL = 10     # Save checkpoint every N episodes
 
 # ============================================================================
+
+
+def collect_demonstrations(buffer, env_config, reward_config, controller_type='LQR',
+                          num_episodes=50, num_envs=100, device='cuda'):
+    """
+    Collect expert demonstrations from PID or LQR controller.
+
+    Uses the actual controller classes from core/control_core.py for accurate behavior.
+    Controller gains are loaded from core/utils.py presets.
+
+    Args:
+        buffer: Replay buffer to fill with demonstrations
+        env_config: Environment configuration
+        reward_config: Reward configuration
+        controller_type: 'PID' or 'LQR'
+        num_episodes: Number of episodes to collect
+        num_envs: Number of parallel environments
+        device: Device for computation
+
+    Returns:
+        Number of transitions collected
+    """
+    import torch
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from core.control_core import PIDController, LQRController
+    from core.utils import PIDConfig, LQRConfig
+
+    print(f"\n{'='*60}")
+    print(f"Collecting demonstrations from {controller_type} controller")
+    print(f"{'='*60}")
+
+    # Create environment for demo collection
+    env = StewartEnvGPU(
+        num_envs=num_envs,
+        config=env_config,
+        reward_config=reward_config,
+        device=device,
+        use_domain_randomization=False  # Clean demos without randomization
+    )
+
+    # Create actual controller instance using presets from core/utils.py
+    if controller_type == 'PID':
+        # Use hardware PID gains with scalar multipliers (tuned for real system)
+        gains = PIDConfig.HW_DEFAULT_GAINS
+        scalars = PIDConfig.SCALAR_VALUES
+        indices = PIDConfig.HW_SCALAR_INDICES
+        kp = gains['kp'] * scalars[indices['kp']]  # 1.0 * 0.1 = 0.1
+        ki = gains['ki'] * scalars[indices['ki']]  # 0.0 * 0.1 = 0.0
+        kd = gains['kd'] * scalars[indices['kd']]  # 4.0 * 0.01 = 0.04
+        controller = PIDController(
+            kp=kp,
+            ki=ki,
+            kd=kd,
+            output_limit=PIDConfig.OUTPUT_LIMIT
+        )
+        print(f"  PID gains: kp={kp}, ki={ki}, kd={kd}")
+    else:  # LQR
+        # Use LQR weights with scalar multipliers
+        weights = LQRConfig.DEFAULT_WEIGHTS
+        scalars = LQRConfig.SCALAR_VALUES
+        indices = LQRConfig.DEFAULT_SCALAR_INDICES
+        Q_pos = weights['Q_pos'] * scalars[indices['Q_pos']]
+        Q_vel = weights['Q_vel'] * scalars[indices['Q_vel']]
+        R = weights['R'] * scalars[indices['R']]
+        controller = LQRController(
+            Q_pos=Q_pos,
+            Q_vel=Q_vel,
+            R=R,
+            output_limit=LQRConfig.OUTPUT_LIMIT
+        )
+        print(f"  LQR weights: Q_pos={Q_pos}, Q_vel={Q_vel}, R={R}")
+        print(f"  LQR K matrix:\n{controller.K}")
+
+    # Max tilt for normalization (degrees to [-1, 1])
+    max_tilt_deg = env_config.max_tilt_deg
+
+    total_transitions = 0
+    dt = env_config.dt  # Controller timestep
+
+    for ep in range(num_episodes):
+        obs, physics_gt = env.reset_tensor()
+
+        episode_transitions = 0
+        done_mask = torch.zeros(num_envs, device=device, dtype=torch.bool)
+
+        # Reset PID integral terms for each episode
+        if controller_type == 'PID':
+            controller.integral_x = 0.0
+            controller.integral_y = 0.0
+            controller.prev_error_x = 0.0
+            controller.prev_error_y = 0.0
+
+        for step in range(env_config.max_steps):
+            # Get ball state from environment (convert to mm and mm/s for controller)
+            ball_x_mm = env.ball_x * 1000.0  # meters to mm
+            ball_y_mm = env.ball_y * 1000.0
+            ball_vx_mm_s = env.ball_vx * 1000.0  # m/s to mm/s
+            ball_vy_mm_s = env.ball_vy * 1000.0
+            target_x_mm = env.target_x * 1000.0
+            target_y_mm = env.target_y * 1000.0
+
+            # Compute expert actions for each environment
+            actions_list = []
+            for i in range(num_envs):
+                if done_mask[i]:
+                    actions_list.append([0.0, 0.0])
+                    continue
+
+                pos = (ball_x_mm[i].item(), ball_y_mm[i].item())
+                vel = (ball_vx_mm_s[i].item(), ball_vy_mm_s[i].item())
+                target = (target_x_mm[i].item(), target_y_mm[i].item())
+
+                if controller_type == 'PID':
+                    rx, ry = controller.update(pos, target, dt)
+                else:  # LQR
+                    rx, ry = controller.update(pos, vel, target)
+
+                # Normalize to [-1, 1]
+                rx_norm = max(-1.0, min(1.0, rx / max_tilt_deg))
+                ry_norm = max(-1.0, min(1.0, ry / max_tilt_deg))
+                actions_list.append([rx_norm, ry_norm])
+
+            actions = torch.tensor(actions_list, device=device, dtype=torch.float32)
+
+            # Step environment
+            next_obs, rewards, dones, next_physics_gt = env.step_tensor(actions)
+
+            # Store transitions (only for non-done envs)
+            active_mask = ~done_mask
+            if active_mask.any():
+                buffer.push_batch_tensor(
+                    obs[active_mask],
+                    actions[active_mask],
+                    rewards[active_mask],
+                    next_obs[active_mask],
+                    dones[active_mask],
+                    physics_gt[active_mask]
+                )
+                episode_transitions += active_mask.sum().item()
+
+            # Update state
+            obs = next_obs
+            physics_gt = next_physics_gt
+            done_mask = done_mask | dones
+
+            # Break if all done
+            if done_mask.all():
+                break
+
+        total_transitions += episode_transitions
+
+        if (ep + 1) % 10 == 0:
+            print(f"  Episode {ep + 1}/{num_episodes} | "
+                  f"Transitions: {total_transitions:,} | "
+                  f"Buffer: {len(buffer):,}")
+
+    print(f"\nCollected {total_transitions:,} demonstration transitions")
+    print(f"Buffer size: {len(buffer):,}")
+
+    return total_transitions
 
 
 def evaluate(agent, env_config, reward_config, num_episodes=10):
@@ -164,7 +332,9 @@ def train():
         use_layer_norm=sac_cfg.use_layer_norm,
         device=train_cfg.device,
         compile_model=USE_COMPILE,
-        use_amp=USE_AMP
+        use_amp=USE_AMP,
+        bc_weight=DEMO_BC_WEIGHT if USE_DEMONSTRATIONS else 0.0,
+        bc_decay_steps=DEMO_BC_DECAY_STEPS
     )
     opts = []
     if USE_COMPILE: opts.append("compiled")
@@ -194,6 +364,25 @@ def train():
     )
     print(f"Replay buffer created with capacity {sac_cfg.buffer_size} on {buffer_device}")
 
+    # Collect demonstrations from expert controller (optional)
+    demo_transitions = 0
+    if USE_DEMONSTRATIONS:
+        demo_transitions = collect_demonstrations(
+            buffer=buffer,
+            env_config=env_cfg,
+            reward_config=reward_cfg,
+            controller_type=DEMO_CONTROLLER,
+            num_episodes=DEMO_EPISODES,
+            num_envs=min(NUM_ENVS, 100),  # Use fewer envs for demo collection
+            device=DEVICE
+        )
+        print(f"Pre-filled buffer with {demo_transitions:,} expert demonstrations")
+
+    # Effective warmup: skip if we have enough demos
+    effective_warmup = 0 if demo_transitions >= sac_cfg.batch_size else sac_cfg.warmup_steps
+    if USE_DEMONSTRATIONS and effective_warmup == 0:
+        print(f"Skipping warmup (have {demo_transitions:,} demo transitions)")
+
     # Training metrics
     episode_rewards = []
     episode_lengths = []
@@ -221,6 +410,7 @@ def train():
         dashboard_state.dist_scale = reward_cfg.dist_scale
         dashboard_state.speed_scale = reward_cfg.speed_scale
         dashboard_state.fall_penalty = reward_cfg.fall_penalty
+        dashboard_state.approach_scale = reward_cfg.approach_scale
         launch_dashboard(dashboard_state, port=7860)
     elif USE_DASHBOARD and not DASHBOARD_AVAILABLE:
         print("Warning: Dashboard requested but gradio not available. Install with: pip install gradio")
@@ -253,8 +443,8 @@ def train():
             # Fixed-step loop to avoid CUDA sync from done_mask.all()
             for step_in_episode in range(1, env_cfg.max_steps + 1):
                 # Select action (all on GPU)
-                if total_steps < sac_cfg.warmup_steps:
-                    # Random actions during warmup
+                if total_steps < effective_warmup:
+                    # Random actions during warmup (skipped if demos present)
                     actions = torch.rand(NUM_ENVS, env_cfg.action_dim, device=DEVICE) * 2 - 1
                 else:
                     actions = agent.select_action_batch_tensor(obs, evaluate=False)
@@ -280,7 +470,7 @@ def train():
                 total_steps += NUM_ENVS
 
                 # Update agent (less frequently)
-                if (total_steps >= sac_cfg.warmup_steps and
+                if (total_steps >= effective_warmup and
                     len(buffer) >= sac_cfg.batch_size and
                     step_in_episode % update_every == 0):
                     for _ in range(sac_cfg.updates_per_step):
@@ -298,7 +488,9 @@ def train():
                         writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
                         writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
                         writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
+                        writer.add_scalar("loss/bc", update_info['bc_loss'], total_steps)
                         writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
+                        writer.add_scalar("params/bc_weight", update_info['bc_weight'], total_steps)
 
             # Convert to numpy only for logging
             episode_reward = episode_reward.cpu().numpy()
@@ -317,7 +509,7 @@ def train():
             episode_start_time = time.time()
 
             while not done_mask.all():
-                if total_steps < sac_cfg.warmup_steps:
+                if total_steps < effective_warmup:
                     actions = np.random.uniform(-1, 1, (NUM_ENVS, env_cfg.action_dim)).astype(np.float32)
                 else:
                     actions, _ = agent.select_action_batch(obs, evaluate=False)
@@ -331,7 +523,7 @@ def train():
 
                 update_every = getattr(sac_cfg, 'update_every', 1)
                 step_in_episode += 1
-                if (total_steps >= sac_cfg.warmup_steps and
+                if (total_steps >= effective_warmup and
                     len(buffer) >= sac_cfg.batch_size and
                     step_in_episode % update_every == 0):
                     for _ in range(sac_cfg.updates_per_step):
@@ -347,7 +539,9 @@ def train():
                         writer.add_scalar("loss/actor", update_info['actor_loss'], total_steps)
                         writer.add_scalar("loss/physics", update_info['physics_loss'], total_steps)
                         writer.add_scalar("loss/policy", update_info['policy_loss'], total_steps)
+                        writer.add_scalar("loss/bc", update_info['bc_loss'], total_steps)
                         writer.add_scalar("params/alpha", update_info['alpha'], total_steps)
+                        writer.add_scalar("params/bc_weight", update_info['bc_weight'], total_steps)
 
                 episode_reward += rewards * (~done_mask)
                 episode_length += (~done_mask)
@@ -407,6 +601,7 @@ def train():
                 env.interactive_dist_scale = reward_settings['dist_scale']
                 env.interactive_speed_scale = reward_settings['speed_scale']
                 env.interactive_fall_penalty = reward_settings['fall_penalty']
+                env.interactive_approach_scale = reward_settings['approach_scale']
 
         # TensorBoard episode logging
         writer.add_scalar("episode/reward", mean_reward, episode)

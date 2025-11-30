@@ -41,6 +41,7 @@ class TrainingState:
     dist_scale: float = 30.0      # Distance scale for reward
     speed_scale: float = 50.0     # Speed scale for reward
     fall_penalty: float = -10.0   # Penalty for falling off
+    approach_scale: float = 0.5   # Approach velocity bonus scale
 
     # ===== Training Controls =====
     paused: bool = False
@@ -100,6 +101,7 @@ class TrainingState:
                 'dist_scale': self.dist_scale,
                 'speed_scale': self.speed_scale,
                 'fall_penalty': self.fall_penalty,
+                'approach_scale': self.approach_scale,
             }
 
     def request_save(self):

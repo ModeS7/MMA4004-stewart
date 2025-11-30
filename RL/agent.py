@@ -422,7 +422,9 @@ class SACAgent:
             use_layer_norm=True,  # LayerNorm on critic for stability
             device="cpu",
             compile_model=False,  # Use torch.compile for speedup (PyTorch 2.0+)
-            use_amp=False  # Use automatic mixed precision (bfloat16)
+            use_amp=False,  # Use automatic mixed precision (bfloat16)
+            bc_weight=0.0,  # Behavioral cloning loss weight (0 = disabled)
+            bc_decay_steps=100000  # Steps to decay BC weight to 0 (linear annealing)
     ):
         self.gamma = gamma
         self.tau = tau
@@ -430,7 +432,10 @@ class SACAgent:
         self.alpha_min = alpha_min
         self.policy_delay = policy_delay
         self.update_counter = 0  # Track critic updates for policy delay
+        self.total_updates = 0  # Track total updates for BC annealing
         self.physics_loss_weight = physics_loss_weight
+        self.bc_weight_initial = bc_weight
+        self.bc_decay_steps = bc_decay_steps
         self.automatic_entropy_tuning = automatic_entropy_tuning
         self.obs_dim = obs_dim
         self.physics_dim = physics_dim
@@ -545,8 +550,15 @@ class SACAgent:
         Returns:
             dict with losses and metrics
         """
-        # Increment update counter
+        # Increment update counters
         self.update_counter += 1
+        self.total_updates += 1
+
+        # Compute current BC weight (linear annealing)
+        if self.bc_weight_initial > 0 and self.bc_decay_steps > 0:
+            bc_weight = self.bc_weight_initial * max(0.0, 1.0 - self.total_updates / self.bc_decay_steps)
+        else:
+            bc_weight = 0.0
 
         # Sample batch
         states, actions, rewards, next_states, dones, physics_gt = replay_buffer.sample(batch_size)
@@ -587,6 +599,7 @@ class SACAgent:
         actor_loss_val = 0.0
         policy_loss_val = 0.0
         physics_loss_val = 0.0
+        bc_loss_val = 0.0
 
         # ===== Update Actor (every policy_delay steps) =====
         if self.update_counter % self.policy_delay == 0:
@@ -603,7 +616,18 @@ class SACAgent:
             # Actor loss = policy loss + physics auxiliary loss (in float32 for stability)
             policy_loss = (alpha * log_probs.float() - min_q.float()).mean()
             physics_loss = nn.MSELoss()(physics_est.float(), physics_gt)
-            actor_loss = policy_loss + self.physics_loss_weight * physics_loss
+
+            # Behavioral cloning loss (MSE between policy output and buffer actions)
+            if bc_weight > 0:
+                # Get deterministic action (mean) for BC comparison
+                with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                    bc_actions, _, _ = self.actor(states)  # Returns mean action
+                bc_loss = nn.MSELoss()(bc_actions.float(), actions.float())
+                bc_loss_val = bc_loss.item()
+            else:
+                bc_loss = 0.0
+
+            actor_loss = policy_loss + self.physics_loss_weight * physics_loss + bc_weight * bc_loss
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -633,6 +657,8 @@ class SACAgent:
             'actor_loss': actor_loss_val,
             'policy_loss': policy_loss_val,
             'physics_loss': physics_loss_val,
+            'bc_loss': bc_loss_val,
+            'bc_weight': bc_weight,
             'alpha': self.alpha
         }
 

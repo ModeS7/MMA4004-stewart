@@ -209,7 +209,7 @@ class ColorScheme:
 
 class ControlLoopConfig:
     """Configuration for real-time control loop (hardware mode)."""
-    DEFAULT_FREQUENCY_HZ = 50  # Default control loop frequency
+    DEFAULT_FREQUENCY_HZ = 100  # Default control loop frequency (matches RL training)
     MIN_FREQUENCY_HZ = 50  # Minimum control loop frequency
     MAX_FREQUENCY_HZ = 500  # Maximum control loop frequency
     FREQUENCY_HZ = DEFAULT_FREQUENCY_HZ  # Current control loop frequency (configurable)

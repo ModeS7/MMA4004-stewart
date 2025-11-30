@@ -53,6 +53,7 @@ class EnvConfig:
     # Only platform tilt offset enabled (simulates gravity vector)
     use_domain_randomization = False  # Physics params fixed
     use_platform_offset = True        # Random tilt offset enabled
+    platform_offset_max_deg = 2.0     # Max platform tilt offset (degrees)
     # Physics parameter ranges for randomization (used when enabled)
     friction_range = (0.01, 0.05)       # Rolling friction coefficient
     servo_tau_range = (0.03, 0.08)      # Servo time constant (30-80ms)
@@ -86,6 +87,7 @@ class RewardConfig:
     dist_scale = 30.0   # ~30mm from center gives 0.5 distance factor
     speed_scale = 50.0  # ~50mm/s gives 0.5 speed factor
     fall_penalty = -10.0  # Penalty when ball falls off
+    approach_scale = 0.5  # Approach velocity bonus: reward moving towards target when far
 
 
 # ============================================================================
@@ -110,15 +112,16 @@ class SACConfig:
     automatic_entropy_tuning = True
     policy_delay = 8  # Update actor every N critic updates (TD3-style, prevents following unstable Q)
 
-    # Replay buffer (must be large enough to hold multiple episodes worth of data)
-    # With 1000 envs × 800 steps = 800k transitions/episode
-    buffer_size = 2_000_000  # 2M for better experience diversity
+    # Replay buffer (must be large enough to hold demos + multiple episodes)
+    # With 1000 envs × 1000 steps = 1M transitions/episode
+    # 10M buffer retains ~10 episodes worth + demos
+    buffer_size = 10_000_000  # 10M to retain demos longer
     batch_size = 1024  # Larger batch = more GPU utilization
 
-    # Training (reduced gradient steps to prevent overfitting)
-    warmup_steps = 1000  # Random actions before training
-    updates_per_step = 8  # Gradient updates per update call (reduced from 32)
-    update_every = 10  # Update every N environment steps
+    # Training (higher update ratio for better sample efficiency)
+    warmup_steps = 1000  # Random actions before training (skipped if demos)
+    updates_per_step = 32  # Gradient updates per update call
+    update_every = 4  # Update every N environment steps (more frequent)
 
 
 # ============================================================================

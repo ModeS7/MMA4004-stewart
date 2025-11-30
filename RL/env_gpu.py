@@ -74,6 +74,7 @@ class StewartEnvGPU:
         self.interactive_dist_scale = self.reward_cfg.dist_scale
         self.interactive_speed_scale = self.reward_cfg.speed_scale
         self.interactive_fall_penalty = self.reward_cfg.fall_penalty
+        self.interactive_approach_scale = getattr(self.reward_cfg, 'approach_scale', 0.5)  # Approach velocity reward
 
         # State tensors
         self.ball_x = torch.zeros(num_envs, device=self.device, dtype=torch.float32)
@@ -570,27 +571,52 @@ class StewartEnvGPU:
 
     def _compute_reward(self, actions, fell_off):
         """
-        Compute reward - multiplicative form from IsaacGymEnvs BallBalance.
+        Compute reward - multiplicative form + approach velocity bonus.
 
-        reward = 1/(1+dist) * 1/(1+speed)
+        Base reward: 1/(1+dist) * 1/(1+speed)
+        Approach bonus: proportional to velocity towards target, scaled by distance
 
         This reward:
-        - Is bounded [0, 1] - no exploding rewards
+        - Base is bounded [0, 1] - no exploding rewards
         - Naturally rewards both centering AND stopping
+        - Approach bonus encourages moving towards target when far
         - Fall penalty only applied on fall
         """
-        # Distance from center in mm
-        dist_mm = torch.sqrt((self.ball_x * 1000.0)**2 + (self.ball_y * 1000.0)**2)
+        # Ball position in mm (relative to target at origin)
+        ball_x_mm = (self.ball_x - self.target_x) * 1000.0
+        ball_y_mm = (self.ball_y - self.target_y) * 1000.0
 
-        # Velocity magnitude in mm/s
-        speed_mm_s = torch.sqrt((self.ball_vx * 1000.0)**2 + (self.ball_vy * 1000.0)**2)
+        # Distance from target in mm
+        dist_mm = torch.sqrt(ball_x_mm**2 + ball_y_mm**2)
 
-        # Multiplicative reward (bounded 0-1)
-        # Scale factors use interactive settings (can be modified via dashboard)
+        # Velocity in mm/s
+        vx_mm_s = self.ball_vx * 1000.0
+        vy_mm_s = self.ball_vy * 1000.0
+        speed_mm_s = torch.sqrt(vx_mm_s**2 + vy_mm_s**2)
+
+        # === Base multiplicative reward (bounded 0-1) ===
         dist_factor = 1.0 / (1.0 + dist_mm / self.interactive_dist_scale)
         speed_factor = 1.0 / (1.0 + speed_mm_s / self.interactive_speed_scale)
+        base_reward = dist_factor * speed_factor
 
-        reward = dist_factor * speed_factor  # Range: [0, 1]
+        # === Approach velocity bonus ===
+        # Velocity towards target (positive = approaching, negative = moving away)
+        # vel_towards = -dot(velocity, direction_from_target) = -dot(v, pos/|pos|)
+        # Simplified: vel_towards = -(vx*px + vy*py) / dist
+        eps = 1e-6  # Avoid division by zero
+        vel_towards_target = -(vx_mm_s * ball_x_mm + vy_mm_s * ball_y_mm) / (dist_mm + eps)
+
+        # Scale approach reward by distance (bigger reward when far and approaching fast)
+        # Normalized: (dist/dist_scale) * (vel_towards/speed_scale) * approach_scale
+        approach_reward = (dist_mm / self.interactive_dist_scale) * \
+                          (vel_towards_target / self.interactive_speed_scale) * \
+                          self.interactive_approach_scale
+
+        # Clamp approach reward to avoid extreme values
+        approach_reward = torch.clamp(approach_reward, -1.0, 1.0)
+
+        # Total reward
+        reward = base_reward + approach_reward
 
         # Termination penalty (uses interactive fall penalty)
         reward = torch.where(fell_off, torch.full_like(reward, self.interactive_fall_penalty), reward)

@@ -19,9 +19,11 @@ def create_reward_plot(state: TrainingState):
     rewards = metrics['episode_rewards']
 
     fig, ax = plt.subplots(figsize=(8, 4))
+    has_labels = False
 
     if len(rewards) > 0:
         ax.plot(rewards, alpha=0.3, color='blue', label='Raw')
+        has_labels = True
 
         # Smoothed line (rolling average)
         if len(rewards) >= 10:
@@ -38,7 +40,8 @@ def create_reward_plot(state: TrainingState):
     ax.set_xlabel('Episode')
     ax.set_ylabel('Reward')
     ax.set_title(f'Episode Rewards (Episode {metrics["current_episode"]})')
-    ax.legend(loc='upper left')
+    if has_labels:
+        ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -53,13 +56,13 @@ def create_length_plot(state: TrainingState):
     fig, ax = plt.subplots(figsize=(8, 4))
 
     if len(lengths) > 0:
-        ax.plot(lengths, color='green', alpha=0.7)
+        ax.plot(lengths, color='green', alpha=0.7, label='Length')
         ax.axhline(y=1000, color='red', linestyle='--', alpha=0.5, label='Max (1000)')
+        ax.legend()
 
     ax.set_xlabel('Episode')
     ax.set_ylabel('Length')
     ax.set_title('Episode Lengths')
-    ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -97,7 +100,7 @@ def create_dashboard(state: Optional[TrainingState] = None):
     if state is None:
         state = get_state()
 
-    with gr.Blocks(title="RL Training Dashboard", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="RL Training Dashboard") as demo:
         gr.Markdown("# 🎮 Stewart Platform RL Training Dashboard")
 
         with gr.Row():
@@ -137,6 +140,10 @@ def create_dashboard(state: Optional[TrainingState] = None):
                     minimum=-100, maximum=-1, value=state.fall_penalty,
                     step=1, label="Fall Penalty"
                 )
+                approach_scale = gr.Slider(
+                    minimum=0, maximum=2.0, value=state.approach_scale,
+                    step=0.1, label="Approach Bonus - reward moving towards target"
+                )
 
                 gr.Markdown("## 🎛️ Training Control")
 
@@ -159,18 +166,15 @@ def create_dashboard(state: Optional[TrainingState] = None):
 
         # ===== Event Handlers =====
 
-        # Environment toggles
+        # Environment toggles (no return - Gradio warns about unused outputs)
         def update_domain_rand(value):
             state.use_domain_randomization = value
-            return f"Domain Randomization: {'ON' if value else 'OFF'}"
 
         def update_platform_tilt(value):
             state.use_platform_offset = value
-            return f"Platform Tilt: {'ON' if value else 'OFF'}"
 
         def update_camera_noise(value):
             state.use_camera_noise = value
-            return f"Camera Noise: {'ON' if value else 'OFF'}"
 
         def update_offset_max(value):
             state.platform_offset_max_deg = value
@@ -184,6 +188,9 @@ def create_dashboard(state: Optional[TrainingState] = None):
 
         def update_fall_penalty(value):
             state.fall_penalty = value
+
+        def update_approach_scale(value):
+            state.approach_scale = value
 
         # Training control
         def toggle_pause():
@@ -206,6 +213,7 @@ def create_dashboard(state: Optional[TrainingState] = None):
         dist_scale.change(update_dist_scale, inputs=dist_scale)
         speed_scale.change(update_speed_scale, inputs=speed_scale)
         fall_penalty.change(update_fall_penalty, inputs=fall_penalty)
+        approach_scale.change(update_approach_scale, inputs=approach_scale)
 
         pause_btn.click(toggle_pause, outputs=pause_btn)
         save_btn.click(request_save, outputs=save_btn)
@@ -213,6 +221,8 @@ def create_dashboard(state: Optional[TrainingState] = None):
 
         # ===== Auto-refresh Timer =====
         def refresh_plots():
+            # Close previous figures to prevent memory leak
+            plt.close('all')
             return (
                 create_reward_plot(state),
                 create_length_plot(state),
