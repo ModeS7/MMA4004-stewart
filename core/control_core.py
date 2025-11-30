@@ -437,9 +437,29 @@ class RLController:
                 action_mean = torch.tanh(self.actor_mean(features))
                 return action_mean
 
-        # Store both network classes for later instantiation
+        # Simple MLP actor (for train_sac_simple.py)
+        class ActorSimple(nn.Module):
+            """Simple MLP actor (no CNN)."""
+            def __init__(self, state_dim=84, action_dim=2, hidden_dim=256):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(state_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU()
+                )
+                self.mean = nn.Linear(hidden_dim, action_dim)
+                self.log_std = nn.Linear(hidden_dim, action_dim)
+
+            def forward(self, state):
+                features = self.network(state)
+                action_mean = torch.tanh(self.mean(features))
+                return action_mean
+
+        # Store all network classes for later instantiation
         self._Actor = Actor
         self._ActorCritic = ActorCritic
+        self._ActorSimple = ActorSimple
 
         # Will be set during model load
         self.actor = None
@@ -494,11 +514,20 @@ class RLController:
                 print(f"[RLController] Loaded PPO model from {model_path}")
 
             elif 'actor' in checkpoint:
-                # SAC format: {'actor': state_dict, 'critic1': ..., ...}
-                self.model_type = 'sac'
-                self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
-                self.actor.load_state_dict(checkpoint['actor'], strict=False)
-                print(f"[RLController] Loaded SAC model from {model_path}")
+                actor_state = checkpoint['actor']
+                # Detect if it's simple MLP or CNN actor by checking keys
+                if 'network.0.weight' in actor_state or 'mean.weight' in actor_state:
+                    # Simple MLP actor (from train_sac_simple.py)
+                    self.model_type = 'sac_simple'
+                    self.actor = self._ActorSimple(state_dim=self.obs_dim).to(self.device)
+                    self.actor.load_state_dict(actor_state, strict=False)
+                    print(f"[RLController] Loaded Simple SAC model from {model_path}")
+                else:
+                    # CNN actor (from train.py)
+                    self.model_type = 'sac'
+                    self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
+                    self.actor.load_state_dict(actor_state, strict=False)
+                    print(f"[RLController] Loaded SAC model from {model_path}")
 
             else:
                 # Raw state_dict (assume SAC actor)
