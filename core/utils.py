@@ -30,7 +30,7 @@ CAMERA_TYPE = 'STEREO'  # Options: 'PIXY2' or 'STEREO'
 # ============================================================================
 # 'ROI_CNN'    - Old pipeline: HSV color ROI extraction + 128x128 CNN refinement
 # 'STEREO_NN'  - New pipeline: tiny_stereo (320x180) + optional 128x128 refinement
-DETECTION_MODE = 'STEREO_NN'
+DETECTION_MODE = 'ROI_CNN'
 
 # ============================================================================
 # DEBUG OPTIONS
@@ -577,7 +577,7 @@ class StereoCameraConfig:
     #   2 = mobileLiteV3         (1M params, full MobileNetV3-Small)
     #   3 = CustomCNN            (custom architecture)
     #   4 = shufflenetV2         (ShuffleNetV2 x0.5)
-    MODEL_SELECT = 1  # <-- Change this to switch models
+    MODEL_SELECT = 5  # <-- Change this to switch models
     USE_INT8 = False  # <-- Set True to use INT8 quantized version
 
     # Model paths (auto-selected based on MODEL_SELECT and USE_INT8)
@@ -586,6 +586,7 @@ class StereoCameraConfig:
         2: 'ball_detection/models/mobileLiteV3/mobileLiteV3',
         3: 'ball_detection/models/CustomCNN/CustomCNN',
         4: 'ball_detection/models/shufflenetV2/shufflenetV2',
+        5: 'ball_detection/models/new/mobilenet/mobilenet'
     }
     MODEL_PATH = _MODEL_PATHS[MODEL_SELECT] + ('_int8.onnx' if USE_INT8 else '.onnx')
     # =========================================================================
@@ -618,8 +619,8 @@ class StereoDetectionConfig:
     """
 
     # Model paths
-    STEREO_MODEL_PATH = 'ball_detection/models/tiny_stereo/tiny_stereo.onnx'
-    CROP_MODEL_PATH = 'ball_detection/models/mobileLiteV3_prunned/mobileLiteV3_pruned.onnx'
+    STEREO_MODEL_PATH = 'ball_detection/models/new/Tiny_stereo/Tiny_stereo.onnx'
+    CROP_MODEL_PATH = 'ball_detection/models/new/cnn/cnn.onnx'
 
     # Input sizes
     STEREO_WIDTH = 320
@@ -633,6 +634,9 @@ class StereoDetectionConfig:
     # Detection settings
     CONFIDENCE_THRESHOLD = 0.5
     USE_REFINEMENT = True  # Enable stage 2 crop refinement
+
+    # Color format - set to True if models were trained on RGB input
+    CONVERT_TO_RGB = False  # False = BGR (OpenCV native), True = RGB
 
     # GPU settings
     USE_GPU = False  # Use DirectML GPU acceleration

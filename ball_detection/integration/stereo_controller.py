@@ -201,7 +201,8 @@ class StereoCameraController:
                     crop_model_path=StereoDetectionConfig.CROP_MODEL_PATH if StereoDetectionConfig.USE_REFINEMENT else None,
                     use_gpu=StereoDetectionConfig.USE_GPU,
                     confidence_threshold=StereoDetectionConfig.CONFIDENCE_THRESHOLD,
-                    use_refinement=StereoDetectionConfig.USE_REFINEMENT
+                    use_refinement=StereoDetectionConfig.USE_REFINEMENT,
+                    convert_to_rgb=StereoDetectionConfig.CONVERT_TO_RGB
                 )
             else:  # ROI_CNN
                 # Old pipeline: ROI extraction + CNN

@@ -236,7 +236,7 @@ class StereoBallDetector:
     """
 
     def __init__(self, stereo_model_path, crop_model_path=None, use_gpu=True,
-                 confidence_threshold=0.5, use_refinement=True):
+                 confidence_threshold=0.5, use_refinement=True, convert_to_rgb=False):
         """
         Initialize stereo detector.
 
@@ -246,6 +246,7 @@ class StereoBallDetector:
             use_gpu: Use DirectML GPU acceleration
             confidence_threshold: Minimum confidence for detection
             use_refinement: Enable stage 2 crop refinement
+            convert_to_rgb: Convert BGR to RGB (True if model trained on RGB)
         """
         print("Initializing Stereo Ball Detector...")
         self.stereo_detector = ONNXStereoDetector(
@@ -253,7 +254,8 @@ class StereoBallDetector:
             crop_model_path=crop_model_path,
             use_gpu=use_gpu,
             confidence_threshold=confidence_threshold,
-            use_refinement=use_refinement
+            use_refinement=use_refinement,
+            convert_to_rgb=convert_to_rgb
         )
         print("Stereo detector ready!\n")
 

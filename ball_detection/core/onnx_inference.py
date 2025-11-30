@@ -347,6 +347,9 @@ class ONNXStereoDetector:
         h, w = self.stereo_size[1], self.stereo_size[0]
         self._stereo_buffer = np.empty((1, 6, h, w), dtype=np.float32)
 
+        # Pre-allocate crop buffer (reused for refinement)
+        self._crop_buffer = np.empty((1, 3, self.crop_size, self.crop_size), dtype=np.float32)
+
     def _preprocess_stereo(self, left_bgr, right_bgr):
         """Preprocess stereo pair for tiny_stereo model.
 
@@ -393,14 +396,16 @@ class ONNXStereoDetector:
     def _preprocess_crop(self, crop_bgr):
         """Preprocess single crop for refinement model (BGR, no conversion)."""
         if crop_bgr.shape[:2] != (self.crop_size, self.crop_size):
-            crop_bgr = cv2.resize(crop_bgr, (self.crop_size, self.crop_size))
+            crop_bgr = cv2.resize(crop_bgr, (self.crop_size, self.crop_size), interpolation=cv2.INTER_NEAREST)
 
-        # Normalize with BGR mean/std (same as stereo model)
-        crop_norm = (crop_bgr.astype(np.float32) / 255.0 - self.mean_bgr) / self.std_bgr
-        crop_tensor = np.transpose(crop_norm, (2, 0, 1))
-        crop_tensor = np.expand_dims(crop_tensor, axis=0)
+        # Reuse pre-allocated crop buffer
+        crop_out = self._crop_buffer
 
-        return crop_tensor.astype(np.float32)
+        # Fast normalization: pixel * alpha + beta (pre-computed in __init__)
+        for c in range(3):
+            crop_out[0, c] = crop_bgr[:, :, c].astype(np.float32) * self.alpha_bgr[c] + self.beta_bgr[c]
+
+        return crop_out
 
     def _extract_crop(self, frame, x_norm, y_norm):
         """Extract crop centered at normalized coordinates.
