@@ -117,8 +117,10 @@ class ActorCNN(nn.Module):
             nn.ReLU(),
         )
 
-        # Calculate CNN output size: 64 channels × 5 time steps = 320
-        cnn_out_dim = 64 * 5
+        # Calculate CNN output size dynamically
+        # After stride=2 conv with kernel=3: floor((num_frames - 3) / 2) + 1
+        cnn_time_out = (num_frames - 3) // 2 + 1
+        cnn_out_dim = 64 * cnn_time_out
 
         # MLP after CNN
         self.fc = nn.Sequential(
@@ -213,7 +215,9 @@ class CriticCNN(nn.Module):
             nn.ReLU(),
         )
 
-        cnn_out_dim = 64 * 5
+        # Calculate CNN output size dynamically
+        cnn_time_out = (num_frames - 3) // 2 + 1
+        cnn_out_dim = 64 * cnn_time_out
 
         # Q1 network with LayerNorm for stability
         self.q1 = nn.Sequential(

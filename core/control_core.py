@@ -316,7 +316,7 @@ class RLController:
 
         # Normalization constants (must match training)
         self.platform_radius_mm = 150.0
-        self.max_tilt_deg = 10.0
+        self.max_tilt_deg = 15.0  # Must match MAX_CONTROLLER_OUTPUT_DEG used in training
 
         # Frame history buffer
         self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
@@ -352,9 +352,9 @@ class RLController:
                     nn.ReLU(),
                 )
 
-                # Action head
-                self.action_mean = nn.Linear(hidden_dim, action_dim)
-                self.action_log_std = nn.Linear(hidden_dim, action_dim)
+                # Action head (names must match training: networks.py ActorCNN)
+                self.mean = nn.Linear(hidden_dim, action_dim)
+                self.log_std = nn.Linear(hidden_dim, action_dim)
 
                 # Physics head (not used for inference, but needed for loading weights)
                 self.physics_head = nn.Sequential(
@@ -377,8 +377,8 @@ class RLController:
                 # MLP
                 features = self.fc(x)
 
-                # Action output
-                action_mean = torch.tanh(self.action_mean(features))
+                # Action output - single tanh matches get_deterministic() in training
+                action_mean = torch.tanh(self.mean(features))
                 return action_mean
 
         # Build PPO actor-critic network
@@ -467,6 +467,15 @@ class RLController:
         # Load trained weights (this also creates the appropriate network)
         self._load_model(model_path)
 
+        # Pre-allocate observation tensor for inference (avoid allocation per step)
+        self._obs_tensor = torch.zeros(1, self.obs_dim, device=self.device)
+
+        # Ring buffer index for frame history (avoids O(n) array shift)
+        self._ring_idx = 0
+
+        # Debug counter (pre-initialized to avoid hasattr check)
+        self._debug_counter = 0
+
         # Track current platform tilt
         self.current_rx = 0.0
         self.current_ry = 0.0
@@ -515,15 +524,22 @@ class RLController:
 
             elif 'actor' in checkpoint:
                 actor_state = checkpoint['actor']
-                # Detect if it's simple MLP or CNN actor by checking keys
-                if 'network.0.weight' in actor_state or 'mean.weight' in actor_state:
+                # Detect architecture by checking for CNN-specific keys FIRST
+                # CNN has conv layers, MLP has network.0 linear layers
+                if 'conv.0.weight' in actor_state:
+                    # CNN actor (from train.py) - has conv layers
+                    self.model_type = 'sac'
+                    self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
+                    self.actor.load_state_dict(actor_state, strict=False)
+                    print(f"[RLController] Loaded SAC CNN model from {model_path}")
+                elif 'network.0.weight' in actor_state:
                     # Simple MLP actor (from train_sac_simple.py)
                     self.model_type = 'sac_simple'
                     self.actor = self._ActorSimple(state_dim=self.obs_dim).to(self.device)
                     self.actor.load_state_dict(actor_state, strict=False)
                     print(f"[RLController] Loaded Simple SAC model from {model_path}")
                 else:
-                    # CNN actor (from train.py)
+                    # Fallback to CNN for unknown format
                     self.model_type = 'sac'
                     self.actor = self._Actor(input_dim=self.obs_dim).to(self.device)
                     self.actor.load_state_dict(actor_state, strict=False)
@@ -549,15 +565,20 @@ class RLController:
                    platform_tilt_deg: Tuple[float, float],
                    dt: float,
                    target_pos_mm: Tuple[float, float]) -> np.ndarray:
-        """Build single frame observation (normalized)."""
+        """Build single frame observation (normalized and clipped).
+
+        IMPORTANT: During training, episodes end when ball falls off platform,
+        so network never sees normalized positions > 1.0. We must clip to
+        prevent out-of-distribution inputs that cause erratic outputs.
+        """
         frame = np.array([
-            ball_pos_mm[0] / self.platform_radius_mm,  # ball_x normalized
-            ball_pos_mm[1] / self.platform_radius_mm,  # ball_y normalized
-            platform_tilt_deg[0] / self.max_tilt_deg,  # platform_rx normalized
-            platform_tilt_deg[1] / self.max_tilt_deg,  # platform_ry normalized
-            dt / 0.01,  # dt normalized (10ms = 1.0)
-            target_pos_mm[0] / self.platform_radius_mm,  # target_x normalized
-            target_pos_mm[1] / self.platform_radius_mm,  # target_y normalized
+            np.clip(ball_pos_mm[0] / self.platform_radius_mm, -1.5, 1.5),  # ball_x
+            np.clip(ball_pos_mm[1] / self.platform_radius_mm, -1.5, 1.5),  # ball_y
+            np.clip(platform_tilt_deg[0] / self.max_tilt_deg, -1.5, 1.5),  # platform_rx
+            np.clip(platform_tilt_deg[1] / self.max_tilt_deg, -1.5, 1.5),  # platform_ry
+            np.clip(dt / 0.01, 0.1, 3.0),  # dt normalized (10ms = 1.0)
+            np.clip(target_pos_mm[0] / self.platform_radius_mm, -1.0, 1.0),  # target_x
+            np.clip(target_pos_mm[1] / self.platform_radius_mm, -1.0, 1.0),  # target_y
         ], dtype=np.float32)
         return frame
 
@@ -595,22 +616,36 @@ class RLController:
             else:
                 dt = 0.01  # Default 10ms
             self.last_time = current_time
-        dt = np.clip(dt, 0.001, 0.1)  # Clamp to reasonable range
+        # Clamp dt to training range (8-30ms) to prevent out-of-distribution observations
+        # Training used dt_range=(0.008, 0.03), so values outside this are OOD
+        dt = np.clip(dt, 0.008, 0.03)
 
         # Build new frame
         new_frame = self._get_frame(ball_pos_mm, (rx_current, ry_current), dt, target_pos_mm)
 
-        # Shift history and add new frame
-        self.frame_history[:-1] = self.frame_history[1:]
-        self.frame_history[-1] = new_frame
+        # Ring buffer: write to current position, then advance index
+        self.frame_history[self._ring_idx] = new_frame
+        self._ring_idx = (self._ring_idx + 1) % self.num_frames
 
-        # Flatten for network input
-        obs = self.frame_history.flatten()
+        # Flatten with correct temporal order (oldest first)
+        # Ring buffer index points to next write position = oldest frame
+        obs = np.roll(self.frame_history, -self._ring_idx, axis=0).flatten()
 
-        # Run inference
+        # Run inference using pre-allocated tensor
         with torch.no_grad():
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            action = self.actor(obs_tensor).cpu().numpy()[0]
+            self._obs_tensor.copy_(torch.from_numpy(obs))
+            action = self.actor(self._obs_tensor).cpu().numpy()[0]
+
+        # DEBUG: Print observation and action every 100 steps
+        self._debug_counter += 1
+        if self._debug_counter % 100 == 1:
+            print(f"[RL DEBUG] step={self._debug_counter}")
+            print(f"  ball_pos_mm={ball_pos_mm}")
+            print(f"  platform_tilt_deg=({rx_current:.2f}, {ry_current:.2f})")
+            print(f"  target_pos_mm={target_pos_mm}")
+            print(f"  dt={dt:.4f}s (normalized={dt/0.01:.2f})")
+            print(f"  latest_frame={new_frame}")
+            print(f"  raw_action={action}")
 
         # Scale action from [-1, 1] to degrees
         rx_target = action[0] * self.max_tilt_deg
@@ -643,6 +678,9 @@ class RLController:
         self.current_rx = platform_tilt_deg[0]
         self.current_ry = platform_tilt_deg[1]
         self.last_time = None
+
+        # Reset ring buffer index
+        self._ring_idx = 0
 
         # Build initial frame with actual position (matches training env_gpu.py reset)
         initial_frame = self._get_frame(ball_pos_mm, platform_tilt_deg, 0.01, target_pos_mm)

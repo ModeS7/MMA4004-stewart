@@ -75,7 +75,7 @@ IK_MAX_ROLL_PITCH_DEG = 60.0  # Maximum roll/pitch angle (degrees)
 IK_MAX_YAW_DEG = 120.0  # Maximum yaw angle (degrees)
 IK_PENALTY_VALUE = 1e6  # Penalty value for invalid IK solutions
 IK_VALID_THRESHOLD = 1e5  # Threshold for valid IK solution detection
-IK_Z_SAMPLES_STANDARD = 41  # Number of Z samples for standard search
+IK_Z_SAMPLES_STANDARD = 21  # Number of Z samples for standard search (reduced from 41 for faster IK)
 IK_Z_SAMPLES_EXTENDED = 31  # Number of Z samples for extended search
 IK_Z_SEARCH_MIN_MM = 100.0  # Minimum Z for extended search (mm)
 IK_Z_SEARCH_EXTEND_MM = 150.0  # Z extension for extended search (mm)
@@ -746,7 +746,7 @@ class SerialConfig:
     # Thread management
     THREAD_JOIN_TIMEOUT_S = 1.0  # Timeout for joining threads on shutdown
     READ_LOOP_SLEEP_S = 0.0005  # Sleep duration in read loop (0.5ms)
-    WRITE_DELAY_S = 0.003  # Delay after each write in write loop (3ms)
+    WRITE_DELAY_S = 0.001  # Delay after each write in write loop (1ms) - reduced from 3ms for faster control
 
 # ============================================================================
 # PERFORMANCE OPTIMIZATION CONFIGURATION

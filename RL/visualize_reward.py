@@ -1,237 +1,334 @@
 """
 Visualize the RL Reward Function
 
-Shows the multiplicative reward structure:
-    reward = 1/(1 + dist/dist_scale) * 1/(1 + speed/speed_scale)
+Matches the actual reward computation in env.py:
+    base = 1 / (1 + dist_mm / dist_scale)
+    alignment = vel_towards / speed  (cos of angle to target)
+    optimal_vel = dist_mm * 2.0
 
-Where:
-    - dist_scale = 30mm (30mm from center gives 0.5 distance factor)
-    - speed_scale = 50mm/s (50mm/s gives 0.5 speed factor)
-    - Fall penalty = -10
+    if vel_towards <= 0:
+        approach = alignment * approach_scale  (penalty for moving away)
+    elif speed <= optimal_vel:
+        approach = (vel_towards / optimal_vel) * alignment * approach_scale
+    else:
+        approach = alignment * approach_scale * exp(-(speed-optimal)/optimal)
+
+    reward = base + clip(approach, -0.5, 0.5)
+
+Key features:
+    - Optimal velocity = 2 * distance (decelerate as you approach)
+    - Alignment factor penalizes perpendicular/orbiting motion
+    - Moving away is penalized proportionally to how directly away
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 
-def compute_reward(dist_mm, speed_mm_s, dist_scale=30.0, speed_scale=50.0):
-    """Compute reward given distance and speed."""
+def compute_base_reward(dist_mm, speed_mm_s=0.0, dist_scale=30.0, speed_scale=100.0):
+    """Compute base reward based on distance and speed."""
     dist_factor = 1.0 / (1.0 + dist_mm / dist_scale)
     speed_factor = 1.0 / (1.0 + speed_mm_s / speed_scale)
     return dist_factor * speed_factor
 
 
+def compute_center_bonus(dist_mm, speed_mm_s=0.0, radius=5.0, max_bonus=1.0, speed_scale=40.0):
+    """
+    Compute center bonus (extra reward for being very close to target AND slow).
+
+    Distance factor: linear from 0 at radius to 1 at center
+    Speed factor: linear cutoff - full bonus when still, zero above threshold
+    """
+    if isinstance(dist_mm, np.ndarray):
+        bonus = np.zeros_like(dist_mm)
+        mask = dist_mm < radius
+        distance_factor = 1.0 - dist_mm[mask] / radius
+        if isinstance(speed_mm_s, np.ndarray):
+            speed_factor = np.maximum(0.0, 1.0 - speed_mm_s[mask] / speed_scale)
+        else:
+            speed_factor = max(0.0, 1.0 - speed_mm_s / speed_scale)
+        bonus[mask] = max_bonus * distance_factor * speed_factor
+        return bonus
+    else:
+        if dist_mm < radius:
+            distance_factor = 1.0 - dist_mm / radius
+            speed_factor = max(0.0, 1.0 - speed_mm_s / speed_scale)
+            return max_bonus * distance_factor * speed_factor
+        return 0.0
+
+
+def compute_approach_reward(dist_mm, vel_towards, speed, approach_scale=0.5):
+    """
+    Approach reward with cosine alignment factor.
+
+    vel_towards: component of velocity towards target (can be negative)
+    speed: total speed (magnitude of velocity)
+
+    alignment = cos(angle) = vel_towards / speed
+    0° → 1.0, 90° → 0.0, 180° → -1.0
+    """
+    if dist_mm < 1e-6 or speed < 1e-6:
+        return 0.0
+
+    alignment = vel_towards / speed  # This IS cosine
+
+    optimal_vel = dist_mm * 2.0
+
+    if vel_towards <= 0:
+        approach = alignment * approach_scale
+    elif speed <= optimal_vel:
+        approach = (vel_towards / optimal_vel) * alignment * approach_scale
+    else:
+        excess = (speed - optimal_vel) / optimal_vel
+        approach = alignment * approach_scale * np.exp(-excess)
+
+    return np.clip(approach, -0.5, 0.5)
+
+
+def compute_total_reward(dist_mm, vel_towards, speed, dist_scale=30.0, base_speed_scale=100.0,
+                         approach_scale=0.5, center_radius=5.0, center_bonus_max=1.0,
+                         center_speed_scale=40.0):
+    """Compute total reward."""
+    base = compute_base_reward(dist_mm, speed, dist_scale, base_speed_scale)
+    center = compute_center_bonus(dist_mm, speed, center_radius, center_bonus_max, center_speed_scale)
+    approach = compute_approach_reward(dist_mm, vel_towards, speed, approach_scale)
+    return base + center + approach
+
+
 def main():
-    # Parameters (from env_gpu.py)
-    dist_scale = 30.0   # mm
-    speed_scale = 50.0  # mm/s
-    platform_radius = 150.0  # mm
+    # Parameters
+    dist_scale = 30.0
+    base_speed_scale = 100.0  # Base reward speed factor: 0.5 at 100mm/s
+    center_radius = 5.0
+    center_bonus_max = 1.0
+    center_speed_scale = 40.0  # Linear cutoff: full bonus at 0mm/s, zero at 40mm/s
+    approach_scale = 0.5
+    platform_radius = 150.0
     fall_penalty = -10.0
 
-    # Create figure with subplots
-    fig = plt.figure(figsize=(16, 10))
-    fig.suptitle('RL Reward Function Visualization', fontsize=14, fontweight='bold')
+    # Create figure
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle('RL Reward Function (Alignment-Based Approach)', fontsize=14, fontweight='bold')
 
     # =========================================================================
-    # 1. 3D Surface Plot
+    # 1. Center Bonus vs Distance (at different speeds)
     # =========================================================================
-    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+    ax1 = axes[0, 0]
 
-    dist = np.linspace(0, platform_radius, 100)
-    speed = np.linspace(0, 300, 100)  # mm/s
-    D, S = np.meshgrid(dist, speed)
-    R = compute_reward(D, S, dist_scale, speed_scale)
+    dist = np.linspace(0, center_radius, 200)
+    speeds = [0, 10, 20, 30, 40]  # Linear cutoff at 40mm/s
+    colors = ['green', 'blue', 'orange', 'red', 'purple']
 
-    surf = ax1.plot_surface(D, S, R, cmap='viridis', alpha=0.8, edgecolor='none')
+    for speed, color in zip(speeds, colors):
+        bonus = compute_center_bonus(dist, speed, center_radius, center_bonus_max, center_speed_scale)
+        ax1.plot(dist, bonus, color=color, linewidth=2, label=f'speed={speed}mm/s')
+
+    ax1.axvline(x=center_radius, color='gray', linestyle='--', alpha=0.5)
+    ax1.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+
     ax1.set_xlabel('Distance from center (mm)')
-    ax1.set_ylabel('Speed (mm/s)')
-    ax1.set_zlabel('Reward')
-    ax1.set_title('3D Reward Surface')
-    ax1.view_init(elev=25, azim=-60)
-    fig.colorbar(surf, ax=ax1, shrink=0.5, label='Reward')
+    ax1.set_ylabel('Center Bonus')
+    ax1.set_title(f'Center Bonus (distance × speed factor)')
+    ax1.set_xlim(0, center_radius)
+    ax1.set_ylim(0, 1.05)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=8)
 
     # =========================================================================
-    # 2. Contour Plot
+    # 2. Alignment Factor: Linear vs Smoothed
     # =========================================================================
-    ax2 = fig.add_subplot(2, 2, 2)
+    ax2 = axes[0, 1]
 
-    contour = ax2.contourf(D, S, R, levels=20, cmap='viridis')
-    ax2.contour(D, S, R, levels=[0.1, 0.25, 0.5, 0.75, 0.9], colors='white', linewidths=0.5)
-    ax2.set_xlabel('Distance from center (mm)')
-    ax2.set_ylabel('Speed (mm/s)')
-    ax2.set_title('Reward Contours')
-    fig.colorbar(contour, ax=ax2, label='Reward')
+    angles = np.linspace(0, 180, 200)
 
-    # Mark key points
-    ax2.axvline(x=dist_scale, color='red', linestyle='--', alpha=0.7, label=f'dist_scale={dist_scale}mm')
-    ax2.axhline(y=speed_scale, color='orange', linestyle='--', alpha=0.7, label=f'speed_scale={speed_scale}mm/s')
-    ax2.legend(loc='upper right')
+    # Linear alignment
+    alignment_linear = np.cos(np.radians(angles))
+    # Smoothed alignment
+    alignment_smooth = alignment_linear * (1.0 + alignment_linear) / 2.0
+
+    ax2.plot(angles, alignment_linear, 'b-', linewidth=2, label='Linear: cos(θ)', alpha=0.7)
+    ax2.plot(angles, alignment_smooth, 'g-', linewidth=2.5, label='Smoothed: cos(θ)×(1+cos(θ))/2')
+    ax2.axvline(x=90, color='gray', linestyle='--', alpha=0.5)
+    ax2.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+
+    ax2.set_xlabel('Angle from target direction (degrees)')
+    ax2.set_ylabel('Alignment Factor')
+    ax2.set_title('Alignment: Linear vs Smoothed')
+    ax2.set_xlim(0, 180)
+    ax2.set_ylim(-0.6, 1.1)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    # Annotate key points on smoothed curve
+    for angle in [0, 45, 90, 135, 180]:
+        align = np.cos(np.radians(angle)) * (1.0 + np.cos(np.radians(angle))) / 2.0
+        ax2.plot(angle, align, 'ro', markersize=6)
+        ax2.annotate(f'{align:+.2f}', (angle, align),
+                    textcoords='offset points', xytext=(5, 5), fontsize=8)
 
     # =========================================================================
-    # 3. Distance Factor (speed=0)
+    # 3. Approach Reward vs Speed (direct approach, angle=0)
     # =========================================================================
-    ax3 = fig.add_subplot(2, 2, 3)
+    ax3 = axes[0, 2]
 
-    dist_factor = 1.0 / (1.0 + dist / dist_scale)
-    ax3.plot(dist, dist_factor, 'b-', linewidth=2, label='Distance Factor')
-    ax3.axvline(x=dist_scale, color='red', linestyle='--', alpha=0.7, label=f'dist_scale={dist_scale}mm (factor=0.5)')
-    ax3.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+    speeds = np.linspace(0, 300, 200)
+    distances = [30, 60, 90]
+    colors = ['blue', 'green', 'orange']
 
-    # Mark platform edge
-    ax3.axvline(x=platform_radius, color='black', linestyle='-', alpha=0.5, label=f'Platform edge ({platform_radius}mm)')
+    for d, c in zip(distances, colors):
+        optimal = d * 2.0
+        approaches = [compute_approach_reward(d, s, s, approach_scale) for s in speeds]
+        ax3.plot(speeds, approaches, color=c, linewidth=2, label=f'd={d}mm (opt={optimal:.0f})')
+        ax3.axvline(x=optimal, color=c, linestyle=':', alpha=0.5)
 
-    ax3.set_xlabel('Distance from center (mm)')
-    ax3.set_ylabel('Distance Factor')
-    ax3.set_title('Distance Factor: 1/(1 + dist/30)')
-    ax3.set_xlim(0, platform_radius)
-    ax3.set_ylim(0, 1.05)
+    ax3.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax3.axhline(y=0.5, color='black', linestyle=':', alpha=0.3)
+
+    ax3.set_xlabel('Speed directly towards target (mm/s)')
+    ax3.set_ylabel('Approach Reward')
+    ax3.set_title('Approach vs Speed (moving directly, angle=0°)')
+    ax3.set_xlim(0, 300)
+    ax3.set_ylim(-0.1, 0.6)
     ax3.grid(True, alpha=0.3)
     ax3.legend()
 
-    # Add annotations
-    for d in [0, 15, 30, 60, 90, 150]:
-        f = 1.0 / (1.0 + d / dist_scale)
-        ax3.plot(d, f, 'ro', markersize=6)
-        ax3.annotate(f'{f:.2f}', (d, f), textcoords='offset points', xytext=(5, 5), fontsize=8)
+    # =========================================================================
+    # 4. Total Reward Heatmap (direct approach)
+    # =========================================================================
+    ax4 = axes[1, 0]
+
+    dist_grid = np.linspace(1, platform_radius, 100)
+    speed_grid = np.linspace(0, 300, 100)
+    D, S = np.meshgrid(dist_grid, speed_grid)
+
+    R = np.zeros_like(D)
+    for i in range(D.shape[0]):
+        for j in range(D.shape[1]):
+            # Direct approach (angle=0, so vel_towards = speed)
+            R[i, j] = compute_total_reward(D[i, j], S[i, j], S[i, j], dist_scale, base_speed_scale, approach_scale)
+
+    im = ax4.imshow(R, extent=[1, platform_radius, 0, 300], origin='lower',
+                    aspect='auto', cmap='RdYlGn', vmin=0, vmax=1.5)
+    ax4.contour(D, S, R, levels=[0.5, 0.75, 1.0, 1.25], colors='black', linewidths=0.5)
+
+    # Plot optimal velocity line
+    ax4.plot(dist_grid, dist_grid * 2.0, 'b--', linewidth=2, label='Optimal velocity')
+
+    ax4.set_xlabel('Distance from center (mm)')
+    ax4.set_ylabel('Speed towards target (mm/s)')
+    ax4.set_title('Total Reward (direct approach, angle=0°)')
+    ax4.legend(loc='upper left')
+    fig.colorbar(im, ax=ax4, label='Reward')
 
     # =========================================================================
-    # 4. Speed Factor (dist=0)
+    # 5. Total Reward Heatmap (angled approach, 45°)
     # =========================================================================
-    ax4 = fig.add_subplot(2, 2, 4)
+    ax5 = axes[1, 1]
 
-    speed_factor = 1.0 / (1.0 + speed / speed_scale)
-    ax4.plot(speed, speed_factor, 'g-', linewidth=2, label='Speed Factor')
-    ax4.axvline(x=speed_scale, color='orange', linestyle='--', alpha=0.7, label=f'speed_scale={speed_scale}mm/s (factor=0.5)')
-    ax4.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+    angle = 45
+    R = np.zeros_like(D)
+    for i in range(D.shape[0]):
+        for j in range(D.shape[1]):
+            vel_towards = S[i, j] * np.cos(np.radians(angle))
+            R[i, j] = compute_total_reward(D[i, j], vel_towards, S[i, j], dist_scale, base_speed_scale, approach_scale)
 
-    ax4.set_xlabel('Speed (mm/s)')
-    ax4.set_ylabel('Speed Factor')
-    ax4.set_title('Speed Factor: 1/(1 + speed/50)')
-    ax4.set_xlim(0, 300)
-    ax4.set_ylim(0, 1.05)
-    ax4.grid(True, alpha=0.3)
-    ax4.legend()
+    im = ax5.imshow(R, extent=[1, platform_radius, 0, 300], origin='lower',
+                    aspect='auto', cmap='RdYlGn', vmin=0, vmax=1.5)
+    ax5.contour(D, S, R, levels=[0.5, 0.75, 1.0], colors='black', linewidths=0.5)
 
-    # Add annotations
-    for s in [0, 25, 50, 100, 150, 200]:
-        f = 1.0 / (1.0 + s / speed_scale)
-        ax4.plot(s, f, 'go', markersize=6)
-        ax4.annotate(f'{f:.2f}', (s, f), textcoords='offset points', xytext=(5, 5), fontsize=8)
+    ax5.plot(dist_grid, dist_grid * 2.0, 'b--', linewidth=2, label='Optimal total speed')
 
-    plt.tight_layout()
+    ax5.set_xlabel('Distance from center (mm)')
+    ax5.set_ylabel('Total speed (mm/s)')
+    ax5.set_title(f'Total Reward (angled approach, {angle}°)')
+    ax5.legend(loc='upper left')
+    fig.colorbar(im, ax=ax5, label='Reward')
 
     # =========================================================================
-    # Second figure: Reward examples and fall penalty
+    # 6. Example Scenarios
     # =========================================================================
-    fig2, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig2.suptitle('Reward Examples & Episode Returns', fontsize=14, fontweight='bold')
+    ax6 = axes[1, 2]
 
-    # Example scenarios
-    ax5 = axes[0]
+    # (name, dist, vel_towards, speed)
     scenarios = [
-        ('Centered, still', 0, 0),
-        ('Centered, slow', 0, 25),
-        ('Centered, fast', 0, 100),
-        ('Near center, still', 15, 0),
-        ('Near center, slow', 15, 25),
-        ('Mid-range, moving', 50, 50),
-        ('Edge, still', 100, 0),
-        ('Edge, fast', 100, 150),
+        ('Centered, still', 0, 0, 0),
+        ('Centered, 50mm/s', 0, 0, 50),
+        ('2mm, still', 2, 0, 0),
+        ('2mm, 20mm/s', 2, 0, 20),
+        ('5mm, still', 5, 0, 0),
+        ('10mm, direct 20mm/s', 10, 20, 20),
+        ('30mm, still', 30, 0, 0),
+        ('30mm, direct 60mm/s', 30, 60, 60),
     ]
 
     names = [s[0] for s in scenarios]
-    rewards = [compute_reward(s[1], s[2]) for s in scenarios]
-    colors = plt.cm.viridis(np.array(rewards))
+    base_rewards = [compute_base_reward(s[1], s[3], dist_scale, base_speed_scale) for s in scenarios]
+    center_bonuses = [compute_center_bonus(s[1], s[3], center_radius, center_bonus_max, center_speed_scale) for s in scenarios]
+    approach_rewards = [compute_approach_reward(s[1], s[2], s[3], approach_scale) for s in scenarios]
+    total_rewards = [b + c + a for b, c, a in zip(base_rewards, center_bonuses, approach_rewards)]
 
-    bars = ax5.barh(names, rewards, color=colors)
-    ax5.set_xlabel('Reward per step')
-    ax5.set_title('Example Scenarios')
-    ax5.set_xlim(0, 1)
-    ax5.grid(True, alpha=0.3, axis='x')
+    y_pos = np.arange(len(names))
 
-    for bar, r in zip(bars, rewards):
-        ax5.text(r + 0.02, bar.get_y() + bar.get_height()/2, f'{r:.3f}', va='center', fontsize=9)
+    # Stack: base, then center bonus, then approach
+    bars_base = ax6.barh(y_pos, base_rewards, color='steelblue', label='Base')
+    bars_center = ax6.barh(y_pos, center_bonuses, left=base_rewards,
+                           color='gold', alpha=0.8, label='Center')
+    approach_left = [b + c for b, c in zip(base_rewards, center_bonuses)]
+    approach_colors = ['green' if a >= 0 else 'red' for a in approach_rewards]
+    bars_approach = ax6.barh(y_pos, approach_rewards, left=approach_left,
+                             color=approach_colors, alpha=0.7, label='Approach')
 
-    # Episode return simulation
-    ax6 = axes[1]
-    steps = np.arange(0, 1000)
+    ax6.set_yticks(y_pos)
+    ax6.set_yticklabels(names, fontsize=8)
+    ax6.set_xlabel('Total Reward')
+    ax6.set_title('Example Scenarios')
+    ax6.axvline(x=0, color='black', linewidth=0.5)
+    ax6.set_xlim(-0.5, 2.6)
+    ax6.grid(True, alpha=0.3, axis='x')
 
-    # Simulate different behaviors
-    # Perfect: stays at center
-    perfect_return = np.cumsum(np.ones(1000) * 1.0)
+    for i, total in enumerate(total_rewards):
+        ax6.text(max(total, 0.05) + 0.05, i, f'{total:.2f}', va='center', fontsize=8)
 
-    # Good: average reward ~0.7
-    good_return = np.cumsum(np.ones(1000) * 0.7)
-
-    # Medium: average reward ~0.4
-    medium_return = np.cumsum(np.ones(1000) * 0.4)
-
-    # Poor: falls at step 200
-    poor_rewards = np.ones(200) * 0.3
-    poor_rewards = np.append(poor_rewards, [-10])  # Fall
-    poor_return = np.cumsum(poor_rewards)
-    poor_steps = np.arange(len(poor_return))
-
-    ax6.plot(steps, perfect_return, 'g-', label='Perfect (r=1.0)', linewidth=2)
-    ax6.plot(steps, good_return, 'b-', label='Good (r=0.7)', linewidth=2)
-    ax6.plot(steps, medium_return, 'orange', label='Medium (r=0.4)', linewidth=2)
-    ax6.plot(poor_steps, poor_return, 'r-', label='Falls at step 200', linewidth=2)
-
-    ax6.set_xlabel('Step')
-    ax6.set_ylabel('Cumulative Return')
-    ax6.set_title('Episode Returns (1000 steps max)')
-    ax6.legend()
-    ax6.grid(True, alpha=0.3)
-
-    # Fall penalty visualization
-    ax7 = axes[2]
-    x = np.linspace(-1, 1, 100)
-    normal_rewards = np.linspace(0, 1, 100)
-    ax7.fill_between(x[:50], 0, 1, alpha=0.3, color='green', label='Normal reward range [0, 1]')
-    ax7.axhline(y=fall_penalty, color='red', linewidth=3, label=f'Fall penalty = {fall_penalty}')
-    ax7.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-    ax7.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-
-    ax7.set_ylim(-12, 2)
-    ax7.set_xlim(-1, 1)
-    ax7.set_ylabel('Reward')
-    ax7.set_title('Reward Range')
-    ax7.legend()
-    ax7.set_xticks([])
-    ax7.grid(True, alpha=0.3, axis='y')
-
-    # Add text annotations
-    ax7.text(0, 0.5, 'Normal\nreward\n[0, 1]', ha='center', va='center', fontsize=12, fontweight='bold')
-    ax7.text(0, fall_penalty, f'FALL\n{fall_penalty}', ha='center', va='top', fontsize=12, fontweight='bold', color='red')
+    ax6.legend(loc='lower right', fontsize=8)
 
     plt.tight_layout()
 
     # =========================================================================
     # Print summary
     # =========================================================================
-    print("=" * 60)
-    print("REWARD FUNCTION SUMMARY")
-    print("=" * 60)
+    print("=" * 75)
+    print("REWARD FUNCTION SUMMARY (env.py)")
+    print("=" * 75)
     print()
     print("Formula:")
-    print("  reward = dist_factor * speed_factor")
-    print("  dist_factor = 1 / (1 + dist_mm / 30)")
-    print("  speed_factor = 1 / (1 + speed_mm_s / 50)")
+    print(f"  base = 1/(1 + dist/{dist_scale}) × 1/(1 + speed/{base_speed_scale})")
+    print(f"  center_bonus = {center_bonus_max} × (1-dist/{center_radius}) × max(0, 1-speed/{center_speed_scale})")
+    print(f"                 if dist < {center_radius}mm (linear cutoff at {center_speed_scale}mm/s)")
+    print(f"  alignment = vel_towards / speed  (cosine: 0°→1, 90°→0, 180°→-1)")
+    print(f"  optimal_vel = dist_mm × 2.0")
+    print(f"  approach:")
+    print(f"    if vel_towards <= 0:    alignment × {approach_scale}")
+    print(f"    if speed <= optimal:    (vel_towards/optimal) × alignment × {approach_scale}")
+    print(f"    if speed > optimal:     alignment × {approach_scale} × exp(-(speed-opt)/opt)")
+    print(f"  reward = base + center_bonus + clip(approach, -0.5, +0.5)")
     print()
-    print("Parameters:")
-    print(f"  dist_scale = {dist_scale} mm")
-    print(f"  speed_scale = {speed_scale} mm/s")
-    print(f"  fall_penalty = {fall_penalty}")
-    print()
-    print("Reward range: [0, 1] (normal), -10 (fall)")
+    print("Key features:")
+    print(f"  - Base reward: dist × speed factors (soft decay, never zero)")
+    print(f"  - Center bonus: ZERO when speed >= {center_speed_scale}mm/s (hard cutoff)")
+    print("  - Optimal velocity = 2 × distance (decelerate as you approach)")
+    print("  - Alignment = cosine: 0°→+1, 90°→0, 180°→-1 (full penalty for retreat)")
     print()
     print("Example rewards:")
-    for name, d, s in scenarios:
-        r = compute_reward(d, s)
-        print(f"  {name:25s}: dist={d:3.0f}mm, speed={s:3.0f}mm/s -> reward={r:.3f}")
+    print(f"  {'Scenario':<28s} {'Base':>6s} {'Center':>7s} {'Appr':>6s} {'Total':>7s}")
+    print("-" * 62)
+    for i, (name, d, vt, s) in enumerate(scenarios):
+        base = base_rewards[i]
+        center = center_bonuses[i]
+        appr = approach_rewards[i]
+        total = total_rewards[i]
+        print(f"  {name:<28s} {base:>6.2f} {center:>7.2f} {appr:>+6.2f} {total:>7.2f}")
     print()
-    print("=" * 60)
+    print("=" * 75)
 
     plt.show()
 

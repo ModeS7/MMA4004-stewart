@@ -376,14 +376,15 @@ class MinimalController(IMUControllerMixin, HardwareControllerBase):
                 self.last_ball_update = self.simulation_time
 
                 # Handle coordinate conversion based on camera type
-                if self.camera_type == 'PIXY2':
+                if self._is_pixy2:
                     # Pixy2 returns pixel coordinates, convert to mm
                     pixy_x = ball_data['x']
                     pixy_y = ball_data['y']
 
                     # Camera dimensions: 316×208 pixels, origin at top-left
-                    ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
-                    ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
+                    # Using cached values from parent class for performance
+                    ball_x_mm = (pixy_x - self._pixy_center_x) * self.pixels_to_mm_x
+                    ball_y_mm = (self._pixy_res_height - pixy_y - self._pixy_center_y) * self.pixels_to_mm_y
                 else:  # ZED camera
                     # ZED returns coordinates already in mm (from platform center)
                     ball_x_mm = ball_data['x']

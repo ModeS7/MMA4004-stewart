@@ -25,14 +25,14 @@ from RL.sac_agent import SACAgent, ReplayBuffer
 # ============================================================================
 
 # Architecture: "mlp" (simple) or "cnn" (temporal)
-ARCHITECTURE = "mlp"
+ARCHITECTURE = "cnn"
 
 # Training
 NUM_ENVS = 1              # Single environment
-MAX_EPISODES = 1000       # Training episodes
+MAX_EPISODES = 3000       # Training episodes
 MAX_STEPS = 1000          # Steps per episode (30 seconds at 100Hz)
 BATCH_SIZE = 512          # Batch size for updates
-BUFFER_SIZE = 100_000     # Replay buffer size
+BUFFER_SIZE = 300_000     # Replay buffer size
 
 # SAC Hyperparameters
 HIDDEN_DIM = 256          # Network hidden layer size
@@ -47,16 +47,28 @@ USE_PHYSICS_HEAD = False  # Enable physics estimation auxiliary task
 PHYSICS_DIM = 3           # Physics estimation dimension
 PHYSICS_LOSS_WEIGHT = 0.1 # Weight for physics auxiliary loss
 
+# Domain Randomization (for sim-to-real transfer)
+RANDOMIZATION = True              # Enable/disable all randomization
+TARGET_RANDOMIZATION = True       # Randomize target position within 100mm radius
+
 # Training Options
 WARMUP_STEPS = 1000       # Random actions before training
-EVAL_INTERVAL = 10        # Evaluate every N episodes
-SAVE_INTERVAL = 50        # Save model every N episodes
+EVAL_INTERVAL = 5        # Evaluate every N episodes
+SAVE_INTERVAL = 10        # Save model every N episodes
+
+# Performance optimizations
+USE_COMPILE = True        # torch.compile for faster NN (1.5x speedup after warmup)
+USE_AMP = False           # Mixed precision (FP16) - disabled: adds overhead for small networks
 
 # Device
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Enable TensorFloat32 for faster matmul on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
+
 # Resume from checkpoint (set to path or None)
-CHECKPOINT = None
+CHECKPOINT = "./RL/checkpoints/sac_cnn_20251130_223233/sac_cnn_ep970.pt"
 
 
 # ============================================================================
@@ -76,11 +88,17 @@ def train():
     print(f"Batch size: {BATCH_SIZE}")
     if ARCHITECTURE == "cnn":
         print(f"Physics head: {USE_PHYSICS_HEAD}")
+    print(f"Randomization: {RANDOMIZATION}")
     print()
 
     # Load configs
     env_cfg = EnvConfig()
     env_cfg.max_steps = MAX_STEPS
+    env_cfg.use_domain_randomization = RANDOMIZATION
+    env_cfg.use_platform_offset = RANDOMIZATION
+    env_cfg.use_camera_noise = RANDOMIZATION
+    env_cfg.use_dt_randomization = RANDOMIZATION
+    env_cfg.randomize_target = TARGET_RANDOMIZATION
     reward_cfg = RewardConfig()
 
     # Create simulation environment
@@ -113,9 +131,15 @@ def train():
         tau=TAU,
         alpha=ALPHA,
         automatic_entropy=AUTOMATIC_ENTROPY,
-        device=DEVICE
+        device=DEVICE,
+        compile_model=USE_COMPILE,
+        use_amp=USE_AMP
     )
     print(f"Agent created on {agent.device}")
+    if USE_COMPILE:
+        print("torch.compile enabled (first episodes slower due to compilation)")
+    if USE_AMP:
+        print("Mixed precision (AMP) enabled for faster training")
 
     # Load checkpoint if specified
     start_episode = 0
@@ -145,6 +169,7 @@ def train():
     episode_rewards = []
     episode_lengths = []
     total_steps = 0
+    training_start_time = time.time()
 
     print()
     print("=" * 60)
@@ -152,49 +177,46 @@ def train():
     print("=" * 60)
 
     for episode in range(start_episode, MAX_EPISODES):
+        episode_start_time = time.time()
+
         # Reset environment
-        obs, _ = env.reset()
-        obs = obs[0]  # Single env
+        obs_batch, _ = env.reset()
 
         episode_reward = 0
         episode_length = 0
 
         for step in range(MAX_STEPS):
-            # Select action
+            # Select actions for all envs
             if total_steps < WARMUP_STEPS:
-                action = np.random.uniform(-1, 1, action_dim).astype(np.float32)
+                actions = np.random.uniform(-1, 1, (NUM_ENVS, action_dim)).astype(np.float32)
             else:
-                action = agent.select_action(obs, evaluate=False)
+                actions = np.array([agent.select_action(obs_batch[i], evaluate=False)
+                                   for i in range(NUM_ENVS)])
 
             # Step environment
-            next_obs, reward, done, truncated, _ = env.step(np.array([action]))
+            next_obs_batch, rewards, dones, truncateds, _ = env.step(actions)
 
-            next_obs = next_obs[0]
-            reward = float(reward[0])
-            done = bool(done[0]) or bool(truncated[0])
+            # Store transitions for all envs
+            for i in range(NUM_ENVS):
+                buffer.push(obs_batch[i], actions[i], rewards[i], next_obs_batch[i],
+                           float(dones[i] or truncateds[i]))
 
-            # Store transition
-            buffer.push(obs, action, reward, next_obs, float(done))
+            obs_batch = next_obs_batch
+            episode_reward += rewards.sum()
+            episode_length += NUM_ENVS
+            total_steps += NUM_ENVS
 
             # Update agent
             if total_steps >= WARMUP_STEPS and len(buffer) >= BATCH_SIZE:
                 update_info = agent.update(buffer, BATCH_SIZE)
 
                 # Log to TensorBoard
-                if total_steps % 100 == 0:
+                if total_steps % 1000 == 0:
                     writer.add_scalar('Loss/Critic', update_info['critic_loss'], total_steps)
                     writer.add_scalar('Loss/Actor', update_info['actor_loss'], total_steps)
                     writer.add_scalar('Params/Alpha', update_info['alpha'], total_steps)
                     if USE_PHYSICS_HEAD and ARCHITECTURE == "cnn":
                         writer.add_scalar('Loss/Physics', update_info['physics_loss'], total_steps)
-
-            obs = next_obs
-            episode_reward += reward
-            episode_length += 1
-            total_steps += 1
-
-            if done:
-                break
 
         # Episode complete
         episode_rewards.append(episode_reward)
@@ -203,15 +225,30 @@ def train():
         # Log episode metrics
         writer.add_scalar('Episode/Reward', episode_reward, episode)
         writer.add_scalar('Episode/Length', episode_length, episode)
+        writer.add_scalar('Episode/Time', time.time() - episode_start_time, episode)
 
         # Print progress
+        episode_time = time.time() - episode_start_time
+        elapsed_time = time.time() - training_start_time
+        steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
         avg_reward = np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards)
-        print(f"Episode {episode + 1:4d} | "
-              f"Reward: {episode_reward:7.1f} | "
+
+        # ETA calculation
+        episodes_done = episode - start_episode + 1
+        episodes_remaining = MAX_EPISODES - episode - 1
+        if episodes_done > 0:
+            eta_seconds = (elapsed_time / episodes_done) * episodes_remaining
+            eta_str = f"{eta_seconds/3600:.1f}h" if eta_seconds > 3600 else f"{eta_seconds/60:.0f}m"
+        else:
+            eta_str = "?"
+
+        print(f"Ep {episode + 1:4d} | "
+              f"R: {episode_reward:7.1f} | "
               f"Avg: {avg_reward:7.1f} | "
-              f"Length: {episode_length:4d} | "
-              f"Alpha: {agent.alpha:.3f} | "
-              f"Buffer: {len(buffer):6d}")
+              f"α: {agent.alpha:.3f} | "
+              f"T: {episode_time:.1f}s | "
+              f"SPS: {steps_per_sec:.0f} | "
+              f"ETA: {eta_str}")
 
         # Save checkpoint
         if (episode + 1) % SAVE_INTERVAL == 0:

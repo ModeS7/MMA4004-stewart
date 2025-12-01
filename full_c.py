@@ -30,10 +30,11 @@ from setup.base_hardware import HardwareControllerBase, SerialController
 from gui import gui_modules as gm
 from gui.gui_builder import create_standard_layout, GUIBuilder
 from core.control_core import IMUControllerMixin, LQRController, clip_tilt_vector
+from core.core import FirstOrderServo
 from core.utils import (IKZOptimizationConfig, MAX_TILT_ANGLE_DEG, MAX_CONTROLLER_OUTPUT_DEG,
                          MAX_YAW_ANGLE_DEG, Pixy2CameraConfig, BallPhysicsConfig,
                          HardwareConnectionConfig, GUIConfig, VisualizationConfig, ControlLoopConfig,
-                         GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL, PerformanceConfig)
+                         GUI_FONT_MONOSPACE, GUI_FONT_SIZE_NORMAL, PerformanceConfig, SimulationConfig)
 
 
 class StewartController(IMUControllerMixin, HardwareControllerBase):
@@ -65,6 +66,19 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
         # Effective platform angles (gravity frame) for Kalman filter prediction
         # Excludes IMU compensation to maintain consistent physics model
         self.prev_effective_angles = {'rx': 0.0, 'ry': 0.0}
+
+        # Servo dynamics simulation (matches training environment)
+        # Required for RL controller - network expects servo lag in observations
+        self.sim_servos = [
+            FirstOrderServo(
+                K=1.0,
+                tau=SimulationConfig.DEFAULT_SERVO_TAU,
+                delay=SimulationConfig.DEFAULT_SERVO_DELAY,
+                max_velocity=SimulationConfig.DEFAULT_SERVO_MAX_VELOCITY
+            )
+            for _ in range(6)
+        ]
+        self.sim_time = 0.0  # Track simulation time for servo updates
 
         # Ball trail history (for hardware mode)
         self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
@@ -156,7 +170,38 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 actual_dt=dt
             )
         elif self.controller_type_selection == 'RL':
-            platform_tilt = (self.prev_effective_angles['rx'], self.prev_effective_angles['ry'])
+            # Update servo dynamics BEFORE reading platform tilt
+            # This is critical - servo simulation must run at control loop rate, not GUI rate
+            if hasattr(self, 'sim_servos') and hasattr(self, 'last_cmd_angles') and self.last_cmd_angles is not None:
+                # Update simulation time
+                self.sim_time += dt
+
+                # Send commanded angles to simulated servos
+                for i, angle in enumerate(self.last_cmd_angles):
+                    self.sim_servos[i].send_command(angle, self.sim_time)
+
+                # Update servo dynamics
+                for servo in self.sim_servos:
+                    servo.update(dt, self.sim_time)
+
+                # Get ACTUAL angles after servo dynamics (with lag)
+                actual_angles = np.array([servo.get_angle() for servo in self.sim_servos])
+
+                # Compute FK from ACTUAL angles (not commanded)
+                fk_translation, fk_rotation, fk_success, _ = self.ik.calculate_forward_kinematics(
+                    actual_angles,
+                    use_top_surface_offset=self.use_top_surface_offset
+                )
+                if fk_success:
+                    self.last_fk_translation = fk_translation
+                    self.last_fk_rotation = fk_rotation
+
+            # Use ACTUAL platform angles from FK (after servo dynamics), not commanded angles
+            # This matches training where observations include servo-filtered platform state
+            if hasattr(self, 'last_fk_rotation') and self.last_fk_rotation is not None:
+                platform_tilt = (self.last_fk_rotation[0], self.last_fk_rotation[1])
+            else:
+                platform_tilt = (0.0, 0.0)
             rx, ry = self.controller.update(
                 ball_pos_filtered, ball_vel_filtered, target_pos_mm,
                 platform_tilt_deg=platform_tilt,
@@ -833,6 +878,13 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
     def on_kalman_reset(self) -> None:
         """Reset Kalman filter to current ball position."""
         self.kalman_filter.reset(self.ball_pos_mm)
+        # Also reset servo simulation to current state
+        if hasattr(self, 'sim_servos'):
+            for servo in self.sim_servos:
+                servo.reset()
+            self.sim_time = 0.0
+            if hasattr(self, '_last_servo_update_time'):
+                delattr(self, '_last_servo_update_time')
         self.log("Kalman filter reset")
 
     def on_z_optimization_toggle(self, enabled: bool) -> None:
@@ -937,14 +989,15 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 self.last_ball_update = self.simulation_time
 
                 # Handle coordinate conversion based on camera type
-                if self.camera_type == 'PIXY2':
+                if self._is_pixy2:
                     # Pixy2 returns pixel coordinates, convert to mm
                     pixy_x = ball_data['x']
                     pixy_y = ball_data['y']
 
                     # Camera dimensions: 316×208 pixels, origin at top-left
-                    ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * Pixy2CameraConfig.PIXELS_TO_MM_X
-                    ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * Pixy2CameraConfig.PIXELS_TO_MM_Y
+                    # Using cached values from parent class for performance
+                    ball_x_mm = (pixy_x - self._pixy_center_x) * self.pixels_to_mm_x
+                    ball_y_mm = (self._pixy_res_height - pixy_y - self._pixy_center_y) * self.pixels_to_mm_y
                 else:  # STEREO camera
                     # Stereo returns 3D coordinates in platform frame (mm)
                     # X, Y used for control; Z logged only
@@ -1386,21 +1439,73 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             else:
                 vel_x_mm, vel_y_mm = 0.0, 0.0
 
-            # Calculate FK from sent servo angles
+            # Calculate FK from servo state
+            # For RL controller: servo dynamics are updated in control loop, just read current state
+            # For other controllers: update servo dynamics here (for display only)
             if hasattr(self, 'last_cmd_angles') and self.last_cmd_angles is not None:
-                fk_translation, fk_rotation, fk_success, _ = self.ik.calculate_forward_kinematics(
-                    self.last_cmd_angles,
-                    use_top_surface_offset=self.use_top_surface_offset
+                # Only update servo dynamics here for non-RL controllers
+                # RL controller updates servos in _update_controller at control loop rate
+                if self.controller_type_selection != 'RL':
+                    current_time = time.time()
+
+                    # Calculate dt from last update
+                    if not hasattr(self, '_last_servo_update_time'):
+                        self._last_servo_update_time = current_time
+                    dt = current_time - self._last_servo_update_time
+                    self._last_servo_update_time = current_time
+
+                    # Clamp dt to reasonable range
+                    dt = np.clip(dt, 0.001, 0.1)
+
+                    # Update simulation time
+                    self.sim_time += dt
+
+                    # Send commanded angles to simulated servos
+                    for i, angle in enumerate(self.last_cmd_angles):
+                        self.sim_servos[i].send_command(angle, self.sim_time)
+
+                    # Update servo dynamics
+                    for servo in self.sim_servos:
+                        servo.update(dt, self.sim_time)
+
+                # Get ACTUAL angles after servo dynamics (with lag)
+                actual_angles = np.array([servo.get_angle() for servo in self.sim_servos])
+
+                # Compute FK from ACTUAL angles (only if changed - FK is expensive)
+                angles_changed = (
+                    self._fk_cache_angles is None or
+                    not np.allclose(actual_angles, self._fk_cache_angles, atol=0.01)
                 )
-                if fk_success:
-                    self.last_fk_translation = fk_translation
-                    self.last_fk_rotation = fk_rotation
+
+                if angles_changed:
+                    fk_translation, fk_rotation, fk_success, _ = self.ik.calculate_forward_kinematics(
+                        actual_angles,
+                        use_top_surface_offset=self.use_top_surface_offset
+                    )
+                    if fk_success:
+                        self.last_fk_translation = fk_translation
+                        self.last_fk_rotation = fk_rotation
+                        # Update cache
+                        self._fk_cache_angles = actual_angles.copy()
+                        self._fk_cache_translation = fk_translation
+                        self._fk_cache_rotation = fk_rotation
+                        self._fk_cache_valid = True
+                    else:
+                        fk_translation = np.zeros(3)
+                        fk_rotation = np.zeros(3)
                 else:
-                    fk_translation = np.zeros(3)
-                    fk_rotation = np.zeros(3)
+                    # Use cached values
+                    fk_translation = self._fk_cache_translation if self._fk_cache_valid else np.zeros(3)
+                    fk_rotation = self._fk_cache_rotation if self._fk_cache_valid else np.zeros(3)
             else:
                 fk_translation = np.zeros(3)
                 fk_rotation = np.zeros(3)
+
+            # Get actual servo angles from simulation
+            if hasattr(self, 'sim_servos'):
+                actual_servo_angles = np.array([servo.get_angle() for servo in self.sim_servos])
+            else:
+                actual_servo_angles = self.last_cmd_angles
 
             state = {
                 'simulation_time': self.simulation_time,
@@ -1409,7 +1514,7 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 'ball_vel': (vel_x_mm, vel_y_mm),
                 'dof_values': self.dof_values,
                 'cmd_angles': self.last_cmd_angles,
-                'actual_angles': self.last_cmd_angles,  # No servo simulation in hardware
+                'actual_angles': actual_servo_angles,  # Actual angles from servo dynamics simulation
                 'fk_translation': fk_translation,
                 'fk_rotation': fk_rotation,
                 'z_optimization_enabled': self.z_optimization_enabled,

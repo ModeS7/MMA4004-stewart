@@ -791,6 +791,7 @@ class HardwareControllerBase(BaseStewartSimulator):
 
         # Camera type and calibration parameters (pixels to mm conversion)
         self.camera_type: str = CAMERA_TYPE
+        self._is_pixy2: bool = (CAMERA_TYPE == 'PIXY2')  # Boolean flag to avoid string comparison in loop
         if CAMERA_TYPE == 'STEREO':
             # Stereo uses triangulation - no pixel-to-mm conversion needed
             # These are kept for compatibility but not used
@@ -803,11 +804,21 @@ class HardwareControllerBase(BaseStewartSimulator):
             self.camera_height_mm: float = Pixy2CameraConfig.FOV_HEIGHT_MM
             self.pixels_to_mm_x: float = Pixy2CameraConfig.PIXELS_TO_MM_X
             self.pixels_to_mm_y: float = Pixy2CameraConfig.PIXELS_TO_MM_Y
+            # Cache additional config values for loop performance
+            self._pixy_center_x: float = Pixy2CameraConfig.CENTER_X
+            self._pixy_center_y: float = Pixy2CameraConfig.CENTER_Y
+            self._pixy_res_height: float = Pixy2CameraConfig.RESOLUTION_HEIGHT_PX
 
         self.last_ball_update: float = 0.0
         self.ball_pos_mm: np.ndarray = np.array([0.0, 0.0])
         self.ball_detected: bool = False
         self.ball_in_control_zone: bool = False  # True when ball is within 200mm radius
+
+        # FK cache for GUI updates (avoid expensive recalculation)
+        self._fk_cache_angles: Optional[np.ndarray] = None
+        self._fk_cache_translation: Optional[np.ndarray] = None
+        self._fk_cache_rotation: Optional[np.ndarray] = None
+        self._fk_cache_valid: bool = False
 
         # Performance tracking
         self.performance_data: Dict[str, List[float]] = {
@@ -939,6 +950,14 @@ class HardwareControllerBase(BaseStewartSimulator):
                     output_limit=15.0,
                     device='cpu'
                 )
+                # Reset frame history with current ball position (critical for proper init)
+                # In training, all 12 frames start with actual observation, not zeros
+                if hasattr(self, 'ball_pos_mm'):
+                    self.controller.reset(
+                        ball_pos_mm=self.ball_pos_mm,
+                        platform_tilt_deg=(0.0, 0.0),
+                        target_pos_mm=getattr(self, 'target_pos_mm', (0.0, 0.0))
+                    )
                 self.log("RL controller initialized (SAC policy)")
             except Exception as e:
                 self.log(f"RL initialization failed: {str(e)}")
@@ -1171,14 +1190,15 @@ class HardwareControllerBase(BaseStewartSimulator):
                 self.last_ball_update = self.simulation_time
 
                 # Handle coordinate conversion based on camera type
-                if self.camera_type == 'PIXY2':
+                if self._is_pixy2:
                     # Pixy2 returns pixel coordinates, convert to mm
                     pixy_x = ball_data['x']
                     pixy_y = ball_data['y']
 
                     # Camera coordinate conversion (origin at top-left, convert to center-origin)
-                    ball_x_mm = (pixy_x - Pixy2CameraConfig.CENTER_X) * self.pixels_to_mm_x
-                    ball_y_mm = (Pixy2CameraConfig.RESOLUTION_HEIGHT_PX - pixy_y - Pixy2CameraConfig.CENTER_Y) * self.pixels_to_mm_y
+                    # Using cached values for performance
+                    ball_x_mm = (pixy_x - self._pixy_center_x) * self.pixels_to_mm_x
+                    ball_y_mm = (self._pixy_res_height - pixy_y - self._pixy_center_y) * self.pixels_to_mm_y
                 else:  # STEREO camera
                     # Stereo returns 3D coordinates in platform frame (mm)
                     ball_x_mm = ball_data['x']
@@ -1390,14 +1410,33 @@ class HardwareControllerBase(BaseStewartSimulator):
                 'time_since_update': self.simulation_time - self.last_ball_update
             })
 
-        # Update platform state (calculate FK from servo angles)
+        # Update platform state (use cached FK if angles unchanged)
         if 'platform_state' in self.gui_modules and hasattr(self, 'last_cmd_angles'):
-            translation_fk, rotation_fk, fk_success, _ = self.ik.calculate_forward_kinematics(
-                self.last_cmd_angles,
-                use_top_surface_offset=self.use_top_surface_offset
+            # Check if we can use cached FK result
+            angles_changed = (
+                self._fk_cache_angles is None or
+                not np.allclose(self.last_cmd_angles, self._fk_cache_angles, atol=0.01)
             )
 
-            if fk_success:
+            if angles_changed:
+                # Angles changed - recalculate FK
+                translation_fk, rotation_fk, fk_success, _ = self.ik.calculate_forward_kinematics(
+                    self.last_cmd_angles,
+                    use_top_surface_offset=self.use_top_surface_offset
+                )
+                if fk_success:
+                    # Update cache
+                    self._fk_cache_angles = self.last_cmd_angles.copy()
+                    self._fk_cache_translation = translation_fk
+                    self._fk_cache_rotation = rotation_fk
+                    self._fk_cache_valid = True
+            else:
+                # Use cached values
+                translation_fk = self._fk_cache_translation
+                rotation_fk = self._fk_cache_rotation
+                fk_success = self._fk_cache_valid
+
+            if fk_success and translation_fk is not None:
                 self.gui_modules['platform_state'].update({
                     'x': translation_fk[0],
                     'y': translation_fk[1],

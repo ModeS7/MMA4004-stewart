@@ -43,11 +43,20 @@ class EnvConfig:
     init_pos_range_mm = 100.0  # Ball starts within [-100, 100] mm (harder)
     init_vel_range_mm_s = 50.0  # Initial velocity range
 
+    # Target randomization
+    randomize_target = True    # Enable target randomization
+    target_range_mm = 100.0    # Target within 100mm radius of center
+
     # Camera noise (ZED camera model)
     use_camera_noise = False
     position_noise_std_mm = 2.0  # 2mm std noise
-    # Noise can also scale with distance from camera (depth-dependent)
-    noise_depth_scale = 0.0
+
+    # Timing randomization (simulates variable control loop timing)
+    use_dt_randomization = False
+    dt_range = (0.008, 0.03)       # Base dt range per episode (8-30ms)
+    dt_noise_std = 0.000005        # Per-step noise std (0.005ms)
+    dt_jitter_prob = 0.01          # Probability of 40ms jitter per step
+    dt_jitter_ms = 40              # Jitter duration in ms
 
     # Domain randomization (for sim-to-real transfer)
     # Only platform tilt offset enabled (simulates gravity vector)
@@ -66,29 +75,43 @@ class EnvConfig:
 # ============================================================================
 
 class RewardConfig:
-    """Reward function weights."""
+    """
+    Reward function parameters.
 
-    # Penalties (negative)
-    k_position = 0.01  # Position error: -k * (x^2 + y^2) in mm^2 [5x increase to punish off-center]
-    k_velocity = 0.005  # Velocity penalty: -k * (vx^2 + vy^2) [increased 50x from original]
-    k_tilt = 0.01  # Tilt penalty: -k * (rx^2 + ry^2)
-    k_action = 0.001  # Action magnitude: -k * (a^2)
-    k_action_rate = 0.2  # Action rate penalty: -k * (da^2) [increased for smoother control]
+    Reward formula (env.py):
+        base = 1/(1 + dist/dist_scale) × 1/(1 + speed/base_speed_scale)
+        distance_factor = (1 - dist/center_bonus_radius) if dist < radius else 0
+        speed_factor = max(0, 1 - speed/center_bonus_speed_scale)  # Linear cutoff
+        center_bonus = center_bonus_max * distance_factor * speed_factor
+        alignment = vel_towards / speed  (cosine: 0°→1, 90°→0, 180°→-1)
+        optimal_vel = dist_mm * 2.0
+        approach = alignment * approach_scale * f(speed, optimal_vel)
+        reward = base + center_bonus + clip(approach, -0.5, 0.5)
 
-    # Bonus (positive)
-    k_center_bonus = 1.0  # Bonus for being centered
-    center_threshold_mm = 10.0  # Distance to get full bonus
-    k_stability_bonus = 1.0  # Bonus for being centered AND slow [increased]
-    stability_vel_threshold = 10.0  # Velocity threshold for stability bonus (mm/s) [tighter]
+    Key behaviors:
+        - Base reward: dist_factor × speed_factor (0.5 at 100mm/s, never zero)
+        - Center bonus: distance factor (0→1 at 0-5mm) × speed factor (linear cutoff)
+        - Center bonus ZERO when speed >= 40mm/s (hard cutoff for stable centering)
+        - Optimal velocity = 2 × distance from target (encourages deceleration)
+        - Alignment = cosine: 0°→1.0, 45°→0.71, 90°→0.0, 180°→-1.0
+        - Target position randomized within 100mm radius (agent sees it in observation)
+        - Max total reward: 2.5 (at target, still + max approach)
+    """
+
+    # Position reward
+    dist_scale = 30.0      # 30mm from center gives 0.5 base reward
+    base_speed_scale = 100.0  # Speed factor for base: 1/(1+speed/scale), 0.5 at 100mm/s
+
+    # Center bonus (extra reward for being very close to target AND slow)
+    center_bonus_radius = 5.0   # Bonus active within 5mm of target
+    center_bonus_max = 1.0      # Max bonus at exact center (linear from 0 at radius to max at center)
+    center_bonus_speed_scale = 40.0  # Speed cutoff: full bonus at 0mm/s, zero at 40mm/s (linear)
+
+    # Approach reward (moving towards target at appropriate speed)
+    approach_scale = 0.5   # Max approach bonus when at optimal velocity
 
     # Termination
-    out_of_bounds_penalty = -100.0  # Ball fell off
-
-    # Multiplicative reward scales (used by GPU env)
-    dist_scale = 30.0   # ~30mm from center gives 0.5 distance factor
-    speed_scale = 50.0  # ~50mm/s gives 0.5 speed factor
-    fall_penalty = -10.0  # Penalty when ball falls off
-    approach_scale = 0.5  # Approach velocity bonus: reward moving towards target when far
+    fall_penalty = -10.0   # Penalty when ball falls off platform
 
 
 # ============================================================================

@@ -4,6 +4,7 @@ Unified SAC Agent
 Single agent class that works with both MLP and CNN architectures.
 """
 
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
@@ -100,7 +101,9 @@ class SACAgent:
             tau=0.005,
             alpha=0.2,
             automatic_entropy=True,
-            device="cuda"
+            device="cuda",
+            compile_model=False,
+            use_amp=False
     ):
         self.architecture = architecture
         self.gamma = gamma
@@ -110,6 +113,14 @@ class SACAgent:
         self.use_physics_head = use_physics_head and architecture == "cnn"
         self.physics_loss_weight = physics_loss_weight
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.compile_model = compile_model
+        self.use_amp = use_amp and self.device.type == "cuda"
+
+        # Mixed precision training (AMP)
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler = None
 
         # Create networks based on architecture
         if architecture == "mlp":
@@ -129,6 +140,13 @@ class SACAgent:
             ).to(self.device)
         else:
             raise ValueError(f"Unknown architecture: {architecture}. Use 'mlp' or 'cnn'.")
+
+        # Apply torch.compile for kernel fusion (reduces kernel launch overhead)
+        # Note: "default" mode is more compatible with profiling than "reduce-overhead"
+        if compile_model:
+            self.actor = torch.compile(self.actor, mode="default")
+            self.critic = torch.compile(self.critic, mode="default")
+            self.critic_target = torch.compile(self.critic_target, mode="default")
 
         # Copy parameters to target
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
@@ -186,63 +204,76 @@ class SACAgent:
         # Sample batch
         states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
 
-        # ===== Update Critic =====
-        with torch.no_grad():
-            if self.use_physics_head:
-                next_actions, next_log_probs, _ = self.actor.sample(next_states)
-            else:
-                next_actions, next_log_probs = self.actor.sample(next_states)
+        # Use autocast for mixed precision if enabled
+        amp_context = torch.amp.autocast('cuda') if self.use_amp else nullcontext()
 
-            target_q1, target_q2 = self.critic_target(next_states, next_actions)
-            target_q = torch.min(target_q1, target_q2)
+        # ===== Update Critic =====
+        with amp_context:
+            with torch.no_grad():
+                if self.use_physics_head:
+                    next_actions, next_log_probs, _ = self.actor.sample(next_states)
+                else:
+                    next_actions, next_log_probs = self.actor.sample(next_states)
+
+                target_q1, target_q2 = self.critic_target(next_states, next_actions)
+                target_q = torch.min(target_q1, target_q2)
+
+                if self.automatic_entropy:
+                    alpha = self.log_alpha.exp()
+                else:
+                    alpha = self.alpha
+
+                target_q = target_q - alpha * next_log_probs
+                target_q = rewards + (1 - dones) * self.gamma * target_q
+
+            current_q1, current_q2 = self.critic(states, actions)
+            critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
+
+        self.critic_optimizer.zero_grad()
+        if self.use_amp:
+            self.scaler.scale(critic_loss).backward()
+            self.scaler.step(self.critic_optimizer)
+        else:
+            critic_loss.backward()
+            self.critic_optimizer.step()
+
+        # ===== Update Actor =====
+        with amp_context:
+            if self.use_physics_head:
+                new_actions, log_probs, physics_est = self.actor.sample(states)
+            else:
+                new_actions, log_probs = self.actor.sample(states)
+
+            q1, q2 = self.critic(states, new_actions)
+            min_q = torch.min(q1, q2)
 
             if self.automatic_entropy:
                 alpha = self.log_alpha.exp()
             else:
                 alpha = self.alpha
 
-            target_q = target_q - alpha * next_log_probs
-            target_q = rewards + (1 - dones) * self.gamma * target_q
+            actor_loss = (alpha * log_probs - min_q).mean()
 
-        current_q1, current_q2 = self.critic(states, actions)
-        critic_loss = nn.MSELoss()(current_q1, target_q) + nn.MSELoss()(current_q2, target_q)
-
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-
-        # ===== Update Actor =====
-        if self.use_physics_head:
-            new_actions, log_probs, physics_est = self.actor.sample(states)
-        else:
-            new_actions, log_probs = self.actor.sample(states)
-
-        q1, q2 = self.critic(states, new_actions)
-        min_q = torch.min(q1, q2)
-
-        if self.automatic_entropy:
-            alpha = self.log_alpha.exp()
-        else:
-            alpha = self.alpha
-
-        actor_loss = (alpha * log_probs - min_q).mean()
-
-        # Add physics loss if enabled and ground truth provided
-        physics_loss_val = 0.0
-        if self.use_physics_head and physics_gt is not None:
-            physics_gt_tensor = torch.FloatTensor(physics_gt).to(self.device)
-            physics_loss = nn.MSELoss()(physics_est, physics_gt_tensor)
-            actor_loss = actor_loss + self.physics_loss_weight * physics_loss
-            physics_loss_val = physics_loss.item()
+            # Add physics loss if enabled and ground truth provided
+            physics_loss_val = 0.0
+            if self.use_physics_head and physics_gt is not None:
+                physics_gt_tensor = torch.FloatTensor(physics_gt).to(self.device)
+                physics_loss = nn.MSELoss()(physics_est, physics_gt_tensor)
+                actor_loss = actor_loss + self.physics_loss_weight * physics_loss
+                physics_loss_val = physics_loss.item()
 
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        if self.use_amp:
+            self.scaler.scale(actor_loss).backward()
+            self.scaler.step(self.actor_optimizer)
+        else:
+            actor_loss.backward()
+            self.actor_optimizer.step()
 
-        # ===== Update Alpha =====
+        # ===== Update Alpha (always in FP32) =====
         alpha_loss_val = 0.0
         if self.automatic_entropy:
-            alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.log_alpha * (log_probs.float() + self.target_entropy).detach()).mean()
 
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
@@ -250,6 +281,10 @@ class SACAgent:
 
             self.alpha = self.log_alpha.exp().item()
             alpha_loss_val = alpha_loss.item()
+
+        # Update scaler for next iteration
+        if self.use_amp:
+            self.scaler.update()
 
         # ===== Soft Update Target =====
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
@@ -264,11 +299,21 @@ class SACAgent:
 
     def save(self, path):
         """Save model checkpoint."""
+        # Handle saving compiled models (save the underlying module, not wrapper)
+        if self.compile_model:
+            actor_state = self.actor._orig_mod.state_dict()
+            critic_state = self.critic._orig_mod.state_dict()
+            critic_target_state = self.critic_target._orig_mod.state_dict()
+        else:
+            actor_state = self.actor.state_dict()
+            critic_state = self.critic.state_dict()
+            critic_target_state = self.critic_target.state_dict()
+
         torch.save({
             'architecture': self.architecture,
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
-            'critic_target': self.critic_target.state_dict(),
+            'actor': actor_state,
+            'critic': critic_state,
+            'critic_target': critic_target_state,
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
             'log_alpha': self.log_alpha.detach() if self.automatic_entropy else None,
@@ -278,9 +323,17 @@ class SACAgent:
     def load(self, path):
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.actor.load_state_dict(checkpoint['actor'])
-        self.critic.load_state_dict(checkpoint['critic'])
-        self.critic_target.load_state_dict(checkpoint['critic_target'])
+
+        # Handle loading into compiled models (they have _orig_mod wrapper)
+        if self.compile_model:
+            # Load into the underlying module, not the compiled wrapper
+            self.actor._orig_mod.load_state_dict(checkpoint['actor'])
+            self.critic._orig_mod.load_state_dict(checkpoint['critic'])
+            self.critic_target._orig_mod.load_state_dict(checkpoint['critic_target'])
+        else:
+            self.actor.load_state_dict(checkpoint['actor'])
+            self.critic.load_state_dict(checkpoint['critic'])
+            self.critic_target.load_state_dict(checkpoint['critic_target'])
 
         if 'actor_optimizer' in checkpoint:
             self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])

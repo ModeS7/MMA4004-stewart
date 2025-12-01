@@ -76,9 +76,16 @@ class StewartEnv:
         self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
 
+        # Gravity offset (simulates unlevel surface / gravity vector misalignment)
+        self.gravity_offset_rx = 0.0  # degrees
+        self.gravity_offset_ry = 0.0  # degrees
+        self.gravity_offset_max = self.cfg.platform_offset_max_deg
+
         # Simulation time
         self.sim_time = 0.0
         self.dt = self.cfg.dt
+        self._base_dt = self.dt     # Base dt for this episode (randomized per episode)
+        self._current_dt = self.dt  # Current step dt (may vary with randomization)
         self.step_count = 0
 
         # Frame history for observations
@@ -86,15 +93,18 @@ class StewartEnv:
         self.obs_per_frame = self.cfg.obs_per_frame
         self.frame_history = np.zeros((self.num_frames, self.obs_per_frame), dtype=np.float32)
 
-        # Target position (always center for now)
-        self.target_x = 0.0
-        self.target_y = 0.0
+        # Target position (randomized on reset if enabled)
+        self.target_x = 0.0  # mm
+        self.target_y = 0.0  # mm
 
-        # Reward scales (from interactive dashboard values)
+        # Reward scales
         self.dist_scale = self.reward_cfg.dist_scale
-        self.speed_scale = self.reward_cfg.speed_scale
-        self.fall_penalty = self.reward_cfg.fall_penalty
+        self.base_speed_scale = self.reward_cfg.base_speed_scale
+        self.center_bonus_radius = self.reward_cfg.center_bonus_radius
+        self.center_bonus_max = self.reward_cfg.center_bonus_max
+        self.center_bonus_speed_scale = self.reward_cfg.center_bonus_speed_scale
         self.approach_scale = self.reward_cfg.approach_scale
+        self.fall_penalty = self.reward_cfg.fall_penalty
 
         # Physics ground truth for auxiliary loss
         self.physics_gt = np.array([
@@ -119,6 +129,51 @@ class StewartEnv:
         self.prev_platform_angles = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_vel = {'rx': 0.0, 'ry': 0.0}
         self.platform_angular_accel = {'rx': 0.0, 'ry': 0.0}
+
+        # Randomize gravity offset (random direction with random magnitude)
+        if self.cfg.use_platform_offset:
+            magnitude = np.random.uniform(0, self.gravity_offset_max)
+            direction = np.random.uniform(0, 2 * np.pi)
+            self.gravity_offset_rx = magnitude * np.sin(direction)
+            self.gravity_offset_ry = magnitude * np.cos(direction)
+        else:
+            self.gravity_offset_rx = 0.0
+            self.gravity_offset_ry = 0.0
+
+        # Domain randomization: randomize physics parameters
+        if self.cfg.use_domain_randomization:
+            # Randomize rolling friction
+            friction = np.random.uniform(*self.cfg.friction_range)
+            self.ball_physics.mu_roll = friction
+
+            # Randomize servo time constant
+            servo_tau = np.random.uniform(*self.cfg.servo_tau_range)
+            for servo in self.servos:
+                servo.tau = servo_tau
+
+            # Randomize ball mass factor (effective inertia)
+            mass_factor = np.random.uniform(*self.cfg.mass_factor_range)
+            self.ball_physics.mass_factor = mass_factor
+
+            # Update physics ground truth
+            self.physics_gt = np.array([friction, servo_tau, mass_factor], dtype=np.float32)
+
+        # Randomize base dt for this episode
+        if self.cfg.use_dt_randomization:
+            self._base_dt = np.random.uniform(*self.cfg.dt_range)
+        else:
+            self._base_dt = self.dt
+
+        # Randomize target position within specified radius
+        if self.cfg.randomize_target:
+            target_radius_mm = self.cfg.target_range_mm
+            r = np.sqrt(np.random.random()) * target_radius_mm
+            theta = np.random.random() * 2 * np.pi
+            self.target_x = r * np.cos(theta)
+            self.target_y = r * np.sin(theta)
+        else:
+            self.target_x = 0.0
+            self.target_y = 0.0
 
         # Random initial ball position (uniform in circle)
         init_radius_m = self.cfg.init_pos_range_mm / 1000.0
@@ -152,7 +207,8 @@ class StewartEnv:
         obs = self.frame_history.flatten()
 
         info = {
-            'physics_gt': self.physics_gt.copy()
+            'physics_gt': self.physics_gt.copy(),
+            'target_pos_mm': (self.target_x, self.target_y)
         }
 
         return obs, info
@@ -162,12 +218,18 @@ class StewartEnv:
         ball_x_mm = self.ball_pos[0, 0] * 1000.0
         ball_y_mm = self.ball_pos[0, 1] * 1000.0
 
+        # Add camera noise to ball position if enabled
+        if self.cfg.use_camera_noise:
+            noise_std = self.cfg.position_noise_std_mm
+            ball_x_mm += np.random.normal(0, noise_std)
+            ball_y_mm += np.random.normal(0, noise_std)
+
         frame = np.array([
             ball_x_mm / self.platform_radius_mm,           # ball_x normalized
             ball_y_mm / self.platform_radius_mm,           # ball_y normalized
             self.platform_rx / self.max_tilt_deg,          # platform_rx normalized
             self.platform_ry / self.max_tilt_deg,          # platform_ry normalized
-            self.dt / 0.01,                                # dt normalized
+            self._current_dt / 0.01,                       # dt normalized (varies with randomization)
             self.target_x / self.platform_radius_mm,       # target_x normalized
             self.target_y / self.platform_radius_mm,       # target_y normalized
         ], dtype=np.float32)
@@ -184,6 +246,19 @@ class StewartEnv:
         Returns:
             obs, reward, done, truncated, info
         """
+        # Randomize dt if enabled (simulates variable control loop timing)
+        if self.cfg.use_dt_randomization:
+            # Start with episode's base dt
+            step_dt = self._base_dt
+            # Add small per-step noise
+            step_dt += np.random.normal(0, self.cfg.dt_noise_std)
+            # Occasional large jitter
+            if np.random.random() < self.cfg.dt_jitter_prob:
+                step_dt += self.cfg.dt_jitter_ms / 1000.0
+            step_dt = max(0.001, step_dt)  # Ensure positive
+        else:
+            step_dt = self.dt
+
         # Scale action to degrees
         rx_target = float(action[0]) * self.max_tilt_deg
         ry_target = float(action[1]) * self.max_tilt_deg
@@ -203,7 +278,7 @@ class StewartEnv:
 
         # Update servo dynamics
         for servo in self.servos:
-            servo.update(self.dt, self.sim_time)
+            servo.update(step_dt, self.sim_time)
 
         # Get actual servo angles
         actual_angles = np.array([servo.get_angle() for servo in self.servos])
@@ -230,10 +305,10 @@ class StewartEnv:
             actual_ry = ry_target
 
         # Compute platform angular acceleration
-        omega_rx = (actual_rx - self.prev_platform_angles['rx']) / self.dt
-        omega_ry = (actual_ry - self.prev_platform_angles['ry']) / self.dt
-        alpha_rx = (omega_rx - self.platform_angular_vel['rx']) / self.dt
-        alpha_ry = (omega_ry - self.platform_angular_vel['ry']) / self.dt
+        omega_rx = (actual_rx - self.prev_platform_angles['rx']) / step_dt
+        omega_ry = (actual_ry - self.prev_platform_angles['ry']) / step_dt
+        alpha_rx = (omega_rx - self.platform_angular_vel['rx']) / step_dt
+        alpha_ry = (omega_ry - self.platform_angular_vel['ry']) / step_dt
 
         self.platform_angular_vel['rx'] = omega_rx
         self.platform_angular_vel['ry'] = omega_ry
@@ -246,14 +321,15 @@ class StewartEnv:
         self.platform_rx = actual_rx
         self.platform_ry = actual_ry
 
-        # Build platform pose for ball physics
+        # Build platform pose for ball physics (with gravity offset applied)
         # SimpleBallPhysics2D expects [x, y, z, rx, ry, rz] with x,y,z in mm and angles in degrees
+        # Gravity offset simulates unlevel surface - adds constant bias to effective tilt
         platform_pose = np.array([[
             0.0,  # x in mm (platform centered)
             0.0,  # y in mm
             self.home_z,  # z in mm
-            actual_rx,  # rx in degrees
-            actual_ry,  # ry in degrees
+            actual_rx + self.gravity_offset_rx,  # rx + gravity offset
+            actual_ry + self.gravity_offset_ry,  # ry + gravity offset
             0.0   # rz in degrees
         ]], dtype=np.float32)
 
@@ -263,7 +339,7 @@ class StewartEnv:
             self.ball_vel,
             self.ball_omega,
             platform_pose,
-            self.dt,
+            step_dt,
             platform_angular_accel=self.platform_angular_accel
         )
 
@@ -279,8 +355,11 @@ class StewartEnv:
         self.frame_history[-1] = new_frame
 
         # Update time
-        self.sim_time += self.dt
+        self.sim_time += step_dt
         self.step_count += 1
+
+        # Store current dt for observation
+        self._current_dt = step_dt
 
         # Check truncation
         truncated = self.step_count >= self.cfg.max_steps
@@ -290,6 +369,7 @@ class StewartEnv:
         info = {
             'physics_gt': self.physics_gt.copy(),
             'ball_pos_mm': (self.ball_pos[0, 0] * 1000, self.ball_pos[0, 1] * 1000),
+            'target_pos_mm': (self.target_x, self.target_y),
             'platform_angles': (actual_rx, actual_ry),
             'fell_off': done
         }
@@ -306,28 +386,54 @@ class StewartEnv:
         ball_y_mm = (self.ball_pos[0, 1] - self.target_y / 1000.0) * 1000.0
         dist_mm = np.sqrt(ball_x_mm**2 + ball_y_mm**2)
 
-        # Ball velocity (in mm/s)
+        # Ball speed (in mm/s)
         vx_mm_s = self.ball_vel[0, 0] * 1000.0
         vy_mm_s = self.ball_vel[0, 1] * 1000.0
         speed_mm_s = np.sqrt(vx_mm_s**2 + vy_mm_s**2)
 
-        # Base multiplicative reward (bounded 0-1)
+        # Base reward: position × speed factor
         dist_factor = 1.0 / (1.0 + dist_mm / self.dist_scale)
-        speed_factor = 1.0 / (1.0 + speed_mm_s / self.speed_scale)
+        speed_factor = 1.0 / (1.0 + speed_mm_s / self.base_speed_scale)
         base_reward = dist_factor * speed_factor
 
-        # Approach velocity bonus
-        eps = 1e-6
-        if dist_mm > eps:
-            vel_towards_target = -(vx_mm_s * ball_x_mm + vy_mm_s * ball_y_mm) / (dist_mm + eps)
-            approach_reward = (dist_mm / self.dist_scale) * \
-                              (vel_towards_target / self.speed_scale) * \
-                              self.approach_scale
-            approach_reward = np.clip(approach_reward, -1.0, 1.0)
+        # Center bonus: extra reward for being very close to target AND slow
+        # Distance component: linear from 0 at radius to max at center
+        # Speed component: linear cutoff - full bonus when still, zero bonus above threshold
+        if dist_mm < self.center_bonus_radius:
+            distance_factor = 1.0 - dist_mm / self.center_bonus_radius
+            speed_factor = max(0.0, 1.0 - speed_mm_s / self.center_bonus_speed_scale)
+            center_bonus = self.center_bonus_max * distance_factor * speed_factor
         else:
-            approach_reward = 0.0
+            center_bonus = 0.0
 
-        return float(base_reward + approach_reward)
+        # Approach reward: bonus for moving towards target at APPROPRIATE speed
+        # vel_towards is positive when moving towards target
+        approach_reward = 0.0
+        if dist_mm > 1e-6 and speed_mm_s > 1e-6:
+            vel_towards = -(vx_mm_s * ball_x_mm + vy_mm_s * ball_y_mm) / dist_mm
+
+            # Alignment: how directly is ball moving towards target?
+            # cos(0°)=1.0 towards, cos(90°)=0.0 perpendicular, cos(180°)=-1.0 away
+            alignment = vel_towards / speed_mm_s
+
+            # Optimal velocity scales with distance (for smooth deceleration to stop)
+            # At 30mm, optimal ~60mm/s; at 60mm, optimal ~120mm/s
+            optimal_vel = dist_mm * 2.0
+
+            if vel_towards <= 0:
+                # Moving away from target: penalty scaled by alignment (-1 at 180°)
+                approach_reward = alignment * self.approach_scale
+            elif speed_mm_s <= optimal_vel:
+                # Total speed within optimal: reward based on towards component and alignment
+                approach_reward = (vel_towards / optimal_vel) * alignment * self.approach_scale
+            else:
+                # Total speed exceeds optimal: penalize excess, scale by alignment
+                excess = (speed_mm_s - optimal_vel) / optimal_vel
+                approach_reward = alignment * self.approach_scale * np.exp(-excess)
+
+            approach_reward = np.clip(approach_reward, -0.5, 0.5)
+
+        return float(base_reward + center_bonus + approach_reward)
 
 
 class StewartEnvVec:

@@ -182,6 +182,7 @@ class BaseStewartSimulator(QMainWindow):
         self.simulation_time = 0.0
         self.last_update_time = None
         self.update_rate_ms = 10  # 100 Hz target (10ms), more reliable than 2ms
+        self.use_fixed_timestep = True  # True = fixed dt (matches training), False = real-time
 
         self.use_top_surface_offset = True
         self.dof_values = {
@@ -465,6 +466,7 @@ class BaseStewartSimulator(QMainWindow):
             'pattern_reset': self.reset_pattern,
             'pattern_param_change': self.on_pattern_param_change,
             'reset_ball': self.reset_ball,
+            'set_ball_position': self.set_ball_position,
             'push_ball': self.push_ball,
             'toggle_offset': self.on_offset_toggle,
             'slider_change': self.on_slider_change,
@@ -473,6 +475,8 @@ class BaseStewartSimulator(QMainWindow):
             'camera_param_change': self.on_camera_param_change,
             'camera_reset': self.on_camera_reset,
             'z_optimization_toggle': self.on_z_optimization_toggle,
+            'timestep_mode_change': self.on_timestep_mode_change,
+            'timestep_change': self.on_timestep_change,
             'log': self.log,
         }
 
@@ -827,20 +831,44 @@ class BaseStewartSimulator(QMainWindow):
         if self.controller_enabled and self.controller is not None:
             self.controller.reset()
 
-    def reset_ball(self) -> None:
-        """Reset ball to center position with zero velocity."""
+    def reset_ball(self, x_mm: float = 0.0, y_mm: float = 0.0) -> None:
+        """Reset ball to specified position with zero velocity.
+
+        Args:
+            x_mm: Initial X position in mm (default: 0.0 = center)
+            y_mm: Initial Y position in mm (default: 0.0 = center)
+        """
         home_z = self.ik.home_height_top_surface if self.use_top_surface_offset else self.ik.home_height
         ball_start_height = (home_z / 1000) + self.ball_physics.radius
 
-        self.ball_pos = np.array([[0.0, 0.0, ball_start_height]], dtype=np.float32)
+        # Convert mm to meters for internal representation
+        x_m = x_mm / 1000.0
+        y_m = y_mm / 1000.0
+
+        self.ball_pos = np.array([[x_m, y_m, ball_start_height]], dtype=np.float32)
         self.ball_vel = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
         self.ball_omega = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
 
         if self.controller_enabled and self.controller is not None:
-            self.controller.reset()
+            # Reset controller with actual ball position
+            ball_pos_mm = (x_mm, y_mm)
+            platform_tilt = (self.dof_values.get('rx', 0.0), self.dof_values.get('ry', 0.0))
+            self.controller.reset(ball_pos_mm=ball_pos_mm, platform_tilt_deg=platform_tilt)
 
         self.update_plot()
-        self.log("Ball reset to center")
+        if x_mm == 0.0 and y_mm == 0.0:
+            self.log("Ball reset to center")
+        else:
+            self.log(f"Ball reset to ({x_mm:.1f}, {y_mm:.1f}) mm")
+
+    def set_ball_position(self, x_mm: float, y_mm: float) -> None:
+        """Set ball to custom position (convenience wrapper for reset_ball).
+
+        Args:
+            x_mm: X position in mm
+            y_mm: Y position in mm
+        """
+        self.reset_ball(x_mm=x_mm, y_mm=y_mm)
 
     def push_ball(self) -> None:
         """Apply random velocity to ball (magnitude from BallControlConfig)."""
@@ -941,6 +969,20 @@ class BaseStewartSimulator(QMainWindow):
         # Immediately recalculate IK with new optimization setting
         if not self.controller_enabled:  # Only in manual mode
             self.calculate_ik()
+
+    def on_timestep_mode_change(self, fixed: bool) -> None:
+        """Handle fixed/real-time timestep toggle."""
+        self.use_fixed_timestep = fixed
+        mode_str = "FIXED" if fixed else "REAL-TIME"
+        self.log(f"Timestep mode: {mode_str} ({self.update_rate_ms}ms)")
+
+    def on_timestep_change(self, value_ms: int) -> None:
+        """Handle timestep slider change."""
+        self.update_rate_ms = value_ms
+        # Update timer interval if simulation is running
+        if self.simulation_running:
+            self.simulation_timer.setInterval(value_ms)
+        self.log(f"Timestep: {value_ms}ms ({1000/value_ms:.1f}Hz)")
 
     def calculate_ik(self) -> None:
         """Calculate inverse kinematics for current pose and update servos."""
@@ -1071,10 +1113,15 @@ class BaseStewartSimulator(QMainWindow):
 
         current_time = time.time()
         if self.last_update_time is not None:
-            # Use actual elapsed time for real-time simulation
-            dt = current_time - self.last_update_time
-            # Cap dt to prevent huge jumps if timer was delayed
-            dt = min(dt, 0.1)  # Max 100ms per step
+            if self.use_fixed_timestep:
+                # Fixed timestep mode (matches training environment)
+                # Ensures consistent physics regardless of actual loop timing
+                dt = self.update_rate_ms / 1000.0
+            else:
+                # Real-time mode - use actual elapsed time
+                dt = current_time - self.last_update_time
+                # Cap dt to prevent huge jumps if timer was delayed
+                dt = min(dt, 0.1)  # Max 100ms per step
             self.simulation_time += dt
 
             # Get true ball position for camera measurement (always needed for visualization)

@@ -12,7 +12,7 @@ import serial.tools.list_ports
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                               QLabel, QPushButton, QSlider, QCheckBox, QComboBox,
-                              QGroupBox, QTextEdit, QMessageBox)
+                              QGroupBox, QTextEdit, QMessageBox, QSpinBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QMatrix4x4, QQuaternion, QVector3D
 import numpy as np
@@ -106,9 +106,50 @@ class SimulationControlModule(GUIModule):
         self.calibration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.calibration_label)
 
+        # Timestep mode controls
+        timestep_layout = QHBoxLayout()
+
+        self.fixed_timestep_checkbox = QCheckBox("Fixed Timestep")
+        self.fixed_timestep_checkbox.setChecked(True)  # Default to fixed (matches training)
+        self.fixed_timestep_checkbox.stateChanged.connect(self._on_timestep_mode_change)
+        timestep_layout.addWidget(self.fixed_timestep_checkbox)
+
+        self.timestep_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timestep_slider.setMinimum(5)    # 5ms minimum (200Hz)
+        self.timestep_slider.setMaximum(100)  # 100ms maximum (10Hz)
+        self.timestep_slider.setValue(10)     # 10ms default (100Hz)
+        self.timestep_slider.setSingleStep(1)  # 1ms increments
+        self.timestep_slider.setPageStep(10)   # 10ms for page up/down
+        self.timestep_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.timestep_slider.setTickInterval(10)
+        self.timestep_slider.valueChanged.connect(self._on_timestep_change)
+        timestep_layout.addWidget(self.timestep_slider)
+
+        self.timestep_label = QLabel("10ms")
+        self.timestep_label.setMinimumWidth(45)
+        timestep_layout.addWidget(self.timestep_label)
+
+        layout.addLayout(timestep_layout)
+
         group.setLayout(layout)
         self.widget = group
         return self.widget
+
+    def _on_timestep_mode_change(self, state: int) -> None:
+        """Handle fixed/real-time timestep toggle."""
+        fixed = state == Qt.CheckState.Checked.value
+        callback = self.callbacks.get('timestep_mode_change')
+        if callback:
+            callback(fixed)
+        # Enable/disable slider based on mode
+        self.timestep_slider.setEnabled(fixed)
+
+    def _on_timestep_change(self, value: int) -> None:
+        """Handle timestep slider change."""
+        self.timestep_label.setText(f"{value}ms")
+        callback = self.callbacks.get('timestep_change')
+        if callback:
+            callback(value)
 
     def update(self, state: Dict[str, Any]) -> None:
         """Update simulation time display, button states, and calibration timer."""
@@ -427,26 +468,71 @@ class TrajectoryPatternModule(GUIModule):
 
 
 class BallControlModule(GUIModule):
-    """Ball reset and push buttons."""
+    """Ball reset, push, and custom position controls."""
 
     def create(self) -> QWidget:
-        """Create ball control widget with reset and push buttons."""
+        """Create ball control widget with reset, push, and position controls."""
         group = QGroupBox("Ball Control")
-        layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
+
+        # Row 1: Reset and Push buttons
+        button_layout = QHBoxLayout()
 
         reset_btn = QPushButton("Reset Ball")
-        reset_btn.clicked.connect(self.callbacks.get('reset_ball'))
+        reset_btn.clicked.connect(self._on_reset_ball)
         reset_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
-        layout.addWidget(reset_btn)
+        button_layout.addWidget(reset_btn)
 
         push_btn = QPushButton("Push Ball")
         push_btn.clicked.connect(self.callbacks.get('push_ball'))
         push_btn.setMinimumWidth(GUI_BUTTON_WIDTH_LARGE)
-        layout.addWidget(push_btn)
+        button_layout.addWidget(push_btn)
 
-        group.setLayout(layout)
+        main_layout.addLayout(button_layout)
+
+        # Row 2: Custom position inputs
+        pos_layout = QHBoxLayout()
+
+        pos_layout.addWidget(QLabel("X:"))
+        self.pos_x_input = QSpinBox()
+        self.pos_x_input.setRange(-150, 150)  # Platform radius ~150mm
+        self.pos_x_input.setValue(0)
+        self.pos_x_input.setSuffix(" mm")
+        self.pos_x_input.setMinimumWidth(80)
+        pos_layout.addWidget(self.pos_x_input)
+
+        pos_layout.addWidget(QLabel("Y:"))
+        self.pos_y_input = QSpinBox()
+        self.pos_y_input.setRange(-150, 150)
+        self.pos_y_input.setValue(0)
+        self.pos_y_input.setSuffix(" mm")
+        self.pos_y_input.setMinimumWidth(80)
+        pos_layout.addWidget(self.pos_y_input)
+
+        set_pos_btn = QPushButton("Set")
+        set_pos_btn.clicked.connect(self._on_set_position)
+        set_pos_btn.setToolTip("Reset ball to specified position")
+        pos_layout.addWidget(set_pos_btn)
+
+        main_layout.addLayout(pos_layout)
+
+        group.setLayout(main_layout)
         self.widget = group
         return self.widget
+
+    def _on_reset_ball(self) -> None:
+        """Reset ball to center (0, 0)."""
+        callback = self.callbacks.get('reset_ball')
+        if callback:
+            callback()
+
+    def _on_set_position(self) -> None:
+        """Set ball to custom position from input fields."""
+        x_mm = self.pos_x_input.value()
+        y_mm = self.pos_y_input.value()
+        callback = self.callbacks.get('set_ball_position')
+        if callback:
+            callback(x_mm, y_mm)
 
 
 class BallStateModule(GUIModule):

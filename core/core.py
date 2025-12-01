@@ -12,6 +12,7 @@ import logging
 from typing import Optional, Tuple, Dict
 import numpy as np
 from collections import deque
+from numba import njit
 
 from scipy.optimize import brentq, minimize_scalar
 
@@ -28,6 +29,313 @@ from core.utils import (
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# JIT-Compiled Physics Functions
+# =============================================================================
+
+@njit(cache=True, fastmath=True)
+def _compute_ball_accelerations_jit(
+    xy_pos: np.ndarray,
+    xy_vel: np.ndarray,
+    xy_omega: np.ndarray,
+    rx_rad: np.ndarray,
+    ry_rad: np.ndarray,
+    g: float,
+    mass_factor: float,
+    mu_roll: float,
+    radius: float,
+    air_density: float,
+    drag_coef: float,
+    cross_section: float,
+    mass: float,
+    g_eff_override: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    JIT-compiled ball acceleration computation.
+
+    Args:
+        xy_pos: (batch, 2) ball XY position
+        xy_vel: (batch, 2) ball XY velocity
+        xy_omega: (batch, 2) ball angular velocity
+        rx_rad: (batch,) platform roll angle in radians
+        ry_rad: (batch,) platform pitch angle in radians
+        g: gravity constant
+        mass_factor: 1 + I/(m*r^2)
+        mu_roll: rolling friction coefficient
+        radius: ball radius
+        air_density: air density for drag
+        drag_coef: drag coefficient
+        cross_section: ball cross-section area
+        mass: ball mass
+        g_eff_override: (batch,) effective gravity (or zeros if no override)
+
+    Returns:
+        accel_linear: (batch, 2) linear acceleration
+        accel_angular: (batch, 2) angular acceleration
+    """
+    batch_size = xy_pos.shape[0]
+
+    # Use override gravity if provided (non-zero), else standard gravity
+    g_eff = np.empty(batch_size)
+    for i in range(batch_size):
+        if g_eff_override[i] != 0.0:
+            g_eff[i] = g_eff_override[i]
+        else:
+            g_eff[i] = g
+
+    # Trig functions
+    cos_rx = np.cos(rx_rad)
+    cos_ry = np.cos(ry_rad)
+    sin_rx = np.sin(rx_rad)
+    sin_ry = np.sin(ry_rad)
+
+    # Gravity components on tilted surface
+    gx = g_eff * sin_ry * cos_ry * cos_rx
+    gy = -g_eff * sin_rx * cos_rx * cos_ry
+
+    # Rolling ball dynamics
+    ax = gx / mass_factor
+    ay = gy / mass_factor
+
+    # Velocity magnitude
+    vel_mag = np.empty(batch_size)
+    for i in range(batch_size):
+        vel_mag[i] = np.sqrt(xy_vel[i, 0]**2 + xy_vel[i, 1]**2)
+
+    # Rolling resistance
+    eps = 1e-9
+    for i in range(batch_size):
+        denom = vel_mag[i] + eps
+        ax[i] -= mu_roll * g_eff[i] * xy_vel[i, 0] / denom
+        ay[i] -= mu_roll * g_eff[i] * xy_vel[i, 1] / denom
+
+    # Air resistance (quadratic drag)
+    for i in range(batch_size):
+        vel_sq = vel_mag[i]**2
+        drag_mag = 0.5 * air_density * drag_coef * cross_section * vel_sq / mass
+        denom = vel_mag[i] + eps
+        ax[i] -= drag_mag * xy_vel[i, 0] / denom
+        ay[i] -= drag_mag * xy_vel[i, 1] / denom
+
+    # Stack results
+    accel_linear = np.empty((batch_size, 2))
+    accel_linear[:, 0] = ax
+    accel_linear[:, 1] = ay
+
+    # Angular acceleration from rolling constraint
+    accel_angular = np.empty((batch_size, 2))
+    accel_angular[:, 0] = ax / radius - mu_roll * xy_omega[:, 0]
+    accel_angular[:, 1] = ay / radius - mu_roll * xy_omega[:, 1]
+
+    return accel_linear, accel_angular
+
+
+@njit(cache=True, fastmath=True)
+def _rk4_ball_step_jit(
+    xy_pos: np.ndarray,
+    xy_vel: np.ndarray,
+    xy_omega: np.ndarray,
+    rx_rad: np.ndarray,
+    ry_rad: np.ndarray,
+    dt: float,
+    g: float,
+    mass_factor: float,
+    mu_roll: float,
+    radius: float,
+    air_density: float,
+    drag_coef: float,
+    cross_section: float,
+    mass: float,
+    g_eff: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    JIT-compiled RK4 integration step for ball physics.
+
+    Returns:
+        new_xy_pos, new_xy_vel, new_xy_omega
+    """
+    # k1
+    a1_lin, a1_ang = _compute_ball_accelerations_jit(
+        xy_pos, xy_vel, xy_omega, rx_rad, ry_rad,
+        g, mass_factor, mu_roll, radius, air_density, drag_coef, cross_section, mass, g_eff
+    )
+    k1_pos = xy_vel
+    k1_vel = a1_lin
+    k1_omega = a1_ang
+
+    # k2
+    pos_k2 = xy_pos + 0.5 * dt * k1_pos
+    vel_k2 = xy_vel + 0.5 * dt * k1_vel
+    omega_k2 = xy_omega + 0.5 * dt * k1_omega
+    a2_lin, a2_ang = _compute_ball_accelerations_jit(
+        pos_k2, vel_k2, omega_k2, rx_rad, ry_rad,
+        g, mass_factor, mu_roll, radius, air_density, drag_coef, cross_section, mass, g_eff
+    )
+    k2_pos = vel_k2
+    k2_vel = a2_lin
+    k2_omega = a2_ang
+
+    # k3
+    pos_k3 = xy_pos + 0.5 * dt * k2_pos
+    vel_k3 = xy_vel + 0.5 * dt * k2_vel
+    omega_k3 = xy_omega + 0.5 * dt * k2_omega
+    a3_lin, a3_ang = _compute_ball_accelerations_jit(
+        pos_k3, vel_k3, omega_k3, rx_rad, ry_rad,
+        g, mass_factor, mu_roll, radius, air_density, drag_coef, cross_section, mass, g_eff
+    )
+    k3_pos = vel_k3
+    k3_vel = a3_lin
+    k3_omega = a3_ang
+
+    # k4
+    pos_k4 = xy_pos + dt * k3_pos
+    vel_k4 = xy_vel + dt * k3_vel
+    omega_k4 = xy_omega + dt * k3_omega
+    a4_lin, a4_ang = _compute_ball_accelerations_jit(
+        pos_k4, vel_k4, omega_k4, rx_rad, ry_rad,
+        g, mass_factor, mu_roll, radius, air_density, drag_coef, cross_section, mass, g_eff
+    )
+    k4_pos = vel_k4
+    k4_vel = a4_lin
+    k4_omega = a4_ang
+
+    # Combine
+    new_xy_pos = xy_pos + (dt / 6.0) * (k1_pos + 2*k2_pos + 2*k3_pos + k4_pos)
+    new_xy_vel = xy_vel + (dt / 6.0) * (k1_vel + 2*k2_vel + 2*k3_vel + k4_vel)
+    new_xy_omega = xy_omega + (dt / 6.0) * (k1_omega + 2*k2_omega + 2*k3_omega + k4_omega)
+
+    return new_xy_pos, new_xy_vel, new_xy_omega
+
+
+@njit(cache=True, fastmath=True)
+def _compute_platform_height_jit(
+    xy_pos: np.ndarray,
+    px: np.ndarray,
+    py: np.ndarray,
+    pz: np.ndarray,
+    rx_rad: np.ndarray,
+    ry_rad: np.ndarray
+) -> np.ndarray:
+    """JIT-compiled platform height computation."""
+    dx = xy_pos[:, 0] - px
+    dy = xy_pos[:, 1] - py
+    height = pz - dx * np.tan(ry_rad) - dy * np.tan(rx_rad)
+    return height
+
+
+@njit(cache=True, fastmath=True)
+def _calculate_servo_angles_jit(
+    translation: np.ndarray,
+    quat: np.ndarray,
+    platform_anchors: np.ndarray,
+    base_anchors: np.ndarray,
+    beta_angles: np.ndarray,
+    horn_length: float,
+    rod_length: float,
+    max_angle_deg: float
+) -> Tuple[np.ndarray, bool]:
+    """
+    JIT-compiled IK servo angle calculation.
+
+    Returns:
+        angles: (6,) servo angles in degrees
+        valid: whether all angles are valid
+    """
+    angles = np.zeros(6)
+
+    for k in range(6):
+        # Rotate platform anchor by quaternion
+        p_local = platform_anchors[k]
+        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+        vx, vy, vz = p_local[0], p_local[1], p_local[2]
+
+        # Quaternion rotation
+        p_rotated_x = vx * (w*w + x*x - y*y - z*z) + vy * (2*x*y - 2*w*z) + vz * (2*x*z + 2*w*y)
+        p_rotated_y = vx * (2*x*y + 2*w*z) + vy * (w*w - x*x + y*y - z*z) + vz * (2*y*z - 2*w*x)
+        p_rotated_z = vx * (2*x*z - 2*w*y) + vy * (2*y*z + 2*w*x) + vz * (w*w - x*x - y*y + z*z)
+
+        # World position of platform anchor
+        p_world_x = translation[0] + p_rotated_x
+        p_world_y = translation[1] + p_rotated_y
+        p_world_z = translation[2] + p_rotated_z
+
+        # Leg vector from base to platform
+        leg_x = p_world_x - base_anchors[k, 0]
+        leg_y = p_world_y - base_anchors[k, 1]
+        leg_z = p_world_z - base_anchors[k, 2]
+        leg_length_sq = leg_x*leg_x + leg_y*leg_y + leg_z*leg_z
+
+        # IK equations
+        e_k = 2 * horn_length * leg_z
+        f_k = 2 * horn_length * (np.cos(beta_angles[k]) * leg_x + np.sin(beta_angles[k]) * leg_y)
+        g_k = leg_length_sq - (rod_length**2 - horn_length**2)
+
+        sqrt_term = e_k**2 + f_k**2
+        if sqrt_term < 1e-10:
+            return angles, False
+
+        ratio = g_k / np.sqrt(sqrt_term)
+        if abs(ratio) > 1.0:
+            return angles, False
+
+        alpha_k = np.arcsin(ratio) - np.arctan2(f_k, e_k)
+        angle_deg = np.degrees(alpha_k)
+
+        if abs(angle_deg) > max_angle_deg:
+            return angles, False
+
+        angles[k] = -angle_deg
+
+    return angles, True
+
+
+@njit(cache=True, fastmath=True)
+def _euler_to_quaternion_jit(rx: float, ry: float, rz: float) -> np.ndarray:
+    """JIT-compiled Euler to quaternion conversion (ZYX convention)."""
+    cy = np.cos(rz * 0.5)
+    sy = np.sin(rz * 0.5)
+    cp = np.cos(ry * 0.5)
+    sp = np.sin(ry * 0.5)
+    cr = np.cos(rx * 0.5)
+    sr = np.sin(rx * 0.5)
+
+    quat = np.empty(4)
+    quat[0] = cr * cp * cy + sr * sp * sy  # w
+    quat[1] = sr * cp * cy - cr * sp * sy  # x
+    quat[2] = cr * sp * cy + sr * cp * sy  # y
+    quat[3] = cr * cp * sy - sr * sp * cy  # z
+    return quat
+
+
+# Warm up JIT functions on module load
+def _warmup_jit():
+    """Pre-compile JIT functions to avoid first-call latency."""
+    # Ball physics
+    _xy = np.zeros((1, 2), dtype=np.float64)
+    _r = np.zeros(1, dtype=np.float64)
+    _compute_ball_accelerations_jit(
+        _xy, _xy, _xy, _r, _r,
+        9.81, 1.67, 0.02, 0.02, 1.225, 0.47, 0.00126, 0.0027, _r
+    )
+    _rk4_ball_step_jit(
+        _xy, _xy, _xy, _r, _r,
+        0.01, 9.81, 1.67, 0.02, 0.02, 1.225, 0.47, 0.00126, 0.0027, _r
+    )
+    _compute_platform_height_jit(_xy, _r, _r, _r, _r, _r)
+
+    # IK
+    _trans = np.zeros(3, dtype=np.float64)
+    _quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    _anchors = np.zeros((6, 3), dtype=np.float64)
+    _betas = np.zeros(6, dtype=np.float64)
+    _calculate_servo_angles_jit(_trans, _quat, _anchors, _anchors, _betas, 31.75, 145.0, 30.0)
+    _euler_to_quaternion_jit(0.0, 0.0, 0.0)
+
+
+# Run warmup at import time
+_warmup_jit()
 
 
 class FirstOrderServo:
@@ -173,43 +481,35 @@ class StewartPlatformIK:
 
     def calculate_servo_angles(self, translation: np.ndarray, rotation: np.ndarray,
                                use_top_surface_offset: bool = True) -> Optional[np.ndarray]:
-        quat = self._euler_to_quaternion(np.radians(rotation))
+        """Calculate servo angles using JIT-compiled IK solver."""
+        # Convert rotation to quaternion using JIT
+        rotation_rad = np.radians(rotation)
+        quat = _euler_to_quaternion_jit(rotation_rad[0], rotation_rad[1], rotation_rad[2])
 
         if use_top_surface_offset:
-            offset_platform_frame = np.array([0, 0, -self.top_surface_offset])
+            # Apply top surface offset
+            offset_platform_frame = np.array([0.0, 0.0, -self.top_surface_offset])
             offset_world_frame = self._rotate_vector(offset_platform_frame, quat)
             anchor_center_translation = translation + offset_world_frame
         else:
             anchor_center_translation = translation
 
-        angles = np.zeros(6)
-        for k in range(6):
-            p_world = anchor_center_translation + self._rotate_vector(self.platform_anchors[k], quat)
-            leg = p_world - self.base_anchors[k]
-            leg_length_sq = np.dot(leg, leg)
+        # Call JIT-compiled IK solver
+        angles, valid = _calculate_servo_angles_jit(
+            anchor_center_translation.astype(np.float64),
+            quat.astype(np.float64),
+            self.platform_anchors.astype(np.float64),
+            self.base_anchors.astype(np.float64),
+            self.beta_angles.astype(np.float64),
+            self.horn_length,
+            self.rod_length,
+            MAX_SERVO_ANGLE_DEG
+        )
 
-            e_k = 2 * self.horn_length * leg[2]
-            f_k = 2 * self.horn_length * (
-                    np.cos(self.beta_angles[k]) * leg[0] +
-                    np.sin(self.beta_angles[k]) * leg[1]
-            )
-            g_k = leg_length_sq - (self.rod_length ** 2 - self.horn_length ** 2)
+        if not valid:
+            return None
 
-            sqrt_term = e_k ** 2 + f_k ** 2
-            if sqrt_term < IK_SQRT_TERM_EPSILON:
-                return None
-
-            ratio = g_k / np.sqrt(sqrt_term)
-            if abs(ratio) > 1.0:
-                return None
-
-            alpha_k = np.arcsin(ratio) - np.arctan2(f_k, e_k)
-            angles[k] = np.degrees(alpha_k)
-
-            if abs(angles[k]) > MAX_SERVO_ANGLE_DEG:
-                return None
-
-        return -angles
+        return angles
 
     def calculate_forward_kinematics(self, servo_angles: np.ndarray,
                                      initial_guess: Optional[tuple] = None,
@@ -590,7 +890,7 @@ class SimpleBallPhysics2D:
 
     def step(self, ball_pos, ball_vel, ball_omega, platform_pose, dt, platform_angular_accel=None):
         """
-        Step physics using RK4 integration with rolling motion.
+        Step physics using JIT-compiled RK4 integration with rolling motion.
 
         Args:
             ball_pos: (batch, 3) - only X and Y matter, Z is computed
@@ -604,24 +904,42 @@ class SimpleBallPhysics2D:
             new_pos, new_vel, new_omega, contact_info
         """
         batch_size = ball_pos.shape[0]
-        device = ball_pos.device
 
-        xy_pos = ball_pos[:, :2]
-        xy_vel = ball_vel[:, :2]
-        xy_omega = ball_omega[:, :2]
+        # Extract XY components
+        xy_pos = ball_pos[:, :2].astype(np.float64)
+        xy_vel = ball_vel[:, :2].astype(np.float64)
+        xy_omega = ball_omega[:, :2].astype(np.float64)
 
-        state = (xy_pos, xy_vel, xy_omega)
-        new_xy_pos, new_xy_vel, new_xy_omega = rk4_step(
-            state,
-            self._compute_derivatives,
-            dt,
-            platform_pose,
-            platform_angular_accel
+        # Platform angles in radians
+        rx_rad = np.radians(platform_pose[:, 3]).astype(np.float64)
+        ry_rad = np.radians(platform_pose[:, 4]).astype(np.float64)
+
+        # Compute effective gravity (accounting for platform angular acceleration)
+        if platform_angular_accel is not None:
+            alpha_rx_rad = platform_angular_accel['rx'] * (np.pi / 180.0)
+            alpha_ry_rad = platform_angular_accel['ry'] * (np.pi / 180.0)
+            ball_x = xy_pos[:, 0]
+            ball_y = xy_pos[:, 1]
+            a_z_platform = ball_x * alpha_ry_rad - ball_y * alpha_rx_rad
+            g_eff = np.clip(
+                self.g - a_z_platform,
+                BALL_GEFF_MIN_FACTOR * self.g,
+                BALL_GEFF_MAX_FACTOR * self.g
+            ).astype(np.float64)
+        else:
+            g_eff = np.zeros(batch_size, dtype=np.float64)  # Will use default g in JIT
+
+        # Call JIT-compiled RK4 step
+        new_xy_pos, new_xy_vel, new_xy_omega = _rk4_ball_step_jit(
+            xy_pos, xy_vel, xy_omega, rx_rad, ry_rad,
+            dt, self.g, self.mass_factor, self.mu_roll, self.radius,
+            self.air_density, self.drag_coefficient, self.cross_section_area, self.mass,
+            g_eff
         )
 
         # Check if ball fell off circular platform
         max_radius = PLATFORM_RADIUS_MM / 1000.0
-        distance_from_center = np.linalg.norm(new_xy_pos, axis=1)
+        distance_from_center = np.sqrt(new_xy_pos[:, 0]**2 + new_xy_pos[:, 1]**2)
         fell_off = distance_from_center > max_radius
 
         contact_info = {'fell_off': False}
@@ -634,7 +952,11 @@ class SimpleBallPhysics2D:
                     new_xy_omega[i] = 0.0
             contact_info['fell_off'] = True
 
-        platform_z = self._compute_platform_height(new_xy_pos, platform_pose)
+        # Compute platform height using JIT
+        px = (platform_pose[:, 0] / 1000).astype(np.float64)
+        py = (platform_pose[:, 1] / 1000).astype(np.float64)
+        pz = (platform_pose[:, 2] / 1000).astype(np.float64)
+        platform_z = _compute_platform_height_jit(new_xy_pos, px, py, pz, rx_rad, ry_rad)
 
         new_ball_pos = np.zeros((batch_size, 3), dtype=np.float32)
         new_ball_pos[:, :2] = new_xy_pos
@@ -647,7 +969,7 @@ class SimpleBallPhysics2D:
         new_ball_omega[:, :2] = new_xy_omega
 
         contact_info['in_contact'] = np.ones(batch_size, dtype=bool)
-        contact_info['rolling_speed'] = np.linalg.norm(new_xy_omega, axis=1) * self.radius
+        contact_info['rolling_speed'] = np.sqrt(new_xy_omega[:, 0]**2 + new_xy_omega[:, 1]**2) * self.radius
 
         return new_ball_pos, new_ball_vel, new_ball_omega, contact_info
 
