@@ -636,16 +636,16 @@ class RLController:
             self._obs_tensor.copy_(torch.from_numpy(obs))
             action = self.actor(self._obs_tensor).cpu().numpy()[0]
 
-        # DEBUG: Print observation and action every 100 steps
-        self._debug_counter += 1
-        if self._debug_counter % 100 == 1:
-            print(f"[RL DEBUG] step={self._debug_counter}")
-            print(f"  ball_pos_mm={ball_pos_mm}")
-            print(f"  platform_tilt_deg=({rx_current:.2f}, {ry_current:.2f})")
-            print(f"  target_pos_mm={target_pos_mm}")
-            print(f"  dt={dt:.4f}s (normalized={dt/0.01:.2f})")
-            print(f"  latest_frame={new_frame}")
-            print(f"  raw_action={action}")
+        # DEBUG: Print observation and action every 100 steps (disabled)
+        # self._debug_counter += 1
+        # if self._debug_counter % 100 == 1:
+        #     print(f"[RL DEBUG] step={self._debug_counter}")
+        #     print(f"  ball_pos_mm={ball_pos_mm}")
+        #     print(f"  platform_tilt_deg=({rx_current:.2f}, {ry_current:.2f})")
+        #     print(f"  target_pos_mm={target_pos_mm}")
+        #     print(f"  dt={dt:.4f}s (normalized={dt/0.01:.2f})")
+        #     print(f"  latest_frame={new_frame}")
+        #     print(f"  raw_action={action}")
 
         # Scale action from [-1, 1] to degrees
         rx_target = action[0] * self.max_tilt_deg

@@ -22,7 +22,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QMessageBox, QDialog, QVBoxLayout, QLabel, QTextEdit,
                               QPushButton, QApplication, QWidget, QHBoxLayout, QCheckBox,
-                              QTabWidget, QGroupBox)
+                              QTabWidget, QGroupBox, QSlider)
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import QTimer, Qt
 
@@ -79,6 +79,12 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             for _ in range(6)
         ]
         self.sim_time = 0.0  # Track simulation time for servo updates
+
+        # RL output low-pass filter state
+        self.rl_filter_enabled = True  # Enable/disable via GUI
+        self.rl_filter_alpha = 0.3  # Filter coefficient (0.1=very smooth, 0.5=responsive)
+        self.rl_filtered_rx = 0.0
+        self.rl_filtered_ry = 0.0
 
         # Ball trail history (for hardware mode)
         self.max_history = VisualizationConfig.BALL_TRAIL_MAX_HISTORY
@@ -202,11 +208,18 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                 platform_tilt = (self.last_fk_rotation[0], self.last_fk_rotation[1])
             else:
                 platform_tilt = (0.0, 0.0)
-            rx, ry = self.controller.update(
+            rx_raw, ry_raw = self.controller.update(
                 ball_pos_filtered, ball_vel_filtered, target_pos_mm,
                 platform_tilt_deg=platform_tilt,
                 dt=dt
             )
+            # Apply low-pass filter to smooth RL outputs (if enabled)
+            if self.rl_filter_enabled:
+                self.rl_filtered_rx = self.rl_filter_alpha * rx_raw + (1 - self.rl_filter_alpha) * self.rl_filtered_rx
+                self.rl_filtered_ry = self.rl_filter_alpha * ry_raw + (1 - self.rl_filter_alpha) * self.rl_filtered_ry
+                rx, ry = self.rl_filtered_rx, self.rl_filtered_ry
+            else:
+                rx, ry = rx_raw, ry_raw
         else:
             return None
 
@@ -313,8 +326,9 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
                                        'min_freq': ControlLoopConfig.MIN_FREQUENCY_HZ,
                                        'max_freq': ControlLoopConfig.MAX_FREQUENCY_HZ}})
 
-        # Simulation control
-        left_modules.append({'type': 'simulation_control'})
+        # Simulation control (hide timestep controls in hardware mode)
+        left_modules.append({'type': 'simulation_control',
+                            'args': {'show_timestep_controls': self.operation_mode == 'sim'}})
 
         # Trajectory pattern
         left_modules.append({'type': 'trajectory_pattern', 'args': {'pattern_var': self.pattern_type}})
@@ -477,6 +491,49 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
             gain_layout.addStretch()
 
             controller_layout.addWidget(gain_widget)
+
+        elif self.controller_type_selection == 'RL' and 'controller' in self.gui_modules:
+            # Add filter controls for RL
+            controller_frame = self.gui_modules['controller'].widget
+            controller_layout = controller_frame.layout()
+
+            # Filter enable toggle
+            filter_widget = QWidget()
+            filter_layout = QHBoxLayout(filter_widget)
+            filter_layout.setContentsMargins(0, 10, 0, 0)
+
+            self.rl_filter_checkbox = QCheckBox("Enable Output Filter")
+            self.rl_filter_checkbox.setChecked(self.rl_filter_enabled)
+            self.rl_filter_checkbox.stateChanged.connect(self.on_rl_filter_toggle)
+            filter_layout.addWidget(self.rl_filter_checkbox)
+
+            self.rl_filter_status = QLabel("[ON]" if self.rl_filter_enabled else "[OFF]")
+            self.rl_filter_status.setStyleSheet(f"color: {self.colors['highlight'] if self.rl_filter_enabled else self.colors['border']}; font-size: 10pt;")
+            filter_layout.addWidget(self.rl_filter_status)
+            filter_layout.addStretch()
+
+            controller_layout.addWidget(filter_widget)
+
+            # Alpha slider (smoothness control)
+            alpha_widget = QWidget()
+            alpha_layout = QHBoxLayout(alpha_widget)
+            alpha_layout.setContentsMargins(0, 5, 0, 0)
+
+            alpha_label = QLabel("Filter Alpha:")
+            alpha_layout.addWidget(alpha_label)
+
+            self.rl_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+            self.rl_alpha_slider.setMinimum(5)   # 0.05
+            self.rl_alpha_slider.setMaximum(100)  # 1.0
+            self.rl_alpha_slider.setValue(int(self.rl_filter_alpha * 100))
+            self.rl_alpha_slider.valueChanged.connect(self.on_rl_alpha_change)
+            alpha_layout.addWidget(self.rl_alpha_slider)
+
+            self.rl_alpha_value = QLabel(f"{self.rl_filter_alpha:.2f}")
+            self.rl_alpha_value.setMinimumWidth(40)
+            alpha_layout.addWidget(self.rl_alpha_value)
+
+            controller_layout.addWidget(alpha_widget)
 
     # ============================================================================
     # Hardware-specific methods
@@ -726,6 +783,32 @@ class StewartController(IMUControllerMixin, HardwareControllerBase):
 
         dialog.setLayout(layout)
         dialog.exec()
+
+    # ============================================================================
+    # RL-specific methods
+    # ============================================================================
+
+    def on_rl_filter_toggle(self, state: int) -> None:
+        """Toggle RL output filter on/off."""
+        enabled = state == Qt.CheckState.Checked.value
+        self.rl_filter_enabled = enabled
+
+        if hasattr(self, 'rl_filter_status'):
+            if enabled:
+                self.rl_filter_status.setText("[ON]")
+                self.rl_filter_status.setStyleSheet(f"color: {self.colors['highlight']}; font-size: 10pt;")
+            else:
+                self.rl_filter_status.setText("[OFF]")
+                self.rl_filter_status.setStyleSheet(f"color: {self.colors['border']}; font-size: 10pt;")
+
+        self.log(f"RL filter: {'ENABLED' if enabled else 'DISABLED'}")
+
+    def on_rl_alpha_change(self, value: int) -> None:
+        """Handle RL filter alpha slider change."""
+        alpha = value / 100.0
+        self.rl_filter_alpha = alpha
+        if hasattr(self, 'rl_alpha_value'):
+            self.rl_alpha_value.setText(f"{alpha:.2f}")
 
     # ============================================================================
     # Controller parameter methods

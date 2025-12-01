@@ -66,6 +66,20 @@ class GUIModule:
 class SimulationControlModule(GUIModule):
     """Start/Stop/Reset simulation controls."""
 
+    def __init__(self, parent: QWidget, colors: Dict[str, str], callbacks: Optional[Dict[str, Any]] = None,
+                 show_timestep_controls: bool = True) -> None:
+        """
+        Initialize simulation control module.
+
+        Args:
+            parent: Parent QWidget
+            colors: Color scheme dict
+            callbacks: Callback functions dict
+            show_timestep_controls: Whether to show fixed timestep controls (False for hardware mode)
+        """
+        super().__init__(parent, colors, callbacks)
+        self.show_timestep_controls = show_timestep_controls
+
     def create(self) -> QWidget:
         """Create simulation control widget with start/stop/reset buttons and time display."""
         group = QGroupBox("Simulation Control")
@@ -106,30 +120,31 @@ class SimulationControlModule(GUIModule):
         self.calibration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.calibration_label)
 
-        # Timestep mode controls
-        timestep_layout = QHBoxLayout()
+        # Timestep mode controls (simulation only)
+        if self.show_timestep_controls:
+            timestep_layout = QHBoxLayout()
 
-        self.fixed_timestep_checkbox = QCheckBox("Fixed Timestep")
-        self.fixed_timestep_checkbox.setChecked(True)  # Default to fixed (matches training)
-        self.fixed_timestep_checkbox.stateChanged.connect(self._on_timestep_mode_change)
-        timestep_layout.addWidget(self.fixed_timestep_checkbox)
+            self.fixed_timestep_checkbox = QCheckBox("Fixed Timestep")
+            self.fixed_timestep_checkbox.setChecked(True)  # Default to fixed (matches training)
+            self.fixed_timestep_checkbox.stateChanged.connect(self._on_timestep_mode_change)
+            timestep_layout.addWidget(self.fixed_timestep_checkbox)
 
-        self.timestep_slider = QSlider(Qt.Orientation.Horizontal)
-        self.timestep_slider.setMinimum(5)    # 5ms minimum (200Hz)
-        self.timestep_slider.setMaximum(100)  # 100ms maximum (10Hz)
-        self.timestep_slider.setValue(10)     # 10ms default (100Hz)
-        self.timestep_slider.setSingleStep(1)  # 1ms increments
-        self.timestep_slider.setPageStep(10)   # 10ms for page up/down
-        self.timestep_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.timestep_slider.setTickInterval(10)
-        self.timestep_slider.valueChanged.connect(self._on_timestep_change)
-        timestep_layout.addWidget(self.timestep_slider)
+            self.timestep_slider = QSlider(Qt.Orientation.Horizontal)
+            self.timestep_slider.setMinimum(5)    # 5ms minimum (200Hz)
+            self.timestep_slider.setMaximum(100)  # 100ms maximum (10Hz)
+            self.timestep_slider.setValue(10)     # 10ms default (100Hz)
+            self.timestep_slider.setSingleStep(1)  # 1ms increments
+            self.timestep_slider.setPageStep(10)   # 10ms for page up/down
+            self.timestep_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.timestep_slider.setTickInterval(10)
+            self.timestep_slider.valueChanged.connect(self._on_timestep_change)
+            timestep_layout.addWidget(self.timestep_slider)
 
-        self.timestep_label = QLabel("10ms")
-        self.timestep_label.setMinimumWidth(45)
-        timestep_layout.addWidget(self.timestep_label)
+            self.timestep_label = QLabel("10ms")
+            self.timestep_label.setMinimumWidth(45)
+            timestep_layout.addWidget(self.timestep_label)
 
-        layout.addLayout(timestep_layout)
+            layout.addLayout(timestep_layout)
 
         group.setLayout(layout)
         self.widget = group
