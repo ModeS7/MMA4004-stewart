@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Models and checkpoints (large binary files)
+ball_detection/models/*/
+!ball_detection/models/.gitkeep
+RL/checkpoints/
+*.pth
+*.onnx
+*.onnx.data
+
+# Training/visualization artifacts
+RL/*.png
+ball_detection/augmentation_examples*.png
+ball_detection/segmentation_workflow/*.mp4
+
+# Data
+ball_detection/data/
+data/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -2,6 +2,25 @@
 
 Real-time control system for balancing a ball on a 6-DOF Stewart platform using vision feedback and IMU-based tilt compensation.
 
+## Demos
+
+### Circle Tracking
+Ball following a circular trajectory with real-time 3D visualization:
+
+![Circle tracking](circle.gif)
+
+### Star Pattern
+Ball tracing a star pattern:
+
+![Star pattern](star.gif)
+
+### Ball Jumping
+The controller accidentally discovered a resonance that makes the ball jump in place — not an intended feature, but a fun emergent behavior:
+
+![Ball jumping](jumping.gif)
+
+---
+
 ## Features
 
 - **Control Modes**: PID, LQR, and Manual control with real-time parameter tuning
