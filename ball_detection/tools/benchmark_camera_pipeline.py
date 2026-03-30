@@ -61,9 +61,15 @@ DEFAULT_MODELS = {
 # ============================================================
 
 class StereoFrameLoader:
-    """Load stereo frame pairs from dataset, simulating camera stream."""
+    """Load stereo frame pairs from dataset, simulating camera stream.
 
-    def __init__(self, dataset_path, max_frames=None, loop=True):
+    Simulates real camera pipeline by:
+    1. Loading JPEG files as raw bytes (simulates MJPEG stream from camera)
+    2. Decoding JPEG bytes with cv2.imdecode (simulates MJPEG decode)
+    3. Timing all numpy operations
+    """
+
+    def __init__(self, dataset_path, max_frames=None, loop=True, simulate_mjpeg=True):
         """
         Initialize frame loader.
 
@@ -71,9 +77,12 @@ class StereoFrameLoader:
             dataset_path: Path to dataset with images/ and labels.json
             max_frames: Maximum number of frame pairs to load (None = all)
             loop: Loop frames when reaching end
+            simulate_mjpeg: If True, load as bytes and decode (realistic timing)
+                           If False, use cv2.imread (faster but unrealistic)
         """
         self.dataset_path = Path(dataset_path)
         self.loop = loop
+        self.simulate_mjpeg = simulate_mjpeg
 
         # Find image directory
         if (self.dataset_path / 'images').exists():
@@ -96,9 +105,13 @@ class StereoFrameLoader:
             self.pairs = self.pairs[:max_frames]
 
         print(f"Loaded {len(self.pairs)} stereo pairs from {dataset_path}")
+        print(f"  MJPEG simulation: {simulate_mjpeg}")
 
         self.current_idx = 0
         self.frame_count = 0
+
+        # Timing for decode operations
+        self.decode_times = []
 
     def _find_stereo_pairs(self):
         """Find matching left/right frame pairs."""
@@ -148,7 +161,7 @@ class StereoFrameLoader:
         Get next stereo frame pair.
 
         Returns:
-            dict with left_frame, right_frame (BGR), labels, or None if exhausted
+            dict with left_frame, right_frame (BGR), labels, decode_ms, or None if exhausted
         """
         if self.current_idx >= len(self.pairs):
             if self.loop:
@@ -160,9 +173,37 @@ class StereoFrameLoader:
         self.current_idx += 1
         self.frame_count += 1
 
-        # Load frames (BGR from OpenCV)
-        left_frame = cv2.imread(pair['left_path'], cv2.IMREAD_COLOR)
-        right_frame = cv2.imread(pair['right_path'], cv2.IMREAD_COLOR)
+        if self.simulate_mjpeg:
+            # Simulate real camera pipeline:
+            # 1. Read JPEG as raw bytes (simulates receiving MJPEG from camera)
+            # 2. Decode with cv2.imdecode (simulates MJPEG decode)
+            t_decode_start = time.perf_counter()
+
+            # Read as raw bytes (simulates MJPEG stream)
+            with open(pair['left_path'], 'rb') as f:
+                left_bytes = f.read()
+            with open(pair['right_path'], 'rb') as f:
+                right_bytes = f.read()
+
+            # Convert to numpy array (simulates buffer from camera)
+            left_arr = np.frombuffer(left_bytes, dtype=np.uint8)
+            right_arr = np.frombuffer(right_bytes, dtype=np.uint8)
+
+            # Decode JPEG (simulates MJPEG decode - this is the expensive part)
+            left_frame = cv2.imdecode(left_arr, cv2.IMREAD_COLOR)
+            right_frame = cv2.imdecode(right_arr, cv2.IMREAD_COLOR)
+
+            t_decode_end = time.perf_counter()
+            decode_ms = (t_decode_end - t_decode_start) * 1000
+            self.decode_times.append(decode_ms)
+        else:
+            # Fast path: direct imread (unrealistic but faster for testing)
+            t_decode_start = time.perf_counter()
+            left_frame = cv2.imread(pair['left_path'], cv2.IMREAD_COLOR)
+            right_frame = cv2.imread(pair['right_path'], cv2.IMREAD_COLOR)
+            t_decode_end = time.perf_counter()
+            decode_ms = (t_decode_end - t_decode_start) * 1000
+            self.decode_times.append(decode_ms)
 
         if left_frame is None or right_frame is None:
             return self.get_next_frame()  # Skip broken frames
@@ -173,6 +214,7 @@ class StereoFrameLoader:
             'left_label': pair['left_label'],
             'right_label': pair['right_label'],
             'frame_id': pair['frame_id'],
+            'decode_ms': decode_ms,
         }
 
     def __len__(self):
@@ -182,6 +224,22 @@ class StereoFrameLoader:
         """Reset to beginning."""
         self.current_idx = 0
         self.frame_count = 0
+        self.decode_times = []
+
+    def get_decode_statistics(self):
+        """Get MJPEG decode timing statistics."""
+        if not self.decode_times:
+            return None
+        arr = np.array(self.decode_times)
+        return {
+            'mean': np.mean(arr),
+            'std': np.std(arr),
+            'min': np.min(arr),
+            'max': np.max(arr),
+            'p50': np.percentile(arr, 50),
+            'p95': np.percentile(arr, 95),
+            'p99': np.percentile(arr, 99),
+        }
 
 
 # ============================================================
@@ -211,9 +269,14 @@ class ROIPipelineBenchmark:
         # Timing accumulators
         self.timing = defaultdict(list)
 
-    def process_frame(self, left_frame, right_frame):
+    def process_frame(self, left_frame, right_frame, decode_ms=0.0):
         """
         Process stereo pair with ROI pipeline.
+
+        Args:
+            left_frame: Left BGR frame
+            right_frame: Right BGR frame
+            decode_ms: Time spent decoding MJPEG (from loader)
 
         Returns:
             dict with detection results and timing
@@ -272,10 +335,15 @@ class ROIPipelineBenchmark:
             self.timing['cnn_R'].append((t_cnn_r - t_roi_r) * 1000)
 
         t_end = time.perf_counter()
-        self.timing['total'].append((t_end - t_start) * 1000)
+        detection_ms = (t_end - t_start) * 1000
+        self.timing['decode'].append(decode_ms)
+        self.timing['detection'].append(detection_ms)
+        self.timing['total'].append(detection_ms + decode_ms)
 
         results['timing'] = {
-            'total_ms': (t_end - t_start) * 1000
+            'total_ms': detection_ms + decode_ms,
+            'detection_ms': detection_ms,
+            'decode_ms': decode_ms,
         }
 
         return results
@@ -340,9 +408,14 @@ class StereoPipelineBenchmark:
         # Timing accumulators
         self.timing = defaultdict(list)
 
-    def process_frame(self, left_frame, right_frame):
+    def process_frame(self, left_frame, right_frame, decode_ms=0.0):
         """
         Process stereo pair with STEREO_NN pipeline.
+
+        Args:
+            left_frame: Left BGR frame
+            right_frame: Right BGR frame
+            decode_ms: Time spent decoding MJPEG (from loader)
 
         Returns:
             dict with detection results and timing
@@ -355,7 +428,9 @@ class StereoPipelineBenchmark:
         t_end = time.perf_counter()
 
         # Accumulate timing
-        self.timing['total'].append((t_end - t_start) * 1000)
+        self.timing['detection'].append((t_end - t_start) * 1000)
+        self.timing['decode'].append(decode_ms)
+        self.timing['total'].append((t_end - t_start) * 1000 + decode_ms)
         self.timing['resize'].append(result['timing']['resize_ms'])
         self.timing['convert'].append(result['timing']['convert_ms'])
         self.timing['normalize'].append(result['timing']['normalize_ms'])
@@ -459,7 +534,12 @@ def run_benchmark(args):
 
     # Load frames
     print(f"\nLoading dataset: {args.dataset}")
-    loader = StereoFrameLoader(args.dataset, max_frames=args.max_frames, loop=False)
+    loader = StereoFrameLoader(
+        args.dataset,
+        max_frames=args.max_frames,
+        loop=False,
+        simulate_mjpeg=args.simulate_mjpeg
+    )
 
     if len(loader) == 0:
         print("ERROR: No stereo pairs found in dataset!")
@@ -486,13 +566,15 @@ def run_benchmark(args):
     print(f"  Frames: {len(loader)}")
     print(f"  Warmup: {args.warmup}")
     print(f"  Display: {args.display}")
+    print(f"  MJPEG simulation: {args.simulate_mjpeg}")
 
     # Warmup
     print("\nWarming up...")
     for i in range(args.warmup):
         frame_data = loader.get_next_frame()
         if frame_data:
-            pipeline.process_frame(frame_data['left_frame'], frame_data['right_frame'])
+            decode_ms = frame_data.get('decode_ms', 0.0)
+            pipeline.process_frame(frame_data['left_frame'], frame_data['right_frame'], decode_ms)
     loader.reset()
 
     # Reset timing after warmup
@@ -509,16 +591,19 @@ def run_benchmark(args):
         if frame_data is None:
             break
 
+        decode_ms = frame_data.get('decode_ms', 0.0)
         t_loop_start = time.perf_counter()
 
-        # Process frame
+        # Process frame (decode_ms already timed separately by loader)
         result = pipeline.process_frame(
             frame_data['left_frame'],
-            frame_data['right_frame']
+            frame_data['right_frame'],
+            decode_ms
         )
 
         t_loop_end = time.perf_counter()
-        frame_time = (t_loop_end - t_loop_start) * 1000
+        # Total frame time = decode + detection
+        frame_time = (t_loop_end - t_loop_start) * 1000 + decode_ms
         frame_times.append(frame_time)
 
         # FPS calculation
@@ -535,11 +620,11 @@ def run_benchmark(args):
             timing = result['timing']
             if 'resize_ms' in timing:  # STEREO_NN mode
                 print(f"  Frame {loader.frame_count}/{len(loader)} | FPS: {fps:.1f} | Total: {frame_time:.1f}ms")
-                print(f"    resize: {timing.get('resize_ms', 0):.2f} | cvt: {timing.get('convert_ms', 0):.2f} | "
+                print(f"    decode: {decode_ms:.2f} | resize: {timing.get('resize_ms', 0):.2f} | cvt: {timing.get('convert_ms', 0):.2f} | "
                       f"norm: {timing.get('normalize_ms', 0):.2f} | stereo: {timing.get('stereo_ms', 0):.2f} | "
                       f"refine_L: {timing.get('refine_L_ms', 0):.2f} | refine_R: {timing.get('refine_R_ms', 0):.2f}")
             else:  # ROI_NN mode
-                print(f"  Frame {loader.frame_count}/{len(loader)} | FPS: {fps:.1f} | Total: {frame_time:.1f}ms")
+                print(f"  Frame {loader.frame_count}/{len(loader)} | FPS: {fps:.1f} | Total: {frame_time:.1f}ms | decode: {decode_ms:.2f}ms")
 
         # Visualization
         if args.display:
@@ -562,10 +647,10 @@ def run_benchmark(args):
         cv2.destroyAllWindows()
 
     # Print results
-    print_results(pipeline, frame_times, args)
+    print_results(pipeline, frame_times, loader, args)
 
 
-def print_results(pipeline, frame_times, args):
+def print_results(pipeline, frame_times, loader, args):
     """Print benchmark results."""
     stats = pipeline.get_statistics()
 
@@ -577,6 +662,7 @@ def print_results(pipeline, frame_times, args):
     print(f"Convert to RGB: {args.convert_rgb}")
     print(f"Use refinement: {args.refinement}")
     print(f"GPU: {args.gpu}")
+    print(f"MJPEG simulation: {args.simulate_mjpeg}")
     print(f"Total frames: {len(frame_times)}")
 
     # Overall stats
@@ -593,18 +679,28 @@ def print_results(pipeline, frame_times, args):
 
     # Detailed timing breakdown
     print(f"\n{'Timing Breakdown':}")
-    print("-" * 50)
+    print("-" * 60)
     print(f"{'Stage':<20} {'Mean':>8} {'Std':>8} {'P95':>8} {'P99':>8}")
-    print("-" * 50)
+    print("-" * 60)
 
-    for key in ['total', 'resize', 'convert', 'normalize', 'stereo_nn',
-                'roi_L', 'roi_R', 'cnn_L', 'cnn_R', 'refine_L', 'refine_R']:
+    # Order: decode -> preprocessing -> inference -> refinement -> total
+    for key in ['decode', 'resize', 'convert', 'normalize', 'stereo_nn',
+                'roi_L', 'roi_R', 'cnn_L', 'cnn_R', 'refine_L', 'refine_R',
+                'detection', 'total']:
         if key in stats:
             s = stats[key]
             print(f"{key:<20} {s['mean']:>7.2f}ms {s['std']:>7.2f}ms "
                   f"{s['p95']:>7.2f}ms {s['p99']:>7.2f}ms")
 
-    print("-" * 50)
+    print("-" * 60)
+
+    # Show pipeline breakdown summary
+    if args.simulate_mjpeg and 'decode' in stats and 'detection' in stats:
+        decode_stats = stats['decode']
+        detection_stats = stats['detection']
+        print(f"\nPipeline breakdown (mean):")
+        print(f"  MJPEG decode:    {decode_stats['mean']:>7.2f}ms ({100*decode_stats['mean']/(decode_stats['mean']+detection_stats['mean']):.1f}%)")
+        print(f"  Detection:       {detection_stats['mean']:>7.2f}ms ({100*detection_stats['mean']/(decode_stats['mean']+detection_stats['mean']):.1f}%)")
 
     # Summary
     print(f"\n{'='*60}")
@@ -678,6 +774,9 @@ Examples:
     parser.add_argument('--no-gpu', action='store_true',
                         help='Disable GPU acceleration (use CPU only)')
 
+    parser.add_argument('--no-mjpeg', action='store_true',
+                        help='Disable MJPEG simulation (use direct imread, unrealistic but faster)')
+
     parser.add_argument('--max-frames', type=int, default=None,
                         help='Maximum number of frames to process')
 
@@ -719,6 +818,7 @@ Examples:
     # Set derived args
     args.refinement = not args.no_refinement
     args.gpu = not args.no_gpu
+    args.simulate_mjpeg = not args.no_mjpeg
 
     # Run benchmark
     run_benchmark(args)
